@@ -75,6 +75,11 @@ impl<R: Read> BufferedReader<R> {
         Ok(true)
     }
 
+    /// 底层读取器的可变引用（写方向 / 超时设置；不触碰读缓冲）。
+    pub(super) fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
     /// 取回底层读取器（丢弃未消费缓冲）。
     pub(super) fn into_inner(self) -> R {
         self.inner

@@ -61,6 +61,13 @@ const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 中继缓冲（spec §2.2）。
 const RELAY_BUF_LEN: usize = 8192;
+/// dial 在飞期间客户端数据的缓冲上限。
+///
+/// Gate 2 真机 TUN 暴露：SYN 即开始 dial，客户端可能先于 dial 完成发出首个 TCP
+/// 段；必须缓冲后补发，不能丢弃——否则真实 TUN 流量会丢失首个 TCP 段。
+/// 超出上限的流在 dial 完成后 fail-closed（RST），绝不静默截断。
+/// 上限 × MAX_CONCURRENT_DIALS = 16 MiB 最坏情况。
+const DIAL_BUFFER_MAX_BYTES: usize = 64 * 1024;
 
 /// TCP 转发器（dataplane 线程拥有）。
 pub struct TcpForwarder {
@@ -75,6 +82,8 @@ pub struct TcpForwarder {
     relays: HashMap<u32, RelayHandle>,
     /// stream_id → 目标（dial 中，用于失败时 RST）。
     pending: HashMap<u32, SocketAddr>,
+    /// dial 在飞期间已到达的客户端数据（dial 成功后按序补发）。
+    dial_buffer: DialBuffer,
     /// dial 在飞时已被 smoltcp 关闭的流（DialDone 成功后直接丢弃句柄，防泄漏）。
     closed_during_dial: HashSet<u32>,
     /// drain_events 暂存的待写 TUN 包。
@@ -96,6 +105,7 @@ impl TcpForwarder {
             event_rx,
             relays: HashMap::new(),
             pending: HashMap::new(),
+            dial_buffer: DialBuffer::default(),
             closed_during_dial: HashSet::new(),
             pending_tun: Vec::new(),
             stats: ProxyFwdStats::default(),
@@ -150,14 +160,40 @@ impl TcpForwarder {
                             // 流在 dial 期间已关闭：句柄无人消费，直接 drop
                             // （relay 线程因命令通道断开而退出）。
                             drop(handle);
+                            self.dial_buffer.discard(stream_id);
+                        } else if self.dial_buffer.take_overflowed(stream_id) {
+                            // dial 期间缓冲超限：fail-closed（RST），不静默截断。
+                            drop(handle);
+                            self.stats.tcp_dials_failed += 1;
+                            let four = self.terminator.lookup_id(stream_id);
+                            let mut pkts = self.terminator.handle_fabric_rst(stream_id);
+                            if !has_rst(&pkts)
+                                && let Some(four) = four
+                            {
+                                pkts.push(craft_rst(&four));
+                            }
+                            let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
+                            eprintln!(
+                                "[proxy-fwd] event=dial_failed stream_id={stream_id} kind={} tag={} error=internal detail=dial_buffer_overflow",
+                                self.kind.as_str(),
+                                self.tag
+                            );
                         } else {
                             self.relays.insert(stream_id, handle);
                             self.stats.tcp_dials_ok += 1;
+                            // 补发 dial 期间缓冲的客户端数据（保持字节顺序）。
+                            if let Some(buffered) = self.dial_buffer.take(stream_id)
+                                && !buffered.is_empty()
+                                && let Some(relay) = self.relays.get(&stream_id)
+                            {
+                                let _ = relay.tx.send(RelayCmd::Data(buffered));
+                            }
                         }
                     }
                     Err(error) => {
                         self.pending.remove(&stream_id);
                         self.closed_during_dial.remove(&stream_id);
+                        self.dial_buffer.discard(stream_id);
                         self.stats.tcp_dials_failed += 1;
                         // RST smoltcp 侧；terminator 在 SynReceived 直接 release
                         // 时不产包，需按四元组兜底构造 RST（E4 可观察）。
@@ -244,8 +280,11 @@ impl TcpForwarder {
                     // 非阻塞发送（中继线程可能已退出，忽略错误）。
                     self.stats.tcp_bytes_up += bytes.len() as u64;
                     let _ = relay.tx.send(RelayCmd::Data(bytes));
+                } else if self.pending.contains_key(&stream_id) {
+                    // dial 在飞：先缓冲，dial 成功后按序补发（不丢首个 TCP 段）。
+                    self.stats.tcp_bytes_up += bytes.len() as u64;
+                    self.dial_buffer.append(stream_id, &bytes);
                 }
-                // 无中继（dial 中）：丢弃（dial 成功后新数据会正常走）。
             }
             TcpEvent::Closed {
                 stream_id, reset, ..
@@ -256,6 +295,7 @@ impl TcpForwarder {
                 if self.pending.remove(&stream_id).is_some() {
                     self.closed_during_dial.insert(stream_id);
                 }
+                self.dial_buffer.discard(stream_id);
                 // smoltcp 侧已关闭，无需额外动作。
                 let _ = reset;
             }
@@ -281,6 +321,53 @@ impl TcpForwarder {
 
     pub fn stats(&self) -> ProxyFwdStats {
         self.stats.clone()
+    }
+}
+
+/// dial 在飞期间的客户端数据缓冲。
+///
+/// SYN 即开始 dial，客户端可能在 dial 完成前就发出首个 TCP 段；这段时间的数据
+/// 必须按序保存并在 dial 成功后补发。超过 [`DIAL_BUFFER_MAX_BYTES`] 的流标记为
+/// overflow，由调用方在 dial 完成后 fail-closed（RST），绝不静默截断字节流。
+#[derive(Default)]
+struct DialBuffer {
+    streams: HashMap<u32, Vec<u8>>,
+    overflowed: HashSet<u32>,
+}
+
+impl DialBuffer {
+    fn append(&mut self, stream_id: u32, bytes: &[u8]) {
+        if self.overflowed.contains(&stream_id) {
+            return;
+        }
+        let buffered = self.streams.entry(stream_id).or_default();
+        if buffered.len().saturating_add(bytes.len()) > DIAL_BUFFER_MAX_BYTES {
+            buffered.clear();
+            buffered.shrink_to_fit();
+            self.overflowed.insert(stream_id);
+        } else {
+            buffered.extend_from_slice(bytes);
+        }
+    }
+
+    /// 取出缓冲数据；无缓冲时返回 `None`。
+    fn take(&mut self, stream_id: u32) -> Option<Vec<u8>> {
+        self.streams.remove(&stream_id)
+    }
+
+    /// 取出并清除 overflow 标记；`true` = 该流 dial 期间超限，必须 fail-closed。
+    fn take_overflowed(&mut self, stream_id: u32) -> bool {
+        if self.overflowed.remove(&stream_id) {
+            self.streams.remove(&stream_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn discard(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
+        self.overflowed.remove(&stream_id);
     }
 }
 
@@ -371,9 +458,50 @@ fn spawn_relay(
                 }
             }
         }
+        if !reset {
+            // 客户端正常关闭 → 半关闭写方向（AnyTLS 在此发 Fin 帧；spec §3.2）。
+            let _ = stream.shutdown();
+        }
         eprintln!(
             "[proxy-fwd] event=relay_closed stream_id={stream_id} reset={reset} up_bytes={up_bytes} down_bytes={down_bytes}"
         );
     });
     RelayHandle { tx: cmd_tx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dial_buffer_preserves_order_and_flushes_once() {
+        let mut buffer = DialBuffer::default();
+        buffer.append(7, b"abc");
+        buffer.append(7, b"def");
+        assert_eq!(buffer.take(7).as_deref(), Some(&b"abcdef"[..]));
+        assert!(buffer.take(7).is_none());
+    }
+
+    #[test]
+    fn dial_buffer_overflow_is_fail_closed_not_truncated() {
+        let mut buffer = DialBuffer::default();
+        buffer.append(1, &vec![0u8; DIAL_BUFFER_MAX_BYTES]);
+        buffer.append(1, b"x");
+        assert!(buffer.take_overflowed(1));
+        // overflow 流不会把截断后的字节交给 relay；调用方改发 RST。
+        assert!(buffer.take(1).is_none());
+    }
+
+    #[test]
+    fn dial_buffer_discard_clears_buffered_bytes_and_overflow_flag() {
+        let mut buffer = DialBuffer::default();
+        buffer.append(2, b"data");
+        buffer.discard(2);
+        assert!(buffer.take(2).is_none());
+
+        buffer.append(3, &vec![0u8; DIAL_BUFFER_MAX_BYTES]);
+        buffer.append(3, b"x");
+        buffer.discard(3);
+        assert!(!buffer.take_overflowed(3));
+    }
 }

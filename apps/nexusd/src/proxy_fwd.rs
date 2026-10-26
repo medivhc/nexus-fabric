@@ -21,6 +21,8 @@ pub use udp_relay::build_udp_reply;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use nexus_proxy_config::OutboundKind;
+
 /// Proxy 转发统计（P4 可观测；dataplane 合并到 DataplaneStats；spec §6.4）。
 #[derive(Debug, Default, Clone)]
 pub struct ProxyFwdStats {
@@ -54,6 +56,9 @@ pub struct ProxyFwdStats {
 
 /// Proxy 转发引擎（dataplane 拥有）。
 pub struct ProxyEngine {
+    /// 选中出站的 kind/tag（启动日志与 E4 证据用；spec §6.5 / §8.2）。
+    kind: OutboundKind,
+    tag: String,
     tcp: tcp_relay::TcpForwarder,
     udp: udp_relay::UdpForwarder,
 }
@@ -68,10 +73,20 @@ impl ProxyEngine {
             return Ok(None);
         };
         let dialer = adapter::select_dialer(proxy_yaml)?.dialer;
+        let kind = dialer.kind();
+        let tag = dialer.tag().to_string();
         Ok(Some(Self {
+            kind,
+            tag,
             tcp: tcp_relay::TcpForwarder::new(Arc::clone(&dialer)),
             udp: udp_relay::UdpForwarder::new(dialer),
         }))
+    }
+
+    /// 选中出站的 `(kind, tag)`（只读；不暴露 dialer 内部配置）。
+    #[must_use]
+    pub fn outbound(&self) -> (OutboundKind, &str) {
+        (self.kind, &self.tag)
     }
 
     /// 处理一个 proxy 分类的包；返回 (待写回 TUN 的包, 是否真实转发)。

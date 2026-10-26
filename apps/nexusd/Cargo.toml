@@ -52,6 +52,10 @@ libc = "0.2"
 chacha20poly1305 = { version = "0.10.1", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
 sha1 = { version = "0.10", default-features = false }
+# 步骤 2：VLESS / AnyTLS 出站的 TLS 客户端（与 crates/nexus-outbound-{vless,anytls}
+# 同版本同 feature 集；已在 Cargo.lock，无 lock churn）。系统根经 rustls-native-certs。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = { version = "0.8", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 nexus-platform-windows = { path = "../../crates/nexus-platform-windows" }

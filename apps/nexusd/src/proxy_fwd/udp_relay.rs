@@ -531,6 +531,65 @@ mod tests {
     }
 
     #[test]
+    fn vless_and_anytls_udp_fail_closed_with_per_protocol_counters() {
+        struct NotWiredDialer {
+            kind: OutboundKind,
+            tag: &'static str,
+        }
+
+        impl OutboundDialer for NotWiredDialer {
+            fn kind(&self) -> OutboundKind {
+                self.kind
+            }
+
+            fn tag(&self) -> &str {
+                self.tag
+            }
+
+            fn dial_tcp(
+                &self,
+                _target: SocketAddr,
+            ) -> Result<Box<dyn TunnelStream>, OutboundError> {
+                Err(OutboundError::UdpUnsupported)
+            }
+
+            fn udp_capability(&self) -> UdpCapability {
+                UdpCapability::Unsupported {
+                    reason: UdpUnsupportedReason::NotWired,
+                }
+            }
+        }
+
+        for (kind, tag) in [
+            (OutboundKind::Vless, "vless-a"),
+            (OutboundKind::Anytls, "anytls-a"),
+        ] {
+            let mut forwarder = UdpForwarder::new(Arc::new(NotWiredDialer { kind, tag }));
+            let packet = udp_packet(b"business-udp");
+            assert!(!forwarder.handle_packet(&packet));
+            assert!(!forwarder.handle_packet(&packet));
+            let stats = forwarder.stats();
+            assert_eq!(stats.udp_unsupported, 2, "{tag}");
+            assert_eq!(stats.udp_send_failed, 2, "{tag}");
+            assert_eq!(stats.udp_sent, 0, "{tag}");
+            match kind {
+                OutboundKind::Vless => {
+                    assert_eq!(stats.udp_unsupported_vless, 2);
+                    assert_eq!(stats.udp_unsupported_anytls, 0);
+                }
+                OutboundKind::Anytls => {
+                    assert_eq!(stats.udp_unsupported_anytls, 2);
+                    assert_eq!(stats.udp_unsupported_vless, 0);
+                }
+                other => panic!("unexpected kind {other:?}"),
+            }
+            assert_eq!(stats.udp_unsupported_other, 0, "{tag}");
+            // 首条必打；第二条在 10s 窗口内被抑制。
+            assert_eq!(stats.udp_unsupported_log_suppressed, 1, "{tag}");
+        }
+    }
+
+    #[test]
     fn udp_packet_parse_and_build() {
         // 构造一个 UDP 包：20B IP + 8B UDP + payload。
         let payload = b"hello udp";

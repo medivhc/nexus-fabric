@@ -1704,6 +1704,8 @@ dependencies = [
  "nexus-storage",
  "nexus-turn",
  "nexus-workspace",
+ "rustls",
+ "rustls-native-certs",
  "serde_json",
  "sha1",
  "signal-hook",

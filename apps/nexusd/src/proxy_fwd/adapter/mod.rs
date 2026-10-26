@@ -12,12 +12,15 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nexus_outbound_vless::VlessFlow;
 use nexus_proxy_config::{ConfigError, OutboundConfig, OutboundKind};
 pub(crate) use nexus_proxy_config::{UdpCapability, UdpMode, UdpUnsupportedReason};
 
+mod anytls;
 mod framing;
 mod legacy;
 mod tls;
+mod vless;
 
 #[cfg(test)]
 mod tests;
@@ -26,6 +29,8 @@ mod tests;
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// 单次 TLS 握手超时（spec §2.2；与 proxy-transport TrojanTlsConfig 的 10s 对齐）。
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 协议层握手超时（spec §6.6；AnyTLS 的 auth/settings/SYNACK）。
+pub(crate) const PROTOCOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 服务端 reason / 日志 detail 的截断上限（spec §2.2）。
 pub(crate) const DETAIL_MAX_BYTES: usize = 128;
 
@@ -373,11 +378,26 @@ impl std::fmt::Debug for SelectedOutbound {
     }
 }
 
-/// 本 run（步骤 1）已接线的代理出站集合。
+/// 配置面 warning 码（spec §3.1/§3.2/§5）。步骤 3 的五载体从
+/// `verdicts.json.messages` 取文案；本步只登记稳定码，不在 adapter 内渲染文案。
+#[allow(dead_code)]
+pub(crate) const SNI_IGNORED_FOR_VLESS: &str = "SNI_IGNORED_FOR_VLESS";
+#[allow(dead_code)]
+pub(crate) const ALPN_IGNORED: &str = "ALPN_IGNORED";
+#[allow(dead_code)]
+pub(crate) const SERVERNAME_IGNORED_FOR_ANYTLS: &str = "SERVERNAME_IGNORED_FOR_ANYTLS";
+#[allow(dead_code)]
+pub(crate) const VLESS_VISION_SPLICE_NOT_IMPLEMENTED: &str = "VLESS_VISION_SPLICE_NOT_IMPLEMENTED";
+
+/// 本 run（步骤 1 + 步骤 2）已接线的代理出站集合（spec §1.5 / P3）。
 pub(crate) fn is_wired(kind: OutboundKind) -> bool {
     matches!(
         kind,
-        OutboundKind::Socks5 | OutboundKind::Shadowsocks | OutboundKind::Trojan
+        OutboundKind::Socks5
+            | OutboundKind::Shadowsocks
+            | OutboundKind::Trojan
+            | OutboundKind::Vless
+            | OutboundKind::Anytls
     )
 }
 
@@ -385,7 +405,7 @@ pub(crate) fn is_wired(kind: OutboundKind) -> bool {
 ///
 /// # Errors
 /// - `Config`：配置非法（spec §2.6.1）；
-/// - `ProtocolNotWired`：协议本 run 未接线（vmess/vless/anytls/hysteria2）。
+/// - `ProtocolNotWired`：协议本 run 未接线（vmess/hysteria2）。
 pub fn build_dialer(
     outbound: &OutboundConfig,
 ) -> Result<Arc<dyn OutboundDialer>, BuildDialerError> {
@@ -478,6 +498,67 @@ pub fn build_dialer(
             Ok(Arc::new(legacy::TrojanProxyTransportDialer::new(
                 outbound.tag.clone(),
                 config,
+            )))
+        }
+        OutboundKind::Vless => {
+            let uuid_text = non_empty(&outbound.uuid)
+                .ok_or(BuildDialerError::Config(OutboundConfigError::MissingUuid))?;
+            let uuid = nexus_outbound_vless::VlessUuid::parse(uuid_text)
+                .map_err(|_| BuildDialerError::Config(OutboundConfigError::InvalidUuid))?;
+            let flow_text = outbound.flow.as_deref().unwrap_or("");
+            let flow = VlessFlow::parse(flow_text).map_err(|_| {
+                BuildDialerError::Config(OutboundConfigError::UnsupportedFlow {
+                    flow: flow_text.to_string(),
+                })
+            })?;
+            let use_tls = outbound.tls.unwrap_or(false);
+            if flow == VlessFlow::XtlsRprxVision && !use_tls {
+                return Err(BuildDialerError::Config(
+                    OutboundConfigError::VisionRequiresTls,
+                ));
+            }
+            // §3.1：`servername` 作 SNI；缺省 = locator host；`sni` 忽略（warning 码登记）。
+            let sni = match non_empty(&outbound.servername) {
+                Some(server_name) if valid_sni(server_name) => server_name.to_string(),
+                Some(server_name) => {
+                    return Err(BuildDialerError::Config(OutboundConfigError::InvalidSni {
+                        sni: server_name.to_string(),
+                    }));
+                }
+                None => host,
+            };
+            Ok(Arc::new(vless::VlessDialer::new(
+                outbound.tag.clone(),
+                server,
+                sni,
+                uuid,
+                flow,
+                use_tls,
+                outbound.skip_cert_verify.unwrap_or(false),
+            )))
+        }
+        OutboundKind::Anytls => {
+            let password = non_empty(&outbound.password)
+                .ok_or(BuildDialerError::Config(
+                    OutboundConfigError::MissingPassword,
+                ))?
+                .to_string();
+            // §3.2：`sni` 优先；缺省 = locator host；`servername` 忽略（warning 码登记）。
+            let sni = match non_empty(&outbound.sni) {
+                Some(sni) if valid_sni(sni) => sni.to_string(),
+                Some(sni) => {
+                    return Err(BuildDialerError::Config(OutboundConfigError::InvalidSni {
+                        sni: sni.to_string(),
+                    }));
+                }
+                None => host,
+            };
+            Ok(Arc::new(anytls::AnytlsDialer::new(
+                outbound.tag.clone(),
+                server,
+                sni,
+                password,
+                outbound.skip_cert_verify.unwrap_or(false),
             )))
         }
         _ => Err(BuildDialerError::ProtocolNotWired {

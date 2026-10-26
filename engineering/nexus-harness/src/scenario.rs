@@ -2764,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_returns_none_current_dir_for_all_268() {
+    fn resolve_returns_none_current_dir_for_all_cargo_run() {
         let repo = Repo::discover().expect("repo must be discoverable");
         let config = Config::load(&repo).expect("config must load");
         let scenarios = load_all(
@@ -2815,12 +2815,12 @@ mod tests {
                 ),
             }
         }
-        assert_eq!(parseable, 271, "271 cargo-run [when].command");
+        assert_eq!(parseable, 272, "272 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 249, "all declared targets resolve to Direct");
+        assert_eq!(direct, 250, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -2859,10 +2859,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            193,
-            "189 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            194,
+            "190 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 189);
+        assert_eq!(examples.len(), 190);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(

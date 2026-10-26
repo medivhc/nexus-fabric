@@ -227,12 +227,7 @@ fn build_dialer_invalid_header_format() {
 
 #[test]
 fn build_dialer_reports_unwired_protocols() {
-    for kind in [
-        OutboundKind::Vless,
-        OutboundKind::Anytls,
-        OutboundKind::Vmess,
-        OutboundKind::Hysteria2,
-    ] {
+    for kind in [OutboundKind::Vmess, OutboundKind::Hysteria2] {
         let mut config = outbound(kind);
         config.locator = Some("127.0.0.1:443".to_string());
         assert!(matches!(
@@ -240,6 +235,147 @@ fn build_dialer_reports_unwired_protocols() {
             BuildDialerError::ProtocolNotWired { .. }
         ));
     }
+}
+
+fn vless_config() -> OutboundConfig {
+    let mut config = outbound(OutboundKind::Vless);
+    config.locator = Some("127.0.0.1:443".to_string());
+    config.uuid = Some("11111111-1111-1111-1111-111111111111".to_string());
+    config
+}
+
+#[test]
+fn build_vless_requires_uuid() {
+    let mut config = vless_config();
+    config.uuid = None;
+    assert_eq!(
+        config_error(build_error(&config)),
+        OutboundConfigError::MissingUuid
+    );
+}
+
+#[test]
+fn build_vless_rejects_invalid_uuid() {
+    let mut config = vless_config();
+    config.uuid = Some("not-a-uuid".to_string());
+    assert_eq!(
+        config_error(build_error(&config)),
+        OutboundConfigError::InvalidUuid
+    );
+}
+
+#[test]
+fn build_vless_rejects_unknown_flow() {
+    let mut config = vless_config();
+    config.flow = Some("xtls-rprx-direct".to_string());
+    assert!(matches!(
+        config_error(build_error(&config)),
+        OutboundConfigError::UnsupportedFlow { .. }
+    ));
+}
+
+#[test]
+fn build_vless_vision_requires_tls() {
+    let mut config = vless_config();
+    config.flow = Some("xtls-rprx-vision".to_string());
+    config.tls = None;
+    assert_eq!(
+        config_error(build_error(&config)),
+        OutboundConfigError::VisionRequiresTls
+    );
+    config.tls = Some(true);
+    let dialer = build_dialer(&config).expect("vision vless dialer");
+    assert_eq!(dialer.kind(), OutboundKind::Vless);
+}
+
+#[test]
+fn build_vless_ignores_sni_and_alpn_but_keeps_servername_as_sni() {
+    let mut config = vless_config();
+    config.sni = Some("ignored.example".to_string());
+    config.alpn = Some(vec!["h2".to_string()]);
+    config.servername = Some("front.example".to_string());
+    let dialer = build_dialer(&config).expect("vless dialer");
+    assert_eq!(dialer.kind(), OutboundKind::Vless);
+    assert_eq!(dialer.tag(), "test");
+    // Q5=B：VLESS UDP 一律 fail-closed。
+    assert_eq!(
+        dialer.udp_capability(),
+        UdpCapability::Unsupported {
+            reason: UdpUnsupportedReason::NotWired
+        }
+    );
+}
+
+#[test]
+fn build_vless_rejects_invalid_servername() {
+    let mut config = vless_config();
+    config.servername = Some("bad/name".to_string());
+    assert!(matches!(
+        config_error(build_error(&config)),
+        OutboundConfigError::InvalidSni { .. }
+    ));
+}
+
+#[test]
+fn build_anytls_requires_password_and_declares_not_wired_udp() {
+    let mut config = outbound(OutboundKind::Anytls);
+    config.locator = Some("127.0.0.1:443".to_string());
+    assert_eq!(
+        config_error(build_error(&config)),
+        OutboundConfigError::MissingPassword
+    );
+
+    config.password = Some("secret".to_string());
+    config.sni = Some("front.example".to_string());
+    config.servername = Some("ignored.example".to_string());
+    config.alpn = Some(vec!["h2".to_string()]);
+    let dialer = build_dialer(&config).expect("anytls dialer");
+    assert_eq!(dialer.kind(), OutboundKind::Anytls);
+    assert_eq!(
+        dialer.udp_capability(),
+        UdpCapability::Unsupported {
+            reason: UdpUnsupportedReason::NotWired
+        }
+    );
+}
+
+#[test]
+fn build_anytls_rejects_invalid_sni() {
+    let mut config = outbound(OutboundKind::Anytls);
+    config.locator = Some("127.0.0.1:443".to_string());
+    config.password = Some("secret".to_string());
+    config.sni = Some("bad/name".to_string());
+    assert!(matches!(
+        config_error(build_error(&config)),
+        OutboundConfigError::InvalidSni { .. }
+    ));
+}
+
+#[test]
+fn select_dialer_skips_unwired_protocols() {
+    let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: v\noutbounds:\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n  - tag: h\n    kind: hysteria2\n    locator: 127.0.0.1:1235\n    password: secret\n";
+    let skipped = match select_dialer(yaml) {
+        Ok(selected) => panic!("expected NoUsableOutbound, got Ok({selected:?})"),
+        Err(EngineInitError::NoUsableOutbound { skipped }) => skipped,
+        Err(other) => panic!("expected NoUsableOutbound, got {other:?}"),
+    };
+    assert_eq!(skipped.len(), 2);
+    for item in skipped {
+        assert_eq!(item.reason, SkipReason::ProtocolNotWired);
+    }
+}
+
+#[test]
+fn select_dialer_accepts_vless_and_anytls() {
+    let vless = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: v\noutbounds:\n  - tag: v\n    kind: vless\n    locator: 127.0.0.1:1236\n    uuid: 11111111-1111-1111-1111-111111111111\n";
+    let selected = select_dialer(vless).expect("vless selected");
+    assert_eq!(selected.dialer.kind(), OutboundKind::Vless);
+    assert_eq!(selected.dialer.tag(), "v");
+
+    let anytls = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: a\noutbounds:\n  - tag: a\n    kind: anytls\n    locator: 127.0.0.1:1237\n    password: secret\n";
+    let selected = select_dialer(anytls).expect("anytls selected");
+    assert_eq!(selected.dialer.kind(), OutboundKind::Anytls);
+    assert_eq!(selected.dialer.tag(), "a");
 }
 
 #[test]
@@ -251,20 +387,6 @@ fn select_dialer_skips_direct_and_relay() {
     assert_eq!(selected.skipped.len(), 2);
     assert_eq!(selected.skipped[0].reason, SkipReason::NotProxyKind);
     assert_eq!(selected.skipped[1].reason, SkipReason::NotProxyKind);
-}
-
-#[test]
-fn select_dialer_skips_unwired_protocols() {
-    let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: v\noutbounds:\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n  - tag: h\n    kind: hysteria2\n    locator: 127.0.0.1:1235\n    password: secret\n  - tag: l\n    kind: vless\n    locator: 127.0.0.1:1236\n    uuid: 11111111-1111-1111-1111-111111111111\n  - tag: a\n    kind: anytls\n    locator: 127.0.0.1:1237\n    password: secret\n";
-    let skipped = match select_dialer(yaml) {
-        Ok(selected) => panic!("expected NoUsableOutbound, got Ok({selected:?})"),
-        Err(EngineInitError::NoUsableOutbound { skipped }) => skipped,
-        Err(other) => panic!("expected NoUsableOutbound, got {other:?}"),
-    };
-    assert_eq!(skipped.len(), 4);
-    for item in skipped {
-        assert_eq!(item.reason, SkipReason::ProtocolNotWired);
-    }
 }
 
 #[test]
