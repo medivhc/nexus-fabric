@@ -896,14 +896,40 @@ impl Dataplane {
         self.transparent_udp_reply_tx = None;
     }
 
-    /// 单个 tick：先 drain TPROXY channel（最多 256 条），驱动透明前端，再读 TUN 一包。
+    /// 单个 tick：先 drain TPROXY channel（最多 256 条），驱动透明前端，
+    /// 空闲也泵送一次 proxy 回程（P8b），再读 TUN 一包。
     pub fn tick(&mut self, now_millis: u64) -> io::Result<bool> {
         let drained = self.drain_transparent_inbound(now_millis);
         let polled = self.poll_transparent(now_millis);
+        // P8b（fix-review-r7 F1）：proxy 回程不能只在入站包到达时写回。
+        // 本调用无入站包（`process_one_at` WouldBlock 早返）时也必须把
+        // `ProxyEngine` 里已入队的回程泵出去；放在 `process_one_at` 之前，
+        // 保证同 tick 内旧的回程先于本 tick 新包产生的回程写回。
+        let proxy_pumped = self.poll_proxy_engine();
         match self.process_one_at(now_millis) {
-            Ok(processed) => Ok(processed || drained > 0 || polled > 0),
+            Ok(processed) => Ok(processed || drained > 0 || polled > 0 || proxy_pumped),
             Err(e) => Err(e),
         }
+    }
+
+    /// P8b：空闲 tick 泵送 proxy 回程；返回是否写出了包。
+    ///
+    /// 无引擎时直接返回（零副作用）。每次 tick 只调用一次 `ProxyEngine::poll`，
+    /// 其工作量以引擎自身「排空当前队列」语义为界：排空 relay 事件（上限为
+    /// 已入队事件数）+ 每条在途连接一次 smoltcp poll（上限为在途流数，产出受
+    /// tx 窗口/MSS 限），不产生新工作、不阻塞、不自旋。产出一律走既有
+    /// `write_proxy_tun_packets` → `ProxyEngine::fixup_tun_packets` → `tun.write`，
+    /// 与包驱动路径同一条写回路。
+    fn poll_proxy_engine(&mut self) -> bool {
+        let Some(engine) = self.proxy_engine.as_mut() else {
+            return false;
+        };
+        let pkts = engine.poll().tun_packets;
+        if pkts.is_empty() {
+            return false;
+        }
+        self.write_proxy_tun_packets(pkts);
+        true
     }
 
     /// 驱动透明前端下行/老化，并把 UDP 回包交给 listener 线程。
