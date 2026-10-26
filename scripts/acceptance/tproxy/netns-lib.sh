@@ -288,6 +288,27 @@ start_upstream() {
 }
 
 stop_upstream() {
+    # `UPSTREAM_PID` 是本地 `timeout … sudo …` 包装：只 TERM 包装会留下
+    # root 的 sudo/python 子进程（r7 遗留 8 对孤儿即此因）。先按本步
+    # upstream.log 唯一匹配 netns 内的 python 本体，再回收包装。
+    if [ -n "${NS_U}" ] && [ -n "${EVIDENCE_DIR}" ]; then
+        local up_pids pid i
+        up_pids="$(timeout 10 sudo -n "${IP}" netns exec "${NS_U}" \
+            pgrep -f "upstream\\.py.*--log ${EVIDENCE_DIR}/upstream\\.log" 2>/dev/null || true)"
+        for pid in ${up_pids}; do
+            timeout 10 sudo -n "${IP}" netns exec "${NS_U}" kill -TERM "${pid}" >/dev/null 2>&1 || true
+        done
+        for i in $(seq 1 30); do
+            [ -z "$(timeout 10 sudo -n "${IP}" netns exec "${NS_U}" \
+                pgrep -f "upstream\\.py.*--log ${EVIDENCE_DIR}/upstream\\.log" 2>/dev/null || true)" ] && break
+            sleep 0.1
+        done
+        up_pids="$(timeout 10 sudo -n "${IP}" netns exec "${NS_U}" \
+            pgrep -f "upstream\\.py.*--log ${EVIDENCE_DIR}/upstream\\.log" 2>/dev/null || true)"
+        for pid in ${up_pids}; do
+            timeout 10 sudo -n "${IP}" netns exec "${NS_U}" kill -KILL "${pid}" >/dev/null 2>&1 || true
+        done
+    fi
     if [ -n "${UPSTREAM_PID}" ] && ps -p "${UPSTREAM_PID}" >/dev/null 2>&1; then
         timeout 10 sudo -n "${IP}" netns exec "${NS_U}" kill -TERM "${UPSTREAM_PID}" >/dev/null 2>&1 || true
         local i
