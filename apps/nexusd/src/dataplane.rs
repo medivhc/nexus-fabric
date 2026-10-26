@@ -4137,4 +4137,261 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
         assert_eq!(cache.misses, 1, "only the first packet is a new flow");
         assert_eq!(cache.hits, 1, "the retransmission reuses the decision");
     }
+
+    // ===== P8b：纯单流静默窗口的空闲 tick 泵送（fix-review-r7 F1） =====
+    //
+    // r8 真实形状：客户端发完请求后不再有任何包，上游响应在最后一个入站包
+    // 处理之后才入队。旧实现只有 `Classification::Proxy` 分支才会 `poll`
+    // engine，因此响应滞留到客户端超时 FIN。这里在 dataplane 层复现：客户端
+    // 静默后只驱动主循环实际入口 `Dataplane::tick`，断言回程在有界 tick 内
+    // 写回 TUN 且字节内容正确。
+
+    /// 解析写回包的应用层载荷与 TCP seq（非 TCP/无载荷返回空）。
+    fn written_tcp_seq_payload(pkt: &[u8]) -> Option<(u32, Vec<u8>)> {
+        if pkt.len() < 40 || pkt[9] != 6 {
+            return None;
+        }
+        let ihl = usize::from(pkt[0] & 0x0f) * 4;
+        let doff = usize::from(pkt[ihl + 12] >> 4) * 4;
+        let total = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+        if total < ihl + doff || pkt.len() < total {
+            return None;
+        }
+        let seq = u32::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5], pkt[ihl + 6], pkt[ihl + 7]]);
+        Some((seq, pkt[ihl + doff..total].to_vec()))
+    }
+
+    /// 装配 proxy 数据面：`10.200.3.3/32` 走 socks5 出站（locator 指向测试替身）。
+    fn silent_window_dataplane(
+        socks_addr: std::net::SocketAddr,
+    ) -> (Dataplane, Arc<Mutex<nexus_projection::MockTun>>) {
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let tun = Box::new(SharedTun {
+            inner: Arc::clone(&mock),
+        });
+        let config = DataplaneConfig {
+            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
+            n1_configured: true,
+            proxy_configured: true,
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "10.200.3.3/32".parse().expect("cidr"),
+            target: nexus_domain::RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        let yaml = format!(
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: p1\noutbounds:\n  - tag: p1\n    kind: socks5\n    locator: {socks_addr}\n"
+        );
+        dp.set_proxy_engine(crate::proxy_fwd::ProxyEngine::new(&yaml).expect("proxy engine"));
+        (dp, mock)
+    }
+
+    /// 核心回归：零入站包、仅 tick → 静默窗口内的响应必须写回 TUN。
+    #[test]
+    fn idle_tick_pumps_silent_proxy_response_without_inbound_packets() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // socks5 测试替身：完成握手/CONNECT 应答，把“上游侧”连接交还测试；
+        // 不模拟真实代理语义，只让 `ProxyEngine` 走完整拨号 + 中继线程。
+        let socks = TcpListener::bind("127.0.0.1:0").expect("bind socks stub");
+        let socks_addr = socks.local_addr().expect("socks addr");
+        let (upstream_tx, upstream_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut conn, _) = socks.accept().expect("socks accept");
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout");
+            let mut greeting = [0u8; 2];
+            conn.read_exact(&mut greeting).expect("socks greeting");
+            assert_eq!(greeting[0], 5, "socks5 version");
+            let mut methods = vec![0u8; usize::from(greeting[1])];
+            conn.read_exact(&mut methods).expect("socks methods");
+            conn.write_all(&[5, 0]).expect("method reply");
+            let mut head = [0u8; 4];
+            conn.read_exact(&mut head).expect("socks request head");
+            assert_eq!((head[0], head[1]), (5, 1), "CONNECT request");
+            match head[3] {
+                1 => {
+                    let mut addr = [0u8; 4];
+                    conn.read_exact(&mut addr).expect("ipv4 addr");
+                }
+                3 => {
+                    let mut len = [0u8; 1];
+                    conn.read_exact(&mut len).expect("domain len");
+                    let mut addr = vec![0u8; usize::from(len[0])];
+                    conn.read_exact(&mut addr).expect("domain addr");
+                }
+                4 => {
+                    let mut addr = [0u8; 16];
+                    conn.read_exact(&mut addr).expect("ipv6 addr");
+                }
+                other => panic!("unexpected ATYP {other}"),
+            }
+            let mut port = [0u8; 2];
+            conn.read_exact(&mut port).expect("port");
+            conn.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("connect reply");
+            // 读到客户端 GET 即证明中继已把请求送出；此后客户端静默。
+            let mut req = [0u8; 512];
+            let n = conn.read(&mut req).expect("upstream request");
+            assert!(n > 0, "relay forwarded the client request");
+            upstream_tx.send(conn).expect("hand over proxy stream");
+        });
+
+        let (mut dp, mock) = silent_window_dataplane(socks_addr);
+        let client_ip = [10, 200, 1, 2];
+        let server_ip = [10, 200, 3, 3];
+        let client_port = 57365u16;
+        let server_port = 8080u16;
+        let mut now = 0u64;
+
+        // 握手：SYN → SYN-ACK（经 tick 写回）。
+        let syn = craft_tcp(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        now += 1;
+        assert!(dp.tick(now).expect("tick syn"));
+        let written = mock.lock().unwrap().take_written();
+        assert_eq!(written.len(), 1, "SYN-ACK expected: {written:?}");
+        let server_isn1 = syn_ack_srv_seq(&written[0]) + 1;
+
+        // ACK + GET：最后一个入站包。
+        let ack = craft_tcp(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            1001,
+            server_isn1,
+            0x10,
+            &[],
+        );
+        mock.lock().unwrap().inject(ack);
+        now += 1;
+        assert!(dp.tick(now).expect("tick ack"));
+        let get = craft_tcp(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            1001,
+            server_isn1,
+            0x18,
+            b"GET / HTTP/1.1\r\n\r\n",
+        );
+        mock.lock().unwrap().inject(get);
+        now += 1;
+        assert!(dp.tick(now).expect("tick get"));
+
+        // 等拨号完成 + GET 送达上游（这段时间仍靠 tick 泵送 relay 事件）。
+        let mut upstream = None;
+        for _ in 0..5_000 {
+            now += 1;
+            let _ = dp.tick(now).expect("tick during dial");
+            let _ = mock.lock().unwrap().take_written();
+            match upstream_rx.recv_timeout(Duration::from_millis(1)) {
+                Ok(conn) => {
+                    upstream = Some(conn);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(e) => panic!("upstream handoff failed: {e}"),
+            }
+        }
+        let mut upstream = upstream.expect("proxy dial + relay within tick budget");
+
+        // 客户端从此完全静默：不再向 MockTun 注入任何包。
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        upstream
+            .write_all(&response)
+            .expect("write upstream response");
+        assert!(
+            mock.lock().unwrap().take_written().is_empty(),
+            "client is silent before the response"
+        );
+
+        // 只驱动主循环实际入口 tick；有界 tick 内必须把响应写回 TUN。
+        let mut payload = Vec::new();
+        let mut segments: Vec<(u32, usize)> = Vec::new();
+        let mut ticks_used = 0usize;
+        for _ in 0..200 {
+            now += 1;
+            let _ = dp.tick(now).expect("idle tick");
+            ticks_used += 1;
+            for pkt in mock.lock().unwrap().take_written() {
+                if let Some((seq, bytes)) = written_tcp_seq_payload(&pkt) {
+                    if !bytes.is_empty() {
+                        assert!(
+                            payload.len() + bytes.len() <= response.len(),
+                            "no bytes beyond the response"
+                        );
+                        segments.push((seq, bytes.len()));
+                        payload.extend_from_slice(&bytes);
+                    }
+                }
+            }
+            if payload.len() == response.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(
+            payload, response,
+            "silent-window response must be delivered by idle ticks"
+        );
+        assert!(
+            ticks_used < 200,
+            "response must be pumped within the bounded tick budget"
+        );
+        // 分段 seq 必须按写回顺序连续递增（同流不乱序）。
+        let mut expect_seq = server_isn1;
+        for (idx, (seq, len)) in segments.iter().enumerate() {
+            assert_eq!(*seq, expect_seq, "data segment {idx} seq order");
+            expect_seq += u32::try_from(*len).expect("segment len");
+        }
+        assert_eq!(
+            usize::try_from(expect_seq - server_isn1).expect("bytes pumped"),
+            response.len()
+        );
+        drop(upstream);
+    }
+
+    /// 无待办时 tick 零副作用：有 engine 但无回程 → 不写 TUN、返回 false。
+    #[test]
+    fn idle_tick_without_pending_proxy_output_is_noop() {
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let tun = Box::new(SharedTun {
+            inner: Arc::clone(&mock),
+        });
+        let config = DataplaneConfig {
+            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
+            n1_configured: true,
+            proxy_configured: true,
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        dp.set_proxy_engine(
+            crate::proxy_fwd::ProxyEngine::new(P6_PROXY_YAML).expect("proxy engine"),
+        );
+        assert!(!dp.tick(1).expect("idle tick"), "no work reported");
+        assert!(
+            mock.lock().unwrap().take_written().is_empty(),
+            "no TUN write without pending proxy output"
+        );
+        assert_eq!(dp.stats().tun_written, 0);
+    }
 }
