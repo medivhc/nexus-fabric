@@ -1021,6 +1021,7 @@ impl Dataplane {
         );
         let Some(pipeline) = self.transparent.as_mut() else {
             self.with_tproxy_counters(|c| c.tcp_rejected += 1);
+            self.note_tproxy_failure("tcp_rejected_no_pipeline", format!("{peer}->{orig_dst}"));
             return;
         };
         let input = TransparentTcpInput {
@@ -1073,6 +1074,10 @@ impl Dataplane {
         }
         let Some(pipeline) = self.transparent.as_mut() else {
             self.with_tproxy_counters(|c| c.udp_dropped += 1);
+            self.note_tproxy_failure(
+                "udp_dropped_no_pipeline",
+                format!("{}->{}", datagram.peer, datagram.orig_dst),
+            );
             return;
         };
         let input = TransparentUdpInput {
