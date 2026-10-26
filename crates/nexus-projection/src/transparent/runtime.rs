@@ -46,6 +46,38 @@ struct TcpFlow {
     proxy: bool,
 }
 
+/// 透明前端的失败类别（token 与 LocalAPI `tproxy.counters` 同名，spec §9.16）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentFailureKind {
+    /// 代理上游拨号/发送失败（`upstream_failed`）。
+    UpstreamFailed,
+    /// TCP 直连拨号失败（`direct_tcp_dial_failed`）。
+    DirectTcpDialFailed,
+    /// Direct 发送失败（`direct_udp_failed`）。
+    DirectUdpFailed,
+}
+
+impl TransparentFailureKind {
+    /// 规范类别 token（可直接与计数器名对齐）。
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::UpstreamFailed => "upstream_failed",
+            Self::DirectTcpDialFailed => "direct_tcp_dial_failed",
+            Self::DirectUdpFailed => "direct_udp_failed",
+        }
+    }
+}
+
+/// 一次待发布的失败：在递增计数的同一点记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentFailure {
+    /// 规范类别。
+    pub kind: TransparentFailureKind,
+    /// 原始细节（不解析、不改写）。
+    pub detail: String,
+}
+
 /// 透明 TCP/UDP 前端管道。
 pub struct TransparentPipeline {
     deps: TransparentDeps,
@@ -53,6 +85,8 @@ pub struct TransparentPipeline {
     udp: HashMap<UdpFlowKey, UdpFlowState>,
     udp_by_key: HashMap<FlowKey, UdpFlowKey>,
     stats: TransparentStats,
+    /// 最近一次异步失败（同步错误由调用方从 `Result` 持久化）。
+    pending_failure: Option<TransparentFailure>,
 }
 
 impl TransparentPipeline {
@@ -64,6 +98,7 @@ impl TransparentPipeline {
             udp: HashMap::new(),
             udp_by_key: HashMap::new(),
             stats: TransparentStats::default(),
+            pending_failure: None,
         }
     }
 
@@ -272,7 +307,10 @@ impl TransparentPipeline {
                 }
                 DirectEgressEvent::Failed { key, error } => {
                     self.stats.direct_tcp_dial_failed += 1;
-                    let _ = error;
+                    self.note_failure(
+                        TransparentFailureKind::DirectTcpDialFailed,
+                        error.to_string(),
+                    );
                     self.finish_tcp(&key, true, &mut out);
                 }
             }
@@ -301,8 +339,8 @@ impl TransparentPipeline {
                         }
                     }
                     ProxyEgressEvent::Failed { key, reason } => {
-                        let _ = reason;
                         self.stats.upstream_failed += 1;
+                        self.note_failure(TransparentFailureKind::UpstreamFailed, reason);
                         self.finish_tcp(&key, true, &mut out);
                     }
                 }
@@ -328,6 +366,21 @@ impl TransparentPipeline {
     /// 计数器快照。
     pub fn stats(&self) -> TransparentStats {
         self.stats.clone()
+    }
+
+    /// 取走最近一次异步失败（每 tick 由 owner 取一次并发布）。
+    ///
+    /// 同步失败（`on_tcp`/`on_udp` 的 `Err`）由调用方直接持久化，不在此排队。
+    #[must_use]
+    pub fn take_failure(&mut self) -> Option<TransparentFailure> {
+        self.pending_failure.take()
+    }
+
+    fn note_failure(&mut self, kind: TransparentFailureKind, detail: impl Into<String>) {
+        self.pending_failure = Some(TransparentFailure {
+            kind,
+            detail: detail.into(),
+        });
     }
 
     /// 当前 UDP 流表条目数（测试/状态用）。
@@ -382,11 +435,19 @@ impl TransparentPipeline {
                                     reason: e.to_string(),
                                 })
                         };
-                        if result.is_err() {
+                        if let Err(error) = result {
                             if proxy {
                                 self.stats.upstream_failed += 1;
+                                self.note_failure(
+                                    TransparentFailureKind::UpstreamFailed,
+                                    error.to_string(),
+                                );
                             } else {
                                 self.stats.direct_udp_failed += 1;
+                                self.note_failure(
+                                    TransparentFailureKind::DirectUdpFailed,
+                                    error.to_string(),
+                                );
                             }
                             self.finish_tcp(&key, true, out);
                             break;

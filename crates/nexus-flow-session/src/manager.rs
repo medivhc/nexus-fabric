@@ -84,6 +84,8 @@ pub struct SessionManager {
     pub planner_calls: u64,
     /// 后台建连失败累计数（E4 `session_establish_failed` 证明）。
     pub establish_failures: u64,
+    /// 最近一次建连失败原因（`pump` 与计数同点记录，供状态面发布）。
+    last_failure_reason: Option<String>,
 }
 
 impl SessionManager {
@@ -110,6 +112,7 @@ impl SessionManager {
             next_id: 0,
             planner_calls: 0,
             establish_failures: 0,
+            last_failure_reason: None,
         }
     }
 
@@ -122,6 +125,12 @@ impl SessionManager {
     #[must_use]
     pub fn establish_failures(&self) -> u64 {
         self.establish_failures
+    }
+
+    /// 取走最近一次建连失败原因（dataplane 每轮 `pump` 后发布）。
+    #[must_use]
+    pub fn take_failure_reason(&mut self) -> Option<String> {
+        self.last_failure_reason.take()
     }
 
     /// 某流首包链规划出的 Provider（plan.provider_id）。
@@ -299,8 +308,8 @@ impl SessionManager {
                     }
                 }
                 EstablishEvent::Failed { session_id, reason } => {
-                    let _ = reason;
                     self.establish_failures += 1;
+                    self.last_failure_reason = Some(reason);
                     if let Some(key) = self.key_of_session(&session_id) {
                         if let Some(entry) = self.table.get_mut(&key) {
                             entry.phase = FlowPhase::Draining;

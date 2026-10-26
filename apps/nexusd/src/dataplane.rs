@@ -38,7 +38,7 @@ use nexus_projection::tcp::{
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
 use nexus_projection::transparent::direct::{DirectEgressConfig, DirectTcpEvent, DirectTcpRelay};
-use nexus_projection::transparent::runtime::TransparentPipeline;
+use nexus_projection::transparent::runtime::{TransparentFailureKind, TransparentPipeline};
 use nexus_projection::transparent::{
     TcpConnection, TransparentDecision, TransparentOutput, TransparentTcpInput, TransparentUdpInput,
 };
@@ -873,6 +873,27 @@ impl Dataplane {
         self.tproxy_last_failure.as_deref()
     }
 
+    /// 记录最近一次失败（spec §9.16 `last_failure_reason`）。
+    ///
+    /// 格式：`<规范类别 token>: <细节>`。token 与 `tproxy.counters` 同名
+    /// （如 `upstream_failed`），使类别可机判、细节可读。
+    /// 只在失败发生的同步路径调用；后续失败覆盖先前值，成功不清除。
+    fn note_tproxy_failure(&mut self, token: &str, detail: impl std::fmt::Display) {
+        self.tproxy_last_failure = Some(format!("{token}: {detail}"));
+    }
+
+    /// 记录 TUN Proxy 引擎拨号失败（`ProxyStreamEvent::Failed`）。
+    ///
+    /// 与 `sync_proxy_stats` 的 `tcp_dials_failed → upstream_failed` 同源；
+    /// 事件里的 reason 原先被丢弃，现持久化到同一 `last_failure_reason` 面。
+    fn record_proxy_stream_failures(&mut self, events: Vec<crate::proxy_fwd::ProxyStreamEvent>) {
+        for event in events {
+            if let crate::proxy_fwd::ProxyStreamEvent::Failed { reason, .. } = event {
+                self.note_tproxy_failure(TransparentFailureKind::UpstreamFailed.token(), reason);
+            }
+        }
+    }
+
     /// 注入透明前端管道与 UDP 回包通道（S42 组合根调用）。
     pub fn set_transparent_pipeline(
         &mut self,
@@ -924,21 +945,26 @@ impl Dataplane {
         let Some(engine) = self.proxy_engine.as_mut() else {
             return false;
         };
-        let pkts = engine.poll().tun_packets;
-        if pkts.is_empty() {
-            return false;
-        }
-        self.write_proxy_tun_packets(pkts);
-        true
+        let result = engine.poll();
+        let wrote = !result.tun_packets.is_empty();
+        self.write_proxy_tun_packets(result.tun_packets);
+        self.record_proxy_stream_failures(result.stream_events);
+        wrote
     }
 
     /// 驱动透明前端下行/老化，并把 UDP 回包交给 listener 线程。
     fn poll_transparent(&mut self, now_millis: u64) -> usize {
-        let Some(pipeline) = self.transparent.as_mut() else {
-            return 0;
+        let (outputs, stats, failure) = match self.transparent.as_mut() {
+            Some(pipeline) => {
+                let outputs = pipeline.poll(now_millis);
+                (outputs, pipeline.stats(), pipeline.take_failure())
+            }
+            None => return 0,
         };
-        let outputs = pipeline.poll(now_millis);
-        let stats = pipeline.stats();
+        // 异步失败（拨号/发送）在计数点已入队；这里与计数器同 tick 发布。
+        if let Some(failure) = failure {
+            self.note_tproxy_failure(failure.kind.token(), failure.detail);
+        }
         let mut replies = 0usize;
         for output in outputs {
             if let TransparentOutput::UdpReply {
@@ -1062,30 +1088,53 @@ impl Dataplane {
     }
 
     fn record_transparent_error(
-        &self,
+        &mut self,
         error: &nexus_projection::transparent::TransparentFrontendError,
     ) {
         use nexus_projection::transparent::TransparentFrontendError as E;
         match error {
             E::OrigDstMissing { .. } => {
                 self.with_tproxy_counters(|c| c.orig_dst_missing += 1);
+                self.note_tproxy_failure("orig_dst_missing", error);
             }
             E::OrigDstInvalid { .. } => {
                 self.with_tproxy_counters(|c| c.udp_dropped += 1);
+                self.note_tproxy_failure("orig_dst_invalid", error);
+            }
+            E::RuleEngineUnavailable { .. } => {
+                self.note_tproxy_failure("rule_engine_unavailable", error);
             }
             E::RuleNoMatch { .. } => {
                 self.with_tproxy_counters(|c| c.rule_no_match += 1);
+                self.note_tproxy_failure("rule_no_match", error);
+            }
+            E::OutboundUnresolved { .. } => {
+                self.note_tproxy_failure("outbound_unresolved", error);
             }
             E::DirectDialFailed { .. } => {
                 self.with_tproxy_counters(|c| c.direct_tcp_dial_failed += 1);
+                self.note_tproxy_failure("direct_tcp_dial_failed", error);
             }
             E::DirectSendFailed { .. } => {
                 self.with_tproxy_counters(|c| c.direct_udp_failed += 1);
+                self.note_tproxy_failure("direct_udp_failed", error);
             }
             E::SessionEstablishFailed { .. } => {
                 self.with_tproxy_counters(|c| c.upstream_failed += 1);
+                self.note_tproxy_failure("upstream_failed", error);
             }
-            _ => {}
+            E::UnsupportedProtocol { .. } => {
+                self.note_tproxy_failure("direct_dropped_unsupported", error);
+            }
+            E::TcpConnLimit { .. } => {
+                self.note_tproxy_failure("tcp_conn_limit", error);
+            }
+            E::PayloadTooLarge { .. } => {
+                self.note_tproxy_failure("payload_too_large", error);
+            }
+            E::UdpTableFull { .. } => {
+                self.note_tproxy_failure("udp_table_full", error);
+            }
         }
     }
 
@@ -1316,23 +1365,36 @@ impl Dataplane {
                 match outcome {
                     Some(Ok(result)) => {
                         self.write_proxy_tun_packets(result.tun_packets);
+                        self.record_proxy_stream_failures(result.stream_events);
                         let more = self
                             .proxy_engine
                             .as_mut()
-                            .map(|e| e.poll().tun_packets)
+                            .map(|e| e.poll())
                             .unwrap_or_default();
-                        self.write_proxy_tun_packets(more);
+                        self.write_proxy_tun_packets(more.tun_packets);
+                        self.record_proxy_stream_failures(more.stream_events);
                         if packet.get(9) == Some(&17) && result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }
                         // 同步 TCP dial / 终结流 / 失败增量（含异步 poll 结果）。
                         self.sync_proxy_stats();
                     }
+                    Some(Err(crate::proxy_fwd::ProxyEngineError::DialFailed {
+                        reason, ..
+                    })) => {
+                        self.note_tproxy_failure(
+                            "upstream_failed",
+                            format!("PROXY_DIAL_FAILED: {reason}"),
+                        );
+                        self.with_stats(|s| {
+                            s.proxy_dropped_no_proxy += 1;
+                            s.dropped += 1;
+                        });
+                    }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { .. }))
                     | Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
                         ..
-                    }))
-                    | Some(Err(crate::proxy_fwd::ProxyEngineError::DialFailed { .. })) => {
+                    })) => {
                         self.with_stats(|s| {
                             s.proxy_dropped_no_proxy += 1;
                             s.dropped += 1;
@@ -1583,6 +1645,7 @@ impl Dataplane {
                 match outcome {
                     Some(Ok(result)) => {
                         self.write_proxy_tun_packets(result.tun_packets);
+                        self.record_proxy_stream_failures(result.stream_events);
                         if result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }
@@ -1683,7 +1746,7 @@ impl Dataplane {
 
     fn flow_pump(&mut self) {
         // 作用域隔离 mgr 借用：pump + 收集 Active 流 + 取信号；flush/转发在外层做。
-        let (active_streams, signals) = match self.flow_mgr.as_mut() {
+        let (active_streams, signals, failure) = match self.flow_mgr.as_mut() {
             Some(mgr) => {
                 mgr.pump();
                 let pairs: Vec<(u32, FlowKey)> = self
@@ -1703,10 +1766,14 @@ impl Dataplane {
                     .map(|(sid, _)| sid)
                     .collect();
                 let signals = mgr.drain_signals();
-                (active, signals)
+                (active, signals, mgr.take_failure_reason())
             }
             None => return,
         };
+        // 建连失败与 `establish_failures` 同点记录，发布到统一失败面（AC-G4-03）。
+        if let Some(detail) = failure {
+            self.note_tproxy_failure("session_establish_failed", detail);
+        }
         // Active 后 flush 建连期缓冲的上行数据（D4）。
         for stream_id in active_streams {
             if let Some(batches) = self.flow_pending_data.remove(&stream_id) {
