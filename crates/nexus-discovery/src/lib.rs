@@ -10,12 +10,14 @@
 #![forbid(unsafe_code)]
 
 pub mod aggregate;
+pub mod hub;
 pub mod lsa;
 pub mod mdns;
 pub mod paired;
 pub mod routing;
 
 pub use aggregate::AggregateDiscovery;
+pub use hub::DiscoveryHub;
 pub use paired::{
     NodeIdentity, PairedDiscovery, PairedPeer, PairingCode, PairingError, PairingFrame,
     decode_pairing_frame, decode_peer_file, encode_pairing_frame, encode_peer_file, hex_decode,
