@@ -952,11 +952,13 @@ mod tests {
     use super::*;
     use crate::config::TurnSection;
     use crate::nat_switch::{NatSwitching, gather_host_candidates};
+    use crate::nat_turn::TurnHandle;
     use nexus_connectivity::nat::NatType;
     use nexus_nat_traversal::LocalCandidates;
     use nexus_nat_wireup::SystemPunchClock;
-    use nexus_turn::client::TurnCredentials;
+    use nexus_turn::client::{TurnClient, TurnCredentials};
     use nexus_turn::server::TurnServer;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
 
     struct Sink(mpsc::Sender<RelayInfo>);
@@ -1223,5 +1225,491 @@ mod tests {
         swb.shutdown();
         swc.shutdown();
         let _ = std::fs::remove_file(&book_path);
+    }
+
+    // ---------- shared fixtures ----------
+
+    /// In-memory address book (no file, no shared directory).
+    #[derive(Default)]
+    struct FakeBook {
+        entries: Mutex<HashMap<[u8; 32], SocketAddr>>,
+    }
+
+    impl FakeBook {
+        fn set(&self, peer: [u8; 32], addr: SocketAddr) {
+            self.entries.lock().unwrap().insert(peer, addr);
+        }
+    }
+
+    impl RelayAddressBook for FakeBook {
+        fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr> {
+            self.entries.lock().unwrap().get(peer).copied()
+        }
+        fn reload(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn publish(&self, peer: [u8; 32], addr: SocketAddr) -> io::Result<()> {
+            self.set(peer, addr);
+            Ok(())
+        }
+    }
+
+    /// Sink that only counts deliveries (no channel, no blocking).
+    #[derive(Default)]
+    struct CountingSink {
+        available: AtomicUsize,
+        lost: AtomicUsize,
+        lost_peers: Mutex<Vec<FabricPeerId>>,
+    }
+
+    impl CountingSink {
+        fn available(&self) -> usize {
+            self.available.load(AtomicOrdering::SeqCst)
+        }
+        fn lost(&self) -> usize {
+            self.lost.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl RelayConnSink for CountingSink {
+        fn on_relay_available(&self, _info: RelayInfo) {
+            self.available.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        fn on_relay_lost(&self, peer: FabricPeerId) {
+            self.lost.fetch_add(1, AtomicOrdering::SeqCst);
+            self.lost_peers.lock().unwrap().push(peer);
+        }
+    }
+
+    fn provider_without_turn(identity_seed: u8, book: Arc<FakeBook>) -> Arc<TurnRelayProvider> {
+        let identity = FabricIdentity::from_ed25519_seed([identity_seed; 32]).unwrap();
+        let my_id = identity.peer_id();
+        TurnRelayProvider::new(my_id, identity, TurnManager::new(None), book)
+    }
+
+    /// Datagram send on a bare `ConnShared` (the same command path
+    /// `FabricConn::send_datagram` uses).
+    fn send_dgram(conn: &Arc<ConnShared>, data: &[u8]) -> Result<(), nexus_fabric::FabricError> {
+        let (tx, rx) = mpsc::channel();
+        conn.tx
+            .send(nexus_fabric::Cmd::SendDatagram {
+                conn: conn.id.0,
+                data: data.to_vec(),
+                reply: tx,
+            })
+            .map_err(|_| nexus_fabric::FabricError::Closed(0))?;
+        rx.recv()
+            .map_err(|_| nexus_fabric::FabricError::Closed(0))?
+    }
+
+    /// Blocking datagram receive on a bare `ConnShared`.
+    fn recv_dgram(conn: &Arc<ConnShared>) -> Result<Vec<u8>, nexus_fabric::FabricError> {
+        let mut q = conn.dgrams.lock().unwrap();
+        loop {
+            if let Some(d) = q.pop_front() {
+                return Ok(d);
+            }
+            if let Some(e) = conn.state.lock().unwrap().closed.clone() {
+                return Err(e);
+            }
+            q = conn
+                .dgram_cv
+                .wait(q)
+                .map_err(|_| nexus_fabric::FabricError::Transport("lock poisoned".into()))?;
+        }
+    }
+
+    fn local_candidates(driver: &Arc<Driver>) -> LocalCandidates {
+        LocalCandidates {
+            host: gather_host_candidates(driver),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        }
+    }
+
+    fn switch(my_id: FabricPeerId) -> Arc<NatSwitching> {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let local = local_candidates(&driver);
+        NatSwitching::new(
+            driver,
+            my_id,
+            local,
+            Vec::new(),
+            Arc::new(SystemPunchClock::new()),
+        )
+    }
+
+    // ---------- AC5: O9 evidence ----------
+
+    #[test]
+    fn o9_weak_sink_pruned_after_drop() {
+        let book = Arc::new(FakeBook::default());
+        let provider = provider_without_turn(7, book);
+        let peer = FabricPeerId([0x01; 32]);
+        let sink = Arc::new(CountingSink::default());
+        provider.subscribe(peer, sink.clone());
+        assert_eq!(provider.sink_count(&peer), 1);
+        assert_eq!(provider.subscribed_peers(), vec![peer]);
+        drop(sink);
+        // The weak edge is pruned on the next read.
+        assert_eq!(provider.sink_count(&peer), 0);
+        assert!(provider.subscribed_peers().is_empty());
+    }
+
+    #[test]
+    fn o9_guard_drop_unsubscribes() {
+        let book = Arc::new(FakeBook::default());
+        let provider = provider_without_turn(8, book);
+        let peer = provider.my_id();
+        let sw = switch(FabricPeerId([0x02; 32]));
+        sw.attach_relay_provider(provider.clone());
+        let guard = sw.subscribe_relay_peer(peer).expect("guard");
+        assert_eq!(provider.sink_count(&peer), 1);
+        assert_eq!(guard.peer(), peer);
+        assert!(guard.is_active());
+        assert_eq!(sw.relay_subscribed_peers(), vec![peer]);
+        drop(guard);
+        assert_eq!(provider.sink_count(&peer), 0);
+        assert!(sw.relay_subscribed_peers().is_empty());
+        sw.shutdown();
+    }
+
+    #[test]
+    fn o9_no_cycle_after_shutdown() {
+        let book = Arc::new(FakeBook::default());
+        let provider = provider_without_turn(9, book);
+        let peer = provider.my_id();
+        let sw = switch(FabricPeerId([0x03; 32]));
+        sw.attach_relay_provider(provider.clone());
+        let guard = sw.subscribe_relay_peer(peer).expect("guard");
+        let weak = Arc::downgrade(&sw);
+        sw.shutdown();
+        drop(guard);
+        drop(sw);
+        // No NatSwitching -> provider -> NatSwitching cycle keeps the stack alive.
+        assert!(weak.upgrade().is_none());
+        // The provider is still usable after the subscriber disappeared.
+        assert_eq!(provider.sink_count(&peer), 0);
+    }
+
+    // ---------- AC11: provider_lost ----------
+
+    #[test]
+    fn provider_lost_notifies_all_subscribed() {
+        let book = Arc::new(FakeBook::default());
+        let provider = provider_without_turn(10, book);
+        let peer_a = FabricPeerId([0x0a; 32]);
+        let peer_b = FabricPeerId([0x0b; 32]);
+        let sink_a = Arc::new(CountingSink::default());
+        let sink_b = Arc::new(CountingSink::default());
+        provider.subscribe(peer_a, sink_a.clone());
+        provider.subscribe(peer_b, sink_b.clone());
+        provider.provider_lost();
+        assert_eq!(sink_a.lost(), 1);
+        assert_eq!(sink_b.lost(), 1);
+        assert_eq!(sink_a.lost_peers.lock().unwrap().as_slice(), &[peer_a]);
+        assert_eq!(sink_b.lost_peers.lock().unwrap().as_slice(), &[peer_b]);
+    }
+
+    #[test]
+    fn ensure_failure_marks_lost() {
+        let book = Arc::new(FakeBook::default());
+        // No `[network.turn]`: ensure_allocated fails immediately.
+        let provider = provider_without_turn(11, book);
+        let peer = FabricPeerId([0x0c; 32]);
+        let sink = Arc::new(CountingSink::default());
+        provider.subscribe(peer, sink.clone());
+        let err = match provider.on_turn_allocated(peer, "127.0.0.1:5000".parse().unwrap()) {
+            Ok(_) => panic!("allocation must fail"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, RelayError::Turn(_)));
+        assert_eq!(sink.lost(), 1, "provider_lost must notify subscribers");
+        assert!(provider.established_peers().is_empty());
+    }
+
+    struct StaleNonceHandle;
+
+    impl TurnHandle for StaleNonceHandle {
+        fn refresh(&self) -> io::Result<()> {
+            Err(io::Error::other(
+                "turn refresh: unexpected response 0x0438 438 Stale Nonce",
+            ))
+        }
+        fn release(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn relayed_addr(&self) -> SocketAddr {
+            "127.0.0.1:5002".parse().unwrap()
+        }
+        fn mapped_addr(&self) -> Option<SocketAddr> {
+            None
+        }
+        fn is_expired(&self) -> bool {
+            false
+        }
+        fn as_turn_client(&self) -> Option<TurnClient> {
+            None
+        }
+    }
+
+    #[test]
+    fn refresh_expiry_marks_lost() {
+        let book = Arc::new(FakeBook::default());
+        let identity = FabricIdentity::from_ed25519_seed([12; 32]).unwrap();
+        let my_id = identity.peer_id();
+        // Active with a stale-nonce failure and a dead factory: the refresh
+        // path degrades the manager to Disabled in one call (Active -> Disabled
+        // is part of the frozen Lost transition).
+        let turn = TurnManager::test_seam(
+            TurnState::Active,
+            Some(Box::new(StaleNonceHandle)),
+            Some(std::time::Instant::now()),
+        );
+        let provider = TurnRelayProvider::new(my_id, identity, turn, book);
+        let peer = FabricPeerId([0x0d; 32]);
+        let sink = Arc::new(CountingSink::default());
+        provider.subscribe(peer, sink.clone());
+        assert_eq!(provider.refresh(), RelayRefresh::Lost);
+        assert_eq!(sink.lost(), 1);
+        // A busy/absent refresh never blocks: the second call is not due.
+        assert_eq!(provider.refresh(), RelayRefresh::NotDue);
+    }
+
+    // ---------- AC12: self-publish + single slot ----------
+
+    fn turn_section(server: SocketAddr) -> TurnSection {
+        TurnSection {
+            server: server.to_string(),
+            realm: "nexus".into(),
+            username: "nexus".into(),
+            password: "test-secret".into(),
+            refresh_interval_sec: 300,
+            stun_server: None,
+            stun_server2: None,
+            bind_addr: "0.0.0.0:0".into(),
+        }
+    }
+
+    #[test]
+    fn self_publish_uses_provider_allocation() {
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).unwrap();
+        let section = turn_section(server.main_addr());
+        let id = FabricIdentity::from_ed25519_seed([1; 32]).unwrap();
+        let my_id = id.peer_id();
+
+        // Runtime's warm-backup allocation is published first (the shipped
+        // double-publish bug); the provider must overwrite it with its own.
+        let mut runtime = TurnManager::new(Some(section.clone()));
+        let runtime_relayed = runtime.ensure_allocated().expect("runtime allocate");
+        let book = Arc::new(FakeBook::default());
+        book.publish(my_id.0, runtime_relayed).unwrap();
+
+        let provider =
+            TurnRelayProvider::new(my_id, id, TurnManager::new(Some(section)), book.clone());
+        let relayed = provider.ensure_relay_ready().expect("provider allocate");
+        assert_eq!(book.relay_addr(&my_id.0), Some(relayed));
+        assert_ne!(
+            relayed, runtime_relayed,
+            "provider and runtime allocations are distinct sockets"
+        );
+    }
+
+    #[test]
+    fn single_relay_slot_and_driver_retention() {
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).unwrap();
+        let section = turn_section(server.main_addr());
+        let book = Arc::new(FakeBook::default());
+
+        let id_a = FabricIdentity::from_ed25519_seed([1; 32]).unwrap();
+        let id_b = FabricIdentity::from_ed25519_seed([2; 32]).unwrap();
+        let id_c = FabricIdentity::from_ed25519_seed([3; 32]).unwrap();
+        let a_id = id_a.peer_id();
+        let b_id = id_b.peer_id();
+        let c_id = id_c.peer_id();
+
+        let mut ta = TurnManager::new(Some(section.clone()));
+        let mut tb = TurnManager::new(Some(section.clone()));
+        let relayed_a = ta.ensure_allocated().expect("allocate a");
+        let relayed_b = tb.ensure_allocated().expect("allocate b");
+        let pa = TurnRelayProvider::new(a_id, id_a, ta, book.clone());
+        let pb = TurnRelayProvider::new(b_id, id_b, tb, book.clone());
+        let sink_a = Arc::new(CountingSink::default());
+        pa.subscribe(b_id, sink_a.clone());
+
+        // --- item 2/3: establish one relay, keep the driver alive ---
+        let ha = {
+            let pa = pa.clone();
+            std::thread::spawn(move || pa.on_turn_allocated(b_id, relayed_b))
+        };
+        let hb = {
+            let pb = pb.clone();
+            std::thread::spawn(move || pb.on_turn_allocated(a_id, relayed_a))
+        };
+        ha.join().expect("join a").expect("relay a");
+        hb.join().expect("join b").expect("relay b");
+        assert_eq!(pa.established_peers(), vec![b_id]);
+        assert_eq!(sink_a.available(), 1);
+        assert_eq!(
+            pa.established_relay(&b_id).expect("established").relayed,
+            relayed_b
+        );
+
+        // A datagram must cross the relay after `on_turn_allocated` returned:
+        // this is the driver-retention proof.
+        let a_conn = pa.established_relay(&b_id).unwrap().conn;
+        let b_conn = pb.established_relay(&a_id).unwrap().conn;
+        let (tx, rx) = mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let _ = tx.send(recv_dgram(&b_conn));
+        });
+        send_dgram(&a_conn, b"relay-ping").expect("send datagram");
+        let got = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("datagram must arrive over the retained driver");
+        assert_eq!(got.expect("datagram payload"), b"relay-ping");
+        receiver.join().expect("receiver thread");
+
+        // --- item 2: another peer is rejected with Capacity ---
+        let err = match pa.on_turn_allocated(c_id, relayed_b) {
+            Ok(_) => panic!("slot is busy"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, RelayError::Capacity(_)));
+        assert_eq!(pa.established_peers(), vec![b_id]);
+
+        // --- item 4: same peer, new relayed address replaces the slot ---
+        // The peer is staggered so our replacement listener is up before its
+        // dial arrives; otherwise the outgoing listener can still accept the
+        // newcomer and be torn down under it (the retry path the feed owns).
+        let id_b2 = FabricIdentity::from_ed25519_seed([4; 32]).unwrap();
+        let mut tb2 = TurnManager::new(Some(section.clone()));
+        let relayed_b2 = tb2.ensure_allocated().expect("allocate b2");
+        let pb2 = TurnRelayProvider::new(b_id, id_b2, tb2, book.clone());
+        let h1 = {
+            let pa = pa.clone();
+            std::thread::spawn(move || pa.on_turn_allocated(b_id, relayed_b2))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let h2 = {
+            let pb2 = pb2.clone();
+            std::thread::spawn(move || pb2.on_turn_allocated(a_id, relayed_a))
+        };
+        let ra = h1.join().expect("join replace a");
+        let rb = h2.join().expect("join replace b2");
+        assert!(ra.is_ok(), "replace a failed: {:?}", ra.err());
+        assert!(rb.is_ok(), "replace b2 failed: {:?}", rb.err());
+        assert_eq!(pa.established_peers(), vec![b_id]);
+        assert_eq!(
+            pa.established_relay(&b_id).unwrap().relayed,
+            relayed_b2,
+            "the slot must carry the new peer address"
+        );
+
+        // --- item 5: zero sinks releases the slot for another peer ---
+        assert_eq!(pa.sink_count(&b_id), 1);
+        pb2.subscribe(a_id, Arc::new(CountingSink::default()));
+        // Drop the last sink through the explicit unsubscribe path.
+        {
+            let sink: Arc<dyn RelayConnSink> = sink_a.clone();
+            pa.unsubscribe(b_id, &sink);
+        }
+        assert_eq!(pa.sink_count(&b_id), 0);
+        assert!(pa.established_peers().is_empty(), "slot released");
+
+        let mut tc = TurnManager::new(Some(section));
+        let relayed_c = tc.ensure_allocated().expect("allocate c");
+        let pc = TurnRelayProvider::new(c_id, id_c, tc, book);
+        let sink_c = Arc::new(CountingSink::default());
+        pa.subscribe(c_id, sink_c.clone());
+        let h3 = {
+            let pa = pa.clone();
+            std::thread::spawn(move || pa.on_turn_allocated(c_id, relayed_c))
+        };
+        let h4 = {
+            let pc = pc.clone();
+            std::thread::spawn(move || pc.on_turn_allocated(a_id, relayed_a))
+        };
+        h3.join().expect("join c a").expect("relay c a");
+        h4.join().expect("join c").expect("relay c");
+        assert_eq!(pa.established_peers(), vec![c_id]);
+        assert_eq!(sink_c.available(), 1);
+    }
+
+    // ---------- dir book ----------
+
+    fn temp_book_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexusd-relay-book-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn dir_book_publish_reload_roundtrip() {
+        let dir = temp_book_dir("roundtrip");
+        let self_peer = [0x11u8; 32];
+        let other_peer = [0x22u8; 32];
+        let addr: SocketAddr = "10.0.0.7:19010".parse().unwrap();
+        {
+            let book = DirRelayAddressBook::new(&dir, self_peer).unwrap();
+            book.publish(self_peer, addr).unwrap();
+            assert_eq!(book.relay_addr(&self_peer), Some(addr));
+        }
+        // A different node opening the same directory sees our entry, and can
+        // reload a later change written by yet another node.
+        let book = DirRelayAddressBook::new(&dir, other_peer).unwrap();
+        assert_eq!(book.relay_addr(&self_peer), Some(addr));
+        std::fs::write(
+            dir.join(format!("{}.addr", hex32(&other_peer))),
+            "10.0.0.8:1
+",
+        )
+        .unwrap();
+        book.reload().unwrap();
+        assert_eq!(
+            book.relay_addr(&other_peer),
+            Some("10.0.0.8:1".parse().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_book_ignores_malformed_files() {
+        let dir = temp_book_dir("malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = [0x33u8; 32];
+        let upper = "AA".repeat(32);
+        std::fs::write(dir.join(format!("{}.addr", hex32(&good))), "10.0.0.9:19010").unwrap();
+        std::fs::write(dir.join("nothex.addr"), "10.0.0.9:19010").unwrap();
+        std::fs::write(dir.join(format!("{upper}.addr")), "10.0.0.9:19010").unwrap();
+        let bad_content = [0x44u8; 32];
+        std::fs::write(dir.join(format!("{}.addr", hex32(&bad_content))), "nope").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "10.0.0.9:19010").unwrap();
+
+        let book = DirRelayAddressBook::new(&dir, [0u8; 32]).unwrap();
+        assert_eq!(
+            book.relay_addr(&good),
+            Some("10.0.0.9:19010".parse().unwrap())
+        );
+        assert!(book.relay_addr(&bad_content).is_none());
+        // Uppercase names are not canonical ids: ignored, not folded.
+        assert!(book.relay_addr(&[0xAAu8; 32]).is_none());
+        // Reloading again must not resurrect them.
+        book.reload().unwrap();
+        assert!(book.relay_addr(&bad_content).is_none());
+
+        // A missing directory is an empty book, not an error.
+        let gone = temp_book_dir("gone");
+        let book = DirRelayAddressBook::new(&gone, [0u8; 32]).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        book.reload().unwrap();
+        assert!(book.relay_addr(&good).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
