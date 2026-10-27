@@ -529,6 +529,9 @@ impl ProxyEngine {
             }
             match self.terminator.fixup_tun_packet(&pkt) {
                 Some(fixed) => ready.push(fixed),
+                // 兜底 RST（`tcp_relay::craft_rst`）地址已正确，且 socket 可能已随
+                // RST 移除 → fixup 查不到连接；RST 直通，数据包仍按丢弃计数。
+                None if pkt.get(33).is_some_and(|flags| flags & 0x04 != 0) => ready.push(pkt),
                 None => dropped += 1,
             }
         }

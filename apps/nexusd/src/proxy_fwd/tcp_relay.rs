@@ -209,8 +209,14 @@ impl TcpForwarder {
                             error: reason,
                             detail: detail.clone(),
                         });
-                        // RST smoltcp 侧。
-                        let pkts = terminator.handle_fabric_rst(stream_id);
+                        // RST smoltcp 侧；终结器不产出可写回 RST 时用 craft 兜底。
+                        let four = terminator.lookup_id(stream_id);
+                        let mut pkts = terminator.handle_fabric_rst(stream_id);
+                        if !has_rst(&pkts)
+                            && let Some(four) = four
+                        {
+                            pkts.push(craft_rst(&four));
+                        }
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
                         eprintln!(
                             "[proxy-fwd] event=dial_failed stream_id={stream_id} kind={kind} tag={tag} error={reason} detail=\"{detail}\""
@@ -482,6 +488,39 @@ fn spawn_relay(
         );
     });
     RelayHandle { tx: cmd_tx }
+}
+
+/// 构造正确寻址的 TCP RST（src=原始目的，dst=客户端）。
+///
+/// dial 失败时终结器偶尔不产出可写回的 RST（socket 已随 RST 移除 → fixup 查不到
+/// 连接）；此时用本函数兜底，保证 `tcp_dials_failed` 与线上 RST 一致（§5.8）。
+fn craft_rst(four: &nexus_projection::tcp::FourTuple) -> Vec<u8> {
+    use nexus_projection::tcp::{ip_checksum, tcp_checksum};
+    let src_ip = four.dst_ip;
+    let dst_ip = four.src_ip;
+    let mut pkt = vec![0u8; 40];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&src_ip);
+    pkt[16..20].copy_from_slice(&dst_ip);
+    pkt[20..22].copy_from_slice(&four.dst_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&four.src_port.to_be_bytes());
+    pkt[32] = 0x50;
+    pkt[33] = 0x14; // RST | ACK
+    pkt[34..36].copy_from_slice(&8192u16.to_be_bytes());
+    let c = ip_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&c.to_be_bytes());
+    let tc = tcp_checksum(src_ip, dst_ip, &pkt[20..]);
+    pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+    pkt
+}
+
+fn has_rst(pkts: &[Vec<u8>]) -> bool {
+    pkts.iter()
+        .any(|p| p.len() > 33 && p[9] == 6 && p[33] & 0x04 != 0)
 }
 
 #[cfg(test)]

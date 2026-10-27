@@ -266,6 +266,7 @@ pub struct Dataplane {
     /// 上次同步的 Proxy 终结流计数（`ProxyFwdStats::tcp_streams`）。
     last_proxy_tcp_streams: u64,
     last_proxy_tcp_streams_ok: u64,
+    last_proxy_udp_send_failed: u64,
     last_proxy_tcp_bytes_up: u64,
     last_proxy_tcp_bytes_down: u64,
     last_proxy_udp_unsupported: u64,
@@ -433,6 +434,7 @@ impl Dataplane {
             last_tcp_dials_failed: 0,
             last_proxy_tcp_streams: 0,
             last_proxy_tcp_streams_ok: 0,
+            last_proxy_udp_send_failed: 0,
             last_proxy_tcp_bytes_up: 0,
             last_proxy_tcp_bytes_down: 0,
             last_proxy_udp_unsupported: 0,
@@ -763,6 +765,9 @@ impl Dataplane {
         let streams_ok_delta = eng_stats
             .tcp_streams_ok
             .saturating_sub(self.last_proxy_tcp_streams_ok);
+        let udp_fail_delta = eng_stats
+            .udp_send_failed
+            .saturating_sub(self.last_proxy_udp_send_failed);
         let bytes_up_delta = eng_stats
             .tcp_bytes_up
             .saturating_sub(self.last_proxy_tcp_bytes_up);
@@ -790,6 +795,7 @@ impl Dataplane {
         self.last_proxy_dial_buffer_dropped = eng_stats.tcp_dial_buffer_dropped_bytes;
         self.last_proxy_dial_buffer_overflow = eng_stats.tcp_dial_buffer_overflow_resets;
         self.last_proxy_tcp_streams_ok = eng_stats.tcp_streams_ok;
+        self.last_proxy_udp_send_failed = eng_stats.udp_send_failed;
         self.last_proxy_tcp_bytes_up = eng_stats.tcp_bytes_up;
         self.last_proxy_tcp_bytes_down = eng_stats.tcp_bytes_down;
         self.last_proxy_udp_unsupported = eng_stats.udp_unsupported;
@@ -800,7 +806,7 @@ impl Dataplane {
         self.with_stats(|s| {
             s.proxy_tcp_streams += stream_delta;
             s.proxy_forwarded += ok_delta;
-            s.proxy_dropped_no_proxy += fail_delta;
+            s.proxy_dropped_no_proxy += fail_delta + udp_fail_delta;
             s.upstream_failed += fail_delta;
             s.proxy_dial_buffer_dropped_bytes += dial_buf_drop_delta;
             s.proxy_dial_buffer_overflow_resets += dial_buf_overflow_delta;
