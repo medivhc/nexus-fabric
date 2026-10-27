@@ -168,6 +168,54 @@
 - 不变量：`enabled=true` 时行为与 D1 完全一致（零回归）；no-tun 时不创建任何
   TUN 设备（`tun0`/系统 TUN 不受影响）；空配置拒绝先于 TUN 创建（快速失败）。
 
+### `daemon.toml [network.discovery]` 与 relay 地址簿（peer 发现/订阅，2026-10-27）
+
+- **键表（全部可选；缺失 = 默认值）**：
+
+| 键 | 类型 | 默认 | 校验/说明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | 总开关；`false` = pump 与 feed 都不启动 |
+| `mdns` | bool | `true` | 只停/启 mDNS pump |
+| `lsa` | bool | `true` | 只停/启 LSA gossip pump |
+| `feed` | bool | `true` | 订阅/触发开关 |
+| `gossip_port` | u16 | `19010` | `1..=65535` 且 ≠ 5353；静态 peer 的 LSA 目标端口按此替换（所有节点需一致，spec §9 R-6） |
+| `advertise_ip` | string | `""`（自动） | 空 = 自动选择；否则必须是 IPv4 字面量。**多网卡主机应显式配置**，自动选择会优先取“最小的私有 IPv4”（常见为 docker `172.17.0.1`） |
+| `lsa_refresh_sec` | u64 | `30` | `5..=300` |
+| `lsa_stale_sec` | u64 | `90` | `max(60, 2×lsa_refresh_sec)..=3600` |
+| `book_poll_ms` | u64 | `5000` | `1000..=60000`；relay 地址簿轮询间隔 |
+| `trigger_max_failures` | u32 | `3` | `1..=10`；连续触发失败达到该值后 park |
+
+- **`[network.turn].relay_book_dir`**：`string`（目录），缺省 `None`。配置 = 共享目录
+  `DirRelayAddressBook`（每节点 `<self64>.addr`，read-all，目录不存在自动创建 `0700`）；
+  缺省 = 兼容的 per-self 临时文件 `$TMP/nexus-relay-<self64>.toml`；空字符串 =
+  `daemon.toml` 解析错误（CONFIG，启动失败）。
+- **可见性（操作者必须能判断“为什么不触发”）**：
+  - 启动打印 `[discovery] advertise_ip=<ip|none> source=<config|auto> gossip_port=<p>
+    mdns=<enabled|disabled> lsa=<enabled|disabled> lsa_locator=<udp://ip:port|none>
+    feed=<enabled|disabled>`；
+  - 启动打印 `[nat-relay] book mode=<shared-dir|per-self> path=<…>`；
+  - `GET /localapi/v0/connectivity/nat` 的 `peer_source` 块包含
+    `book_entries`、`subscribed_peers_without_book_addr`、`trigger_parked_max_failures`、
+    `trigger_parked_capacity`，可直接区分“book 里没有对端地址”与“触发失败被 park”。
+  - 无可用 IPv4（自动选择为空）时 mDNS 不启动：冻结 WARN
+    `[discovery-mdns] WARN: no advertise IPv4; mdns disabled` +
+    `discovery.last_error="advertise-ip-unavailable"`；此时 LSA locator 为空
+    （摘要 `lsa_locator=none`），身份级发现仍可接收。
+- **park 语义**：`trigger_parked_max_failures` 的 peer 只有 **book 地址变化**或
+  **源集合变化**（订阅来源增减）才重开；`trigger_parked_capacity` 在单槽释放后自动重开。
+  `trigger_capacity_parked_total` 仍只累计 capacity 次数。
+- **`last_error`**：成功后**不清空**（spec §4.12.1 明文）；用 `book_last_success_ms`
+  判断当前是否新鲜，不要把旧的 `book-reload-failed` 当成仍在失败。
+- **诚实边界（spec §9 R-1/R-2/R-3，必须在任何对外说明中复述）**：
+  - **R-1 跨主机 D5 仍依赖共享存储**：book 渠道是 **INTERIM**，要求节点间共享文件系统，
+    不是通用生产分发；无共享目录时跨主机 D5 不点火（AC3 记 `BLOCKED(environment)`）。
+  - **R-2 通告端点语义**：LSA locator / mDNS SRV 只表示**发现/gossip 端点**
+    （`advertise_ip:gossip_port`），不是 N1 拨号端点；**本 run 不交付零配置 N1 数据面**，
+    不得宣称“零配置组网已可传数据”。
+  - **R-3 单 relay 容量**：一个 TURN allocation 只安全服务 **1 个 peer**；多 peer
+    relay 属后续工作。
+- 不变量：`[network.discovery]` 任一键变化 → `NeedsRestart`（pump/feed 生命周期需重建）。
+
 ### Composition Root 接线（R1-R5，scenarios/product/composition_root.toml，2026-10-01 冻结）
 
 - **R1（N1 桥接线）**：`network.toml` 存在时，Composition Root 按 §13.3 步骤 5

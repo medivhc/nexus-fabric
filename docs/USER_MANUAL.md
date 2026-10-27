@@ -388,6 +388,58 @@ cargo build --workspace
 
 * **代码级校验**：`product.geoip-nex-roundtrip` (8) / `product.geosite-nex-roundtrip` (8) → PASS
 
+#### 4.1.12 节点发现与 relay 地址簿（`[network.discovery]` / `relay_book_dir`）
+
+* **能力**：daemon 通过 mDNS + LSA gossip 发现同网段/mesh 内的节点，建立 per-peer
+  relay 订阅；relay 建连后按地址簿自动触发 D5 打洞。适用于“零静态 `[[peers]]`”的
+  LAN 发现，以及静态 peer 的 relay 自动触发。
+
+* **配置（`daemon.toml`，全部可选）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `[network.discovery].enabled` | `true` | 总开关 |
+| `.mdns` / `.lsa` / `.feed` | `true` | 分别控制 mDNS pump / LSA pump / 订阅触发 |
+| `.gossip_port` | `19010` | LSA gossip 端口（≠5353；各节点需一致） |
+| `.advertise_ip` | `""`（自动） | 通告 IPv4；**多网卡主机请显式填写**（如 LAN 地址），自动选择可能选中 docker/虚拟网卡 |
+| `.lsa_refresh_sec` / `.lsa_stale_sec` | `30` / `90` | 自身 LSA 刷新与新鲜度窗口；`stale ≥ max(60, 2×refresh)` |
+| `.book_poll_ms` | `5000` | relay 地址簿轮询间隔 |
+| `.trigger_max_failures` | `3` | 连续触发失败上限（达到即 park） |
+| `[network.turn].relay_book_dir` | 缺省（per-self 临时文件） | 跨主机 D5 必须配置为双方可读写的共享目录（INTERIM，见下） |
+
+* **启动时先看这两行**（判断“为什么没触发”的第一步）：
+
+```
+[discovery] advertise_ip=192.168.1.5 source=config gossip_port=19010 mdns=enabled lsa=enabled lsa_locator=udp://192.168.1.5:19010 feed=enabled
+[nat-relay] book mode=shared-dir path=/mnt/nexus-book
+```
+
+  `advertise_ip=none source=auto` 表示自动探测没有可用 IPv4：mDNS 不会启动，日志出现
+  `[discovery-mdns] WARN: no advertise IPv4; mdns disabled`，
+  API `discovery.last_error="advertise-ip-unavailable"`（此时 LSA locator 也为空）。
+
+* **状态查询**：`GET /localapi/v0/connectivity/nat`（需 bearer token）的 `peer_source`：
+
+  * `subscribed_peers` / `sources`：发现了谁、来自哪个源；
+  * `book_entries` / `subscribed_peers_without_book_addr`：地址簿里有几条地址、
+    有几个已订阅 peer 还没有地址（>0 且 `trigger_attempts_total=0` 就是“在等 book”）；
+  * `trigger_parked_max_failures`：连续失败被 park（只有 book 地址变化或源集合变化才重开）；
+  * `trigger_parked_capacity`：单 relay 槽被占用而 park（槽释放后自动重开）；
+  * `book_last_success_ms`：地址簿最近一次成功轮询；`last_error` 成功后不清空，
+    不要拿旧值判断当前状态。
+
+* **诚实边界**（必须随任何对外说明复述）：
+
+  * 跨主机 D5 依赖**共享目录**（`relay_book_dir`），这是 INTERIM 方案，要求节点间共享
+    文件系统；没有共享目录时跨主机自动触发不会发生（同主机双 daemon 只是流程证据）。
+  * LSA locator / mDNS SRV 只表示**发现/gossip 端点**，不是 N1 拨号端点；
+    本 run **不交付零配置 N1 数据面**，不能宣称“零配置组网已可传数据”。
+  * 一个 TURN allocation 只安全服务 **1 个 peer**（单 relay 上限），多 peer relay 属后续工作。
+
+* **代码级校验**：`product.peer-source-wiring`（E4，fake doubles）；生产装配回归
+  `nexusd::tests::peer_source_discovery_production`（daemon 二进制的无 IPv4 降级、
+  默认 per-self book 可见性；非真机）。真机 AC2/AC3 证据归 evidence 阶段。
+
 ### 4.2 Service
 
 #### 4.2.1 Service 资源生命周期
