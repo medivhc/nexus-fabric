@@ -966,4 +966,70 @@ mod tests {
         assert_eq!(calls, vec![PathKind::Direct, PathKind::Proxy]);
         assert!(!calls.contains(&PathKind::Turn));
     }
+    // ---------- peer-source-discovery-wiring: hub wiring (AC4-5 / AC13-1) ----------
+
+    fn discovery_network_toml(peers: &str) -> String {
+        format!(
+            "peer_id = \"{}\"\n{peers}\
+             [vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1200\n",
+            "aa".repeat(32),
+        )
+    }
+
+    #[test]
+    fn static_multi_addr_selects_first() {
+        let peer_hex = "bb".repeat(32);
+        let empty_hex = "cc".repeat(32);
+        let text = discovery_network_toml(&format!(
+            "[[peers]]\nid = \"{peer_hex}\"\n\
+             addrs = [\"10.0.0.2:9000\", \"10.0.0.3:9000\"]\n\
+             [[peers]]\nid = \"{empty_hex}\"\naddrs = []\n"
+        ));
+        let (config, _mgr, hub) = build_session_manager_with_discovery(
+            &text,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            DiscoveryParams::static_only(),
+        )
+        .expect("assembly");
+
+        let peer = DiscoveryPeerId(peer_hex.clone());
+        let resolved = hub.resolve(&peer, Instant::now());
+        let static_addrs: Vec<_> = resolved
+            .iter()
+            .filter(|r| r.source == nexus_discovery::DiscoverySource::Static)
+            .collect();
+        assert_eq!(static_addrs.len(), 1);
+        assert_eq!(static_addrs[0].addr, "10.0.0.2:9000".parse().unwrap());
+
+        // `addrs = []` keeps the peer as a static source with the sentinel.
+        let empty = DiscoveryPeerId(empty_hex.clone());
+        let sentinel = "0.0.0.0:0".parse().unwrap();
+        assert_eq!(hub.resolve(&empty, Instant::now())[0].addr, sentinel);
+        let map = hub.peer_source_map(Instant::now());
+        assert!(map.iter().any(|(p, sources)| p == &empty
+            && sources == &vec![nexus_discovery::DiscoverySource::Static]));
+
+        // `addrs[1..]` stay out of the hub but remain in the config for dialing.
+        assert_eq!(config.peers[0].addrs.len(), 2);
+    }
+
+    #[test]
+    fn hub_shared_with_adapter() {
+        let peer_id = N1PeerId([0x0bu8; 32]);
+        let peer_addr = addr(19001);
+        let (hub, adapter) = build_adapter(
+            N1PeerId([0xaau8; 32]),
+            vec![(peer_id, peer_addr)],
+            None,
+            Duration::from_secs(90),
+        );
+        // One instance: the adapter reads exactly the hub the assembly returns.
+        assert!(Arc::ptr_eq(&hub, &adapter.hub));
+        assert_eq!(
+            N1Discovery::resolve(adapter.as_ref(), &peer_id).expect("resolve"),
+            vec![peer_addr]
+        );
+        assert_eq!(hub.self_id(), DiscoveryPeerId("aa".repeat(32)));
+    }
 }
