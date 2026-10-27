@@ -13034,8 +13034,95 @@ mod hysteria2_dataplane_tests {
         );
     }
 
+    /// UDP relay in front of `server` that delays every datagram by `one_way`
+    /// in each direction (RTT = 2 x one_way); the kernel here has no netem.
+    fn spawn_delay_relay(server: std::net::SocketAddr, one_way: std::time::Duration) -> u16 {
+        use std::net::UdpSocket;
+        use std::sync::{Arc, Mutex};
+        let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = front.local_addr().unwrap().port();
+        let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+        let (up_rx, up_tx, seen) = (
+            front.try_clone().unwrap(),
+            back.try_clone().unwrap(),
+            Arc::clone(&client),
+        );
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, from)) = up_rx.recv_from(&mut buf) {
+                *seen.lock().unwrap() = Some(from);
+                let pkt = buf[..n].to_vec();
+                let tx = up_tx.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(one_way);
+                    let _ = tx.send_to(&pkt, server);
+                });
+            }
+        });
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, _)) = back.recv_from(&mut buf) {
+                let Some(to) = *client.lock().unwrap() else {
+                    continue;
+                };
+                let pkt = buf[..n].to_vec();
+                let tx = front.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(one_way);
+                    let _ = tx.send_to(&pkt, to);
+                });
+            }
+        });
+        port
+    }
+
+    /// Real servers answer the fast-open TCPRequest one RTT (plus their
+    /// upstream dial) after the stream opens. A fixed 50 ms first-read guard
+    /// aborted every connection to a server more than ~25 ms away
+    /// (reproduced: RTT 120 ms -> abort at 54 ms, 0 bytes).
     #[test]
-    fn hysteria2_first_read_guard_timeout_aborts_cleanly() {
+    fn hysteria2_relay_survives_a_slow_tcp_response() {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let port = spawn_delay_relay(server.addr, Duration::from_millis(60));
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(port)).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        let mut hy2 = Hysteria2Client::connect(&target).unwrap();
+        let stream = hy2.open_tcp("example.com:80").unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            s.write_all(b"hello-over-latency").unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            while got.len() < 18 {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            got
+        });
+        let (mut relayed, _) = listener.accept().unwrap();
+        relayed.set_nonblocking(true).unwrap();
+        let (up, down) = hysteria2_pump_stream(&mut hy2, stream, true, &mut relayed);
+        drop(relayed);
+        assert_eq!(app.join().unwrap(), b"hello-over-latency");
+        assert_eq!((up, down), (18, 18));
+        hy2.close();
+    }
+
+    #[test]
+    fn hysteria2_missing_tcp_response_aborts_after_the_response_deadline() {
         use nexus_outbound_hysteria2::Hysteria2Client;
         use nexus_outbound_hysteria2::test_server::TestServer;
         use std::io::Read;
@@ -13049,7 +13136,7 @@ mod hysteria2_dataplane_tests {
 
         let mut client = Hysteria2Client::connect(&target).unwrap();
         // 第一条 stream 占住 server 的 TCP 处理循环（它读而不发数据），
-        // 第二条 stream 的 TCPResponse 因而在守卫窗口内不会到达。
+        // 第二条 stream 的 TCPResponse 因而永远不会到达。
         let _first = client.open_tcp("first.example:80").unwrap();
         let second = client.open_tcp("second.example:80").unwrap();
 
@@ -13063,15 +13150,16 @@ mod hysteria2_dataplane_tests {
         let counts = hysteria2_pump_stream(&mut client, second, true, &mut down_client);
         let elapsed = started.elapsed();
 
-        assert_eq!(counts, (0, 0), "guard abort must not forward any bytes");
+        assert_eq!(counts, (0, 0), "no response: nothing is forwarded");
         assert!(
-            elapsed >= Duration::from_millis(30),
-            "guard must wait for the fixed 50 ms window, took {elapsed:?}"
+            elapsed >= Duration::from_secs(9),
+            "a slow response must not be cut short (10 s window), aborted after {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(5),
-            "guard abort must be bounded, took {elapsed:?}"
+            elapsed < Duration::from_secs(20),
+            "a missing response must still end the relay, took {elapsed:?}"
         );
+        drop(down_client);
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 16];
         let n = peer.read(&mut buf).unwrap_or(0);

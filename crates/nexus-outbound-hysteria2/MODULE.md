@@ -120,6 +120,10 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 
 ## Invariants
 
+- fast-open 首读超时非致命：`TCPResponse` 跨超时按字节累积（读超时保留已读
+  部分），中继在等待期间继续转发上行；只有服务端拒绝、非法帧、响应前 FIN、
+  停滞预算或 10 s 响应期限（与非 fast-open `open_tcp` 的等待上限一致）结束连接。
+  固定的短窗口不得作为中止条件：真实服务端的响应至少晚一个 RTT。
 - fast-open：`open_tcp` 返回后，读侧仍必须先且仅剥离一次 `TCPResponse`
   （由 `stream_read` 或 `await_tcp_response` 消费标记）；剥离后不得把后续
   载荷字节当响应解析。`await_tcp_response` 幂等：标记已消费时直接 `Ok(())`。
@@ -134,7 +138,10 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
   `await_tcp_response` 剥离成功与幂等；既有 driver 读写超时语义不回归。
 - `cargo test -p nexus hysteria2_dataplane_tests`：`EchoMode::Sink` 的 12 MiB
   上传-only 中继在 30 s 内完成（精确字节数、零下行载荷、server 实收字节数）；
-  fast-open 首读守卫超时干净中止（不转发任何字节、下游关闭、有界返回）。
+  fast-open 首个 `TCPResponse` 晚到（真实网络 RTT，测试注入单向 60 ms）不中止，
+  连接正常中继；`TCPResponse` 在 10 s 响应期限内始终未到才干净中止（不转发
+  任何字节、下游关闭、有界返回）（requirement-change 2026-10-27，取代 fixes-7
+  的固定 50 ms 首读守卫）。
 
 ## Allowed Dependencies
 
