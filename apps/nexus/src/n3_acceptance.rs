@@ -17,26 +17,57 @@ pub fn sha256(bytes: &[u8]) -> Sha256Digest {
     raw.copy_from_slice(digest.as_ref());
     Sha256Digest::from_bytes(raw)
 }
+/// Resumable streaming SHA-256 (N3-12 §5): cloning a state that already
+/// covers a verified prefix lets nexusd extend it with appended bytes without
+/// re-reading the prefix.
+#[derive(Clone)]
+pub struct Sha256Stream(ring::digest::Context);
+
+impl Default for Sha256Stream {
+    fn default() -> Self {
+        Self(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+}
+
+impl Sha256Stream {
+    /// Feeds the next bytes of the stream.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Consumes the state and returns SHA-256 of every byte fed so far;
+    /// clone first to keep extending the same prefix.
+    #[must_use]
+    pub fn finish(self) -> Sha256Digest {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(self.0.finish().as_ref());
+        Sha256Digest::from_bytes(raw)
+    }
+}
+
 /// Shared composition-root SHA-256 for the CLI and nexusd staging adapter,
 /// exposed so nexusd can reuse the established crypto dependency through
 /// `nexus::n3_acceptance` rather than adding a separate ring/sha2 dependency.
 /// Scratch space is bounded; input length and IO duration are not: this reads
 /// until EOF. Callers must bound the reader (for example with `Read::take`) and
 /// enforce declared size, file identity, content and authorization checks.
-pub fn sha256_reader(mut reader: impl std::io::Read) -> std::io::Result<Sha256Digest> {
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+pub fn sha256_reader(reader: impl std::io::Read) -> std::io::Result<Sha256Digest> {
+    sha256_stream_reader(reader).map(Sha256Stream::finish)
+}
+
+/// Like [`sha256_reader`], but returns the unfinished state for extension.
+pub fn sha256_stream_reader(mut reader: impl std::io::Read) -> std::io::Result<Sha256Stream> {
+    let mut stream = Sha256Stream::default();
     let mut buffer = [0u8; 65_536];
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
-            Ok(count) => context.update(&buffer[..count]),
+            Ok(count) => stream.update(&buffer[..count]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
-    let mut raw = [0u8; 32];
-    raw.copy_from_slice(context.finish().as_ref());
-    Ok(Sha256Digest::from_bytes(raw))
+    Ok(stream)
 }
 /// Opaque provider-generated TaskId, independent of requester/session identifiers.
 pub fn new_task_id() -> Result<TaskId, TaskError> {

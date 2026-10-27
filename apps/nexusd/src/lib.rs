@@ -5,12 +5,14 @@
 pub mod assembly;
 pub mod config;
 pub mod dataplane;
+pub mod discovery_runtime;
 pub mod nat_gather;
 pub mod nat_relay;
 pub mod nat_status;
 pub mod nat_stun;
 pub mod nat_switch;
 pub mod nat_turn;
+pub mod peer_source;
 pub mod proxy_fwd;
 pub mod recovery;
 /// nexusd Workspace sync 传输适配（C2；fabric QUIC bi-stream）。

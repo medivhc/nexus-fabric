@@ -97,6 +97,14 @@ PutChunk 要求 length>0、offset==durable_offset、offset+length≤size、独�
 
 每次写先 durable 保存 `{blob,old_offset,next_offset,chunk_sha256,scratch_state}` intent，写唯一固定命名 scratch，核实整 chunk/hash 并 fsync，再 durable 标记 `ScratchReady`，此后才允许把 scratch 的原字节追加到 blob；fsync blob 后 atomic fsync ledger 提交 next_offset，并保留 `CommittedCleanup` intent（原chunk范围/hash不变）；随后删除 scratch、fsync，再 durable 清 intent，最后回复。冷恢复先重算原 durable prefix hash：`ScratchReady` 前目标只能恰好停在 old_offset，可清理证明归属的未完成 scratch并保留 old_offset；`ScratchReady` 后必须核实完整 scratch，目标尾部只能是其一致前缀，可在原 intent 范围内补完相同字节并提交原 next_offset，不能回退或改写 old_offset 之前的字节。`CommittedCleanup` 恢复核实已完成 blob/原 chunk，仅清 owned scratch再 durable 清 intent；无 pending intent 的额外尾部、old prefix 缺字节/被改、无法证明归属的文件、内部 record/bindings 不一致均 `STATE_CORRUPT`，预算不返还。ledger record 每 blob 保存 SHA-256(prefix)，每次提交覆盖更新；pending chunk 有独立 hash；不通过 reset/truncate 猜测恢复。
 
+**每请求校验时机（requirement-change，2026-10-27）**：
+- 入口校验（所有请求）：每个 Begin/PutChunk/Get/Seal/Cancel 在租约内、任何 ledger/目录/payload 状态改变之前，对全部 record 的已确认 prefix 做完整流式 SHA-256 校验，不一致即 `STATE_CORRUPT`，且该请求不改变任何状态。
+- 不重复全量重读（PutChunk、Get）：除入口校验与下述幂等重试比较外，同一请求不得再读取已确认 prefix 的字节。随后的 durable 检查点（chunk 追加前的 record 复核、ledger 提交前的复核）只复核 inode/类型/权限/长度等绑定与 intent 一致性；本次提交写入 ledger 的新 SHA-256(prefix) 由入口校验得到的同一摘要状态（`nexus::n3_acceptance::Sha256Stream`，可克隆的流式 SHA-256）续算本 chunk 已追加且经回读核实的字节得到。单次 PutChunk 读取的 blob payload 字节 ≤ 全部已确认 prefix + 1 个 chunk（追加回读核实）。例外：`[offset,offset+length)` 全部落在已确认 prefix 内的幂等重试不写入，只比较该范围现有 bytes（读取 + 回读核实），读取 ≤ 全部已确认 prefix + 2×length，`hash_prefix` 字节仍恰等于全部已确认 prefix；这是有界常数开销，不随 prefix 增长。Begin、Seal、Cancel 每个 upload 各发生有限次，保留现有额外完整校验，不受此条约束。
+- 豁免：入口时存在 pending intent（崩溃遗留）而在请求内完成的恢复，以及 ledger TEMP 恢复发布路径（`ledger::load` 发布前的 `validate_all`），沿用冷恢复的完整校验，不计入上条。具体为：(1) 入口时任一 record 带 pending intent，该 record 的校验可再读一次其 prefix；(2) 请求内恢复改变了某 blob 的已确认 offset 时，该 blob 本次提交的新 prefix 摘要回退为完整重算；(3) Cancelled tombstone 过期清理等任何状态改变都发生在入口校验之后。
+- 冷启动 open/恢复的完整重算与 Seal 的整 blob 流式重算不变。
+- 后果（明确接受）：入口校验之后、同一请求进行中对已确认 prefix 的篡改，推迟到下一个请求入口、Seal 或冷启动时失败关闭（`STATE_CORRUPT`），绝不进入 Staged；若在下一个请求前被恢复原样，提交的 prefix 摘要仍对应原字节，上传可正常继续。
+- 复杂度：单次 PutChunk 流式哈希约 1×已确认 prefix（原实现约 4×），整次上传仍为 O(size²/chunk)；彻底消除需改 ledger 格式，另立 requirement-change。
+
 Seal 流式再 SHA-256 每个完整 blob，校验 manifest digest/SnapshotRef；intent fsync 后发布 Staged record，回复前 ledger fsync。与已有 `FileSnapshotStore` strong CAS/catalog 隔离：本批 Staged 是 owned staging root，不调用当前无预算的 `stage_snapshot` / `release_preview`。即使同 SnapshotId，多 owner 上传互不授权、互不清除。
 
 Cancel 先 durable Cancelling，再删除仅本 UploadId namespace 中已验证 owned payload/scratch，目录 fsync 确认删除，最后持久写零预算 Cancelled tombstone。删除失败/进程死后保持 charge；未能证明 physical deletion 不能先返还预算。授权撤销时上传/Seal/Get/Cancel 拒绝，不改变原 staging；运维显式重新授予 grant 后才能继续/取消，不偷偷以 GC 绕开 owner。normal/serve 在原 managed provider preflight 后、identity ensure/boot reconciliation/token publication 之前打开并恢复所有 staging；listener 的 token authority 核实完成后才能发 READY。任一损坏权威不得创建新空 ledger 或把该 upload 判完成。

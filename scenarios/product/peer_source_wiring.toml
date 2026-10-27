@@ -1,0 +1,59 @@
+schema_version = 1
+id = "product.peer-source-wiring"
+title = "生产 peer 源接线：发现 → 订阅 → 容量仲裁触发（daemon 装配，fake relay）"
+evidence_strength = "E4"
+requirement = "spec §7 AC16 / §4.2 / §4.4.2 / §4.5.1"
+
+[given]
+assembly = "nexus::network::build_session_manager_with_discovery：network.toml 只有 peer_id + [vpi]，[[peers]] 为空，mdns=None"
+feed = "PeerSourceFeed(PeerSourceConfig::default()) + fake RelayTrigger / RelayAddressBook"
+switch = "NatSwitching（loopback driver + fake RelayConnProvider，使 subscribe_relay_peer 返回 Some）"
+peers = "A=\"aa\"*32、B=\"bb\"*32，A < B（固定 64 小写 hex）"
+discovery = "tick 1 只有 A 的 LSA + note_lsa_heard；tick 4 之前注入 B 的 LSA + note_lsa_heard"
+book = "fake 内存 address book：初始为空；tick 2 前 set(A)，tick 4 前 set(B)"
+trigger = "fake trigger_relay 立即返回 Ok(addr) 并写入 established map"
+
+[when]
+command = "cargo run --quiet -p nexusd --example peer_source_wiring -- --json"
+
+# 冻结期望（AC16）：逐 tick 显式驱动，now 单调递增，tick 间 sleep 50ms。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "subscribed_peers"
+equals = 2
+
+[[expect]]
+field = "subscribed_sources_contains_lsa"
+equals = true
+
+[[expect]]
+field = "trigger_attempts_total"
+equals = 1
+
+[[expect]]
+field = "trigger_ok_total"
+equals = 1
+
+[[expect]]
+field = "trigger_capacity_parked_total"
+equals = 1
+
+[[expect]]
+field = "trigger_parked_peers"
+equals = 1
+
+[[expect]]
+field = "panic"
+equals = false
+
+[[expect]]
+field = "step_trace"
+equals = [
+  { tick = 1, subscribed_peers = 1, trigger_attempts_total = 0, trigger_capacity_parked_total = 0 },
+  { tick = 2, subscribed_peers = 1, trigger_attempts_total = 1, trigger_capacity_parked_total = 0 },
+  { tick = 3, subscribed_peers = 1, trigger_attempts_total = 1, trigger_capacity_parked_total = 0 },
+  { tick = 4, subscribed_peers = 2, trigger_attempts_total = 1, trigger_capacity_parked_total = 1 },
+]

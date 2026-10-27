@@ -16,15 +16,18 @@
 //! sw.shutdown();
 //! ```
 //!
-//! D5 生产触发（spec §14.3 / B15–B17）：`NatSwitching` 本身实现生产
-//! `RelayConnSink`，调用方以 `attach_relay_provider` 接入 provider，
-//! `on_relay_available` 直通 `on_relay_connected(auto_punch: true)`。
-//! loopback 验收（`nat_relay` 测试
-//! `d5_production_sink_triggers_on_relay_connected`）证明该路径。
-//! 残留边界：生产侧按 peer 订阅（`subscribe_relay_peer`）与触发
-//! `on_turn_allocated` 需要 peer 来源（mesh 发现），daemon 内目前无 peer
-//! 源调用它们——接线与订阅机制已就位并经 loopback 证明，peer 发现触发是
-//! 后续 mesh 集成工作，不在本轮静默模拟。
+//! D5 生产触发：per-peer attach 模型 + 本 spec §4.7 errata（O8-1..O8-12）。
+//! `NatSwitching` 本身实现生产 `RelayConnSink`，调用方以
+//! `attach_relay_provider` 接入 provider，再按 peer `subscribe_relay_peer`
+//! 取得退订 guard；`on_relay_available` 直通
+//! `on_relay_connected(auto_punch: true)`。provider 是单槽（≤1 relay peer）、
+//! 持有 driver anchor，且**不**向新订阅者重放已建立的 relay（O8-9/O8-10：
+//! 重放会再次覆盖 `nat_conns` 并清掉 direct 热备）。loopback 验收
+//! （`nat_relay` 测试 `d5_production_sink_triggers_on_relay_connected`）证明该路径。
+//! 残留边界：peer 来源由 `PeerSourceFeed` 提供并在 NAT worker 内 tick
+//! （`main.rs` 的 `feed.tick`）：`peer_source.rs` 负责 `subscribe_relay_peer`
+//! / 退订与 `spawn_trigger`（`trigger_relay`），本模块只消费 provider 事件。
+//! 该接线的验收仍是 loopback / E4（fake doubles），**不是真机**证据。
 //! E4（`crates/nexus-nat-wireup/examples/e4_prod_switch.rs`）用真实
 //! TURN + NAT 模拟证明整条链路。
 
@@ -44,7 +47,7 @@ use nexus_projection::path_link::ActiveConn;
 
 use crate::nat_relay::{
     RelayConnProvider, RelayConnSink, RelayInfo as ProviderRelayInfo,
-    RelayKind as ProviderRelayKind,
+    RelayKind as ProviderRelayKind, RelaySubscriptionGuard,
 };
 
 impl crate::nat_status::NatStatusSource for NatSwitching {
@@ -82,7 +85,6 @@ pub struct NatSwitching {
     /// `RelayConnSink` impl reach `on_relay_connected` (which takes
     /// `&Arc<Self>`); it is set by `new` via `Arc::new_cyclic`.
     relay_provider: Mutex<Option<Arc<dyn RelayConnProvider>>>,
-    relay_subscriptions: Mutex<HashSet<[u8; 32]>>,
     relay_lost: Mutex<HashSet<[u8; 32]>>,
     self_weak: Weak<NatSwitching>,
 }
@@ -166,7 +168,6 @@ impl NatSwitching {
                 link,
                 monitor,
                 relay_provider: Mutex::new(None),
-                relay_subscriptions: Mutex::new(HashSet::new()),
                 relay_lost: Mutex::new(HashSet::new()),
                 self_weak: weak.clone(),
             }
@@ -206,29 +207,39 @@ impl NatSwitching {
 
     /// Subscribe this stack as the provider's sink for one peer.
     ///
-    /// Returns false (fail-closed, logged) when no provider is attached.
-    /// The provider feeds `on_relay_available` for this peer, which routes
-    /// into `on_relay_connected` with `auto_punch: true`.
-    pub fn subscribe_relay_peer(self: &Arc<Self>, peer: FabricPeerId) -> bool {
+    /// Returns `None` (fail-closed, logged) when no provider is attached. The
+    /// provider feeds `on_relay_available` for this peer, which routes into
+    /// `on_relay_connected` with `auto_punch: true`.
+    ///
+    /// The returned guard owns the subscription lifetime: dropping it
+    /// unsubscribes and lets the provider release the relay slot when no sink
+    /// is left. Neither edge is strong (O9), so the guard cannot create a
+    /// cycle.
+    pub fn subscribe_relay_peer(
+        self: &Arc<Self>,
+        peer: FabricPeerId,
+    ) -> Option<RelaySubscriptionGuard> {
         let Some(provider) = self.relay_provider.lock().unwrap().clone() else {
             eprintln!(
                 "[nat-switch] WARN: subscribe_relay_peer with no provider attached; refusing"
             );
-            return false;
+            return None;
         };
-        provider.subscribe(peer, Arc::clone(self) as Arc<dyn RelayConnSink>);
-        self.relay_subscriptions.lock().unwrap().insert(peer.0);
-        true
+        let sink: Arc<dyn RelayConnSink> = Arc::clone(self) as Arc<dyn RelayConnSink>;
+        provider.subscribe(peer, Arc::clone(&sink));
+        Some(RelaySubscriptionGuard::new(
+            Arc::downgrade(&provider),
+            peer,
+            Arc::downgrade(&sink),
+        ))
     }
 
-    /// Peers this stack is subscribed for (production trigger introspection).
+    /// Peers this stack is subscribed for (delegated to the provider).
     pub fn relay_subscribed_peers(&self) -> Vec<FabricPeerId> {
-        self.relay_subscriptions
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|b| FabricPeerId(*b))
-            .collect()
+        match self.relay_provider.lock().unwrap().clone() {
+            Some(provider) => provider.subscribed_peers(),
+            None => Vec::new(),
+        }
     }
 
     /// Peers whose relay was reported lost (state only -- see `on_relay_lost`).
@@ -269,6 +280,14 @@ impl NatSwitching {
             "relay kind must be Turn or Mesh"
         );
         let name = peer_name(&peer);
+        // A successful relay clears the "lost" state and makes the peer visible
+        // in `GET /connectivity/nat` with turn/turn as its state evidence
+        // (spec §4.5, AC3). Path decisions are unchanged.
+        self.relay_lost.lock().unwrap().remove(&peer.0);
+        self.punch
+            .set_tunnel_proto(peer, nexus_nat_wireup::TunnelProto::Turn);
+        self.punch
+            .set_relay_source(peer, Some(nexus_nat_wireup::RelaySource::Turn));
         self.punch.register_relay(&relay, peer);
         self.link
             .lock()
@@ -454,8 +473,11 @@ impl RelayConnSink for NatSwitching {
     fn on_relay_lost(&self, peer: FabricPeerId) {
         // Spec section 14.3: only update state. The relay is already gone,
         // so there is nothing to close, and a lost relay must never
-        // trigger a punch.
+        // trigger a punch. Clearing `relay_source` keeps the API from
+        // reporting `turn` after the loss (R-18 allows the residual *path*
+        // state; the relay source itself must not lie).
         self.relay_lost.lock().unwrap().insert(peer.0);
+        self.punch.set_relay_source(peer, None);
         eprintln!(
             "[nat-switch] relay lost for peer {} (state only; relay not closed, no punch triggered)",
             peer_name(&peer)
@@ -560,9 +582,84 @@ mod tests {
 #[cfg(test)]
 mod gap_tests {
     use super::*;
+    use std::time::Duration;
 
     fn pid(byte: u8) -> FabricPeerId {
         FabricPeerId([byte; 32])
+    }
+
+    /// AC3 state evidence: a registered relay clears the lost mark and makes
+    /// the peer observable as `tunnel_proto="turn"` / `relay_source="turn"`.
+    #[test]
+    fn relay_connected_sets_turn_state() {
+        let server = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind server");
+        let peer = server.shared().peer_id.expect("server identity");
+        let server_addr = *server.shared().local_addr.lock().unwrap();
+        let acceptor = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || server.accept_conn())
+        };
+        let client = Driver::new_client().expect("bind client");
+        let local = *client.shared().local_addr.lock().unwrap();
+        let conn = client
+            .connect(peer, server_addr, Duration::from_secs(5))
+            .expect("connect");
+        let _ = acceptor.join().expect("accept thread").expect("accept");
+
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let candidates = nexus_nat_traversal::LocalCandidates {
+            host: gather_host_candidates(&driver),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        };
+        let sw = NatSwitching::new(
+            driver,
+            FabricPeerId([0x33; 32]),
+            candidates,
+            Vec::new(),
+            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+        );
+        // A lost report followed by a successful relay must clear the mark.
+        RelayConnSink::on_relay_lost(sw.as_ref(), peer);
+        assert!(sw.relay_lost_peers().contains(&peer));
+        sw.on_relay_connected(RelayInfo {
+            peer,
+            relay: conn,
+            kind: PathKind::Turn,
+            local,
+            remote: server_addr,
+            remote_nat: NatType::Unknown,
+            auto_punch: false,
+        });
+        assert!(!sw.relay_lost_peers().contains(&peer));
+        let status = sw
+            .punch
+            .all_status()
+            .into_iter()
+            .find(|s| s.peer == peer)
+            .expect("peer status registered");
+        assert_eq!(status.tunnel_proto, nexus_nat_wireup::TunnelProto::Turn);
+        assert_eq!(
+            status.relay_source,
+            Some(nexus_nat_wireup::RelaySource::Turn)
+        );
+        // MINOR-5: a later loss must not leave `relay_source="turn"` behind in
+        // the API (the relay really is gone). Path state stays untouched (R-18).
+        RelayConnSink::on_relay_lost(sw.as_ref(), peer);
+        let status = sw
+            .punch
+            .all_status()
+            .into_iter()
+            .find(|s| s.peer == peer)
+            .expect("peer status registered");
+        assert_eq!(
+            status.relay_source, None,
+            "provider_lost/unsubscribe must clear the stale relay source"
+        );
+        assert_eq!(status.tunnel_proto, nexus_nat_wireup::TunnelProto::Turn);
+        sw.shutdown();
     }
 
     #[test]

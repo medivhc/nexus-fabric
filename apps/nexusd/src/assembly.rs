@@ -12,7 +12,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use nexus_discovery::DiscoveryHub;
 use nexus_network::n1::bridge::N1MeshBridge;
+use nexus_network::n1::{N1PeerId, config::N1Config, session::N1SessionManager};
 
 use super::config::{self, LoadedConfig};
 use super::dataplane::DataplaneConfig;
@@ -89,34 +91,55 @@ pub fn mesh_bypass_overlap(mesh: &[String], bypass: &[String]) -> Vec<String> {
 /// - SessionManager 构造失败。
 ///
 /// 调用方按 §13.3 降级：不调 `set_n1_sender`，dataplane 照常跑。
-pub fn assemble_n1(
+#[derive(Clone)]
+pub struct N1Assembly {
+    pub bridge: Arc<N1MeshBridge>,
+    pub sessions: Arc<N1SessionManager>,
+    pub discovery: Arc<DiscoveryHub>,
+    /// Static peer ids only (the addresses live in `config.peers`; the hub's
+    /// static source keeps just `addrs[0]`, CR-2).
+    pub static_peers: Vec<N1PeerId>,
+    /// The one authoritative `N1Config` copy for this run.
+    pub config: N1Config,
+}
+
+/// Assemble N1 with the single discovery hub (daemon path).
+///
+/// The hub, the N1 session manager and the returned assembly share one
+/// instance; the background dial thread is unchanged (best-effort per peer).
+pub fn assemble_n1_with_discovery(
     network_toml: &str,
     proxy: Option<&config::ProxySection>,
     shutdown: Arc<AtomicBool>,
-) -> Result<Arc<N1MeshBridge>, String> {
+    params: nexus::network::DiscoveryParams,
+) -> Result<N1Assembly, String> {
     let proxy_cfg = match proxy {
         Some(section) => Some(proxy_config_from(section)?),
         None => None,
     };
-    let (config, mgr) = nexus::network::build_session_manager(network_toml, proxy_cfg, shutdown)?;
-    // Arc 共享：bridge 持有 mgr 做路由，dial 线程持有 mgr 做尽力拨号。
-    // dial 线程有界（N peers × 10s 握手超时），随进程退出而终止，无需显式回收。
-    let mgr = Arc::new(mgr);
+    let (config, sessions, discovery) = nexus::network::build_session_manager_with_discovery(
+        network_toml,
+        proxy_cfg,
+        shutdown,
+        params,
+    )?;
     let bridge = Arc::new(N1MeshBridge::new(
-        Arc::clone(&mgr),
+        Arc::clone(&sessions),
         config.vpi.routes.clone(),
     ));
     eprintln!(
         "[nexusd] N1 bridge assembled: {} routes",
         bridge.route_count()
     );
+    let static_peers: Vec<N1PeerId> = config.peers.iter().map(|p| p.id).collect();
     // 后台 dial：不阻塞启动；失败记 warn（降级）。
-    let peers: Vec<_> = config.peers.iter().map(|p| p.id).collect();
+    let peers = static_peers.clone();
+    let dial_sessions = Arc::clone(&sessions);
     std::thread::Builder::new()
         .name("nexusd-n1-dial".to_string())
         .spawn(move || {
             for peer_id in peers {
-                if let Err(e) = mgr.dial(&peer_id) {
+                if let Err(e) = dial_sessions.dial(&peer_id) {
                     let hex = peer_id.to_hex();
                     eprintln!(
                         "[nexusd] WARN: N1 dial peer {} failed: {e:?} (degraded, continuing)",
@@ -126,7 +149,28 @@ pub fn assemble_n1(
             }
         })
         .map_err(|e| format!("spawn n1 dial thread: {e}"))?;
-    Ok(bridge)
+    Ok(N1Assembly {
+        bridge,
+        sessions,
+        discovery,
+        static_peers,
+        config,
+    })
+}
+
+/// Compat wrapper (static-only discovery, no pump): returns the bridge only.
+pub fn assemble_n1(
+    network_toml: &str,
+    proxy: Option<&config::ProxySection>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<Arc<N1MeshBridge>, String> {
+    Ok(assemble_n1_with_discovery(
+        network_toml,
+        proxy,
+        shutdown,
+        nexus::network::DiscoveryParams::static_only(),
+    )?
+    .bridge)
 }
 
 /// 把 `[network.proxy]` 配置节映射为 `nexus::network::ProxyConfig`（#3 AC3）。
@@ -647,5 +691,41 @@ mod tests {
         assert!(!report.actions.is_empty());
         let cleanup = assemble.cleanup().expect("dry-run cleanup");
         assert_eq!(cleanup.excludes_removed, 0);
+    }
+    #[test]
+    fn assemble_n1_with_discovery_static_peers_ids_only() {
+        let text = network_toml_with_routes();
+        let assembly = assemble_n1_with_discovery(
+            &text,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            nexus::network::DiscoveryParams::static_only(),
+        )
+        .expect("assembly");
+        // Id-only: two configured addrs stay in `config.peers`, the id list
+        // carries no address.
+        assert_eq!(assembly.config.peers[0].addrs.len(), 1);
+        assert_eq!(assembly.static_peers.len(), 1);
+        assert_eq!(assembly.static_peers[0], assembly.config.peers[0].id);
+        // The hub the assembly exposes is the one the N1 adapter reads (the
+        // assembly holds the same Arc it passed to the session manager).
+        assert_eq!(
+            assembly.discovery.self_id().0,
+            assembly.config.peer_id.to_hex()
+        );
+        // Multiple configured addrs still yield exactly one static id.
+        let multi = text.replace(
+            "addrs = [\"127.0.0.1:19001\"]",
+            "addrs = [\"127.0.0.1:19001\", \"127.0.0.1:19002\"]",
+        );
+        let assembly = assemble_n1_with_discovery(
+            &multi,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            nexus::network::DiscoveryParams::static_only(),
+        )
+        .expect("assembly with two addrs");
+        assert_eq!(assembly.config.peers[0].addrs.len(), 2);
+        assert_eq!(assembly.static_peers.len(), 1);
     }
 }

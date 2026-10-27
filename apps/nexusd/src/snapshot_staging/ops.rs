@@ -27,6 +27,7 @@ pub(super) fn execute(
     l: &mut Ledger,
     c: &TaskCallContext,
     request: &SnapshotRequest,
+    verified: &recovery::Verified,
 ) -> Result<UploadView, TaskError> {
     if let SnapshotRequest::Get { upload_id } = request {
         return Ok(record(l, upload_id)?.view(&l.binding));
@@ -216,7 +217,7 @@ pub(super) fn execute(
                 }
             })?;
             s.hit("chunk_scratch_ready_durable")?;
-            finish_chunk(s, n, l, upload_id)?;
+            finish_chunk(s, n, l, upload_id, Some(verified))?;
             Ok(record(l, upload_id)?.view(&l.binding))
         }
         SnapshotRequest::Seal { upload_id } => {
@@ -320,14 +321,20 @@ pub(super) fn finish_begin(
     recovery::validate_record(n, &record(l, id)?)?;
     ledger::edit(s, n, l, id, "begin_done", |r| r.intent = None)
 }
+/// `verified` is the entry verification of the current request; recovery
+/// passes `None` and keeps full re-hashing (N3-12 §5 exemptions).
 pub(super) fn finish_chunk(
     s: &FileSnapshotStaging,
     n: &Nodes,
     l: &mut Ledger,
     id: &UploadId,
+    verified: Option<&recovery::Verified>,
 ) -> Result<(), TaskError> {
     let r = record(l, id)?;
-    recovery::validate_record(n, &r)?;
+    match verified {
+        Some(v) => recovery::validate_record_trusting(n, &r, v)?,
+        None => recovery::validate_record(n, &r)?,
+    }
     let Some(Intent::Chunk(c)) = &r.intent else {
         return Err(corrupt("missing ChunkIntent"));
     };
@@ -354,14 +361,30 @@ pub(super) fn finish_chunk(
             .as_ref()
             .ok_or_else(|| corrupt("ScratchReady scratch missing"))?;
         let len = target.len()?;
+        let mut appended = None;
         if len < c.next {
             let remaining = sf.read_range(len - c.old, (c.next - len) as usize)?;
-            io::append(&target, len, &remaining)?
+            io::append(&target, len, &remaining)?;
+            if len == c.old {
+                appended = Some(remaining);
+            }
         }
         s.hit("chunk_blob_appended")?;
         io::sync_file(&target)?;
         s.hit("chunk_blob_durable")?;
-        let prefix = target.hash_prefix(c.next)?;
+        // Continue the entry digest with the appended, read-back-verified
+        // chunk; otherwise (recovery, partial tail) re-hash the whole prefix.
+        let base = verified
+            .and_then(|v| v.get(id, &c.blob))
+            .filter(|p| p.offset == c.old && p.inode == target.id());
+        let prefix = match (base, appended) {
+            (Some(p), Some(bytes)) => {
+                let mut stream = p.stream.clone();
+                stream.update(&bytes);
+                stream.finish()
+            }
+            _ => target.hash_prefix(c.next)?,
+        };
         ledger::edit(s, n, l, id, "chunk_commit", |r| {
             if let Some(b) = r.blobs.iter_mut().find(|b| b.digest == c.blob) {
                 b.offset = c.next;

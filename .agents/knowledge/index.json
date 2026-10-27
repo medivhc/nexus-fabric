@@ -462,5 +462,13 @@
     "module": "engineering",
     "category": "implementation-pitfall",
     "summary": "多个 worktree 共用 CARGO_TARGET_DIR：path crate 产物按相对路径哈希互相覆盖、按 mtime 判新鲜，导致假 FAIL；每个 worktree 独立 target，污染后 cargo clean -p 并重生成 Evidence。"
+  },
+  {
+    "id": "n3-single-pass-prefix",
+    "file": "entries/2026-10-27-n3-staging-single-pass-prefix.md",
+    "date": "2026-10-27",
+    "module": "apps/nexusd",
+    "category": "implementation-pattern",
+    "summary": "每请求入口完整校验一次已确认 prefix，同请求复核只查绑定，提交摘要由入口 Sha256Stream 续算；字节预算须列出幂等重试比较路径。"
   }
 ]

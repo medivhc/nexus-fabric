@@ -465,6 +465,31 @@ impl TurnManager {
         Some(Instant::now() + self.refresh_interval.saturating_sub(REFRESH_MARGIN))
     }
 
+    /// Test seam (unit tests only): a manager in an arbitrary lifecycle state
+    /// with an injected handle and no working allocate factory.
+    ///
+    /// Needed by `nat_relay`'s `refresh_expiry_marks_lost`: the
+    /// Active -> Expired transition has to be driven deterministically instead
+    /// of waiting for a real TURN server to fail three times.
+    #[cfg(test)]
+    pub(crate) fn test_seam(
+        state: TurnState,
+        client: Option<Box<dyn TurnHandle>>,
+        next_refresh_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            config: None,
+            server: None,
+            state,
+            client,
+            factory: Box::new(|| Err(io::Error::other("test seam: no allocate factory"))),
+            consecutive_refresh_failures: 0,
+            stale_nonce_retried: false,
+            next_refresh_at,
+            refresh_interval: Duration::from_secs(300),
+        }
+    }
+
     /// 释放 TURN 资源并进入 `Disabled`（退出路径，幂等）。
     pub fn shutdown(&mut self) {
         // C2：显式 Deallocate（RFC 5766 LIFETIME=0），best-effort。
@@ -521,6 +546,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         }
     }
 
@@ -662,6 +688,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         };
         let mgr = TurnManager::new(Some(cfg));
         assert_eq!(mgr.state(), TurnState::Disabled);

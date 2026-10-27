@@ -14,3 +14,7 @@
 # Python 脚本测试缓存
 __pycache__/
 *.pyc
+
+# OsAssemble 操作日志是运行期产物（crates/nexus-platform-linux op_log 默认写到 cwd）
+os_assemble.log
+/apps/nexusd/os_assemble.log

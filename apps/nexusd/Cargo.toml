@@ -34,6 +34,9 @@ nexus-session = { path = "../../crates/nexus-session" }
 nexus-domain = { path = "../../crates/nexus-domain" }
 nexus-fabric = { path = "../../crates/nexus-fabric" }
 toml = "0.8"
+# mDNS pump: SO_REUSEADDR + join_multicast_v4 on the daemon socket
+# (same version as apps/nexus; no new third-party package).
+socket2 = { version = "0.6", default-features = false }
 nexus-service = { path = "../../crates/nexus-service" }
 nexus-storage = { path = "../../crates/nexus-storage" }
 nexus-flow-session = { path = "../../crates/nexus-flow-session" }
