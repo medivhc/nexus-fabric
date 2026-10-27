@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -17,7 +17,6 @@ use nexus_projection::transparent::{ProxyEgressEvent, ProxyFlowEgress, Transpare
 use crate::proxy_fwd::ProxyDialConfig;
 
 const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum RelayCmd {
     Data(Vec<u8>),
@@ -175,10 +174,9 @@ impl ProxyFlowEgress for StreamProxyEgress {
             .cloned()
             .ok_or_else(|| TransparentFrontendError::OutboundUnresolved { tag: tag.clone() })?;
         let packet = synthetic_udp_packet(key, orig_dst, payload);
-        let forwarder = self
-            .udp
-            .entry(tag.clone())
-            .or_insert_with(|| crate::proxy_fwd::udp_relay::UdpForwarder::new(config));
+        let forwarder = self.udp.entry(tag.clone()).or_insert_with(|| {
+            crate::proxy_fwd::udp_relay::UdpForwarder::new(crate::proxy_fwd::legacy_dialer(&config))
+        });
         if forwarder.handle_packet(&packet) {
             self.udp_peers.insert(key, (key_peer(key), orig_dst));
             Ok(())
@@ -276,84 +274,11 @@ fn synthetic_udp_packet(key: FlowKey, orig_dst: SocketAddrV4, payload: &[u8]) ->
     pkt
 }
 
-enum ProxyStream {
-    Tcp(TcpStream),
-    Tls(Box<nexus_proxy_transport::TlsStream>),
-    Ss(crate::proxy_fwd::ss_std::SsTcpClient),
-}
-
-impl ProxyStream {
-    fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            Self::Tcp(stream) => stream.set_read_timeout(dur),
-            Self::Tls(stream) => stream.get_mut().set_read_timeout(dur),
-            Self::Ss(_) => Ok(()),
-        }
-    }
-}
-
-impl Read for ProxyStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Tcp(stream) => stream.read(buf),
-            Self::Tls(stream) => stream.read(buf),
-            Self::Ss(stream) => stream
-                .read(buf)
-                .map_err(|e| std::io::Error::other(e.to_string())),
-        }
-    }
-}
-
-impl Write for ProxyStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Tcp(stream) => stream.write(buf),
-            Self::Tls(stream) => stream.write(buf),
-            Self::Ss(stream) => stream
-                .write_all(buf)
-                .map(|()| buf.len())
-                .map_err(|e| std::io::Error::other(e.to_string())),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn dial_proxy_stream(config: &ProxyDialConfig, target: SocketAddr) -> std::io::Result<ProxyStream> {
-    match config {
-        ProxyDialConfig::Socks5 { server } => {
-            let cfg = nexus_proxy_transport::Socks5ProxyConfig::new(*server, None);
-            nexus_proxy_transport::socks5_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Trojan { server, password } => {
-            let cfg = nexus_proxy_transport::TrojanProxyConfig::new(*server, password.clone());
-            nexus_proxy_transport::trojan_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::TrojanTls {
-            server,
-            password,
-            sni,
-            skip_verify,
-        } => {
-            let mut cfg =
-                nexus_proxy_transport::TrojanTlsConfig::new(*server, password.clone(), sni.clone());
-            cfg.skip_cert_verify = *skip_verify;
-            nexus_proxy_transport::trojan_tls_connect(&cfg, target)
-                .map(|s| ProxyStream::Tls(Box::new(s)))
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Shadowsocks {
-            server, password, ..
-        } => {
-            crate::proxy_fwd::ss_std::SsTcpClient::connect(*server, password, target, DIAL_TIMEOUT)
-                .map(ProxyStream::Ss)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-    }
+fn dial_proxy_stream(
+    config: &ProxyDialConfig,
+    target: SocketAddr,
+) -> std::io::Result<Box<dyn crate::proxy_fwd::adapter::TunnelStream>> {
+    crate::proxy_fwd::legacy_dialer(config)
+        .dial_tcp(target)
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }

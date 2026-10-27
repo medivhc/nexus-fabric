@@ -889,9 +889,11 @@ impl Dataplane {
     /// 事件里的 reason 原先被丢弃，现持久化到同一 `last_failure_reason` 面。
     fn record_proxy_stream_failures(&mut self, events: Vec<crate::proxy_fwd::ProxyStreamEvent>) {
         for event in events {
-            if let crate::proxy_fwd::ProxyStreamEvent::Failed { reason, .. } = event {
-                self.note_tproxy_failure(TransparentFailureKind::UpstreamFailed.token(), reason);
-            }
+            let crate::proxy_fwd::ProxyStreamEvent::Failed { error, detail, .. } = event;
+            self.note_tproxy_failure(
+                TransparentFailureKind::UpstreamFailed.token(),
+                format!("{error}: {detail}"),
+            );
         }
     }
 
@@ -1410,22 +1412,11 @@ impl Dataplane {
                         // 同步 TCP dial / 终结流 / 失败增量（含异步 poll 结果）。
                         self.sync_proxy_stats();
                     }
-                    Some(Err(crate::proxy_fwd::ProxyEngineError::DialFailed {
-                        reason, ..
-                    })) => {
-                        self.note_tproxy_failure(
-                            "upstream_failed",
-                            format!("PROXY_DIAL_FAILED: {reason}"),
-                        );
-                        self.with_stats(|s| {
-                            s.proxy_dropped_no_proxy += 1;
-                            s.dropped += 1;
-                        });
-                    }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { .. }))
                     | Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
                         ..
-                    })) => {
+                    }))
+                    | Some(Err(crate::proxy_fwd::ProxyEngineError::InvalidOutbound { .. })) => {
                         self.with_stats(|s| {
                             s.proxy_dropped_no_proxy += 1;
                             s.dropped += 1;
@@ -4044,7 +4035,9 @@ proto=udp frontend=tproxy matched_rule=- egress_hint=- outbound=self session=-"
             },
         }])));
         dp.set_proxy_engine(
-            crate::proxy_fwd::ProxyEngine::new(P6_PROXY_YAML).expect("proxy engine"),
+            crate::proxy_fwd::ProxyEngine::new(Some(P6_PROXY_YAML))
+                .expect("proxy engine")
+                .expect("engine constructed"),
         );
         (dp, mock)
     }
@@ -4361,7 +4354,11 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
         let yaml = format!(
             "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: p1\noutbounds:\n  - tag: p1\n    kind: socks5\n    locator: {socks_addr}\n"
         );
-        dp.set_proxy_engine(crate::proxy_fwd::ProxyEngine::new(&yaml).expect("proxy engine"));
+        dp.set_proxy_engine(
+            crate::proxy_fwd::ProxyEngine::new(Some(&yaml))
+                .expect("proxy engine")
+                .expect("engine constructed"),
+        );
         (dp, mock)
     }
 
@@ -4561,7 +4558,9 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
         };
         let mut dp = Dataplane::new(tun, config).expect("dataplane new");
         dp.set_proxy_engine(
-            crate::proxy_fwd::ProxyEngine::new(P6_PROXY_YAML).expect("proxy engine"),
+            crate::proxy_fwd::ProxyEngine::new(Some(P6_PROXY_YAML))
+                .expect("proxy engine")
+                .expect("engine constructed"),
         );
         assert!(!dp.tick(1).expect("idle tick"), "no work reported");
         assert!(

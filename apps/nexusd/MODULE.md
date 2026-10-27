@@ -348,14 +348,24 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   - dial 失败 → `handle_fabric_rst(stream_id)`，`proxy_dropped_no_proxy += 1`；
   - 对端关闭 → `handle_fabric_fin/rst`；本地关闭 → 关 proxy 连接。
 - **P2（UDP 转发）**：`Classification::Proxy` 的 UDP 包 → `ProxyEngine`：
-  - 解析 IP/UDP 头 → 按 P3 选定协议的 UDP 中继发送；
-  - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；trojan：TCP 上的 UDP；
+  - 解析 IP/UDP 头 → `dialer.udp_capability()` 分派 → `UdpMode` 承载：
+    SOCKS5 = `Socks5Associate`；SS = `ShadowsocksAead`（仍由 `ss_std::SsUdp` 承载，
+    删除门归 fixes-6）；VLESS/AnyTLS = `Unsupported{NotWired}`；Trojan（恒 TLS）=
+    `Unsupported{TlsVariantNotSupported}`；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
+  - `Unsupported` → 丢包 + `udp_send_failed`/`udp_unsupported*` 计数 +
+    每 `(kind,tag)` 首次与每 10 s 一条限频日志，**绝不直连**；
   - 发送失败 → `proxy_dropped_no_proxy += 1`。
-- **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，选首个可用
-  `kind ∈ {shadowsocks, trojan, socks5}`（跳过 direct/relay/vmess）；
-  - 无可用出站 → 等价未配置（`proxy_dropped_no_proxy`）；
-  - `OutboundKind` 新增 `Socks5`（ additive；`locator` 为 `host:port`）。
+- **P3（出站选择，Q-4=A 多出站 + strict-first）**：`OutboundRegistry::build` 按
+  `outbound_manifest::select_index`（文件顺序首个 proxy+wired，**唯一定义**）遍历：
+  - 全部 wired 出站（socks5/shadowsocks/trojan/vless/anytls）建 dialer 入表，
+    **按规则 tag 选路**（不是只选一个）；
+  - direct/relay → `skipped(NotProxyKind)`；vmess/hysteria2 → `skipped(ProtocolNotWired)`
+    且进 `unsupported` 槽（运行期结构化错误）；
+  - 首个 wired 配置非法 → `SelectedInvalid`（**硬失败，不跳到下一个**）；
+    非首个 wired 配置非法 → `Invalid` 槽（启动 warn + 运行期 `InvalidOutbound`）；
+  - 无任何 proxy+wired → `NoUsableOutbound` → 无 engine（D1 降级）；
+  - `OutboundKind` 集合不变（`Socks5` 为既有 additive）。
 - **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
   dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
 - **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；

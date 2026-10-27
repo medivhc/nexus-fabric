@@ -18,7 +18,7 @@ pub(crate) use nexus_proxy_config::{UdpCapability, UdpMode, UdpUnsupportedReason
 
 mod anytls;
 mod framing;
-mod legacy;
+pub(crate) mod legacy;
 mod tls;
 mod vless;
 
@@ -312,8 +312,26 @@ pub enum EngineInitError {
         source: OutboundConfigError,
     },
     /// proxy.yaml 存在，但没有任何可接管的出站。
-    NoUsableOutbound { skipped: Vec<SkippedOutbound> },
+    NoUsableOutbound {
+        skipped: Vec<super::SkippedOutbound>,
+    },
 }
+
+impl std::fmt::Display for EngineInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Yaml(error) => write!(f, "{}: {error}", self.variant()),
+            Self::SelectedInvalid { tag, source } => {
+                write!(f, "{}: tag={tag} cause={}", self.variant(), source.name())
+            }
+            Self::NoUsableOutbound { skipped } => {
+                write!(f, "{}: skipped={}", self.variant(), skipped.len())
+            }
+        }
+    }
+}
+
+impl std::error::Error for EngineInitError {}
 
 impl EngineInitError {
     /// 启动失败 JSON 的 `variant`（与枚举一一对应，spec §2.4/§6.5）。
@@ -332,23 +350,6 @@ impl EngineInitError {
 pub enum BuildDialerError {
     Config(OutboundConfigError),
     ProtocolNotWired { kind: OutboundKind },
-}
-
-/// 出站被跳过的原因。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    /// direct / relay：不是代理出站。
-    NotProxyKind,
-    /// 协议实现存在但本 run 未接线。
-    ProtocolNotWired,
-}
-
-/// 被跳过的出站（用于 `NoUsableOutbound` 诊断）。
-#[derive(Debug, Clone)]
-pub struct SkippedOutbound {
-    pub tag: String,
-    pub kind: OutboundKind,
-    pub reason: SkipReason,
 }
 
 /// 配置面 warning 码（spec §3.1/§3.2/§5）。步骤 3 的五载体从

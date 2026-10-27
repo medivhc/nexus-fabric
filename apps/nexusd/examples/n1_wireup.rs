@@ -154,8 +154,9 @@ fn run() -> serde_json::Value {
         "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: {}\n",
         socks_addr
     );
-    let proxy_engine =
-        nexusd::proxy_fwd::ProxyEngine::new(&proxy_yaml).expect("proxy engine from stub socks5");
+    let proxy_engine = nexusd::proxy_fwd::ProxyEngine::new(Some(&proxy_yaml))
+        .expect("proxy engine from stub socks5")
+        .expect("engine constructed");
     dp.set_proxy_engine(proxy_engine);
     // P3：`Dataplane::new` 初始规则为空（fail-closed），须显式注入与
     // ProxyEngine 同源的规则引擎，否则 198.18.1.1 会被判 Drop。

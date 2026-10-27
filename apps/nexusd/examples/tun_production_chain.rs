@@ -485,7 +485,11 @@ fn main() {
     dp.set_rule_engine(Box::new(
         DomainRuleEngine::from_yaml(&yaml).expect("dataplane rule engine"),
     ));
-    dp.set_proxy_engine(ProxyEngine::new(&yaml).expect("proxy engine"));
+    dp.set_proxy_engine(
+        ProxyEngine::new(Some(&yaml))
+            .expect("proxy engine")
+            .expect("engine constructed"),
+    );
 
     for src_port in [40_001u16, 40_002] {
         let pkt = craft_udp(
@@ -541,7 +545,11 @@ fn main() {
     fail_dp.set_rule_engine(Box::new(
         DomainRuleEngine::from_yaml(&fail_yaml).expect("failure rule engine"),
     ));
-    fail_dp.set_proxy_engine(ProxyEngine::new(&fail_yaml).expect("failure proxy engine"));
+    fail_dp.set_proxy_engine(
+        ProxyEngine::new(Some(&fail_yaml))
+            .expect("failure proxy engine")
+            .expect("engine constructed"),
+    );
     let fail_syn = craft_tcp(
         [10, 0, 0, 2],
         [127, 0, 0, 2],

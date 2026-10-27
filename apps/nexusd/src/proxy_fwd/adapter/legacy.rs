@@ -26,13 +26,13 @@ use super::{
 };
 
 /// SOCKS5 出站（RFC 1928 CONNECT）。
-pub(super) struct Socks5Dialer {
+pub(crate) struct Socks5Dialer {
     tag: String,
     server: SocketAddr,
 }
 
 impl Socks5Dialer {
-    pub(super) fn new(tag: String, server: SocketAddr) -> Self {
+    pub(crate) fn new(tag: String, server: SocketAddr) -> Self {
         Self { tag, server }
     }
 }
@@ -64,14 +64,14 @@ impl OutboundDialer for Socks5Dialer {
 ///
 /// 步骤 4 起生产 SS TCP 走 crate（spec §3.3「fixes-2 之后」）；daemon 内嵌
 /// `ss_std` 只保留 UDP 一侧（spec §4.2 条件 5，`TODO(deletion-gate: fixes-6)`）。
-pub(super) struct ShadowsocksCrateDialer {
+pub(crate) struct ShadowsocksCrateDialer {
     tag: String,
     server: SocketAddr,
     password: String,
 }
 
 impl ShadowsocksCrateDialer {
-    pub(super) fn new(tag: String, server: SocketAddr, password: String) -> Self {
+    pub(crate) fn new(tag: String, server: SocketAddr, password: String) -> Self {
         // AC-3 字面要求：生产选路时输出 `kind=shadowsocks source=crate`（不含凭据）。
         eprintln!("[proxy-fwd] outbound kind=shadowsocks source=crate tag={tag}");
         Self {
@@ -142,13 +142,13 @@ impl OutboundDialer for ShadowsocksCrateDialer {
 }
 
 /// Trojan（proxy-transport，始终 TLS）出站。
-pub(super) struct TrojanProxyTransportDialer {
+pub(crate) struct TrojanProxyTransportDialer {
     tag: String,
     config: TrojanTlsConfig,
 }
 
 impl TrojanProxyTransportDialer {
-    pub(super) fn new(tag: String, config: TrojanTlsConfig) -> Self {
+    pub(crate) fn new(tag: String, config: TrojanTlsConfig) -> Self {
         Self { tag, config }
     }
 }

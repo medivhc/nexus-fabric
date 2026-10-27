@@ -587,11 +587,15 @@ fn run_dataplane(
     }
 
     // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
+    // TODO(S8): 改为 spawn 前预构造 + D1 分层启动失败（stderr JSON + exit 1）。
     if let Some(yaml) = proxy_yaml.as_deref() {
-        match nexusd::proxy_fwd::ProxyEngine::new(yaml) {
-            Ok(engine) => {
+        match nexusd::proxy_fwd::ProxyEngine::new(Some(yaml)) {
+            Ok(Some(engine)) => {
                 dp.set_proxy_engine(engine);
                 eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
+            }
+            Ok(None) => {
+                eprintln!("[nexusd] dataplane: ProxyEngine unavailable (NO_USABLE_OUTBOUND)");
             }
             Err(e) => {
                 eprintln!(
