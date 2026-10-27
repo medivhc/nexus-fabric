@@ -546,6 +546,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         }
     }
 
@@ -687,6 +688,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         };
         let mgr = TurnManager::new(Some(cfg));
         assert_eq!(mgr.state(), TurnState::Disabled);

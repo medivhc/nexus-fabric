@@ -270,6 +270,9 @@ pub struct TurnSection {
     pub stun_server2: Option<String>,
     /// TURN 客户端的本地绑定地址（生产 `0.0.0.0:0`）。
     pub bind_addr: String,
+    /// relayed 地址簿目录（`Some` = 共享目录 `DirRelayAddressBook`，INTERIM
+    /// 跨主机渠道；`None` = 现有 per-self 临时文件）。
+    pub relay_book_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for TurnSection {
@@ -283,6 +286,7 @@ impl Default for TurnSection {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".to_string(),
+            relay_book_dir: None,
         }
     }
 }
@@ -748,6 +752,21 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
             addr.to_string()
         }
     };
+    // `relay_book_dir`：缺失 = None（per-self 临时文件）；空字符串 = CONFIG 错误。
+    let relay_book_dir = match t.get("relay_book_dir") {
+        None => None,
+        Some(x) => {
+            let s = x.as_str().ok_or_else(|| {
+                format!("{DAEMON_TOML}: [network.turn].relay_book_dir must be a string")
+            })?;
+            if s.is_empty() {
+                return Err(format!(
+                    "{DAEMON_TOML}: [network.turn].relay_book_dir must not be empty"
+                ));
+            }
+            Some(std::path::PathBuf::from(s))
+        }
+    };
     Ok(TurnSection {
         server,
         realm,
@@ -757,6 +776,7 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
         stun_server,
         stun_server2,
         bind_addr,
+        relay_book_dir,
     })
 }
 

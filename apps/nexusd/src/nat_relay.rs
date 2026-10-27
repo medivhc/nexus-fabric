@@ -989,6 +989,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         };
         let id_a = FabricIdentity::from_ed25519_seed([1; 32]).unwrap();
         let id_b = FabricIdentity::from_ed25519_seed([2; 32]).unwrap();
@@ -1105,6 +1106,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         };
         let id_a = FabricIdentity::from_ed25519_seed([1; 32]).unwrap();
         let id_b = FabricIdentity::from_ed25519_seed([2; 32]).unwrap();
@@ -1490,6 +1492,7 @@ mod tests {
             stun_server: None,
             stun_server2: None,
             bind_addr: "0.0.0.0:0".into(),
+            relay_book_dir: None,
         }
     }
 
