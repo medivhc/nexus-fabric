@@ -2006,6 +2006,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         dataplane_handle,
         n1_bridge,
         n2_sweeper_handle,
+        discovery_handle,
         nat_switch_handle,
         &state_dir,
     );
@@ -2014,14 +2015,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
 /// R4：优雅关闭序列（§13.4）。
 ///
-/// 顺序：LocalAPI → N2 sweeper → NAT switch（5s）→ Workspace unmount（D7）→
-/// Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
+/// 顺序：LocalAPI → N2 sweeper → discovery pump（1s）→ NAT switch（5s，
+/// 内部 feed → switch → turn）→ Workspace unmount（D7）→ Dataplane（1s）→
+/// N1（5s）→ TUN（随 dataplane 线程退出）。
 /// 任一步超时 → warn 日志后强制继续，不无限等。
 fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
     n2_sweeper_handle: Option<std::thread::JoinHandle<()>>,
+    discovery_handle: Option<nexusd::discovery_runtime::DiscoveryRuntimeHandle>,
     nat_switch_handle: Option<std::thread::JoinHandle<()>>,
     state_dir: &std::path::Path,
 ) {
@@ -2032,6 +2035,12 @@ fn shutdown_sequence(
     // P1-1：N2 SessionManager 的唯一持有者（sweeper 线程）确认结束。
     if let Some(handle) = n2_sweeper_handle {
         assembly::join_with_timeout(handle, Duration::from_secs(2), "n2-session-sweeper");
+    }
+
+    // 发现 pump 先停：它的 socket 线程只读 hub，先于 NAT 订阅面退出。
+    if let Some(handle) = discovery_handle {
+        eprintln!("[nexusd] shutdown: stopping discovery pump");
+        handle.join(Duration::from_secs(1));
     }
 
     // AC5：NAT switching worker 共享 daemon shutdown 标志（协作式退出），
