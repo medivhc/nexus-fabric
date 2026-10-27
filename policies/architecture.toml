@@ -220,7 +220,7 @@ layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-hysteria2"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-fabric", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-fabric", "nexus-plugin"]
 portable = false
 layer = "outbound"
 

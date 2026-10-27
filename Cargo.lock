@@ -1379,7 +1379,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "bytes",
- "nexus-connectivity",
+ "nexus-proxy-config",
  "quinn-proto",
  "rcgen 0.13.2",
  "ring",
