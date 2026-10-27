@@ -1,4 +1,4 @@
-//! E4: TUN 生产 TCP Proxy 经 Dataplane::tick() + MockTun 真实转发。
+//! E4: TUN 生产 TCP Proxy 经 Dataplane::tick() + MockTun 真实转发（D2: 无 engine SYN 直接 RST）。
 //!
 //! 场景 `scenarios/product/proxy_fwd_tun_production.toml` 的可执行验证：
 //! - SOCKS5 经真实 dataplane 装配完成 TCP echo 往返（非 engine 直调）；
@@ -253,12 +253,22 @@ fn run(echo_addr: SocketAddr, socks_addr: SocketAddr) -> serde_json::Value {
         Ok(dp) => dp,
         Err(e) => return fail(format!("dataplane init: {e}")),
     };
-    let engine = match ProxyEngine::new(Some(&proxy_yaml(socks_addr))) {
+    let proxy_yaml = proxy_yaml(socks_addr);
+    // 生产装配同源：Dataplane::new 初始规则为空（fail-closed），必须注入同一份
+    // proxy.yaml 的规则引擎，否则 Proxy 包会被判 Drop。
+    let rule_engine = nexus_proxy::domain_engine::DomainRuleEngine::from_yaml(&proxy_yaml)
+        .map_err(|e| format!("rule engine: {e}"));
+    let rule_engine = match rule_engine {
+        Ok(engine) => engine,
+        Err(e) => return fail(e),
+    };
+    let engine = match ProxyEngine::new(Some(&proxy_yaml)) {
         Ok(Some(e)) => e,
         Ok(None) => return fail("ProxyEngine::new returned None"),
         Err(e) => return fail(format!("ProxyEngine::new failed: {}", e.variant())),
     };
     dp.set_proxy_engine(engine);
+    dp.set_rule_engine(Box::new(rule_engine));
 
     let epoch = std::time::Instant::now();
     let now = || u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -342,44 +352,42 @@ fn run(echo_addr: SocketAddr, socks_addr: SocketAddr) -> serde_json::Value {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // 阶段 2：无 engine → SYN 即 RST。
+    // 阶段 2（D2=C）：无 engine → SYN **当场**一个 RST，且**没有** SYN-ACK、
+    // 不进终结器（tcp_handshakes 不增）。
     let mock2 = Arc::new(Mutex::new(MockTun::new("prod1")));
     let mut dp2 = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock2))), config()) {
         Ok(dp) => dp,
         Err(e) => return fail(format!("dataplane2 init: {e}")),
     };
+    // 无 engine 但规则仍把该流判为 Proxy（否则 fail-closed 会 Drop）。
+    let no_engine_rule = match nexus_proxy::domain_engine::DomainRuleEngine::from_yaml(&proxy_yaml)
+    {
+        Ok(engine) => engine,
+        Err(e) => return fail(format!("no-engine rule engine: {e}")),
+    };
+    dp2.set_rule_engine(Box::new(no_engine_rule));
     let syn2 = craft_tcp(src, dst, src_port + 1, echo_addr.port(), 2000, 0, 0x02, &[]);
     mock2.lock().unwrap().inject(syn2);
     if let Err(e) = dp2.tick(now()) {
         return fail(format!("no-engine syn: {e}"));
     }
-    let syn_ack2 = mock2.lock().unwrap().take_written();
-    let srv_seq2 = syn_ack2
-        .iter()
-        .find_map(|pkt| tcp_parts(pkt))
-        .map(|(seq, _, _, _)| seq)
-        .unwrap_or(0);
-    let ack2 = craft_tcp(
-        src,
-        dst,
-        src_port + 1,
-        echo_addr.port(),
-        2001,
-        srv_seq2.wrapping_add(1),
-        0x10,
-        &[],
-    );
-    mock2.lock().unwrap().inject(ack2);
-    if let Err(e) = dp2.tick(now()) {
-        return fail(format!("no-engine ack: {e}"));
-    }
     let written2 = mock2.lock().unwrap().take_written();
-    let rst_ok = written2.iter().any(|pkt| {
+    let rst2 = written2
+        .iter()
+        .filter(|pkt| {
+            tcp_parts(pkt)
+                .map(|(_, _, flags, _)| flags & 0x04 != 0)
+                .unwrap_or(false)
+        })
+        .count();
+    let synack2 = written2.iter().any(|pkt| {
         tcp_parts(pkt)
-            .map(|(_, _, flags, _)| flags & 0x04 != 0)
+            .map(|(_, _, flags, _)| flags & 0x12 == 0x12)
             .unwrap_or(false)
     });
+    let rst_ok = rst2 == 1 && !synack2;
     let no_engine_counter = dp2.stats().proxy_dropped_no_proxy;
+    let no_engine_handshakes = dp2.stats().tcp_handshakes;
 
     let stats = dp.stats();
     let tcp_ok = dialed && downlink_seen;
@@ -396,5 +404,8 @@ fn run(echo_addr: SocketAddr, socks_addr: SocketAddr) -> serde_json::Value {
         "injected_uplink_after_data": 0,
         "no_engine.rst_ok": rst_ok,
         "no_engine.proxy_dropped_no_proxy": no_engine_counter,
+        "no_engine.rst_count": rst2,
+        "no_engine.synack": synack2,
+        "no_engine.tcp_handshakes": no_engine_handshakes,
     })
 }

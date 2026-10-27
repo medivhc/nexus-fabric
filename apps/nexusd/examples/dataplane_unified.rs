@@ -116,7 +116,7 @@ fn run() -> serde_json::Value {
     // 3. 处理所有包。
     let mut processed = 0;
     for _ in 0..10 {
-        match dp.process_one() {
+        match dp.tick(now_ticks()) {
             Ok(true) => processed += 1,
             Ok(false) => break,
             Err(e) => {
@@ -252,4 +252,12 @@ fn build_dns_query(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, qname: &str, txi
     pkt[20..20 + udp.len()].copy_from_slice(&udp);
     pkt[20 + udp.len()..].copy_from_slice(&dns);
     pkt
+}
+
+/// 单调毫秒时间源（example 内允许直接用 std）。
+fn now_ticks() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

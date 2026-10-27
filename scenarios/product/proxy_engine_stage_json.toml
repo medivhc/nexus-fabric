@@ -1,0 +1,28 @@
+schema_version = 1
+id = "product.proxy-engine-stage-json"
+title = "A4：启动失败按阶段（config_load / rule_engine_init / proxy_engine_init）输出 JSON + exit 1"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#统一数据面装配"
+
+[given]
+# 可执行 E4（example proxy_engine_stage_json --json）：真实 `nexusd <config-dir>`
+# 子进程三次，各触发一个 stage：
+# - config_load：proxy.yaml 语法错误（config::load 先失败）；
+# - rule_engine_init：配置可解析但 urltest 组缺 measurement（rule engine 构建失败）；
+# - proxy_engine_init：首个 wired 出站非法（Trojan 未声明 TLS → SelectedInvalid）。
+# 断言只看结构化 stage 字段与 exit code，不读文案。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_engine_stage_json -- --json"
+
+[[expect]]
+field = "config_load.stage"
+equals = "config_load"
+
+[[expect]]
+field = "rule_engine_init.stage"
+equals = "rule_engine_init"
+
+[[expect]]
+field = "proxy_engine_init.stage"
+equals = "proxy_engine_init"

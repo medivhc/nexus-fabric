@@ -328,6 +328,12 @@ pub struct Dataplane {
     tproxy_counters: Arc<Mutex<TproxyCounters>>,
     /// 最近一次捕获失败原因（spec §9.16）。
     tproxy_last_failure: Option<String>,
+    /// D2 去重（spec §4.5.2 / errata E4）：Proxy 分支已当场发过 RST 的 key。
+    ///
+    /// 仅 flow_mgr 开且无 engine 时插入；命中 `FlowSignal::TcpReset` 时只做会话
+    /// 回收，不再发第二个 RST。每 tick 由 `flow_pump` 消费（会话已消失的条目
+    /// 直接遗忘，不会二次拦截）。
+    proxy_egress_rst_pending: std::collections::HashSet<FlowKey>,
     /// 透明前端管道（S42：TPROXY 生产装配）。
     transparent: Option<TransparentPipeline>,
     /// owner → listener 的 UDP 回包通道（`send_from` 在 listener 线程）。
@@ -465,6 +471,7 @@ impl Dataplane {
             transparent_failure_tx: None,
             tproxy_counters: Arc::new(Mutex::new(TproxyCounters::default())),
             tproxy_last_failure: None,
+            proxy_egress_rst_pending: std::collections::HashSet::new(),
             transparent: None,
             transparent_udp_reply_tx: None,
         })
@@ -1469,11 +1476,13 @@ impl Dataplane {
                 }
             }
             Classification::Proxy { ref outbound } => {
-                // P1-P5 / S26：engine 已注入 → 按规则 tag 真实转发；否则计数降级。
+                // P1-P5 / D2：engine 已注入 → 按规则 tag 真实转发；
+                // 无 engine / tag 不可用 → 当场 SYN 直接 RST（单一发射点）。
                 let outcome = self
                     .proxy_engine
                     .as_mut()
                     .map(|e| e.handle_packet(&packet, outbound));
+                let key = FlowKey::parse_ipv4(&packet);
                 match outcome {
                     Some(Ok(result)) => {
                         self.write_proxy_tun_packets(result.tun_packets);
@@ -1490,15 +1499,42 @@ impl Dataplane {
                         }
                         // stats 同步已迁到 poll_proxy_engine（C6：单一同步点）。
                     }
-                    Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { .. }))
-                    | Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
-                        ..
-                    }))
-                    | Some(Err(crate::proxy_fwd::ProxyEngineError::InvalidOutbound { .. })) => {
-                        self.with_stats(|s| {
-                            s.proxy_dropped_no_proxy += 1;
-                            s.dropped += 1;
-                        });
+                    Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { tag })) => {
+                        self.note_tproxy_failure(
+                            "upstream_failed",
+                            format!("PROXY_UNKNOWN_OUTBOUND: {tag}"),
+                        );
+                        if let Some(key) = key {
+                            self.emit_proxy_egress_rst(&packet, &key, RstSubcase::TagUnavailable);
+                        }
+                        Self::log_outbound_unavailable(&tag, "-", "UNKNOWN_OUTBOUND", "");
+                    }
+                    Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
+                        tag,
+                        kind,
+                    })) => {
+                        self.note_tproxy_failure(
+                            "upstream_failed",
+                            format!("PROXY_UNSUPPORTED_OUTBOUND: {tag} ({kind})"),
+                        );
+                        if let Some(key) = key {
+                            self.emit_proxy_egress_rst(&packet, &key, RstSubcase::TagUnavailable);
+                        }
+                        Self::log_outbound_unavailable(&tag, &kind, "PROTOCOL_NOT_WIRED", "");
+                    }
+                    Some(Err(crate::proxy_fwd::ProxyEngineError::InvalidOutbound {
+                        tag,
+                        kind,
+                        cause,
+                    })) => {
+                        self.note_tproxy_failure(
+                            "upstream_failed",
+                            format!("PROXY_INVALID_OUTBOUND: {}", cause.name()),
+                        );
+                        if let Some(key) = key {
+                            self.emit_proxy_egress_rst(&packet, &key, RstSubcase::TagUnavailable);
+                        }
+                        Self::log_outbound_unavailable(&tag, &kind, cause.name(), cause.detail());
                     }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedProtocol {
                         ..
@@ -1506,7 +1542,9 @@ impl Dataplane {
                         self.with_stats(|s| s.dropped += 1);
                     }
                     None => {
-                        self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                        if let Some(key) = key {
+                            self.emit_proxy_egress_rst(&packet, &key, RstSubcase::NoEngine);
+                        }
                     }
                 }
             }
@@ -1896,6 +1934,14 @@ impl Dataplane {
         for signal in signals {
             match signal {
                 FlowSignal::TcpReset { key } => {
+                    // D2 去重：Proxy 分支已在 SYN 当场发过 RST → 这里只回收会话。
+                    if self.proxy_egress_rst_pending.remove(&key) {
+                        if let Some(mgr) = self.flow_mgr.as_mut() {
+                            mgr.dispose_flow(&key);
+                        }
+                        self.with_stats(|s| s.dropped += 1);
+                        continue;
+                    }
                     // 找该流的 smoltcp 连接，发 RST（不静默黑洞，D4）。
                     // 优先用已绑定的 stream_id；握手未完成时按 FourTuple 直接重置。
                     // 若 smoltcp 未产生 RST 包，直接构造一个（E4 可观察性）。
@@ -1946,6 +1992,22 @@ impl Dataplane {
                 }
             }
         }
+        // errata E4：每次 flow_pump 全量消费——会话已消失（无后续 RST 风险）的
+        // 条目直接遗忘；仍有活会话的条目保留到下一 tick 命中其 TcpReset。
+        if !self.proxy_egress_rst_pending.is_empty() {
+            let live: Vec<FlowKey> = self
+                .flow_mgr
+                .as_ref()
+                .map(|mgr| {
+                    self.proxy_egress_rst_pending
+                        .iter()
+                        .copied()
+                        .filter(|key| mgr.get_phase(key).is_some())
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.proxy_egress_rst_pending = live.into_iter().collect();
+        }
     }
 
     /// Phase B：FlowKey → smoltcp stream_id（经已绑定的映射）。
@@ -1975,6 +2037,57 @@ impl Dataplane {
         let c2 = tcp_checksum(key.dst_ip, key.src_ip, &pkt[20..]);
         pkt[36..38].copy_from_slice(&c2.to_be_bytes());
         pkt
+    }
+
+    /// D2 唯一 RST 发射点（spec §4.5.2 伪码逐行）。
+    ///
+    /// 计数：每包恰好一次 `proxy_dropped_no_proxy`；`TagUnavailable` 另加
+    /// `dropped++`（对齐 master `:1429-1432`）。只有 TCP SYN 写包并打日志；
+    /// 非 SYN 只计数，不写包、不打日志。
+    fn emit_proxy_egress_rst(&mut self, packet: &[u8], key: &FlowKey, subcase: RstSubcase) {
+        self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+        if matches!(subcase, RstSubcase::TagUnavailable) {
+            self.with_stats(|s| s.dropped += 1);
+        }
+        if !is_tcp_syn(packet) {
+            return;
+        }
+        let rst = Self::craft_rst(key);
+        match self.tun.write(&rst) {
+            Ok(_) => self.with_stats(|s| s.tun_written += 1),
+            Err(_) => self.with_stats(|s| s.dropped += 1),
+        }
+        eprintln!(
+            "[nexusd] dataplane: proxy egress unavailable; sent RST stream_id=- counter=proxy_dropped_no_proxy"
+        );
+        if self.flow_mgr.is_none() {
+            return;
+        }
+        match subcase {
+            RstSubcase::NoEngine => {
+                // 同一 RST 已由本分支发出：抑制 flow 路径重复发射。
+                self.proxy_egress_rst_pending.insert(*key);
+            }
+            RstSubcase::TagUnavailable => {
+                // 会话已可建立 → 直接回收（不插入 pending，否则永不消费）。
+                if self
+                    .flow_mgr
+                    .as_ref()
+                    .is_some_and(|mgr| mgr.get_phase(key).is_some())
+                    && let Some(mgr) = self.flow_mgr.as_mut()
+                {
+                    mgr.dispose_flow(key);
+                }
+            }
+        }
+    }
+
+    /// §12.3 运行期结构化行：`event=outbound_unavailable`（tag 不可用时）。
+    fn log_outbound_unavailable(tag: &str, kind: &str, cause: &str, detail: &str) {
+        let detail = nexus::redact::sanitize(detail);
+        eprintln!(
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={kind} cause={cause} detail=\"{detail}\""
+        );
     }
 
     fn handle_tcp_terminated(&mut self, packet: &[u8], classification: &Classification) {
@@ -2262,6 +2375,15 @@ fn is_tcp_packet(packet: &[u8]) -> bool {
 }
 
 /// Phase B：是否为 TCP SYN 包（新流触发首包链）。
+/// D2 RST 子情形（计数与 flow 处置不同）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RstSubcase {
+    /// 无 engine：`proxy_dropped_no_proxy++`，插入 pending 抑制 flow 重复 RST。
+    NoEngine,
+    /// tag 不可用：另加 `dropped++`，直接回收会话（不插 pending）。
+    TagUnavailable,
+}
+
 fn is_tcp_syn(packet: &[u8]) -> bool {
     if !is_tcp_packet(packet) {
         return false;
@@ -3304,7 +3426,99 @@ mod tests {
         let _ = sid;
     }
 
-    /// S4/S5-Proxy：Proxy 分类的 TCP 只计数，不经 N1（GAP-1 诚实边界）。
+    /// 建连必然失败的 establisher（flow 会话测试用）。
+    struct AlwaysFailEstablisher;
+    impl nexus_flow_session::ConnectivityEstablisher for AlwaysFailEstablisher {
+        fn establish(
+            &mut self,
+            _session_id: &SessionId,
+            _planned: &nexus_flow_session::Planned,
+        ) -> Result<String, String> {
+            Err("provider unavailable".to_string())
+        }
+    }
+
+    const FLOW_TEST_YAML: &str = "\
+schema_version: 1
+rules:
+  - tag: r1
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: p1
+groups: []
+outbounds:
+  - tag: p1
+    kind: socks5
+    locator: 127.0.0.1:1080
+";
+
+    /// flow_mgr 开启的 Proxy 数据面；`engine_yaml = None` 表示无 engine（D2 NoEngine）。
+    fn flow_sessions_dataplane(
+        engine_yaml: Option<&str>,
+    ) -> (Dataplane, Arc<Mutex<nexus_projection::MockTun>>) {
+        let (mut dp, mock) = test_dataplane();
+        dp.set_production_chain_deps(
+            ProductionChainDeps::from_config(None, Some(FLOW_TEST_YAML)).expect("deps"),
+        );
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().expect("cidr"),
+            target: nexus_domain::RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        if let Some(yaml) = engine_yaml {
+            dp.set_proxy_engine(
+                crate::proxy_fwd::ProxyEngine::new(Some(yaml))
+                    .expect("engine build")
+                    .expect("engine constructed"),
+            );
+        }
+        dp.enable_flow_sessions_with_establisher(Box::new(AlwaysFailEstablisher));
+        (dp, mock)
+    }
+
+    const FLOW_TEST_YAML_OTHER: &str = "\
+schema_version: 1
+rules:
+  - tag: r1
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: other
+groups: []
+outbounds:
+  - tag: other
+    kind: socks5
+    locator: 127.0.0.1:1080
+";
+
+    /// engine 存在、但规则指向 engine 表里没有的 tag（A3 TagUnavailable 子情形）。
+    ///
+    /// provider 派生（planner）来自 `FLOW_TEST_YAML` 的 tag `p1`，engine 用只含
+    /// `other` 的配置构造 → 会话可建立，运行期查 tag 得 `UnknownOutbound`。
+    fn tag_unavailable_dataplane() -> (Dataplane, Arc<Mutex<nexus_projection::MockTun>>) {
+        let (mut dp, mock) = test_dataplane();
+        dp.set_production_chain_deps(
+            ProductionChainDeps::from_config(None, Some(FLOW_TEST_YAML)).expect("deps"),
+        );
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().expect("cidr"),
+            target: nexus_domain::RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        dp.set_proxy_engine(
+            crate::proxy_fwd::ProxyEngine::new(Some(FLOW_TEST_YAML_OTHER))
+                .expect("engine build")
+                .expect("engine constructed"),
+        );
+        dp.enable_flow_sessions_with_establisher(Box::new(AlwaysFailEstablisher));
+        (dp, mock)
+    }
+
+    /// S26（D2=C 改写）：Proxy 分类且无 engine → **SYN 直接 RST**（恰好一个、
+    /// 无 SYN-ACK），不经 N1、不进终结器。
     #[test]
     fn tcp_proxy_classified_only_counted() {
         let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
@@ -3331,21 +3545,103 @@ mod tests {
             frames: Arc::clone(&frames),
         }));
 
-        // S26：Proxy TCP 由 ProxyEngine 终结/中继；未注入 engine → 计数降级，
-        // 不再走 Dataplane 的 Mesh 终结器（§9.10.1 归属）。
         let syn = craft_tcp([10, 0, 0, 2], [8, 8, 8, 8], 40001, 443, 2000, 0, 0x02, &[]);
         mock.lock().unwrap().inject(syn);
         assert!(dp.process_one().expect("syn"));
-        assert!(
-            mock.lock().unwrap().take_written().is_empty(),
-            "S26: Dataplane terminator no longer owns Proxy TCP"
+        let written = mock.lock().unwrap().take_written();
+        // D2=C：恰好一个 RST 包，且不是 SYN-ACK。
+        assert_eq!(
+            written.len(),
+            1,
+            "exactly one RST expected, got {} packets",
+            written.len()
         );
+        let pkt = &written[0];
+        assert_ne!(pkt[33] & 0x04, 0, "RST flag must be set");
+        assert_ne!(pkt[33] & 0x12, 0x12, "must not be a SYN-ACK (no handshake)");
+        // §14.2 保留三条断言。
         assert_eq!(dp.stats().tcp_handshakes, 0);
         assert_eq!(dp.stats().proxy_dropped_no_proxy, 1);
         assert!(frames.lock().unwrap().is_empty(), "Proxy must not use N1");
     }
 
-    /// S9：下行 STREAM 帧注入 → terminator → TUN 包。
+    /// R17 / errata E4：`proxy_egress_rst_pending` 有界且被下一次 `flow_pump` 消费。
+    #[test]
+    fn proxy_egress_rst_pending_is_bounded_and_consumed() {
+        // flow_mgr 开启 + 无 engine：每个无出口 SYN 记一条 pending。
+        let (mut dp, mock) = flow_sessions_dataplane(None);
+        let n = 5usize;
+        for i in 0..n {
+            let syn = craft_tcp(
+                [10, 0, 0, 2],
+                [203, 0, 113, 10],
+                40_000 + u16::try_from(i).expect("port"),
+                8080,
+                1000,
+                0,
+                0x02,
+                &[],
+            );
+            mock.lock().unwrap().inject(syn);
+            assert!(dp.tick(u64::try_from(i).unwrap()).expect("tick syn"));
+        }
+        // (a) 单 tick 内条目数 <= 该 tick 处理的无出口 SYN 数。
+        assert!(
+            dp.proxy_egress_rst_pending.len() <= n,
+            "pending must stay bounded by the SYNs handled: {}",
+            dp.proxy_egress_rst_pending.len()
+        );
+        // (b) 下一次 flow_pump 后集合全量变空（会话由失败建立链回收 → 遗忘）。
+        for step in 0..2_000u64 {
+            let _ = dp.tick(step).expect("tick pump");
+            if dp.proxy_egress_rst_pending.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            dp.proxy_egress_rst_pending.is_empty(),
+            "every inserted key must be consumed"
+        );
+        // 每个 SYN 恰好一个 RST（没有第二个 RST）。
+        let rst_count = mock
+            .lock()
+            .unwrap()
+            .take_written()
+            .iter()
+            .filter(|p| p.len() > 33 && p[33] & 0x04 != 0)
+            .count();
+        assert!(rst_count <= n, "no duplicate RSTs (got {rst_count})");
+    }
+
+    /// A3 子情形：engine 在、tag 不在表 → 单个 RST + 会话回收（不插 pending）。
+    #[test]
+    fn tag_unavailable_sends_single_rst_and_disposes_flow() {
+        let (mut dp, mock) = tag_unavailable_dataplane();
+        let syn = craft_tcp(
+            [10, 0, 0, 2],
+            [203, 0, 113, 10],
+            40001,
+            8080,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.tick(1).expect("syn"));
+        let written = mock.lock().unwrap().take_written();
+        assert_eq!(written.len(), 1, "exactly one RST");
+        assert_ne!(written[0][33] & 0x04, 0, "RST flag");
+        assert!(
+            dp.proxy_egress_rst_pending.is_empty(),
+            "TagUnavailable must not insert pending"
+        );
+        assert_eq!(dp.stats().proxy_dropped_no_proxy, 1);
+        assert_eq!(dp.stats().dropped, 1);
+    }
+
+    /// S9：下行 STREAM 帧注入 → terminator → TUN 包。    /// S9：下行 STREAM 帧注入 → terminator → TUN 包。
     #[test]
     fn inject_stream_frame_downlink() {
         use nexus_projection::tcp::encode_stream_frame;

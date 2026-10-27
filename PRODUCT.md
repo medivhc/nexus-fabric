@@ -978,7 +978,10 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   规则在两条前端上的 `RouteTarget` 与 `selected_outbound` 必须一致。
 - **Direct / Proxy 真转发（G3b/G6）**：Direct TCP 走真实 `connect` 并双向中继，Direct
   UDP 走 `RealUdpEgress`；Proxy TCP 按规则 tag 拨号并中继，失败发 RST 且计数
-  `upstream_failed`。ICMP/分片/非 TCP-UDP 计 `direct_dropped_unsupported`，不伪装成功。
+  `upstream_failed`。**无可用出口（无 engine 或 tag 不可用）时 SYN 直接回 RST
+  （不静默直连、不回 SYN-ACK）**；TUN 与 TPROXY 共用同一 dialer 栈与导出站语义
+  （TPROXY 无 SYN 时刻，按 `on_path_failure` 关闭/阻断）。ICMP/分片/非 TCP-UDP 计
+  `direct_dropped_unsupported`，不伪装成功。
 - **会话层（G4）**：`auto` 在 `proxy.yaml` 派生 Provider 非空时启用，否则
   `disabled/no_providers`；`enabled=true` 且无 provider 源时 Proxy 流显式 RST（不静默直连）。
 - **平台边界（ARCHITECTURE §10/§11）**：`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` /
@@ -993,6 +996,10 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   缺失/非法 → 关闭/丢弃 + 计数，绝不回退 listener 地址。`on_path_failure=block` 时代理
   失效不静默直连。
 - **可观察性**：`/localapi/v0/dataplane/stats` 暴露 `takeover_mode`、`ingress_ip_family`、
+  `dataplane.proxy_tcp_streams_ok`、`dataplane.proxy_tcp_bytes(_down)`、
+  `dataplane.proxy_udp_unsupported{,_vless,_anytls,_other,_log_suppressed}`、顶层
+  `outbound` 块（active/stale/tag/kind/verdict/scope/claim/label/warnings/manifest/
+  sha1/file_*/file_rejected/engine）与 `interop_warnings`、
   `dataplane.flow_sessions.{state,reason,providers,planner_calls}`、
   `dataplane.os_assemble.*` 与 `tproxy.{state,reason,enforcement,backend,privilege,
   chain,mark,route_table,listen,ip_family,ipv6_enabled,counters,last_failure_reason}`。

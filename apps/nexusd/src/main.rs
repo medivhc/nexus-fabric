@@ -28,6 +28,12 @@
 
 #![forbid(unsafe_code)]
 
+// D1 硬约束 3：ProxyEngine 在主线程构造、移入 dataplane 线程 → 必须 Send。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<nexusd::proxy_fwd::ProxyEngine>();
+};
+
 // T4：tun_enabled 状态供 LocalAPI 查询（no-tun 模式可观测）。
 static TUN_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -423,6 +429,96 @@ fn publish_engine_state(tun_enabled: bool) {
     nexus::outbound_manifest::install_engine_state(false, state);
 }
 
+/// D1：spawn **之前**构造 ProxyEngine（spec §3.3 定稿顺序）。
+///
+/// - `Err(Yaml | SelectedInvalid)` → 打印 `stage=proxy_engine_init` JSON 并返回 exit 1；
+/// - `Err(NoUsableOutbound)` → warn 一行（§12.1）+ 无 engine（降级，非错误态）；
+/// - 门槛 `tun_enabled() || has_tproxy`：no-tun 模式不构造、不产生该 stage 失败。
+fn build_proxy_engine_for_startup(
+    proxy_yaml: Option<&str>,
+    tun_enabled: bool,
+    has_tproxy: bool,
+) -> Result<Option<nexusd::proxy_fwd::ProxyEngine>, ExitCode> {
+    if !(tun_enabled || has_tproxy) {
+        return Ok(None);
+    }
+    match nexusd::proxy_fwd::ProxyEngine::new(proxy_yaml) {
+        Ok(Some(engine)) => {
+            // §12.1：非首个 wired 非法出站的启动 warn 行（不静默）。
+            for line in engine.registry().unsupported_warnings() {
+                eprintln!("{line}");
+            }
+            Ok(Some(engine))
+        }
+        Ok(None) => Ok(None),
+        Err(nexusd::proxy_fwd::EngineInitError::NoUsableOutbound { .. }) => {
+            eprintln!(
+                "[nexusd] dataplane: ProxyEngine unavailable (NO_USABLE_OUTBOUND); proxy flows answered with RST"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            eprintln!("{}", proxy_engine_init_failure_json(&error));
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// `stage=proxy_engine_init` 的启动失败 JSON（spec §12.2-A 逐字模板）。
+fn proxy_engine_init_failure_json(error: &nexusd::proxy_fwd::EngineInitError) -> serde_json::Value {
+    use nexusd::proxy_fwd::OutboundConfigError;
+    match error {
+        nexusd::proxy_fwd::EngineInitError::Yaml(config) => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "proxy_engine_init",
+            "error": {
+                "code": "CONFIG",
+                "variant": error.variant(),
+                "cause": "CONFIG_INVALID",
+                "field": nexus::redact::sanitize(&config.field),
+                "tag": "-",
+                "kind": "-",
+                "detail": nexus::redact::sanitize(&config.reason),
+            }
+        }),
+        nexusd::proxy_fwd::EngineInitError::SelectedInvalid { tag, source } => {
+            let mut body = json!({
+                "verdict": "FAIL",
+                "command": "nexusd",
+                "stage": "proxy_engine_init",
+                "error": {
+                    "code": "CONFIG",
+                    "variant": error.variant(),
+                    "cause": source.name(),
+                    "tag": tag,
+                    "kind": "-",
+                    "detail": nexus::redact::sanitize(source.detail()),
+                }
+            });
+            if matches!(source, OutboundConfigError::PlaintextTrojanUnsupported) {
+                body["error"]["hint"] =
+                    json!("add tls: true (or alpn / skip_cert_verify) to use this trojan outbound");
+            }
+            body
+        }
+        // 防御：NoUsableOutbound 在格式化之前已转入降级（§12.2-A）。
+        nexusd::proxy_fwd::EngineInitError::NoUsableOutbound { .. } => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "proxy_engine_init",
+            "error": {
+                "code": "CONFIG",
+                "variant": error.variant(),
+                "cause": "CONFIG_INVALID",
+                "tag": "-",
+                "kind": "-",
+                "detail": "no usable outbound (should have degraded before JSON)",
+            }
+        }),
+    }
+}
+
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
@@ -438,6 +534,7 @@ fn run_dataplane(
     tun_name: &str,
     tun_mtu: u32,
     rule_engine: Option<ErasedRuleEngine>,
+    proxy_engine: Option<nexusd::proxy_fwd::ProxyEngine>,
     proxy_yaml: Option<String>,
     network_toml: Option<String>,
     flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
@@ -615,23 +712,10 @@ fn run_dataplane(
         }
     }
 
-    // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
-    // TODO(S8): 改为 spawn 前预构造 + D1 分层启动失败（stderr JSON + exit 1）。
-    if let Some(yaml) = proxy_yaml.as_deref() {
-        match nexusd::proxy_fwd::ProxyEngine::new(Some(yaml)) {
-            Ok(Some(engine)) => {
-                dp.set_proxy_engine(engine);
-                eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
-            }
-            Ok(None) => {
-                eprintln!("[nexusd] dataplane: ProxyEngine unavailable (NO_USABLE_OUTBOUND)");
-            }
-            Err(e) => {
-                eprintln!(
-                    "[nexusd] dataplane: ProxyEngine unavailable ({e}); proxy packets counted"
-                );
-            }
-        }
+    // P1-P5 / D1：engine 已在 spawn 之前构造（组合根移入），这里只注入。
+    if let Some(engine) = proxy_engine {
+        dp.set_proxy_engine(engine);
+        eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
     }
 
     #[cfg(target_os = "linux")]
@@ -1522,12 +1606,6 @@ fn stun_servers(
     Some((s1, s2))
 }
 
-/// Daemon 主流程：加载配置 → 装配子系统 → 启动线程 → 事件循环 → 优雅关闭。
-///
-/// 启动顺序（§13.3）：配置加载 → 校验 → TUN（致命）→ Dataplane → N1（可降级）
-/// → Proxy（可降级）→ LocalAPI → 主循环。
-/// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
-/// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
 /// `stage=config_load` 失败行（spec §12.2-B）；proxy.yaml 解析失败时补四字段。
 ///
 /// 全部字段经 `redact_secrets`/`sanitize`（写点 1/6，spec §9.1），并用
@@ -1558,6 +1636,14 @@ fn config_load_failure_json(error: &str, dir: Option<&ConfigDir>) -> serde_json:
     }
 }
 
+/// Daemon 主流程：加载配置 → 装配子系统 → 启动线程 → 事件循环 → 优雅关闭。
+///
+/// 启动顺序（§13.3）：配置加载 → 校验 → TUN（致命）→ Dataplane → N1（可降级）
+/// → Proxy（分层：配置错误致命 / 无可用出口降级）→ LocalAPI → 主循环。
+/// D1：ProxyEngine 在 dataplane 线程 `spawn` **之前**构造（硬失败 → stderr JSON +
+/// exit 1；仅 `NoUsableOutbound` 降级为无 engine）。
+/// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
+/// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
 fn run_daemon(config_dir: &str) -> ExitCode {
     // Anchor relative daemon input once without resolving symlinks or removing
     // parent components: managed preflight must retain its path safety checks.
@@ -1881,15 +1967,33 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         match build_dataplane_rule_engine(parsed_proxy.as_ref()) {
             Ok(engine) => engine,
             Err(e) => {
+                // §12.2-C：stage 按阶段定死（rule_engine_init），message 脱敏。
                 eprintln!(
                     "{}",
-                    json!({"verdict":"FAIL","error":{"code":"CONFIG","message":e}})
+                    json!({
+                        "verdict": "FAIL",
+                        "command": "nexusd",
+                        "stage": "rule_engine_init",
+                        "error": {
+                            "code": "CONFIG",
+                            "message": nexus::redact::sanitize(&e),
+                        }
+                    })
                 );
                 return ExitCode::from(1);
             }
         }
     } else {
         None
+    };
+    // D1（spec §3.3 步骤 4）：spawn 之前构造；硬失败在此返回 exit 1（不 process::exit）。
+    let proxy_engine = match build_proxy_engine_for_startup(
+        loaded.proxy_yaml.as_deref(),
+        tun_enabled(),
+        has_tproxy,
+    ) {
+        Ok(engine) => engine,
+        Err(code) => return code,
     };
     let dataplane_handle = if tun_enabled() || has_tproxy {
         let dp_shutdown = Arc::clone(&shutdown);
@@ -1904,6 +2008,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         &tun_name,
                         tun_mtu,
                         rule_engine,
+                        proxy_engine,
                         proxy_yaml,
                         network_toml,
                         flow_sessions_mode,

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use nexus_projection::tcp::TcpTerminator;
 use nexus_proxy_config::{OutboundConfig, OutboundKind};
 
-pub use adapter::EngineInitError;
-pub(crate) use adapter::{OutboundConfigError, OutboundDialer};
+pub(crate) use adapter::OutboundDialer;
+pub use adapter::{EngineInitError, OutboundConfigError};
 
 /// 代理 dial 配置（TPROXY 旧拨号路径；S10 起由 `OutboundRegistry` 取代）。
 #[derive(Debug, Clone)]
@@ -246,6 +246,27 @@ impl OutboundRegistry {
     /// 全部可用 dialer 的 tag。
     pub fn wired_tags(&self) -> impl Iterator<Item = &str> {
         self.dialers.keys().map(String::as_str)
+    }
+
+    /// 启动面（§12.1）：非首个 wired 非法出站的 `engine=unsupported` 行。
+    ///
+    /// 「不静默」的启动半数：配置非法但非 selected 的出站必须人可见。
+    #[must_use]
+    pub fn unsupported_warnings(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .unsupported
+            .iter()
+            .filter_map(|(tag, slot)| match slot {
+                OutboundSlot::Invalid { cause, .. } => Some(format!(
+                    "[nexusd] WARN outbound tag={tag} engine=unsupported cause={} detail=\"{}\"",
+                    cause.name(),
+                    nexus::redact::sanitize(cause.detail())
+                )),
+                OutboundSlot::Dialer(_) | OutboundSlot::ProtocolNotWired { .. } => None,
+            })
+            .collect();
+        lines.sort();
+        lines
     }
 
     /// 内部：拷贝 dialer 表（TcpForwarder 拥有自己的 map）。
@@ -791,6 +812,24 @@ mod tests {
             .handle_packet(&craft_syn([127, 0, 0, 1], 18080), "bad")
             .expect_err("invalid outbound");
         assert!(matches!(err, ProxyEngineError::InvalidOutbound { .. }));
+    }
+
+    /// Q-4=A：非首个 wired 非法 → 运行期 `InvalidOutbound`（含 cause 名称）。
+    #[test]
+    fn engine_invalid_outbound_tag() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: ok\noutbounds:\n  - tag: ok\n    kind: socks5\n    locator: 127.0.0.1:1080\n  - tag: bad\n    kind: trojan\n    locator: 127.0.0.1:443\n    password: secret\n";
+        let mut engine = engine(yaml);
+        let err = engine
+            .handle_packet(&craft_syn([127, 0, 0, 1], 18080), "bad")
+            .expect_err("invalid outbound");
+        match err {
+            ProxyEngineError::InvalidOutbound { tag, kind, cause } => {
+                assert_eq!(tag, "bad");
+                assert_eq!(kind, "trojan");
+                assert_eq!(cause.name(), "PLAINTEXT_TROJAN_UNSUPPORTED");
+            }
+            other => panic!("expected InvalidOutbound, got {other:?}"),
+        }
     }
 
     #[test]

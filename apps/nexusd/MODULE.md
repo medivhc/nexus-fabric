@@ -117,7 +117,8 @@
   不存在"Clash TUN 与 Mesh TUN 抢设备"（设计文档 §6）。
 - **D2（分类管线）**：从 TUN 读取的每个 IPv4 包 → `PacketClassifier::classify()`：
   - `Mesh{..}` → N1 转发（`network.toml` 未配置则计数 `mesh_dropped_no_n1`）；
-  - `Proxy` → proxy 转发（`proxy.yaml` 未配置则计数 `proxy_dropped_no_proxy`）；
+  - `Proxy` → 未配置/无可用出口 → SYN 直接回 RST（`craft_rst`，不进终结器、不回
+    SYN-ACK）+ 计数 `proxy_dropped_no_proxy`（D2=C）；tag 可拨号 → proxy 转发；
   - `Direct` → 直连（MVP 计数 `direct_forwarded`，实际经系统路由）；
   - `Drop` → 计数 `dropped`。
 - **D3（DNS 拦截）**：UDP 目的端口 53 的包短路分类器 → `UnifiedDns::resolve()` →
@@ -251,9 +252,14 @@
 - **R5（热加载分类）**：`network.toml` 内容变更 → `NeedsRestart`
   （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `Hot`
   （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）；
-  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）。
-- 不变量：TUN 失败仍致命（D1）；N1/DNS/Proxy 失败可降级（§13.3 原则）；
-  关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
+  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）；
+  `proxy.yaml` **内容变更 → `NeedsRestart`**（engine 只在启动构造，Q-7=B），
+  并发布 stale 面（`outbound.stale=true` + active/file tag/kind/sha1）。
+- 不变量：TUN 失败仍致命；N1/DNS 失败可降级；**Proxy 失败分层**：`proxy.yaml`
+  解析失败、rule engine 构建失败、以及首个 wired 出站非法（`SelectedInvalid`，
+  含域名不可解析）一律启动失败（stderr JSON + exit 1）；**仅**『无任何可用代理
+  出站』（`NoUsableOutbound`）降级为『无 proxy engine』，Proxy 流按 D2 回 RST
+  并计数。关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
 
 ### TCP 终结接线（S1-S11，scenarios/product/tcp_termination_wireup.toml，2026-10-01 冻结）
 
@@ -368,6 +374,14 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   - `OutboundKind` 集合不变（`Socks5` 为既有 additive）。
 - **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
   dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
+  - **D2=C 无出口 RST**：无 engine 或 tag 不可用（`UnknownOutbound` /
+    `UnsupportedOutboundKind` / `InvalidOutbound`）→ **TCP SYN 当场回 RST**
+    （唯一发射点 `emit_proxy_egress_rst`；不进终结器、不回 SYN-ACK、
+    `stream_id=-`），每包恰好计一次 `proxy_dropped_no_proxy`（tag 不可用另加
+    `dropped++`）；UDP 维持丢包 + 计数（无 RST 语义）。
+  - **两态去重**：flow_mgr 开且无 engine 时，SYN 已发的 RST 记入
+    `proxy_egress_rst_pending`；`FlowSignal::TcpReset` 命中只做会话回收
+    + 既有 `dropped++`，不再发第二个 RST。
 - **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；
   UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
   完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。

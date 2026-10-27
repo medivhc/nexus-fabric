@@ -319,7 +319,7 @@ fn drive_proxy_tcp(
         &[],
     );
     mock.lock().unwrap().inject(syn);
-    dp.process_one().ok()?;
+    dp.tick(now_ticks()).ok()?;
     let written = mock.lock().unwrap().take_written();
     let srv_seq = written
         .iter()
@@ -336,12 +336,12 @@ fn drive_proxy_tcp(
         &[],
     );
     mock.lock().unwrap().inject(ack.clone());
-    dp.process_one().ok()?;
+    dp.tick(now_ticks()).ok()?;
     let dial_before = dp.stats().proxy_forwarded;
     let deadline = Instant::now() + Duration::from_secs(5);
     while dp.stats().proxy_forwarded == dial_before && Instant::now() < deadline {
         mock.lock().unwrap().inject(ack.clone());
-        dp.process_one().ok()?;
+        dp.tick(now_ticks()).ok()?;
         std::thread::sleep(Duration::from_millis(5));
     }
     if dp.stats().proxy_forwarded == dial_before {
@@ -358,11 +358,11 @@ fn drive_proxy_tcp(
         payload,
     );
     mock.lock().unwrap().inject(data);
-    dp.process_one().ok()?;
+    dp.tick(now_ticks()).ok()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         mock.lock().unwrap().inject(ack.clone());
-        dp.process_one().ok()?;
+        dp.tick(now_ticks()).ok()?;
         let written = mock.lock().unwrap().take_written();
         for pkt in written {
             let got = tcp_payload(&pkt);
@@ -394,7 +394,7 @@ fn drive_direct_tcp(
         &[],
     );
     mock.lock().unwrap().inject(syn);
-    dp.process_one().ok()?;
+    dp.tick(now_ticks()).ok()?;
     let written = mock.lock().unwrap().take_written();
     let srv_seq = written
         .iter()
@@ -411,7 +411,7 @@ fn drive_direct_tcp(
         &[],
     );
     mock.lock().unwrap().inject(ack.clone());
-    dp.process_one().ok()?;
+    dp.tick(now_ticks()).ok()?;
     let data = craft_tcp(
         [10, 0, 0, 2],
         dst_ip,
@@ -423,11 +423,11 @@ fn drive_direct_tcp(
         payload,
     );
     mock.lock().unwrap().inject(data);
-    dp.process_one().ok()?;
+    dp.tick(now_ticks()).ok()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         mock.lock().unwrap().inject(ack.clone());
-        dp.process_one().ok()?;
+        dp.tick(now_ticks()).ok()?;
         let written = mock.lock().unwrap().take_written();
         for pkt in written {
             let got = tcp_payload(&pkt);
@@ -500,7 +500,7 @@ fn main() {
             b"chain-udp",
         );
         mock.lock().unwrap().inject(pkt);
-        dp.process_one().expect("udp");
+        dp.tick(now_ticks()).expect("udp");
     }
     let mut udp_replies = 0usize;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -515,7 +515,7 @@ fn main() {
         pkt
     };
     mock.lock().unwrap().inject(icmp);
-    dp.process_one().expect("icmp");
+    dp.tick(now_ticks()).expect("icmp");
 
     let direct_payload = b"direct-tcp-payload";
     let direct_reply = drive_direct_tcp(&mut dp, &mock, 40_010, tcp_port, direct_payload);
@@ -561,7 +561,7 @@ fn main() {
         &[],
     );
     fail_mock.lock().unwrap().inject(fail_syn);
-    fail_dp.process_one().expect("fail syn");
+    fail_dp.tick(now_ticks()).expect("fail syn");
     let fail_written = fail_mock.lock().unwrap().take_written();
     let fail_srv_seq = fail_written
         .iter()
@@ -579,11 +579,11 @@ fn main() {
         &[],
     );
     fail_mock.lock().unwrap().inject(fail_ack.clone());
-    fail_dp.process_one().expect("fail ack");
+    fail_dp.tick(now_ticks()).expect("fail ack");
     let deadline = Instant::now() + Duration::from_secs(3);
     while fail_dp.stats().upstream_failed == 0 && Instant::now() < deadline {
         fail_mock.lock().unwrap().inject(fail_ack.clone());
-        fail_dp.process_one().expect("fail poll");
+        fail_dp.tick(now_ticks()).expect("fail poll");
         std::thread::sleep(Duration::from_millis(5));
     }
     let failure_rst = fail_mock
@@ -632,4 +632,12 @@ fn main() {
     });
     println!("{out}");
     std::process::exit(if pass { 0 } else { 1 });
+}
+
+/// 单调毫秒时间源（example 内允许直接用 std；协议 core 不得取系统时间）。
+fn now_ticks() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
