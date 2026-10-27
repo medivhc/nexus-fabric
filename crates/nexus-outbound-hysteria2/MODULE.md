@@ -104,9 +104,28 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 ## Outputs
 
 - `OutboundAdapter::handoff` → `OutboundHandoff { kind = "hysteria2", tag, locator }`；
-- `Hysteria2Client`：`open_tcp` / `stream_read` / `stream_write` /
-  `stream_finish`、`alloc_udp_session` / `send_udp` / `recv_udp`；
+- `Hysteria2Client`：`open_tcp` / `await_tcp_response` / `stream_read` /
+  `stream_write` / `stream_finish`、`alloc_udp_session` / `send_udp` /
+  `recv_udp`；
 - 认证/帧/地址字节流；结构化错误。
+
+## Invariants
+
+- fast-open：`open_tcp` 返回后，读侧仍必须先且仅剥离一次 `TCPResponse`
+  （由 `stream_read` 或 `await_tcp_response` 消费标记）；剥离后不得把后续
+  载荷字节当响应解析。`await_tcp_response` 幂等：标记已消费时直接 `Ok(())`。
+- `stream_read` / `stream_write` 阻塞至有数据/写完或调用方 timeout；
+  driver 的 `recv_one` 等待不得超过调用方 deadline（Blocked 分支按
+  `min(剩余 deadline, 50ms)` 收缩，下限 1ms）。
+- 上述接缝不改变错误变体集合与 wire 字节（无新增/重命名错误类，无帧格式变化）。
+
+## Verification
+
+- `cargo test -p nexus-outbound-hysteria2`：adapter loopback 覆盖
+  `await_tcp_response` 剥离成功与幂等；既有 driver 读写超时语义不回归。
+- `cargo test -p nexus hysteria2_dataplane_tests`：`EchoMode::Sink` 的 12 MiB
+  上传-only 中继在 30 s 内完成（精确字节数、零下行载荷、server 实收字节数）；
+  fast-open 首读守卫超时干净中止（不转发任何字节、下游关闭、有界返回）。
 
 ## Allowed Dependencies
 

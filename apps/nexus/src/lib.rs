@@ -4684,36 +4684,131 @@ fn vless_pump_stream<S: std::io::Read + std::io::Write>(
     (up_bytes, down_bytes)
 }
 
+/// pump 热路径轮询间隔（上行/下行有进展时）。
+const HY2_POLL_HOT: std::time::Duration = std::time::Duration::from_millis(2);
+/// pump 空闲轮询间隔（无进展时，保持基线唤醒节律）。
+const HY2_POLL_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
+/// fast-open 首读守卫的固定超时（单次、不重试）。
+const HY2_FIRST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+/// pump 单轮读写缓冲（Q3=C：64 KiB；两缓冲合计 128 KiB/会话）。
+const HY2_PUMP_BUF: usize = 64 * 1024;
+/// 写侧停滞/活性守卫的总预算（与 crate 的 10 s 写超时分离）。
+const HY2_STALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 结构化 stderr 事件里的错误变体名（不含错误文本/敏感信息）。
+fn hy2_error_variant_name(err: &nexus_outbound_hysteria2::Hysteria2Error) -> &'static str {
+    use nexus_outbound_hysteria2::Hysteria2Error;
+    match err {
+        Hysteria2Error::AuthFailed => "AuthFailed",
+        Hysteria2Error::UdpDisabled => "UdpDisabled",
+        Hysteria2Error::InvalidFrame => "InvalidFrame",
+        Hysteria2Error::Quic(_) => "Quic",
+        Hysteria2Error::Tls => "Tls",
+        Hysteria2Error::Io(_) => "Io",
+        Hysteria2Error::Timeout => "Timeout",
+        Hysteria2Error::UnsupportedObfs => "UnsupportedObfs",
+        Hysteria2Error::InvalidConfig(_) => "InvalidConfig",
+        Hysteria2Error::Closed => "Closed",
+        Hysteria2Error::TcpRejected(_) => "TcpRejected",
+        Hysteria2Error::DatagramTooLarge { .. } => "DatagramTooLarge",
+        Hysteria2Error::StreamReset { .. } => "StreamReset",
+    }
+}
+
 /// Hysteria2 TCP 中继：client（nonblocking TcpStream）<-> QUIC 双向 stream。
 ///
-/// 与 `vless_pump_stream` 同构；QUIC 侧用 `stream_read` 短超时（50ms）轮询，
+/// 与 `vless_pump_stream` 同构；热路径用 2 ms、空闲用 50 ms 动态轮询，
 /// `Timeout` 为瞬态（继续轮询），其他 QUIC 错误视为节点侧关闭。client EOF 时
 /// 先对 stream 发 FIN 再结束双向（优雅半关闭）。
+///
+/// 写侧 `Timeout` 不再无条件关闭读侧：按有界停滞中止收尾（30 s 预算，一条
+/// 结构化 stderr 事件）。fast-open 的首读先经 `await_tcp_response` 剥离
+/// `TCPResponse`，守卫超时则干净中止、不转发任何字节。
 fn hysteria2_pump_stream(
     hy2: &mut nexus_outbound_hysteria2::Hysteria2Client,
     stream: quinn_proto::StreamId,
+    fast_open: bool,
     client: &mut std::net::TcpStream,
 ) -> (usize, usize) {
     use nexus_outbound_hysteria2::Hysteria2Error;
     use std::io::Read;
+    use std::time::Instant;
+
+    let stream_index = stream.index();
     let mut up_bytes = 0usize;
     let mut down_bytes = 0usize;
-    let mut cbuf = [0u8; 8192];
-    let mut sbuf = [0u8; 8192];
+    let mut cbuf = [0u8; HY2_PUMP_BUF];
+    let mut sbuf = [0u8; HY2_PUMP_BUF];
     let mut c_open = true;
     let mut s_open = true;
     let mut down = PendingWrite::new();
     let mut down_failed = false;
+    let mut hot = false;
+    let mut up_failed = false;
+    let mut abort_reason: Option<&'static str> = None;
+    let mut abort_since: Option<Instant> = None;
+    let mut abort_deadline: Option<Instant> = None;
+    let mut stalled_since: Option<Instant> = None;
+    let mut last_error: Option<Hysteria2Error> = None;
+
+    // R1.4 首读守卫（C3）：fast-open 的 TCPResponse 在此一次性剥离；
+    // 非 fast-open 由 open_tcp 剥离过，不执行守卫。
+    if fast_open {
+        let started = Instant::now();
+        match hy2.await_tcp_response(stream, HY2_FIRST_READ_TIMEOUT) {
+            Ok(()) => {}
+            Err(Hysteria2Error::Timeout) => {
+                eprintln!(
+                    "[hy2] event=hy2_first_read_timeout stream_id={} up_bytes={} down_bytes={} elapsed_ms={}",
+                    stream_index,
+                    up_bytes,
+                    down_bytes,
+                    started.elapsed().as_millis()
+                );
+                hy2.stream_finish(stream);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                return (up_bytes, down_bytes);
+            }
+            Err(_) => {
+                hy2.stream_finish(stream);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                return (up_bytes, down_bytes);
+            }
+        }
+    }
+
     loop {
         if !c_open && !s_open && (down_failed || down.ready_for_read()) {
             break;
         }
+
+        // 停滞中止：预算用尽或下行已排空/结束即收尾。
+        if let Some(reason) = abort_reason {
+            let downstream_done = !s_open || down_failed || down.ready_for_read();
+            let budget_done = abort_deadline.is_none_or(|d| Instant::now() >= d);
+            if downstream_done || budget_done {
+                let stalled_ms = abort_since.map_or(0, |s| s.elapsed().as_millis());
+                let err_name = last_error.as_ref().map_or("none", hy2_error_variant_name);
+                eprintln!(
+                    "[hy2] event=hy2_write_stall_abort stream_id={} trigger={} stalled_ms={} last_error={} up_bytes={} down_bytes={}",
+                    stream_index, reason, stalled_ms, err_name, up_bytes, down_bytes
+                );
+                hy2.stream_finish(stream);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                return (up_bytes, down_bytes);
+            }
+        }
+
+        let up_before = up_bytes;
+        let down_before = down_bytes;
         let mut progressed = false;
+        let mut round_hot = false;
         // 下行 client.write 是裸非阻塞 socket 写：套 PendingWrite 保留尾部。
         match down.try_write(client) {
             Ok((_, n)) => {
                 down_bytes += n;
                 progressed |= n > 0;
+                round_hot |= n > 0;
             }
             Err(_) => {
                 c_open = false;
@@ -4721,34 +4816,78 @@ fn hysteria2_pump_stream(
                 down_failed = true;
             }
         }
-        if c_open && s_open {
+        if c_open && s_open && !up_failed {
             // 上行保持直接调用：`Hysteria2Client::stream_write` 已在 crate 内对
             // `WriteError::Blocked` 循环 pump 到写完或 deadline（阻塞 + 保留已发
             // 进度）。app 层若再对整段尾部重试，超时后可能把已发出的前半段重发，
             // 造成 QUIC stream 字节重复，故此处不套 PendingWrite（见 CHAIN Q1）。
             match client.read(&mut cbuf) {
                 Ok(0) => c_open = false,
-                Ok(n) => match hy2.stream_write(stream, &cbuf[..n]) {
-                    Ok(()) => {
-                        up_bytes += n;
-                        progressed = true;
+                Ok(n) => {
+                    round_hot = true;
+                    match hy2.stream_write(stream, &cbuf[..n]) {
+                        Ok(()) => {
+                            up_bytes += n;
+                            progressed = true;
+                        }
+                        Err(Hysteria2Error::Timeout) => {
+                            // 触发 1：无法得知已写字节数，不重试、不立即关读侧；
+                            // 进入 30 s 有界停滞预算。
+                            up_failed = true;
+                            last_error = Some(Hysteria2Error::Timeout);
+                            let now = Instant::now();
+                            abort_reason = Some("write_timeout");
+                            abort_since = Some(now);
+                            abort_deadline = Some(now + HY2_STALL_BUDGET);
+                        }
+                        Err(e) => {
+                            up_failed = true;
+                            last_error = Some(e);
+                            let now = Instant::now();
+                            abort_reason = Some("hard_error");
+                            abort_since = Some(now);
+                            abort_deadline = Some(now);
+                            continue;
+                        }
                     }
-                    Err(_) => s_open = false,
-                },
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => c_open = false,
             }
         }
         if s_open && c_open && down.ready_for_read() {
-            match hy2.stream_read(stream, &mut sbuf, std::time::Duration::from_millis(50)) {
+            let poll = if hot { HY2_POLL_HOT } else { HY2_POLL_IDLE };
+            match hy2.stream_read(stream, &mut sbuf, poll) {
                 Ok(0) => s_open = false,
                 Ok(n) => {
                     down.enqueue(&sbuf[..n]);
                     progressed = true;
                 }
                 Err(Hysteria2Error::Timeout) => {}
-                Err(_) => s_open = false,
+                Err(e) => {
+                    if abort_reason.is_none() {
+                        last_error = Some(e);
+                    }
+                    s_open = false;
+                }
             }
+        }
+        // 触发 2：有在途下行且双向零字节进展持续 30 s → 立即中止。
+        if abort_reason.is_none() && c_open && s_open && !down.ready_for_read() {
+            if up_bytes == up_before && down_bytes == down_before {
+                let now = Instant::now();
+                let since = *stalled_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= HY2_STALL_BUDGET {
+                    up_failed = true;
+                    abort_reason = Some("liveness");
+                    abort_since = Some(since);
+                    abort_deadline = Some(now);
+                }
+            } else {
+                stalled_since = None;
+            }
+        } else {
+            stalled_since = None;
         }
         // 半关闭：client EOF 后先排空下行尾部，再对 stream 发 FIN。
         if !c_open && s_open && (down_failed || down.ready_for_read()) {
@@ -4758,7 +4897,8 @@ fn hysteria2_pump_stream(
         if !s_open && c_open && (down_failed || down.ready_for_read()) {
             c_open = false;
         }
-        if !progressed {
+        hot = round_hot;
+        if !progressed && abort_reason.is_none() {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -6677,7 +6817,8 @@ pub fn proxy_serve_once(
                 .map_err(|e| NexusError::Internal {
                     message: format!("hysteria2 client nonblocking: {e}"),
                 })?;
-            let (up_bytes, down_bytes) = hysteria2_pump_stream(&mut hy2, stream, &mut client);
+            let (up_bytes, down_bytes) =
+                hysteria2_pump_stream(&mut hy2, stream, target.fast_open, &mut client);
             // 优雅关闭：发送 QUIC CONNECTION_CLOSE（尽力）。
             hy2.close();
             // client 在 arm 结束时 drop 关闭 fd，无需恢复 blocking 模式。
@@ -12804,6 +12945,138 @@ mod hysteria2_dataplane_tests {
         assert_eq!(&buf[..n], b"hello-hy2");
         client.stream_finish(stream);
         client.close();
+    }
+
+    #[test]
+    fn hysteria2_sink_12mib_upload_completes_under_30s() {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use nexus_outbound_hysteria2::test_server::{EchoMode, TestServer};
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const TOTAL: usize = 12 * 1024 * 1024;
+        const GUARD: Duration = Duration::from_secs(30);
+
+        let server = TestServer::spawn_with_mode("secret123", true, EchoMode::Sink).unwrap();
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(server.addr.port())).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        let fast_open = target.fast_open;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut s = std::net::TcpStream::connect(addr)?;
+            let chunk = [0x5au8; 64 * 1024];
+            let mut left = TOTAL;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                s.write_all(&chunk[..n])?;
+                left -= n;
+            }
+            s.shutdown(Shutdown::Write)?;
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink);
+            Ok(())
+        });
+
+        let mut client = Hysteria2Client::connect(&target).unwrap();
+        let stream = client.open_tcp("example.com:80").unwrap();
+        let mut down_client = listener.accept().unwrap().0;
+        down_client.set_nonblocking(true).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let pump = std::thread::spawn(move || {
+            let counts = hysteria2_pump_stream(&mut client, stream, fast_open, &mut down_client);
+            let _ = tx.send(counts);
+            client
+        });
+
+        let counts = match rx.recv_timeout(GUARD) {
+            Ok(c) => c,
+            Err(e) => panic!(
+                "12 MiB sink upload did not finish within {GUARD:?}: {e}; \
+                 elapsed={:?} server_received={}",
+                started.elapsed(),
+                server.received_bytes()
+            ),
+        };
+        let elapsed = started.elapsed();
+        let mut client = pump.join().unwrap();
+        writer.join().unwrap().unwrap();
+
+        assert_eq!(counts.0, TOTAL, "up_bytes must be exactly 12 MiB");
+        assert_eq!(counts.1, 0, "sink must not send payload downstream");
+        // pump 返回只说明 12 MiB 已进入 QUIC 发送缓冲（受对端流控额度限制），
+        // 不等于已发出/已被对端读出：`close()` 发 CONNECTION_CLOSE 后 quinn
+        // 只发 close 包，仍在发送队列里的尾部会被丢弃；对端未读出的字节也不
+        // 再计数。故先驱动连接、等 TestServer 的应用层计数到 12 MiB，再关闭。
+        // 等待有界（10 s）；到不了由下面的精确字节断言判 FAIL，不改变判据。
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        let mut dbuf = [0u8; 64];
+        while server.received_bytes() < TOTAL as u64 && Instant::now() < drain_deadline {
+            // sink 不回载荷：Timeout 只用于推进 QUIC（收 ACK/触发重传），不产生新字节。
+            if client
+                .stream_read(stream, &mut dbuf, Duration::from_millis(20))
+                .is_err()
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        client.close();
+        assert_eq!(
+            server.received_bytes(),
+            TOTAL as u64,
+            "server must receive exactly 12 MiB (elapsed {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn hysteria2_first_read_guard_timeout_aborts_cleanly() {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(server.addr.port())).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+
+        let mut client = Hysteria2Client::connect(&target).unwrap();
+        // 第一条 stream 占住 server 的 TCP 处理循环（它读而不发数据），
+        // 第二条 stream 的 TCPResponse 因而在守卫窗口内不会到达。
+        let _first = client.open_tcp("first.example:80").unwrap();
+        let second = client.open_tcp("second.example:80").unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut peer = std::net::TcpStream::connect(addr).unwrap();
+        let mut down_client = listener.accept().unwrap().0;
+        down_client.set_nonblocking(true).unwrap();
+
+        let started = Instant::now();
+        let counts = hysteria2_pump_stream(&mut client, second, true, &mut down_client);
+        let elapsed = started.elapsed();
+
+        assert_eq!(counts, (0, 0), "guard abort must not forward any bytes");
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "guard must wait for the fixed 50 ms window, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "guard abort must be bounded, took {elapsed:?}"
+        );
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 16];
+        let n = peer.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "downstream must be closed without payload");
+        drop(client);
     }
 }
 
