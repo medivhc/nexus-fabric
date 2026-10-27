@@ -635,10 +635,12 @@ impl TurnManager {
             state,
             client,
             factory: Box::new(|| Err(io::Error::other("test seam: no allocate factory"))),
+            bind: None,
             consecutive_refresh_failures: 0,
             stale_nonce_retried: false,
             next_refresh_at,
             refresh_interval: Duration::from_secs(300),
+            last_failure: None,
         }
     }
 
