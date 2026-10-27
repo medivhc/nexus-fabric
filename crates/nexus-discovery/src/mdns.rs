@@ -456,6 +456,12 @@ impl MdnsDiscovery {
     pub fn cached_peer_count(&self) -> usize {
         self.cache.len()
     }
+
+    /// 枚举缓存中的 peer（不 prune——过期清理由调用方按 `now` 负责）。
+    #[must_use]
+    pub fn cached_peers(&self) -> Vec<PeerId> {
+        self.cache.keys().cloned().collect()
+    }
 }
 
 impl Discovery for MdnsDiscovery {
@@ -465,6 +471,10 @@ impl Discovery for MdnsDiscovery {
             .get(peer)
             .map(|c| vec![c.addr])
             .unwrap_or_default()
+    }
+
+    fn peers(&self) -> Vec<PeerId> {
+        self.cached_peers()
     }
 }
 
