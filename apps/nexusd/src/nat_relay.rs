@@ -701,6 +701,199 @@ fn dispatch_available(sinks: &Mutex<SinkMap>, peer: &FabricPeerId, conn: &RelayC
     }
 }
 
+/// Subscription handle owned by the consumer (feed).
+///
+/// Both edges are weak: the guard never keeps the provider or the sink alive,
+/// so it cannot create a cycle. Dropping it is the explicit unsubscribe path
+/// (spec §4.6.2); if either side is already gone the drop is silent and the
+/// provider's weak table prunes itself on the next dispatch.
+pub struct RelaySubscriptionGuard {
+    provider: Weak<dyn RelayConnProvider>,
+    peer: FabricPeerId,
+    sink: Weak<dyn RelayConnSink>,
+}
+
+impl RelaySubscriptionGuard {
+    pub(crate) fn new(
+        provider: Weak<dyn RelayConnProvider>,
+        peer: FabricPeerId,
+        sink: Weak<dyn RelayConnSink>,
+    ) -> Self {
+        Self {
+            provider,
+            peer,
+            sink,
+        }
+    }
+
+    /// The peer this subscription belongs to.
+    pub fn peer(&self) -> FabricPeerId {
+        self.peer
+    }
+
+    /// Whether both ends are still alive.
+    pub fn is_active(&self) -> bool {
+        self.provider.strong_count() > 0 && self.sink.strong_count() > 0
+    }
+}
+
+impl Drop for RelaySubscriptionGuard {
+    fn drop(&mut self) {
+        let (Some(provider), Some(sink)) = (self.provider.upgrade(), self.sink.upgrade()) else {
+            return;
+        };
+        provider.unsubscribe(self.peer, &sink);
+    }
+}
+
+/// Directory-backed address book: one `<64 lowercase hex>.addr` file per node.
+///
+/// INTERIM cross-host channel (CR-BLOCKED-2 Option A): it requires a shared
+/// file system between the nodes. `publish` writes a temp file in the same
+/// directory and renames it, so readers never observe a half-written entry;
+/// `reload` ignores malformed files (one WARN per file and process) instead of
+/// failing the whole snapshot.
+pub struct DirRelayAddressBook {
+    dir: PathBuf,
+    self_peer: [u8; 32],
+    entries: Mutex<HashMap<[u8; 32], SocketAddr>>,
+    /// Files already warned about (no per-poll log storm).
+    warned: Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+impl DirRelayAddressBook {
+    pub fn new(dir: impl Into<PathBuf>, self_peer: [u8; 32]) -> io::Result<Self> {
+        let dir = dir.into();
+        fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let book = Self {
+            dir,
+            self_peer,
+            entries: Mutex::new(HashMap::new()),
+            warned: Mutex::new(std::collections::HashSet::new()),
+        };
+        book.reload()?;
+        Ok(book)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    fn entry_path(&self, peer: &[u8; 32]) -> PathBuf {
+        self.dir.join(format!("{}.addr", hex32(peer)))
+    }
+
+    /// Strict filename decode: 64 chars, lowercase hex only.
+    fn parse_file_stem(stem: &str) -> Option<[u8; 32]> {
+        if stem.len() != 64 {
+            return None;
+        }
+        let bytes = stem.as_bytes();
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
+            return None;
+        }
+        parse_hex32(stem).ok()
+    }
+
+    fn warn_once(&self, path: &Path, reason: &str) {
+        let first = match self.warned.lock() {
+            Ok(mut set) => set.insert(path.to_path_buf()),
+            Err(e) => e.into_inner().insert(path.to_path_buf()),
+        };
+        if first {
+            eprintln!(
+                "[nat-relay] WARN: ignoring relay book file {} ({reason})",
+                path.display()
+            );
+        }
+    }
+}
+
+impl RelayAddressBook for DirRelayAddressBook {
+    fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr> {
+        self.entries.lock().ok()?.get(peer).copied()
+    }
+
+    fn reload(&self) -> io::Result<()> {
+        let mut map = HashMap::new();
+        let rd = match fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // A missing directory is an empty book, not an error.
+                *self.entries.lock().unwrap() = map;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("addr") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                self.warn_once(&path, "non-utf8 file name");
+                continue;
+            };
+            let Some(peer) = Self::parse_file_stem(stem) else {
+                self.warn_once(&path, "file name is not 64 lowercase hex");
+                continue;
+            };
+            let text = match fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.warn_once(&path, &format!("read failed: {e}"));
+                    continue;
+                }
+            };
+            match text.trim().parse::<SocketAddr>() {
+                Ok(addr) => {
+                    map.insert(peer, addr);
+                }
+                Err(_) => self.warn_once(&path, "content is not a socket address"),
+            }
+        }
+        *self.entries.lock().unwrap() = map;
+        Ok(())
+    }
+
+    fn publish(&self, peer: [u8; 32], addr: SocketAddr) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let path = self.entry_path(&peer);
+        let tmp = self
+            .dir
+            .join(format!("{}.addr.tmp.{}", hex32(&peer), std::process::id()));
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(
+                format!(
+                    "{addr}
+"
+                )
+                .as_bytes(),
+            )?;
+            f.sync_all()?;
+        }
+        // Atomic replace inside one directory: readers see old or new content.
+        fs::rename(&tmp, &path)?;
+        if peer == self.self_peer {
+            // Keep our own entry visible even if this node never reloads.
+            self.entries
+                .lock()
+                .map_err(|_| io::Error::other("book lock poisoned"))?
+                .insert(peer, addr);
+        }
+        Ok(())
+    }
+}
+
 /// Identity seed loading with explicit 0600 enforcement and PeerId assertion.
 pub fn load_seed_file(path: &Path) -> Result<[u8; 32], RelayError> {
     #[cfg(unix)]
@@ -968,12 +1161,12 @@ mod tests {
         );
 
         // Fail-closed: subscribing with no provider attached refuses.
-        assert!(!swc.subscribe_relay_peer(a_id));
+        assert!(swc.subscribe_relay_peer(a_id).is_none());
 
         swa.attach_relay_provider(pa.clone());
         swb.attach_relay_provider(pb.clone());
-        assert!(swa.subscribe_relay_peer(b_id));
-        assert!(swb.subscribe_relay_peer(a_id));
+        let guard_a = swa.subscribe_relay_peer(b_id).expect("subscribe a");
+        let guard_b = swb.subscribe_relay_peer(a_id).expect("subscribe b");
 
         let ha = {
             let pa = pa.clone();
@@ -1012,6 +1205,8 @@ mod tests {
             "lost peer must be recorded"
         );
 
+        drop(guard_a);
+        drop(guard_b);
         swa.shutdown();
         swb.shutdown();
         swc.shutdown();

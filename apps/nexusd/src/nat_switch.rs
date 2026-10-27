@@ -44,7 +44,7 @@ use nexus_projection::path_link::ActiveConn;
 
 use crate::nat_relay::{
     RelayConnProvider, RelayConnSink, RelayInfo as ProviderRelayInfo,
-    RelayKind as ProviderRelayKind,
+    RelayKind as ProviderRelayKind, RelaySubscriptionGuard,
 };
 
 impl crate::nat_status::NatStatusSource for NatSwitching {
@@ -82,7 +82,6 @@ pub struct NatSwitching {
     /// `RelayConnSink` impl reach `on_relay_connected` (which takes
     /// `&Arc<Self>`); it is set by `new` via `Arc::new_cyclic`.
     relay_provider: Mutex<Option<Arc<dyn RelayConnProvider>>>,
-    relay_subscriptions: Mutex<HashSet<[u8; 32]>>,
     relay_lost: Mutex<HashSet<[u8; 32]>>,
     self_weak: Weak<NatSwitching>,
 }
@@ -166,7 +165,6 @@ impl NatSwitching {
                 link,
                 monitor,
                 relay_provider: Mutex::new(None),
-                relay_subscriptions: Mutex::new(HashSet::new()),
                 relay_lost: Mutex::new(HashSet::new()),
                 self_weak: weak.clone(),
             }
@@ -206,29 +204,39 @@ impl NatSwitching {
 
     /// Subscribe this stack as the provider's sink for one peer.
     ///
-    /// Returns false (fail-closed, logged) when no provider is attached.
-    /// The provider feeds `on_relay_available` for this peer, which routes
-    /// into `on_relay_connected` with `auto_punch: true`.
-    pub fn subscribe_relay_peer(self: &Arc<Self>, peer: FabricPeerId) -> bool {
+    /// Returns `None` (fail-closed, logged) when no provider is attached. The
+    /// provider feeds `on_relay_available` for this peer, which routes into
+    /// `on_relay_connected` with `auto_punch: true`.
+    ///
+    /// The returned guard owns the subscription lifetime: dropping it
+    /// unsubscribes and lets the provider release the relay slot when no sink
+    /// is left. Neither edge is strong (O9), so the guard cannot create a
+    /// cycle.
+    pub fn subscribe_relay_peer(
+        self: &Arc<Self>,
+        peer: FabricPeerId,
+    ) -> Option<RelaySubscriptionGuard> {
         let Some(provider) = self.relay_provider.lock().unwrap().clone() else {
             eprintln!(
                 "[nat-switch] WARN: subscribe_relay_peer with no provider attached; refusing"
             );
-            return false;
+            return None;
         };
-        provider.subscribe(peer, Arc::clone(self) as Arc<dyn RelayConnSink>);
-        self.relay_subscriptions.lock().unwrap().insert(peer.0);
-        true
+        let sink: Arc<dyn RelayConnSink> = Arc::clone(self) as Arc<dyn RelayConnSink>;
+        provider.subscribe(peer, Arc::clone(&sink));
+        Some(RelaySubscriptionGuard::new(
+            Arc::downgrade(&provider),
+            peer,
+            Arc::downgrade(&sink),
+        ))
     }
 
-    /// Peers this stack is subscribed for (production trigger introspection).
+    /// Peers this stack is subscribed for (delegated to the provider).
     pub fn relay_subscribed_peers(&self) -> Vec<FabricPeerId> {
-        self.relay_subscriptions
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|b| FabricPeerId(*b))
-            .collect()
+        match self.relay_provider.lock().unwrap().clone() {
+            Some(provider) => provider.subscribed_peers(),
+            None => Vec::new(),
+        }
     }
 
     /// Peers whose relay was reported lost (state only -- see `on_relay_lost`).
