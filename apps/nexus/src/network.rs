@@ -11,10 +11,7 @@
 //! 首期 Linux only（E4 在 xc-pc-linux netns；其他平台诚实报错）。
 
 use nexus_control_api::ControlCommand;
-use nexus_discovery::{
-    AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId, StaticDiscovery, lsa::Lsdb,
-    mdns::MdnsDiscovery,
-};
+use nexus_discovery::{DiscoveryHub, PeerId as DiscoveryPeerId, mdns::MdnsDiscovery};
 use nexus_fabric::{
     ConnConfig, FabricConn, FabricError, PeerId as FabricPeerId, RecvStream, SendStream,
     StdUdpTransport, UdpTransport,
@@ -392,36 +389,90 @@ impl N1Dialer for FabricDialer {
     }
 }
 
-struct DiscoveryAdapter {
-    agg: AggregateDiscovery<'static>,
+/// mDNS parameters for the daemon assembly (CLI passes `None`).
+#[derive(Debug, Clone, Copy)]
+pub struct MdnsParams {
+    /// SRV port advertised by mDNS. This run's semantics: the discovery/gossip
+    /// endpoint (`gossip_port`), not an N1 data-plane port.
+    pub service_port: u16,
+    /// IPv4 address the A record advertises.
+    pub announce_ip: std::net::Ipv4Addr,
 }
 
-impl DiscoveryAdapter {
-    fn new(self_id: N1PeerId, static_peers: Vec<(N1PeerId, SocketAddr)>) -> Self {
-        let static_src = StaticDiscovery::new(
-            static_peers
-                .into_iter()
-                .map(|(id, addr)| (DiscoveryPeerId(id.to_hex()), addr)),
-        );
-        let lsdb: &'static Lsdb = Box::leak(Box::new(Lsdb::new(DiscoveryPeerId(self_id.to_hex()))));
-        let mdns_src = MdnsDiscovery::new(
-            DiscoveryPeerId(self_id.to_hex()),
-            9000,
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        )
-        .expect("mdns discovery construct");
+/// Discovery parameters for [`build_session_manager_with_discovery`].
+#[derive(Debug, Clone)]
+pub struct DiscoveryParams {
+    /// `Some` when an mDNS state machine should be attached.
+    pub mdns: Option<MdnsParams>,
+    /// LSA freshness window (spec §4.9.5).
+    pub lsa_stale_after: Duration,
+}
+
+impl DiscoveryParams {
+    /// CLI behaviour: static table only, no mDNS, default freshness window.
+    pub fn static_only() -> Self {
         Self {
-            agg: AggregateDiscovery::new(static_src, lsdb, mdns_src),
+            mdns: None,
+            lsa_stale_after: Duration::from_secs(90),
         }
     }
 }
 
+/// N1 discovery adapter: the single bridge from the hub to `N1Discovery`.
+///
+/// The hub itself does not implement `Discovery` (that trait has no `now`
+/// parameter); N1 always resolves through this adapter with an explicit
+/// timestamp.
+struct DiscoveryAdapter {
+    hub: Arc<DiscoveryHub>,
+}
+
+/// Build the single [`DiscoveryHub`] plus the adapter that reads it.
+///
+/// `static_peers` carries exactly one address per peer (`addrs[0]`, empty
+/// `addrs` -> `0.0.0.0:0` sentinel); `addrs[1..]` stay in the N1 config for
+/// dialing and gossip neighbours.
+fn build_adapter(
+    self_id: N1PeerId,
+    static_peers: Vec<(N1PeerId, SocketAddr)>,
+    mdns: Option<MdnsParams>,
+    lsa_stale_after: Duration,
+) -> (Arc<DiscoveryHub>, Arc<DiscoveryAdapter>) {
+    let self_key = DiscoveryPeerId(self_id.to_hex());
+    let static_pairs: Vec<(DiscoveryPeerId, SocketAddr)> = static_peers
+        .into_iter()
+        .map(|(id, addr)| (DiscoveryPeerId(id.to_hex()), addr))
+        .collect();
+    let mdns_src = mdns.and_then(|m| {
+        match MdnsDiscovery::new(self_key.clone(), m.service_port, IpAddr::V4(m.announce_ip)) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                // mDNS is optional: degrade without blocking N1.
+                eprintln!("[n1] WARN: mdns discovery disabled ({e})");
+                None
+            }
+        }
+    });
+    let hub = Arc::new(DiscoveryHub::new(
+        self_key,
+        static_pairs,
+        mdns_src,
+        lsa_stale_after,
+    ));
+    let adapter = Arc::new(DiscoveryAdapter {
+        hub: Arc::clone(&hub),
+    });
+    (hub, adapter)
+}
+
 impl N1Discovery for DiscoveryAdapter {
     fn resolve(&self, peer: &N1PeerId) -> Result<Vec<SocketAddr>, N1Error> {
-        Ok(Discovery::resolve(
-            &self.agg,
-            &DiscoveryPeerId(peer.to_hex()),
-        ))
+        Ok(self
+            .hub
+            .resolve(&DiscoveryPeerId(peer.to_hex()), Instant::now())
+            .into_iter()
+            .map(|r| r.addr)
+            .collect())
     }
 }
 
@@ -465,30 +516,36 @@ impl PeerConnLookup for ManagerLookup {
 ///
 /// # Errors
 /// - `network.toml` 解析失败 → `Err(String)`。
-pub fn build_session_manager(
+pub fn build_session_manager_with_discovery(
     config_text: &str,
     proxy: Option<ProxyConfig>,
     cancel: Arc<AtomicBool>,
-) -> Result<(N1Config, Arc<N1SessionManager>), String> {
+    params: DiscoveryParams,
+) -> Result<(N1Config, Arc<N1SessionManager>, Arc<DiscoveryHub>), String> {
     let config =
         N1Config::parse_toml(config_text).map_err(|e| format!("parse network.toml: {e:?}"))?;
     let sink = Arc::new(LogSink);
-    let discovery = Arc::new(DiscoveryAdapter::new(
+    // The one and only static address selection (CR-2): `addrs[0]`, array
+    // order, no sorting/probing; empty `addrs` -> 0.0.0.0:0 sentinel.
+    let static_peers: Vec<(N1PeerId, SocketAddr)> = config
+        .peers
+        .iter()
+        .map(|p| {
+            (
+                p.id,
+                p.addrs
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 parses")),
+            )
+        })
+        .collect();
+    let (hub, adapter) = build_adapter(
         config.peer_id,
-        config
-            .peers
-            .iter()
-            .map(|p| {
-                (
-                    p.id,
-                    p.addrs
-                        .first()
-                        .copied()
-                        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 parses")),
-                )
-            })
-            .collect(),
-    ));
+        static_peers,
+        params.mdns,
+        params.lsa_stale_after,
+    );
     let dialer = Arc::new(FabricDialer {
         local_bind: "0.0.0.0:0".parse().expect("0.0.0.0:0 parses"),
         handshake_timeout: Duration::from_secs(10),
@@ -497,10 +554,25 @@ pub fn build_session_manager(
     });
     let mgr = Arc::new(N1SessionManager::new(
         dialer,
-        discovery,
+        adapter,
         sink,
         config.link.clone(),
     ));
+    Ok((config, mgr, hub))
+}
+
+/// Static-only wrapper (CLI path): no mDNS, no pump, default freshness window.
+pub fn build_session_manager(
+    config_text: &str,
+    proxy: Option<ProxyConfig>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(N1Config, Arc<N1SessionManager>), String> {
+    let (config, mgr, _hub) = build_session_manager_with_discovery(
+        config_text,
+        proxy,
+        cancel,
+        DiscoveryParams::static_only(),
+    )?;
     Ok((config, mgr))
 }
 
@@ -569,22 +641,21 @@ fn network_up_linux(config_text: &str) -> i32 {
 
     // 3. 装配 N1 协议栈。
     let sink = Arc::new(LogSink);
-    let discovery = Arc::new(DiscoveryAdapter::new(
-        config.peer_id,
-        config
-            .peers
-            .iter()
-            .map(|p| {
-                (
-                    p.id,
-                    p.addrs
-                        .first()
-                        .copied()
-                        .unwrap_or("0.0.0.0:0".parse().unwrap()),
-                )
-            })
-            .collect(),
-    ));
+    let static_peers: Vec<(N1PeerId, SocketAddr)> = config
+        .peers
+        .iter()
+        .map(|p| {
+            (
+                p.id,
+                p.addrs
+                    .first()
+                    .copied()
+                    .unwrap_or("0.0.0.0:0".parse().unwrap()),
+            )
+        })
+        .collect();
+    let (_hub, discovery) =
+        build_adapter(config.peer_id, static_peers, None, Duration::from_secs(90));
     let dialer = Arc::new(FabricDialer {
         local_bind: "0.0.0.0:0".parse().unwrap(),
         handshake_timeout: Duration::from_secs(10),
