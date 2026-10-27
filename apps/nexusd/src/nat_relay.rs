@@ -15,10 +15,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use nexus_fabric::{ConnShared, Driver, FabricIdentity, FabricListener, PeerId as FabricPeerId};
-use nexus_turn::client::TurnClient;
 use nexus_turn::socket::TurnSocket;
 
-use crate::nat_turn::TurnManager;
+use crate::nat_turn::{RefreshOutcome, TurnManager, TurnState};
 
 /// Relay connection kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,8 +49,17 @@ pub trait RelayConnSink: Send + Sync {
 }
 
 /// Provider of production relay connections.
+///
+/// Per-peer attach model (spec §4.7 errata O8-2/O8-3): one stack may subscribe
+/// several peers, each subscription is revocable, and the provider never holds
+/// a strong reference to its subscribers.
 pub trait RelayConnProvider: Send + Sync {
     fn subscribe(&self, peer: FabricPeerId, sink: Arc<dyn RelayConnSink>);
+    fn unsubscribe(&self, peer: FabricPeerId, sink: &Arc<dyn RelayConnSink>);
+    fn established_relay(&self, peer: &FabricPeerId) -> Option<RelayConn>;
+    fn established_peers(&self) -> Vec<FabricPeerId>;
+    fn subscribed_peers(&self) -> Vec<FabricPeerId>;
+    fn sink_count(&self, peer: &FabricPeerId) -> usize;
 }
 
 #[derive(Debug)]
@@ -60,6 +68,21 @@ pub enum RelayError {
     Io(io::Error),
     Identity(String),
     AddressBook(String),
+    /// The single relay slot is taken by another peer (CR-BLOCKED-3 guard).
+    Capacity(String),
+}
+
+impl RelayError {
+    /// Stable log category (spec §4.12.2: `turn|io|identity|book|capacity`).
+    pub fn category(&self) -> &'static str {
+        match self {
+            RelayError::Turn(_) => "turn",
+            RelayError::Io(_) => "io",
+            RelayError::Identity(_) => "identity",
+            RelayError::AddressBook(_) => "book",
+            RelayError::Capacity(_) => "capacity",
+        }
+    }
 }
 
 impl std::fmt::Display for RelayError {
@@ -69,6 +92,7 @@ impl std::fmt::Display for RelayError {
             RelayError::Io(e) => write!(f, "io: {e}"),
             RelayError::Identity(s) => write!(f, "identity: {s}"),
             RelayError::AddressBook(s) => write!(f, "address book: {s}"),
+            RelayError::Capacity(s) => write!(f, "capacity: {s}"),
         }
     }
 }
@@ -79,6 +103,17 @@ impl From<io::Error> for RelayError {
     fn from(e: io::Error) -> Self {
         RelayError::Io(e)
     }
+}
+
+/// Outcome of [`TurnRelayProvider::refresh`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRefresh {
+    /// Nothing to do (not due, inactive, or the turn lock was busy).
+    NotDue,
+    /// The allocation was refreshed (address unchanged or re-published).
+    Refreshed,
+    /// The allocation died; the slot was cleared and sinks were notified.
+    Lost,
 }
 
 /// Read-only address book for peer relayed addresses.
@@ -198,6 +233,50 @@ fn prune_peer(sinks: &mut SinkMap, peer: &[u8; 32]) -> usize {
     }
 }
 
+/// One established relay plus its ownership anchor(s).
+///
+/// The anchor is what keeps the relay alive: `Driver::drop` shuts the transport
+/// thread down and joins it, so dropping it as soon as `on_turn_allocated`
+/// returns would kill the connection (shipped gap, spec §1.5 item 2).
+///
+/// Client side anchors on the `Driver` it dialed with. Server side accepts
+/// through a `FabricListener`, which *owns* the equivalent driver but exposes no
+/// accessor (`nexus-fabric` is a frozen boundary for this run), so the listener
+/// itself is the anchor there. Exactly one of the two is set; both keep the
+/// transport alive for the lifetime of the slot, and the slot is always torn
+/// down outside every provider lock.
+///
+/// Single slot by design (CR-BLOCKED-3).
+struct EstablishedRelay {
+    conn: RelayConn,
+    driver: Option<Arc<Driver>>,
+    listener: Option<FabricListener>,
+}
+
+impl EstablishedRelay {
+    fn anchor_label(&self) -> &'static str {
+        if self.listener.is_some() {
+            "listener"
+        } else if self.driver.is_some() {
+            "driver"
+        } else {
+            "none"
+        }
+    }
+}
+
+impl Drop for EstablishedRelay {
+    fn drop(&mut self) {
+        // Observable teardown: the driver's Shutdown + join happens here, which
+        // must never run while a provider lock is held.
+        eprintln!(
+            "[nat-relay] relay slot released peer={} anchor={}",
+            &hex32(&self.conn.conn.peer.0)[..8],
+            self.anchor_label()
+        );
+    }
+}
+
 /// Production TURN relay provider.
 pub struct TurnRelayProvider {
     my_id: FabricPeerId,
@@ -205,6 +284,8 @@ pub struct TurnRelayProvider {
     turn: Mutex<TurnManager>,
     book: Arc<dyn RelayAddressBook>,
     sinks: Mutex<SinkMap>,
+    /// Single relay slot (len <= 1); the value owns the driver anchor.
+    established: Mutex<HashMap<[u8; 32], EstablishedRelay>>,
     up: AtomicBool,
 }
 
@@ -221,6 +302,7 @@ impl TurnRelayProvider {
             turn: Mutex::new(turn),
             book,
             sinks: Mutex::new(HashMap::new()),
+            established: Mutex::new(HashMap::new()),
             up: AtomicBool::new(false),
         })
     }
@@ -240,93 +322,222 @@ impl TurnRelayProvider {
             .map_err(|e| RelayError::AddressBook(e.to_string()))
     }
 
-    /// Frozen steps 1–6: allocate → address book → permission → bind/connect
-    /// with the injected identity → notify every sink.
-    pub fn on_turn_allocated(
-        &self,
-        peer: FabricPeerId,
-        peer_relayed: SocketAddr,
-    ) -> Result<RelayConn, RelayError> {
-        let client: TurnClient = {
+    /// Allocate (if needed) and publish **this provider's** relayed address.
+    ///
+    /// Called once at start-up. The runtime's warm-backup allocation must never
+    /// be published here: peers would dial an allocation nobody accepts (D-D).
+    pub fn ensure_relay_ready(&self) -> Result<SocketAddr, RelayError> {
+        let relayed = {
             let mut turn = self
                 .turn
                 .lock()
                 .map_err(|_| RelayError::Turn("lock".into()))?;
             turn.ensure_allocated()
-                .map_err(|e| RelayError::Turn(format!("{e:?}")))?;
-            turn.client()
-                .ok_or_else(|| RelayError::Turn("no allocated client".into()))?
+                .map_err(|e| RelayError::Turn(format!("{e:?}")))?
         };
+        if self.book.relay_addr(&self.my_id.0) != Some(relayed) {
+            self.book
+                .publish(self.my_id.0, relayed)
+                .map_err(|e| RelayError::AddressBook(e.to_string()))?;
+        }
+        eprintln!("[nat-relay] relay_ready relayed={relayed}");
+        Ok(relayed)
+    }
+
+    /// Keep the provider's own allocation alive (called every 500ms).
+    ///
+    /// Never blocks the worker: a busy turn lock returns `NotDue` immediately.
+    /// An `Active/Refreshing -> Expired/Disabled` transition clears the slot and
+    /// notifies the sinks (`provider_lost`), and a refreshed relay address is
+    /// re-published.
+    pub fn refresh(&self) -> RelayRefresh {
+        let (before, after, outcome, relayed) = {
+            let Ok(mut turn) = self.turn.try_lock() else {
+                return RelayRefresh::NotDue;
+            };
+            let before = turn.state();
+            let outcome = turn.refresh_if_needed();
+            let after = turn.state();
+            (before, after, outcome, turn.relayed_addr())
+        };
+        let was_up = matches!(before, TurnState::Active | TurnState::Refreshing);
+        let now_dead = matches!(after, TurnState::Expired | TurnState::Disabled);
+        if was_up && now_dead {
+            self.provider_lost();
+            return RelayRefresh::Lost;
+        }
+        if after == TurnState::Active {
+            if let Some(relayed) = relayed {
+                if self.book.relay_addr(&self.my_id.0) != Some(relayed) {
+                    if let Err(e) = self.publish_self(relayed) {
+                        eprintln!("[nat-relay] WARN: re-publish after refresh failed: {e}");
+                    }
+                }
+            }
+        }
+        match outcome {
+            RefreshOutcome::Refreshed | RefreshOutcome::StaleNonceRetried => {
+                RelayRefresh::Refreshed
+            }
+            _ => RelayRefresh::NotDue,
+        }
+    }
+
+    /// Establish (or reuse) the relay to `peer` (spec §4.6.3, frozen steps).
+    ///
+    /// 1. TURN allocation (failure => `provider_lost()` + `RelayError::Turn`);
+    /// 2. permission for the peer's relayed address;
+    /// 3. single-slot bookkeeping: same peer+address is idempotent, same peer
+    ///    with a new address replaces the old entry, another peer is rejected
+    ///    with `RelayError::Capacity`;
+    /// 4. identity-injected listener (larger id) or client (smaller id), 5s;
+    /// 5. store the connection with its driver anchor;
+    /// 6. first success logs `provider_up`;
+    /// 7. notify this peer's live sinks; 8. return the connection.
+    pub fn on_turn_allocated(
+        &self,
+        peer: FabricPeerId,
+        peer_relayed: SocketAddr,
+    ) -> Result<RelayConn, RelayError> {
+        // 1. Allocation is the precondition for every new relay.
+        let client = {
+            let mut turn = self
+                .turn
+                .lock()
+                .map_err(|_| RelayError::Turn("lock".into()))?;
+            match turn.ensure_allocated() {
+                Ok(_) => turn.client(),
+                Err(e) => {
+                    drop(turn);
+                    self.provider_lost();
+                    return Err(RelayError::Turn(format!("{e:?}")));
+                }
+            }
+        };
+        let client = client.ok_or_else(|| RelayError::Turn("no allocated client".into()))?;
+        // 2. Relay permission for the peer's relayed address.
         client
             .create_permission(peer_relayed)
             .map_err(|e| RelayError::Turn(format!("create_permission: {e}")))?;
 
-        let conn: Arc<ConnShared> = if self.my_id.0 > peer.0 {
+        // 3. Single-slot bookkeeping (idempotent / replace / capacity).
+        let replaced = {
+            let mut established = self
+                .established
+                .lock()
+                .map_err(|_| RelayError::Turn("established lock".into()))?;
+            if let Some(current) = established.get(&peer.0) {
+                if current.conn.relayed == peer_relayed {
+                    // Already established for this peer and address: do not
+                    // rebuild the driver and do not notify again.
+                    return Ok(current.conn.clone());
+                }
+            }
+            if established.keys().any(|holder| *holder != peer.0) {
+                return Err(RelayError::Capacity("relay slot busy".into()));
+            }
+            established.remove(&peer.0)
+        };
+        // Driver teardown (Shutdown + join) must happen outside every lock.
+        drop(replaced);
+
+        // 4. Larger id listens, smaller id connects; identity is injected.
+        let (conn, driver_anchor, listener_anchor) = if self.my_id.0 > peer.0 {
             let listener = FabricListener::bind_with_transport_identity(
                 Box::new(TurnSocket::new(client)),
                 &self.identity,
             )
             .map_err(|e| RelayError::Identity(format!("listener: {e:?}")))?;
-            listener
+            let conn = listener
                 .accept_timeout(Duration::from_secs(5))
                 .map_err(|e| RelayError::Turn(format!("accept: {e:?}")))?
-                .shared()
+                .shared();
+            (conn, None, Some(listener))
         } else {
             let driver = Driver::new_client_with_transport(Box::new(TurnSocket::new(client)))
                 .map_err(|e| RelayError::Turn(format!("driver: {e:?}")))?;
-            driver
+            let conn = driver
                 .connect(peer, peer_relayed, Duration::from_secs(5))
-                .map_err(|e| RelayError::Turn(format!("connect: {e:?}")))?
+                .map_err(|e| RelayError::Turn(format!("connect: {e:?}")))?;
+            (conn, Some(driver), None)
         };
 
+        // 5. Store the connection together with its driver anchor.
+        let relay_conn = RelayConn {
+            conn,
+            relayed: peer_relayed,
+            kind: RelayKind::Turn,
+        };
+        {
+            let mut established = self
+                .established
+                .lock()
+                .map_err(|_| RelayError::Turn("established lock".into()))?;
+            established.insert(
+                peer.0,
+                EstablishedRelay {
+                    conn: relay_conn.clone(),
+                    driver: driver_anchor,
+                    listener: listener_anchor,
+                },
+            );
+        }
+
+        // 6. First success in this provider lifetime.
         if !self.up.swap(true, Ordering::SeqCst) {
             eprintln!(
                 "[nat-relay] provider_up peer={} relayed={peer_relayed}",
                 hex32(&peer.0)
             );
         }
-        let info = RelayInfo {
-            peer,
-            conn: conn.clone(),
-            relayed: peer_relayed,
-            kind: RelayKind::Turn,
+        // 7. Notify this peer's live sinks (locks `sinks` only; the sink must
+        // not call back into the provider, spec §4.5).
+        dispatch_available(&self.sinks, &peer, &relay_conn);
+        // 8.
+        Ok(relay_conn)
+    }
+
+    /// The provider's allocation is gone (spec §4.6.3, frozen five steps).
+    ///
+    /// Clears the single slot, tears the driver down outside every lock, and
+    /// notifies each subscribed peer once. The feed re-arms from the next book
+    /// poll.
+    pub fn provider_lost(&self) {
+        self.up.swap(false, Ordering::SeqCst);
+        let cleared = {
+            let mut established = match self.established.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let entries: Vec<EstablishedRelay> = established.drain().map(|(_, v)| v).collect();
+            entries.len()
         };
-        if let Ok(mut sinks) = self.sinks.lock() {
-            if let Some(list) = sinks.get(&peer.0) {
-                for weak in list.iter() {
-                    if let Some(sink) = weak.upgrade() {
-                        sink.on_relay_available(info.clone());
+        // `EstablishedRelay` values were dropped when the drain result went out
+        // of scope above — which is still inside this function but outside the
+        // `established` lock. Driver Shutdown + join therefore never runs while
+        // holding a provider lock.
+        let peers = self.live_subscribed_peers();
+        if !peers.is_empty() {
+            if let Ok(mut sinks) = self.sinks.lock() {
+                for peer in &peers {
+                    if let Some(list) = sinks.get(&peer.0) {
+                        for weak in list.iter() {
+                            if let Some(sink) = weak.upgrade() {
+                                sink.on_relay_lost(*peer);
+                            }
+                        }
                     }
                 }
+                for peer in &peers {
+                    prune_peer(&mut sinks, &peer.0);
+                }
             }
-            // Drop entries whose owner went away (prune after dispatch).
-            prune_peer(&mut sinks, &peer.0);
         }
-        Ok(RelayConn {
-            conn,
-            relayed: peer_relayed,
-            kind: RelayKind::Turn,
-        })
+        eprintln!("[nat-relay] provider_lost peers={cleared}");
     }
 
-    pub fn provider_lost(&self) {
-        if self.up.swap(false, Ordering::SeqCst) {
-            eprintln!("[nat-relay] provider_lost");
-        }
-    }
-}
-
-impl TurnRelayProvider {
-    /// Live sink count for one peer (prunes dead entries first).
-    pub fn sink_count(&self, peer: &FabricPeerId) -> usize {
-        match self.sinks.lock() {
-            Ok(mut g) => prune_peer(&mut g, &peer.0),
-            Err(_) => 0,
-        }
-    }
-
-    /// Peers with at least one live sink (prunes dead entries first).
-    pub fn subscribed_peers(&self) -> Vec<FabricPeerId> {
+    /// Live subscribed peers (prunes dead weak entries).
+    fn live_subscribed_peers(&self) -> Vec<FabricPeerId> {
         let mut out = Vec::new();
         if let Ok(mut g) = self.sinks.lock() {
             let peers: Vec<[u8; 32]> = g.keys().copied().collect();
@@ -338,6 +549,39 @@ impl TurnRelayProvider {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+}
+
+impl TurnRelayProvider {
+    /// Clone of the established relay for `peer`, if any.
+    pub fn established_relay(&self, peer: &FabricPeerId) -> Option<RelayConn> {
+        match self.established.lock() {
+            Ok(g) => g.get(&peer.0).map(|e| e.conn.clone()),
+            Err(e) => e.into_inner().get(&peer.0).map(|e| e.conn.clone()),
+        }
+    }
+
+    /// Peers holding the relay slot (always <= 1; ascending for determinism).
+    pub fn established_peers(&self) -> Vec<FabricPeerId> {
+        let mut out: Vec<FabricPeerId> = match self.established.lock() {
+            Ok(g) => g.keys().map(|k| FabricPeerId(*k)).collect(),
+            Err(e) => e.into_inner().keys().map(|k| FabricPeerId(*k)).collect(),
+        };
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Live sink count for one peer (prunes dead entries first).
+    pub fn sink_count(&self, peer: &FabricPeerId) -> usize {
+        match self.sinks.lock() {
+            Ok(mut g) => prune_peer(&mut g, &peer.0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Peers with at least one live sink (prunes dead entries first).
+    pub fn subscribed_peers(&self) -> Vec<FabricPeerId> {
+        self.live_subscribed_peers()
     }
 }
 
@@ -353,6 +597,70 @@ impl RelayConnProvider for TurnRelayProvider {
             }
             list.push(weak);
         }
+    }
+
+    /// Explicit unsubscribe (spec §4.6.1).
+    ///
+    /// Lock order is `sinks` and then, only after releasing it, `established`.
+    /// When the last sink for a peer goes away the relay slot is released: the
+    /// `EstablishedRelay` is taken out and dropped **outside** both locks, so
+    /// the driver teardown (Shutdown + join) never runs under a lock.
+    fn unsubscribe(&self, peer: FabricPeerId, sink: &Arc<dyn RelayConnSink>) {
+        let live = {
+            let Ok(mut sinks) = self.sinks.lock() else {
+                return;
+            };
+            if let Some(list) = sinks.get_mut(&peer.0) {
+                let target = Arc::downgrade(sink);
+                list.retain(|w| !Weak::ptr_eq(w, &target));
+            }
+            prune_peer(&mut sinks, &peer.0)
+        };
+        if live == 0 {
+            let taken = match self.established.lock() {
+                Ok(mut g) => g.remove(&peer.0),
+                Err(e) => e.into_inner().remove(&peer.0),
+            };
+            drop(taken);
+        }
+    }
+
+    fn established_relay(&self, peer: &FabricPeerId) -> Option<RelayConn> {
+        TurnRelayProvider::established_relay(self, peer)
+    }
+
+    fn established_peers(&self) -> Vec<FabricPeerId> {
+        TurnRelayProvider::established_peers(self)
+    }
+
+    fn subscribed_peers(&self) -> Vec<FabricPeerId> {
+        TurnRelayProvider::subscribed_peers(self)
+    }
+
+    fn sink_count(&self, peer: &FabricPeerId) -> usize {
+        TurnRelayProvider::sink_count(self, peer)
+    }
+}
+
+/// Dispatch `on_relay_available` to one peer's live sinks while holding the
+/// sink lock (spec §4.5 callback constraint: sink implementations must not call
+/// back into the provider), then prune dead entries.
+fn dispatch_available(sinks: &Mutex<SinkMap>, peer: &FabricPeerId, conn: &RelayConn) {
+    let info = RelayInfo {
+        peer: *peer,
+        conn: conn.conn.clone(),
+        relayed: conn.relayed,
+        kind: conn.kind,
+    };
+    if let Ok(mut g) = sinks.lock() {
+        if let Some(list) = g.get(&peer.0) {
+            for weak in list.iter() {
+                if let Some(sink) = weak.upgrade() {
+                    sink.on_relay_available(info.clone());
+                }
+            }
+        }
+        prune_peer(&mut g, &peer.0);
     }
 }
 
