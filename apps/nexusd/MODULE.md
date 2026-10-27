@@ -374,6 +374,18 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
   （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
   发生时计数（不再是纯分类计数）。
+- **统计面（D3=A，15 个恒定字段）**：`tcp_streams`（Syn 数）/ `tcp_dials_ok` /
+  `tcp_dials_failed` / `tcp_dial_buffer_dropped_bytes` / `tcp_dial_buffer_overflow_resets` /
+  `udp_sent` / `udp_send_failed` + `tcp_streams_ok`（dial 成功进 relay）/
+  `tcp_bytes_up` / `tcp_bytes_down` / `udp_unsupported` / `udp_unsupported_vless` /
+  `udp_unsupported_anytls` / `udp_unsupported_other` / `udp_unsupported_log_suppressed`。
+  **不存在** `tcp_flows_rejected` / `tcp_dials_throttled`（不引入上限，不是 0 值字段）。
+  - **同步点唯一**：`Dataplane::poll_proxy_engine()` 每 tick 一次（`saturating_sub` delta）；
+    Proxy 分类分支不再同步（避免同 tick 两次 delta）。
+  - 字段语义写死：`proxy_tcp_streams` = 握手流数（Syn）；`proxy_tcp_streams_ok` =
+    dial 成功流数；`proxy_tcp_bytes` **自本版本起为真实上行字节**（旧值恒 0，修死计数）；
+    `proxy_tcp_bytes_down` 为下行；`proxy_dropped_no_proxy` 聚合「无出口」与「dial 失败」，
+    同一事件只加一次。
 
 ### Workspace 生产接线（C1/D1-D9，scenarios/product/daemon_workspace_mount.toml，2026-10-02 冻结）
 

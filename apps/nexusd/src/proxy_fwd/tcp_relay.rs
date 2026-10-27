@@ -377,12 +377,14 @@ impl TcpForwarder {
             Some(false) => {
                 // FIN 先到：先把请求字节送上游，再关闭写端。
                 if !entry.buffered.is_empty() {
+                    self.stats.tcp_bytes_up += entry.buffered.len() as u64;
                     let _ = handle.tx.send(RelayCmd::Data(entry.buffered));
                 }
                 let _ = handle.tx.send(RelayCmd::Close);
             }
             None => {
                 if !entry.buffered.is_empty() {
+                    self.stats.tcp_bytes_up += entry.buffered.len() as u64;
                     let _ = handle.tx.send(RelayCmd::Data(entry.buffered));
                 }
                 self.relays.insert(stream_id, handle);

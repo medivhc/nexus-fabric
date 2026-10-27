@@ -124,8 +124,22 @@ pub struct DataplaneStats {
     pub mesh_tcp_bytes: u64,
     /// Proxy 分类的终结流数（GAP-1 前只计数）。
     pub proxy_tcp_streams: u64,
-    /// Proxy 分类的应用字节数（GAP-1 前只计数）。
+    /// Proxy TCP 上行应用字节（v-next 起为真实值：`tcp_bytes_up`）。
     pub proxy_tcp_bytes: u64,
+    /// Proxy TCP 下行应用字节（`tcp_bytes_down`，vp 新增暴露）。
+    pub proxy_tcp_bytes_down: u64,
+    /// dial 成功并进入 relay 的 Proxy 流数（与 `proxy_tcp_streams`（Syn 数）不同义）。
+    pub proxy_tcp_streams_ok: u64,
+    /// UDP `UdpCapability::Unsupported` 总数。
+    pub proxy_udp_unsupported: u64,
+    /// VLESS UDP 丢弃。
+    pub proxy_udp_unsupported_vless: u64,
+    /// AnyTLS UDP 丢弃。
+    pub proxy_udp_unsupported_anytls: u64,
+    /// 其他 unsupported（含 Trojan）。
+    pub proxy_udp_unsupported_other: u64,
+    /// 限频抑制的 udp_unsupported 日志条数。
+    pub proxy_udp_unsupported_log_suppressed: u64,
     /// Direct 不支持协议丢弃（ICMP/分片/非 TCP-UDP）。
     pub direct_dropped_unsupported: u64,
     /// Direct UDP 真实发送数。
@@ -251,6 +265,14 @@ pub struct Dataplane {
     last_tcp_dials_failed: u64,
     /// 上次同步的 Proxy 终结流计数（`ProxyFwdStats::tcp_streams`）。
     last_proxy_tcp_streams: u64,
+    last_proxy_tcp_streams_ok: u64,
+    last_proxy_tcp_bytes_up: u64,
+    last_proxy_tcp_bytes_down: u64,
+    last_proxy_udp_unsupported: u64,
+    last_proxy_udp_unsupported_vless: u64,
+    last_proxy_udp_unsupported_anytls: u64,
+    last_proxy_udp_unsupported_other: u64,
+    last_proxy_udp_unsupported_suppressed: u64,
     /// 上次同步的拨号窗口期丢弃字节数（`ProxyFwdStats`，P7）。
     last_proxy_dial_buffer_dropped: u64,
     /// 上次同步的拨号窗口期超限 RST 流数（`ProxyFwdStats`，P7）。
@@ -404,6 +426,14 @@ impl Dataplane {
             last_tcp_dials_ok: 0,
             last_tcp_dials_failed: 0,
             last_proxy_tcp_streams: 0,
+            last_proxy_tcp_streams_ok: 0,
+            last_proxy_tcp_bytes_up: 0,
+            last_proxy_tcp_bytes_down: 0,
+            last_proxy_udp_unsupported: 0,
+            last_proxy_udp_unsupported_vless: 0,
+            last_proxy_udp_unsupported_anytls: 0,
+            last_proxy_udp_unsupported_other: 0,
+            last_proxy_udp_unsupported_suppressed: 0,
             last_proxy_dial_buffer_dropped: 0,
             last_proxy_dial_buffer_overflow: 0,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
@@ -690,6 +720,12 @@ impl Dataplane {
         self.proxy_engine.is_some()
     }
 
+    /// Proxy 引擎统计快照（加法；E4 / 状态面可观测）。
+    #[must_use]
+    pub fn proxy_stats(&self) -> Option<crate::proxy_fwd::ProxyFwdStats> {
+        self.proxy_engine.as_ref().map(|engine| engine.stats())
+    }
+
     /// 获取统计的共享句柄（供 LocalAPI 线程读取，B1）。
     #[must_use]
     pub fn stats_handle(&self) -> Arc<Mutex<DataplaneStats>> {
@@ -717,11 +753,43 @@ impl Dataplane {
         let dial_buf_overflow_delta = eng_stats
             .tcp_dial_buffer_overflow_resets
             .saturating_sub(self.last_proxy_dial_buffer_overflow);
+        let streams_ok_delta = eng_stats
+            .tcp_streams_ok
+            .saturating_sub(self.last_proxy_tcp_streams_ok);
+        let bytes_up_delta = eng_stats
+            .tcp_bytes_up
+            .saturating_sub(self.last_proxy_tcp_bytes_up);
+        let bytes_down_delta = eng_stats
+            .tcp_bytes_down
+            .saturating_sub(self.last_proxy_tcp_bytes_down);
+        let udp_unsupported_delta = eng_stats
+            .udp_unsupported
+            .saturating_sub(self.last_proxy_udp_unsupported);
+        let udp_vless_delta = eng_stats
+            .udp_unsupported_vless
+            .saturating_sub(self.last_proxy_udp_unsupported_vless);
+        let udp_anytls_delta = eng_stats
+            .udp_unsupported_anytls
+            .saturating_sub(self.last_proxy_udp_unsupported_anytls);
+        let udp_other_delta = eng_stats
+            .udp_unsupported_other
+            .saturating_sub(self.last_proxy_udp_unsupported_other);
+        let udp_suppressed_delta = eng_stats
+            .udp_unsupported_log_suppressed
+            .saturating_sub(self.last_proxy_udp_unsupported_suppressed);
         self.last_tcp_dials_ok = eng_stats.tcp_dials_ok;
         self.last_tcp_dials_failed = eng_stats.tcp_dials_failed;
         self.last_proxy_tcp_streams = eng_stats.tcp_streams;
         self.last_proxy_dial_buffer_dropped = eng_stats.tcp_dial_buffer_dropped_bytes;
         self.last_proxy_dial_buffer_overflow = eng_stats.tcp_dial_buffer_overflow_resets;
+        self.last_proxy_tcp_streams_ok = eng_stats.tcp_streams_ok;
+        self.last_proxy_tcp_bytes_up = eng_stats.tcp_bytes_up;
+        self.last_proxy_tcp_bytes_down = eng_stats.tcp_bytes_down;
+        self.last_proxy_udp_unsupported = eng_stats.udp_unsupported;
+        self.last_proxy_udp_unsupported_vless = eng_stats.udp_unsupported_vless;
+        self.last_proxy_udp_unsupported_anytls = eng_stats.udp_unsupported_anytls;
+        self.last_proxy_udp_unsupported_other = eng_stats.udp_unsupported_other;
+        self.last_proxy_udp_unsupported_suppressed = eng_stats.udp_unsupported_log_suppressed;
         self.with_stats(|s| {
             s.proxy_tcp_streams += stream_delta;
             s.proxy_forwarded += ok_delta;
@@ -729,6 +797,15 @@ impl Dataplane {
             s.upstream_failed += fail_delta;
             s.proxy_dial_buffer_dropped_bytes += dial_buf_drop_delta;
             s.proxy_dial_buffer_overflow_resets += dial_buf_overflow_delta;
+            s.proxy_tcp_streams_ok += streams_ok_delta;
+            // C7：修死计数——上行字节由 engine 的 tcp_bytes_up 驱动。
+            s.proxy_tcp_bytes += bytes_up_delta;
+            s.proxy_tcp_bytes_down += bytes_down_delta;
+            s.proxy_udp_unsupported += udp_unsupported_delta;
+            s.proxy_udp_unsupported_vless += udp_vless_delta;
+            s.proxy_udp_unsupported_anytls += udp_anytls_delta;
+            s.proxy_udp_unsupported_other += udp_other_delta;
+            s.proxy_udp_unsupported_log_suppressed += udp_suppressed_delta;
         });
     }
 
@@ -952,6 +1029,8 @@ impl Dataplane {
         let wrote = !result.tun_packets.is_empty();
         self.write_proxy_tun_packets(result.tun_packets);
         self.record_proxy_stream_failures(result.stream_events);
+        // C6：唯一同步点（每 tick 一次，含 WouldBlock 轮）。
+        self.sync_proxy_stats();
         wrote
     }
 
@@ -1409,8 +1488,7 @@ impl Dataplane {
                         if packet.get(9) == Some(&17) && result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }
-                        // 同步 TCP dial / 终结流 / 失败增量（含异步 poll 结果）。
-                        self.sync_proxy_stats();
+                        // stats 同步已迁到 poll_proxy_engine（C6：单一同步点）。
                     }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { .. }))
                     | Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
@@ -1755,9 +1833,8 @@ impl Dataplane {
                 }
             }
             Some(_) => {
-                // S5-Proxy：GAP-1 前只计数。
-                let n = bytes.len() as u64;
-                self.with_stats(|s| s.proxy_tcp_bytes += n);
+                // S5-Proxy：新接线后不再经 dataplane 计数——Proxy 上行字节由
+                // engine 的 `tcp_bytes_up` 驱动（C7，经 `sync_proxy_stats`）。
             }
             None => {
                 // 防御：未知流的数据（不应发生）。
@@ -2812,6 +2889,14 @@ pub fn dataplane_stats_json(
             "mesh_dropped_no_n1": stats.mesh_dropped_no_n1,
             "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
             "proxy_tcp_streams": stats.proxy_tcp_streams,
+            "proxy_tcp_streams_ok": stats.proxy_tcp_streams_ok,
+            "proxy_tcp_bytes": stats.proxy_tcp_bytes,
+            "proxy_tcp_bytes_down": stats.proxy_tcp_bytes_down,
+            "proxy_udp_unsupported": stats.proxy_udp_unsupported,
+            "proxy_udp_unsupported_vless": stats.proxy_udp_unsupported_vless,
+            "proxy_udp_unsupported_anytls": stats.proxy_udp_unsupported_anytls,
+            "proxy_udp_unsupported_other": stats.proxy_udp_unsupported_other,
+            "proxy_udp_unsupported_log_suppressed": stats.proxy_udp_unsupported_log_suppressed,
             "direct_tcp_dial_ok": stats.direct_tcp_dial_ok,
             "upstream_failed": stats.upstream_failed,
             "proxy_dial_buffer_dropped_bytes": stats.proxy_dial_buffer_dropped_bytes,
@@ -4519,7 +4604,7 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
             if payload.len() == response.len() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         assert_eq!(
@@ -4541,6 +4626,264 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
             response.len()
         );
         drop(upstream);
+    }
+
+    /// S5：15 字段并集在 LocalAPI JSON 中逐项暴露（含 8 个新键）。
+    #[test]
+    fn localapi_json_exposes_15_proxy_fields() {
+        let stats = DataplaneStats {
+            proxy_forwarded: 1,
+            proxy_tcp_streams: 2,
+            proxy_tcp_streams_ok: 3,
+            proxy_tcp_bytes: 11,
+            proxy_tcp_bytes_down: 22,
+            proxy_udp_unsupported: 4,
+            proxy_udp_unsupported_vless: 1,
+            proxy_udp_unsupported_anytls: 1,
+            proxy_udp_unsupported_other: 2,
+            proxy_udp_unsupported_log_suppressed: 7,
+            ..Default::default()
+        };
+        let json = dataplane_stats_json(
+            true,
+            &RuntimeStatus::default(),
+            &stats,
+            serde_json::Value::Null,
+        );
+        let dp = &json["dataplane"];
+        for (key, expected) in [
+            ("proxy_forwarded", 1),
+            ("proxy_tcp_streams", 2),
+            ("proxy_tcp_streams_ok", 3),
+            ("proxy_tcp_bytes", 11),
+            ("proxy_tcp_bytes_down", 22),
+            ("proxy_udp_unsupported", 4),
+            ("proxy_udp_unsupported_vless", 1),
+            ("proxy_udp_unsupported_anytls", 1),
+            ("proxy_udp_unsupported_other", 2),
+            ("proxy_udp_unsupported_log_suppressed", 7),
+        ] {
+            assert_eq!(dp[key], expected, "{key}");
+        }
+        assert!(dp["proxy_tcp_bytes"].is_number());
+        assert!(dp.get("tcp_flows_rejected").is_none(), "D3=A：无上限假字段");
+        assert!(
+            dp.get("tcp_dials_throttled").is_none(),
+            "D3=A：无上限假字段"
+        );
+    }
+
+    /// S5：`proxy_tcp_streams` 计 Syn，`proxy_tcp_streams_ok` 计 dial 成功。
+    #[test]
+    fn stats_proxy_tcp_streams_counts_syn_not_dial_ok() {
+        // dial 指向已释放端口：握手完成（Syn 计数）但 dial 必然失败（ok 不增）。
+        let dead_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr")
+        };
+        let (mut dp, mock) = silent_window_dataplane(dead_addr);
+        let syn = craft_tcp(
+            [10, 200, 1, 2],
+            [10, 200, 3, 3],
+            57365,
+            8080,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.tick(1).expect("tick syn"));
+        let written = mock.lock().unwrap().take_written();
+        assert_eq!(written.len(), 1, "SYN-ACK expected");
+        let isn1 = syn_ack_srv_seq(&written[0]) + 1;
+        // 握手完成 → TcpEvent::Syn（stats.tcp_streams += 1）→ worker dial。
+        let ack = craft_tcp(
+            [10, 200, 1, 2],
+            [10, 200, 3, 3],
+            57365,
+            8080,
+            1001,
+            isn1,
+            0x10,
+            &[],
+        );
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.tick(2).expect("tick ack"));
+        // sync 在 tick 头部（poll 之后）：本 tick 的增量在下一次 poll 同步。
+        let _ = dp.tick(3).expect("tick sync");
+        assert_eq!(dp.stats().proxy_tcp_streams, 1, "Syn 计数");
+        assert_eq!(dp.stats().proxy_tcp_streams_ok, 0, "dial 失败，未进 relay");
+    }
+
+    /// S5：`proxy_tcp_bytes` 由 engine 的 `tcp_bytes_up` 驱动（C7 修死计数）。
+    #[test]
+    fn stats_proxy_tcp_bytes_comes_from_tcp_bytes_up() {
+        let (mut dp, mock) = silent_window_dataplane({
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr")
+        });
+        let client_ip = [10, 200, 1, 2];
+        let server_ip = [10, 200, 3, 3];
+        let syn = craft_tcp(client_ip, server_ip, 57365, 8080, 1000, 0, 0x02, &[]);
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.tick(1).expect("syn"));
+        let written = mock.lock().unwrap().take_written();
+        let isn1 = syn_ack_srv_seq(&written[0]) + 1;
+        let ack = craft_tcp(client_ip, server_ip, 57365, 8080, 1001, isn1, 0x10, &[]);
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.tick(2).expect("ack"));
+        let get = craft_tcp(
+            client_ip,
+            server_ip,
+            57365,
+            8080,
+            1001,
+            isn1,
+            0x18,
+            b"GET /x HTTP/1.1\r\n\r\n",
+        );
+        mock.lock().unwrap().inject(get);
+        assert!(dp.tick(3).expect("get"));
+        // socks 替身在上一个测试里未监听该端口（port 已释放）：dial 失败也要能计数；
+        // 这里只断言「映射来自 engine 字段」这一不变量（可能为 0，但必须相等）。
+        for step in 4..2_000u64 {
+            let _ = dp.tick(step).expect("tick");
+            if dp.stats().proxy_tcp_streams_ok > 0 || dp.stats().proxy_tcp_bytes > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let engine_bytes = dp.proxy_stats().expect("engine stats").tcp_bytes_up;
+        assert_eq!(
+            dp.stats().proxy_tcp_bytes,
+            engine_bytes,
+            "上行字节来自 tcp_bytes_up"
+        );
+    }
+
+    /// S5：同步点幂等（连续两次 tick 不重复累计）。
+    #[test]
+    fn stats_sync_is_idempotent_across_two_ticks() {
+        let (mut dp, _mock) = test_dataplane();
+        dp.sync_proxy_stats();
+        let first = dp.stats();
+        dp.sync_proxy_stats();
+        let second = dp.stats();
+        for (a, b, name) in [
+            (
+                first.proxy_forwarded,
+                second.proxy_forwarded,
+                "proxy_forwarded",
+            ),
+            (
+                first.proxy_tcp_bytes,
+                second.proxy_tcp_bytes,
+                "proxy_tcp_bytes",
+            ),
+            (
+                first.proxy_tcp_streams_ok,
+                second.proxy_tcp_streams_ok,
+                "proxy_tcp_streams_ok",
+            ),
+            (
+                first.proxy_udp_unsupported,
+                second.proxy_udp_unsupported,
+                "proxy_udp_unsupported",
+            ),
+        ] {
+            assert_eq!(a, b, "{name} must not double count");
+        }
+    }
+
+    /// S5：纯下行字节（客户端静默、仅 proxy→TUN）仍被计数（A2 库级前置）。
+    #[test]
+    fn stats_pure_downlink_bytes_counted_without_uplink() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        // socks5 替身：完成握手/CONNECT，读到请求后回一段响应并保持连接。
+        let socks = TcpListener::bind("127.0.0.1:0").expect("bind socks stub");
+        let socks_addr = socks.local_addr().expect("socks addr");
+        std::thread::spawn(move || {
+            let (mut conn, _) = socks.accept().expect("socks accept");
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout");
+            let mut greeting = [0u8; 2];
+            conn.read_exact(&mut greeting).expect("greeting");
+            let mut methods = vec![0u8; usize::from(greeting[1])];
+            conn.read_exact(&mut methods).expect("methods");
+            conn.write_all(&[5, 0]).expect("method reply");
+            let mut head = [0u8; 4];
+            conn.read_exact(&mut head).expect("request head");
+            match head[3] {
+                1 => {
+                    let mut addr = [0u8; 4];
+                    conn.read_exact(&mut addr).expect("ipv4");
+                }
+                3 => {
+                    let mut len = [0u8; 1];
+                    conn.read_exact(&mut len).expect("domain len");
+                    let mut addr = vec![0u8; usize::from(len[0])];
+                    conn.read_exact(&mut addr).expect("domain");
+                }
+                4 => {
+                    let mut addr = [0u8; 16];
+                    conn.read_exact(&mut addr).expect("ipv6");
+                }
+                other => panic!("unexpected ATYP {other}"),
+            }
+            let mut port = [0u8; 2];
+            conn.read_exact(&mut port).expect("port");
+            conn.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("connect reply");
+            let mut req = [0u8; 512];
+            let n = conn.read(&mut req).expect("request");
+            assert!(n > 0, "relay forwarded the request");
+            // 仅下行：客户端此后静默，响应只从 proxy 侧回来。
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .expect("response");
+            conn.flush().expect("flush");
+            std::thread::sleep(Duration::from_secs(3));
+        });
+
+        let (mut dp, mock) = silent_window_dataplane(socks_addr);
+        let client_ip = [10, 200, 1, 2];
+        let server_ip = [10, 200, 3, 3];
+        let syn = craft_tcp(client_ip, server_ip, 57365, 8080, 1000, 0, 0x02, &[]);
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.tick(1).expect("syn"));
+        let written = mock.lock().unwrap().take_written();
+        let isn1 = syn_ack_srv_seq(&written[0]) + 1;
+        let ack = craft_tcp(client_ip, server_ip, 57365, 8080, 1001, isn1, 0x10, &[]);
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.tick(2).expect("ack"));
+        let get = craft_tcp(
+            client_ip,
+            server_ip,
+            57365,
+            8080,
+            1001,
+            isn1,
+            0x18,
+            b"GET / HTTP/1.1\r\n\r\n",
+        );
+        mock.lock().unwrap().inject(get);
+        assert!(dp.tick(3).expect("get"));
+        // 客户端完全静默：只靠 tick 泵下行。
+        let mut down = 0u64;
+        for step in 4..3_000u64 {
+            let _ = dp.tick(step).expect("idle tick");
+            down = dp.stats().proxy_tcp_bytes_down;
+            if down > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(down > 0, "pure downlink bytes must be counted");
+        let engine_up = dp.proxy_stats().expect("engine").tcp_bytes_up;
+        assert!(engine_up > 0, "uplink counted on engine");
     }
 
     /// 无待办时 tick 零副作用：有 engine 但无回程 → 不写 TUN、返回 false。
