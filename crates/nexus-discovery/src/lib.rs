@@ -88,6 +88,12 @@ impl StaticDiscovery {
     pub fn register(&mut self, peer: PeerId, addr: SocketAddr) {
         self.peers.insert(peer, addr);
     }
+
+    /// 枚举静态表中的全部 peer（顺序不保证；排序责任在调用方）。
+    #[must_use]
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.peers.keys().cloned().collect()
+    }
 }
 
 // ---------- 三源发现 D1/D2/D5/D6（DESIGN §8.2） ----------
@@ -119,6 +125,10 @@ impl Discovery for StaticDiscovery {
     fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr> {
         // 显式调用 inherent（Result 版）冻结方法，再映射到 trait 的 Vec 语义。
         StaticDiscovery::resolve(self, peer).into_iter().collect()
+    }
+
+    fn peers(&self) -> Vec<PeerId> {
+        StaticDiscovery::peers(self)
     }
 }
 
