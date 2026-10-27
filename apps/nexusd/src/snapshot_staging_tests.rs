@@ -350,3 +350,5 @@ mod core;
 mod pressure;
 #[path = "snapshot_staging_tests/recovery.rs"]
 mod recovery;
+#[path = "snapshot_staging_tests/verification_budget.rs"]
+mod verification_budget;

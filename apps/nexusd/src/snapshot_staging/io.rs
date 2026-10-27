@@ -30,6 +30,12 @@ const DIRECTORY_FLAGS: i32 = FILE_FLAGS | 0x10000; // O_DIRECTORY.
 const MAX_CHILDREN: usize = 1025;
 const MAX_RANGE: usize = 65_536;
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes streamed through `hash_prefix` on this thread (N3-12 §5 verification budget).
+    pub(super) static TEST_HASHED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NodeId {
     pub(super) device: u64,
@@ -524,6 +530,8 @@ impl Regular {
     }
 
     pub(super) fn hash_prefix(&self, prefix_len: u64) -> IoResult<Sha256Digest> {
+        #[cfg(test)]
+        TEST_HASHED_BYTES.with(|n| n.set(n.get() + prefix_len));
         self.check()?;
         let before = self.file.metadata().map_err(persistence)?;
         regular_meta(&before, self.policy, self.limit)?;

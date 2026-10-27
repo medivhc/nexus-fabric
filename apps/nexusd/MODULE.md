@@ -347,6 +347,10 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 
 未定义性能预算的路径不得宣称“性能完成”。进入 hot path 后必须在 Contract 中增加 baseline、noise tolerance、warning threshold 与 blocking threshold。
 
+- **N3-12 staging PutChunk 校验预算**（requirement-change 2026-10-27，见 N3-12 §5「每请求校验时机」）：
+  - 机器门禁（确定性，计字节不计时间）：单次 PutChunk 经 `hash_prefix` 流式哈希的字节数 ≥ 本请求入口时全部已确认 prefix 之和（入口完整校验不得删除），且 ≤ 该和 + 2×chunk（不得重复全量重读）。单测 `snapshot_staging::tests::verification_budget::put_chunk_hashes_confirmed_prefix_exactly_once`。
+  - 时延基准（非门禁）：`snapshot_staging::tests::baseline::put_chunk_cost_by_upload_size`（`--release --ignored`）。baseline：2026-10-26 master，sandbox 无争用，32 MiB 上传 28.7 s；noise tolerance ±25%；warning：同条件 32 MiB > 15 s；blocking：> 30 s。
+
 ## Observability
 
 稳定结构化字段优先于自由文本；如涉及 Session/Provider/Path/Workspace，应携带对应 correlation id。

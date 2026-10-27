@@ -351,3 +351,9 @@ pub(super) fn initialize_with_test_fault(
 ) -> Result<StagingStatus, InitFailure> {
     init::initialize(config, budget, point)
 }
+
+/// Takes and resets the bytes `hash_prefix` streamed on this thread.
+#[cfg(test)]
+pub(super) fn test_take_hashed_bytes() -> u64 {
+    io::TEST_HASHED_BYTES.with(|n| n.replace(0))
+}
