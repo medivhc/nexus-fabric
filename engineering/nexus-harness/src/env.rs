@@ -264,36 +264,73 @@ impl Repo {
             .unwrap_or_else(|_| "config-unknown".to_string())
     }
 
-    /// Digest over the scenario contract set (scenarios/**/*.toml).
+    /// Digest over every protected contract: harness.toml
+    /// `[protection].root_contract_paths` plus every git-visible `**/MODULE.md`
+    /// (MODULE.md invariant "contract_hash"). Sentinel `contract-unknown`
+    /// when git cannot list or hash the set.
     pub fn contract_hash(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(self.root.join("scenarios")) {
-            let mut dirs: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            dirs.sort();
-            for d in dirs {
-                if let Ok(files) = std::fs::read_dir(self.root.join("scenarios").join(&d)) {
-                    let mut names: Vec<String> = files
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect();
-                    names.sort();
-                    for n in names {
-                        if let Ok(c) =
-                            std::fs::read_to_string(self.root.join("scenarios").join(&d).join(&n))
-                        {
-                            parts.push(format!("scenarios/{d}/{n}\n{c}"));
-                        }
-                    }
-                }
-            }
-        }
-        self.hash_stdin(&parts.join("\n===\n"))
+        self.contract_digest()
             .unwrap_or_else(|_| "contract-unknown".to_string())
+    }
+
+    fn contract_digest(&self) -> Result<String, String> {
+        let roots = self.contract_roots();
+        let mut args = vec![
+            "ls-files".to_string(),
+            "-z".to_string(),
+            "-co".to_string(),
+            "--exclude-standard".to_string(),
+            "--".to_string(),
+            ":(glob)**/MODULE.md".to_string(),
+        ];
+        args.extend(roots.iter().map(|r| format!(":(literal){r}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let listed = self.git_bytes(&args)?;
+        let paths: std::collections::BTreeSet<&[u8]> = listed
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut input = Vec::new();
+        for path in paths {
+            let rel = String::from_utf8_lossy(path);
+            // A tracked file missing from the working tree still counts.
+            let content = std::fs::read(self.root.join(rel.as_ref()))
+                .unwrap_or_else(|_| b"<missing>".to_vec());
+            input.extend_from_slice(path);
+            input.push(0);
+            input.extend_from_slice(content.len().to_string().as_bytes());
+            input.push(0);
+            input.extend_from_slice(&content);
+        }
+        self.hash_stdin_bytes(&input)
+    }
+
+    /// `[protection].root_contract_paths` without trailing `/`; the default
+    /// set when harness.toml is missing, unparseable or lacks the key.
+    fn contract_roots(&self) -> Vec<String> {
+        let configured = std::fs::read_to_string(self.root.join("harness.toml"))
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|t| {
+                t.get("protection")?
+                    .get("root_contract_paths")?
+                    .as_array()
+                    .cloned()
+            });
+        let roots: Vec<String> = match configured {
+            Some(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            None => ["PRODUCT.md", "ARCHITECTURE.md", "policies/", "scenarios/"]
+                .map(str::to_string)
+                .to_vec(),
+        };
+        roots
+            .iter()
+            .map(|r| r.trim_end_matches('/').to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
     }
 
     pub fn resolve(&self, rel: &str) -> PathBuf {
@@ -401,6 +438,8 @@ pub(crate) mod tests {
             // commit 失败，core.hooksPath 会把外部钩子挂进来。
             vec!["config", "commit.gpgsign", "false"],
             vec!["config", "core.hooksPath", ".git/hooks"],
+            // 宿主的全局忽略规则（如 `*.bin`）不得改变沙盒里哪些文件可见。
+            vec!["config", "core.excludesFile", "/dev/null"],
         ] {
             repo.git(&args)
                 .unwrap_or_else(|e| panic!("sandbox setup `git {args:?}` failed: {e}"));
@@ -737,6 +776,15 @@ pub(crate) mod tests {
             std::fs::create_dir_all(r.resolve("apps/new")).unwrap();
             std::fs::write(r.resolve("apps/new/MODULE.md"), "new\n").unwrap();
         });
+        let extra = "policies/extra.toml";
+        std::fs::write(repo.resolve(extra), "e = 1\n").unwrap();
+        repo.git(&["add", extra]).unwrap();
+        repo.git(&["commit", "-m", "extra"]).unwrap();
+        assert_contract_moves(
+            &repo,
+            "tracked contract deleted from the worktree only",
+            |r| std::fs::remove_file(r.resolve(extra)).unwrap(),
+        );
         assert_contract_moves(&repo, "deleted tracked contract", |r| {
             std::fs::remove_file(r.resolve("ARCHITECTURE.md")).unwrap()
         });
@@ -766,6 +814,9 @@ pub(crate) mod tests {
         std::fs::write(repo.resolve("target/x/MODULE.md"), "build output\n").unwrap();
         // Ignored files inside contract directories do not count either.
         std::fs::write(repo.resolve("policies/scratch.local"), "tmp\n").unwrap();
+        // Only files named exactly MODULE.md are crate contracts.
+        std::fs::write(repo.resolve("crates/demo/NOTMODULE.md"), "x\n").unwrap();
+        std::fs::write(repo.resolve("crates/demo/MODULE.md.bak"), "x\n").unwrap();
         std::fs::write(repo.resolve("scenarios/fixtures/a/b/c/out.local"), "tmp\n").unwrap();
         assert_eq!(repo.contract_hash(), before);
     }
@@ -857,6 +908,24 @@ pub(crate) mod tests {
         assert_contract_moves(&repo, "policies/ with trailing slash", |r| {
             std::fs::write(r.resolve("policies/architecture.toml"), "a = 2\n").unwrap()
         });
+        let with_missing = repo.contract_hash();
+        for config in ["[\"policies/\"]", "[\"policies\"]"] {
+            std::fs::write(
+                repo.resolve("harness.toml"),
+                format!("[protection]\nroot_contract_paths = {config}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                repo.contract_hash(),
+                with_missing,
+                "{config}: trailing slash and absent paths are equivalent"
+            );
+        }
+        std::fs::write(
+            repo.resolve("harness.toml"),
+            "[protection]\nroot_contract_paths = [\"policies/\", \"missing/\"]\n",
+        )
+        .unwrap();
         assert_contract_moves(&repo, "configured path created later", |r| {
             std::fs::create_dir_all(r.resolve("missing")).unwrap();
             std::fs::write(r.resolve("missing/x.md"), "x\n").unwrap();
@@ -882,6 +951,9 @@ pub(crate) mod tests {
         std::fs::create_dir_all(dir.join("scenarios/product")).unwrap();
         std::fs::write(dir.join("PRODUCT.md"), "p\n").unwrap();
         std::fs::write(dir.join("scenarios/product/s.toml"), "s\n").unwrap();
+        // A `.git` file pointing nowhere makes git fail here instead of
+        // searching parent directories for an enclosing repository.
+        std::fs::write(dir.join(".git"), "gitdir: nonexistent\n").unwrap();
         let repo = Repo { root: dir.clone() };
         assert!(
             repo.git(&["rev-parse", "--git-dir"]).is_err(),
