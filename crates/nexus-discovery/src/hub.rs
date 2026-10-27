@@ -554,9 +554,18 @@ fn record_metrics(metrics: &DiscoveryMetrics, out: &[ResolvedAddr]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn peer(id: &str) -> PeerId {
         PeerId(id.to_string())
+    }
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port)
+    }
+
+    fn hex_id(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
     }
 
     fn lsa(id: &str, locator: Option<&str>) -> Lsa {
@@ -597,6 +606,122 @@ mod tests {
         // `all_lsas` filters with the last injected time.
         hub.note_lsa_heard(&peer("n2"), stale);
         assert!(hub.all_lsas().is_empty());
+    }
+
+    /// AC13-2: one writer (`upsert_lsa` ×1000) racing one reader
+    /// (`resolve` / `known_peers` ×1000) must not panic, deadlock, or return a
+    /// torn snapshot.
+    #[test]
+    fn concurrent_read_write() {
+        let hub = std::sync::Arc::new(hub_with(&[]));
+        let t0 = Instant::now();
+        let writer = {
+            let hub = std::sync::Arc::clone(&hub);
+            std::thread::spawn(move || {
+                for i in 0..1000u32 {
+                    let id = hex_id((i % 32) as u8);
+                    let mut l = lsa(&id, Some(&format!("udp://10.0.0.{}:19010", (i % 250) + 1)));
+                    l.seq = u64::from(i) + 1;
+                    hub.upsert_lsa(l, t0 + Duration::from_millis(u64::from(i)));
+                }
+            })
+        };
+        let reader = {
+            let hub = std::sync::Arc::clone(&hub);
+            std::thread::spawn(move || {
+                for i in 0..1000u32 {
+                    let now = t0 + Duration::from_millis(u64::from(i));
+                    let known = hub.known_peers(now);
+                    assert!(known.windows(2).all(|w| w[0].0 <= w[1].0));
+                    for p in &known {
+                        for resolved in hub.resolve(p, now) {
+                            // Locator addresses are gossip endpoints; a torn
+                            // snapshot would show a half-written entry.
+                            assert_eq!(resolved.addr.port(), 19010);
+                        }
+                    }
+                    let _ = hub.peer_source_map(now);
+                }
+            })
+        };
+        writer.join().expect("writer thread");
+        reader.join().expect("reader thread");
+        assert_eq!(hub.lsdb_len(), 32);
+    }
+
+    #[test]
+    fn peer_source_map_orders_by_hex() {
+        let hub = hub_with(&[(hex_id(0xbb).as_str(), addr(9001))]);
+        let t0 = Instant::now();
+        hub.upsert_lsa(lsa(&hex_id(0xaa), Some("udp://10.0.0.2:19010")), t0);
+        let map = hub.peer_source_map(t0);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[0].0, peer(&hex_id(0xaa)));
+        assert_eq!(map[0].1, vec![DiscoverySource::Lsa]);
+        assert_eq!(map[1].0, peer(&hex_id(0xbb)));
+        assert_eq!(map[1].1, vec![DiscoverySource::Static]);
+        let known = hub.known_peers(t0);
+        assert_eq!(known, vec![peer(&hex_id(0xaa)), peer(&hex_id(0xbb))]);
+    }
+
+    #[test]
+    fn static_single_addr_sentinel() {
+        // Empty `addrs` maps to the 0.0.0.0:0 sentinel (shipped behaviour); the
+        // peer still counts as a static source so the subscription survives.
+        let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let hub = DiscoveryHub::new(
+            peer("self"),
+            [(peer("aa"), sentinel)],
+            None,
+            Duration::from_secs(90),
+        );
+        let t0 = Instant::now();
+        let map = hub.peer_source_map(t0);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, peer("aa"));
+        assert_eq!(map[0].1, vec![DiscoverySource::Static]);
+        assert_eq!(hub.known_peers(t0), vec![peer("aa")]);
+        assert_eq!(hub.resolve(&peer("aa"), t0)[0].addr, sentinel);
+    }
+
+    #[test]
+    fn resolve_priority_paired_over_static() {
+        use crate::paired::{PairedDiscovery, PairedPeer};
+
+        let hex = hex_id(0xcc);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&crate::paired::hex_decode(&hex).unwrap());
+        let mut paired = PairedDiscovery::new();
+        paired.insert(&PairedPeer {
+            peer_id: bytes,
+            name: "paired".to_string(),
+            addresses: vec![addr(9100)],
+            paired_at: 0,
+        });
+        let hub = DiscoveryHub::new(
+            peer("self"),
+            [(peer(&hex), addr(9000))],
+            None,
+            Duration::from_secs(90),
+        )
+        .with_paired(paired);
+        let t0 = Instant::now();
+        hub.upsert_lsa(lsa(&hex, Some("udp://10.0.0.1:9200")), t0);
+        let resolved = hub.resolve(&peer(&hex), t0);
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].source, DiscoverySource::Paired);
+        assert_eq!(resolved[0].addr, addr(9100));
+        assert_eq!(resolved[1].source, DiscoverySource::Static);
+        assert_eq!(resolved[2].source, DiscoverySource::Lsa);
+        // Source labels follow priority order.
+        assert_eq!(
+            hub.peer_source_map(t0)[0].1,
+            vec![
+                DiscoverySource::Paired,
+                DiscoverySource::Static,
+                DiscoverySource::Lsa
+            ]
+        );
     }
 
     #[test]
