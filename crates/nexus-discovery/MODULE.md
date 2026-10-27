@@ -4,9 +4,14 @@
 
 执行 Bootstrap、Peer Discovery、Endpoint/Candidate Exchange 与 Presence 建立。
 
+`DiscoveryHub`（`src/hub.rs`）持有进程内唯一的发现快照：LSDB、mDNS 缓存、静态表、
+可选 paired 表与 LSA 新鲜度窗口。
+
 ## Non-Responsibilities
 
 不承担长期业务数据转发，不决定业务 Provider，不拥有 Session。
+不实现 `Discovery` trait（trait 的 `resolve`/`peers` 无时间参数，无法表达新鲜度）；
+不发起 socket/线程/文件 I/O；不做 relay 触发或路径决策。
 
 ## Inputs
 
@@ -35,6 +40,11 @@
 
 - Discovery != Connectivity Establishment。
 - Bootstrap 不成为已建立 Session 的长期数据依赖。
+- 每进程只有一个 `DiscoveryHub` 实例（N1 适配器、pump、peer-source feed 共享同一 `Arc`）。
+- hub 的每个查询都显式接收 `now`；不得在读路径上隐式取时（`all_lsas` 用最近注入的时间戳过滤）。
+- 锁内只做内存状态机：不得在持锁期间 send/connect/文件/`thread::spawn`/join。
+- LSA 新鲜度：`lsa_heard + lsa_stale_after > now` 才算发现源；LSDB 不 evict（过期条目仍留在库内）。
+- `peer_source_map` / `known_peers` 的顺序固定为 PeerId 64-hex 升序（不依赖 `HashMap` 迭代顺序）。
 
 ## Side Effects
 
@@ -129,6 +139,40 @@
 
 冻结语义：`resolve` 只做静态表查询，不发起网络 I/O、不建立 Connectivity（Discovery != Connectivity Establishment）；P0 的 Peer/Endpoint 关系由组合根以静态表注入。
 
+### 契约（peer-source-discovery-wiring，spec §4.10 / §6.1）
+
+`pub struct DiscoveryHub`（`crates/nexus-discovery/src/hub.rs`）：owned 发现快照，
+每进程唯一实例，由 `nexus::network::build_session_manager_with_discovery` 构造。
+
+- `pub fn new(self_id, static_peers: impl IntoIterator<Item = (PeerId, SocketAddr)>, mdns: Option<MdnsDiscovery>, lsa_stale_after: Duration) -> Self`
+  `static_peers` 每 peer 恰一个地址：代表性地址 = `N1PeerEntry.addrs[0]`（空 `addrs` →
+  `0.0.0.0:0` 哨兵），映射由组合根唯一一次完成。
+- `pub fn with_paired(self, paired: PairedDiscovery) -> Self`
+- `pub fn self_id(&self) -> PeerId`
+- `pub fn resolve(&self, peer: &PeerId, now: Instant) -> Vec<ResolvedAddr>`：Paired > Static > LSA > mDNS，
+  同地址去重保留最高优先级（与 `AggregateDiscovery` 共用 `aggregate::merge_ranked`）。
+- `pub fn known_peers(&self, now: Instant) -> Vec<PeerId>`：static ∪ paired ∪ 新鲜 LSA ∪ mDNS 缓存，
+  排除 self，PeerId 64-hex 升序。
+- `pub fn peer_source_map(&self, now: Instant) -> Vec<(PeerId, Vec<DiscoverySource>)>`：每 peer 命中的
+  来源列表（顺序 paired,static,lsa,mdns），排除 self，64-hex 升序。
+- `pub fn fresh_lsa_peers(&self, now: Instant) -> Vec<PeerId>`
+- `pub fn neighbor_candidates(&self, now: Instant) -> Vec<ResolvedAddr>`：新鲜 LSA locator ∪ mDNS 缓存地址
+  （同地址去重；自身 advertise 端点由调用方过滤）。
+- LSA 状态机：`upsert_lsa`（Stale 也刷新存活时间戳）、`note_lsa_heard`、`set_self_lsa`、`self_lsa`、
+  `all_lsas`（仅新鲜、不含 self）、`lsdb_len`、`should_flood`。
+- mDNS 委托：`mdns_enabled` / `mdns_query` / `mdns_announce` / `mdns_handle_datagram` / `mdns_prune` /
+  `mdns_cached_peers`（`mdns = None` 时全部惰性返回 None/空/0，不 panic）。
+- `pub fn metrics(&self) -> DiscoveryMetricsSnapshot`。
+
+**`DiscoveryHub` 不实现 `Discovery` trait**（不存在 `impl Discovery for DiscoveryHub`）：
+trait 的 `resolve`/`peers` 没有 `now` 参数，hub 的全部新鲜度语义必须由调用方显式注入时间才可判定；
+N1 侧只经 `apps/nexus/src/network.rs` 的 `N1Discovery` 适配器桥接（`hub.resolve(peer, Instant::now())`）。
+`FreshLsaView` 是 hub 内部的一次性适配器（私有），不是公开 trait 实现。
+
+`pub trait Discovery` 新增 `fn peers(&self) -> Vec<PeerId> { Vec::new() }`（默认空，不破坏既有实现）；
+`StaticDiscovery` / `PairedDiscovery` / `MdnsDiscovery` / `LsaDiscovery` / `AggregateDiscovery` 提供实现。
+`lsa` 新增 `pub const CAP_RELAY: u32 = 0x01; CAP_EXIT_NODE: u32 = 0x02; CAP_TUN: u32 = 0x04;`。
+
 ### 常规要求
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
@@ -144,6 +188,14 @@ cargo clippy -p nexus-discovery --all-targets -- -D warnings
 ```
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
+
+Hub（spec AC13）：
+```text
+cargo test -p nexus-discovery hub::
+```
+覆盖 `hub::tests::concurrent_read_write`、`peer_source_map_orders_by_hex`、
+`static_single_addr_sentinel`、`resolve_priority_paired_over_static`、
+`lsa_freshness_window_filters_stale`、`self_lsa_excluded_from_all_lsas`、`mdns_none_is_inert`。
 
 ## Performance Budget
 
