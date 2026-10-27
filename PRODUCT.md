@@ -969,7 +969,7 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   -> 有界 channel（1024）-> Dataplane owner 线程
   -> TransparentPipeline（nexus-projection::transparent，core 不读时钟/不做系统调用）
   -> Direct：DirectEgress；Proxy：ProxyFlowEgress（真实代理字节流 / UDP 中继）
-  -> UDP 回包经 sendmsg + IP_PKTINFO 以 orig_dst 为源地址发出
+  -> UDP 回包以 orig_dst（IP 与端口）为源地址发出
 ```
 
 - **规则与决策（G2/G3）**：`apps/nexusd` 直接构造 `nexus_proxy::DomainRuleEngine`
@@ -981,6 +981,13 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   `upstream_failed`。ICMP/分片/非 TCP-UDP 计 `direct_dropped_unsupported`，不伪装成功。
 - **会话层（G4）**：`auto` 在 `proxy.yaml` 派生 Provider 非空时启用，否则
   `disabled/no_providers`；`enabled=true` 且无 provider 源时 Proxy 流显式 RST（不静默直连）。
+- **UDP 回包源地址（requirement-change 2026-10-27，E5 S2）**：客户端收到的回包源
+  地址必须恰为它发出时的原始目的地 `orig_dst`（IP **与端口**），否则使用 connected UDP
+  socket 的应用（DNS、游戏、QUIC）会丢弃回包。回包经按 `orig_dst` 复用的
+  `IP_TRANSPARENT` 回包 socket（bind `orig_dst` 后 `sendto` 客户端）发出；回包 socket
+  数量有界（LRU 淘汰），随 TPROXY UDP 前端一起关闭。为某个 `orig_dst` 建立回包 socket
+  失败（如该地址端口已被本机其它 socket 独占）时丢弃该回包并计 `udp_reply_failed`，
+  **不得**以监听端口或其它源端口冒充发出。
 - **平台边界（ARCHITECTURE §10/§11）**：`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` /
   `IP_PKTINFO` 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core
   （`nexus-projection` / `nexus-domain` / `nexus-proxy`）不直接调用平台 API、不取系统时间。

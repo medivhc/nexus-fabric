@@ -165,11 +165,15 @@ assert_file_empty() {
 
 setup_host_alias() {
     timeout 10 sudo -n "${IP}" netns delete "${NS_HOST}" >/dev/null 2>&1 || true
-    timeout 10 sudo -n "${IP}" netns attach "${NS_HOST}" 1 >/dev/null 2>&1 || {
-        record "FAIL host_alias_attach ns=${NS_HOST}"
+    # The host netns is PID 1's by default. Sandboxes that hide PID 1's
+    # namespaces can point NEXUS_E5_HOST_PID at a process in the host netns
+    # (e.g. the invoking shell).
+    local host_pid="${NEXUS_E5_HOST_PID:-1}"
+    timeout 10 sudo -n "${IP}" netns attach "${NS_HOST}" "${host_pid}" >/dev/null 2>&1 || {
+        record "FAIL host_alias_attach ns=${NS_HOST} pid=${host_pid}"
         return 1
     }
-    record "host_alias=${NS_HOST} (pid 1 netns)"
+    record "host_alias=${NS_HOST} (pid ${host_pid} netns)"
 }
 
 cleanup_host_alias() {
