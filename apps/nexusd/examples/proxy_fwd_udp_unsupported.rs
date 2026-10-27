@@ -7,6 +7,8 @@
 //!   限频日志抑制计数 > 0、无直连（`direct_forwarded == 0`）。
 //! - Trojan 轮（MAJOR-5）：TLS Trojan 的 `udp_capability` 恒为
 //!   `Unsupported{TlsVariantNotSupported}` → 落 `udp_unsupported_other`。
+//! - Trojan 轮（SUG-2）：另取 MockTun 写侧（`take_written`），断言为空——
+//!   「不伪造回包」从文档说法变成机器可判（`udp.trojan_tun_written == 0`）。
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -77,6 +79,8 @@ struct Phase {
     log_suppressed: u64,
     unsupported_other: u64,
     active_kind: String,
+    /// MockTun 写侧（us → OS）包数：Trojan 轮必须为 0（不伪造回包）。
+    tun_written_packets: usize,
 }
 
 fn run_phase(kind: &str) -> Result<Phase, String> {
@@ -122,6 +126,8 @@ fn run_phase(kind: &str) -> Result<Phase, String> {
 
     // stats 同步点在 tick 头部（poll 之后）：再泵一次让 udp_send_failed 增量落账。
     let _ = dataplane.tick(now_ticks());
+    // 写侧观测（SUG-2）：排空 MockTun 的 us→OS 队列。Trojan 轮必须为空。
+    let tun_written_packets = mock.lock().unwrap().take_written().len();
     let proxy = dataplane
         .proxy_stats()
         .ok_or_else(|| "proxy stats missing".to_string())?;
@@ -134,6 +140,7 @@ fn run_phase(kind: &str) -> Result<Phase, String> {
         log_suppressed: proxy.udp_unsupported_log_suppressed,
         unsupported_other: proxy.udp_unsupported_other,
         active_kind: active_kind.as_str().to_string(),
+        tun_written_packets,
     })
 }
 
@@ -194,7 +201,8 @@ fn main() {
         && suppressed >= 3
         && vless.active_kind == "vless"
         && anytls.active_kind == "anytls"
-        && trojan.active_kind == "trojan";
+        && trojan.active_kind == "trojan"
+        && trojan.tun_written_packets == 0;
 
     let output = json!({
         "verdict": if verdict { "PASS" } else { "FAIL" },
@@ -212,6 +220,7 @@ fn main() {
         "udp.direct_forwarded": total_direct,
         "udp.log_suppressed": suppressed,
         "udp.log_suppressed_positive": suppressed > 0,
+        "udp.trojan_tun_written": trojan.tun_written_packets,
         "proxy.dropped_no_proxy": dropped,
         "outbound.vless_kind": vless.active_kind,
         "outbound.anytls_kind": anytls.active_kind,

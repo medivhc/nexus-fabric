@@ -12,7 +12,9 @@ requirement = "apps/nexusd/MODULE.md#proxy-fwd"
 #   Unsupported{TlsVariantNotSupported} → 落 udp_unsupported_other）；
 # - 每轮注入 2 个业务 UDP 包，断言全部丢弃、udp_sent == 0、无直连；
 # - udp_unsupported 与分协议计数 > 0；同一 (kind,tag) 第二条日志被 10s
-#   限频抑制（udp.log_suppressed_positive），即每轮 suppressed >= 1。
+#   限频抑制（udp.log_suppressed_positive），即每轮 suppressed >= 1；
+# - Trojan 轮另取 MockTun 写侧（`take_written`）为空：`不伪造回包` 由
+#   `udp.trojan_tun_written == 0` 钉住（SUG-2）。
 
 [when]
 command = "cargo run --quiet -p nexusd --example proxy_fwd_udp_unsupported -- --json"
@@ -52,6 +54,10 @@ equals = 0
 [[expect]]
 field = "udp.log_suppressed_positive"
 equals = true
+
+[[expect]]
+field = "udp.trojan_tun_written"
+equals = 0
 
 [[expect]]
 field = "proxy.dropped_no_proxy"
