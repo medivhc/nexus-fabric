@@ -277,6 +277,14 @@ impl NatSwitching {
             "relay kind must be Turn or Mesh"
         );
         let name = peer_name(&peer);
+        // A successful relay clears the "lost" state and makes the peer visible
+        // in `GET /connectivity/nat` with turn/turn as its state evidence
+        // (spec §4.5, AC3). Path decisions are unchanged.
+        self.relay_lost.lock().unwrap().remove(&peer.0);
+        self.punch
+            .set_tunnel_proto(peer, nexus_nat_wireup::TunnelProto::Turn);
+        self.punch
+            .set_relay_source(peer, Some(nexus_nat_wireup::RelaySource::Turn));
         self.punch.register_relay(&relay, peer);
         self.link
             .lock()
@@ -568,9 +576,70 @@ mod tests {
 #[cfg(test)]
 mod gap_tests {
     use super::*;
+    use std::time::Duration;
 
     fn pid(byte: u8) -> FabricPeerId {
         FabricPeerId([byte; 32])
+    }
+
+    /// AC3 state evidence: a registered relay clears the lost mark and makes
+    /// the peer observable as `tunnel_proto="turn"` / `relay_source="turn"`.
+    #[test]
+    fn relay_connected_sets_turn_state() {
+        let server = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind server");
+        let peer = server.shared().peer_id.expect("server identity");
+        let server_addr = *server.shared().local_addr.lock().unwrap();
+        let acceptor = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || server.accept_conn())
+        };
+        let client = Driver::new_client().expect("bind client");
+        let local = *client.shared().local_addr.lock().unwrap();
+        let conn = client
+            .connect(peer, server_addr, Duration::from_secs(5))
+            .expect("connect");
+        let _ = acceptor.join().expect("accept thread").expect("accept");
+
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let candidates = nexus_nat_traversal::LocalCandidates {
+            host: gather_host_candidates(&driver),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        };
+        let sw = NatSwitching::new(
+            driver,
+            FabricPeerId([0x33; 32]),
+            candidates,
+            Vec::new(),
+            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+        );
+        // A lost report followed by a successful relay must clear the mark.
+        RelayConnSink::on_relay_lost(sw.as_ref(), peer);
+        assert!(sw.relay_lost_peers().contains(&peer));
+        sw.on_relay_connected(RelayInfo {
+            peer,
+            relay: conn,
+            kind: PathKind::Turn,
+            local,
+            remote: server_addr,
+            remote_nat: NatType::Unknown,
+            auto_punch: false,
+        });
+        assert!(!sw.relay_lost_peers().contains(&peer));
+        let status = sw
+            .punch
+            .all_status()
+            .into_iter()
+            .find(|s| s.peer == peer)
+            .expect("peer status registered");
+        assert_eq!(status.tunnel_proto, nexus_nat_wireup::TunnelProto::Turn);
+        assert_eq!(
+            status.relay_source,
+            Some(nexus_nat_wireup::RelaySource::Turn)
+        );
+        sw.shutdown();
     }
 
     #[test]
