@@ -64,6 +64,11 @@
   （daemon/CLI 复用，N9）；启动面 `startup_surface` / `startup_warnings`、
   运行快照 `runtime_snapshot` / `runtime_outbound_json`（R2-F12：`update_file_side`
   成功即清 `file_rejected`）。
+- `nexus config check --dir <dir> [proxy.yaml]`（`outbound_check` 模块，§7.7 载体 2）：
+  单 JSON 到 stdout，exit 0/1/2；**不发 DNS、不建连、不改 schema**；输出固定句
+  `dns_resolution: skipped (performed only at daemon engine construction)`；
+  `static_valid = errors.is_empty() && selected.is_some() && selected_errors == 0`；
+  `DUPLICATE_OUTBOUND_TAG` 只 warning 不改 exit code。
   - 领域未就绪命令（connectivity trace 等）返回
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
   - CLI 前端（apps/nexus/src/main.rs + control_service.rs + localapi_client.rs）：thin-client，

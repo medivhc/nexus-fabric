@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "method": "chacha20-ietf-poly1305",
+  "info": "ss-subkey",
+  "reference": "independent-python-evp-bytestokey+hkdf-sha1",
+  "vectors": [
+    {
+      "vector_id": "sip004-vec-1",
+      "password_sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+      "password_hex": "61",
+      "password_len": 1,
+      "salt_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "expected_subkey_hex": "ebf456f1b7a0a3ba6f6a57b8c94e13f6c647f91e7c6e49ec9af3c28bee99b652"
+    },
+    {
+      "vector_id": "sip004-vec-2",
+      "password_sha256": "9f9f5111f7b27a781f1f1ddde5ebc2dd2b796bfc7365c9c28b548e564176929f",
+      "password_hex": "30313233343536373839616263646566",
+      "password_len": 16,
+      "salt_hex": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "expected_subkey_hex": "076e193f05a27e73a3719c43f57d9346470bc2df4f8f4ddfd8e4a9184378462d"
+    },
+    {
+      "vector_id": "sip004-vec-3",
+      "password_sha256": "a8ae6e6ee929abea3afcfc5258c8ccd6f85273e0d4626d26c7279f3250f77c8e",
+      "password_hex": "30313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566",
+      "password_len": 64,
+      "salt_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_subkey_hex": "425224c268bf12ac166f7625e48ba0809d9eca4482b8b3282247c53fc1be0f61"
+    },
+    {
+      "vector_id": "sip004-vec-4",
+      "password_sha256": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
+      "password_hex": "70617373776f7264",
+      "password_len": 8,
+      "salt_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_subkey_hex": "8c945d161c1cb5a06f884ba84d32352eecc2367284af3b975f921a67b804b69e"
+    }
+  ]
+}

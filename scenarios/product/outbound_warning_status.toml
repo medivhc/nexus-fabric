@@ -1,0 +1,60 @@
+schema_version = 1
+id = "product.outbound-warning-status"
+title = "出站 interop 警示（daemon/stats/status 载体）：SS partial 在启动日志、LocalAPI stats 与 nexus status 一致"
+evidence_strength = "E3"
+requirement = "apps/nexusd/MODULE.md#出站-interop-标注五载体步骤-3spec-v14-5253542026-10-26"
+
+[given]
+# 可执行 E4（example outbound_warning_status --json）：
+# - 临时配置目录：daemon.toml（临时 LocalAPI 端口 + [tun] enabled=false）+ proxy.yaml
+#   （shadowsocks 出站，MATRIX 派生 PARTIAL / TCP_ONLY / USABLE_WITH_GAPS）；
+# - 启动真实 nexusd 二进制；查询 LocalAPI /dataplane/stats 与 /status，
+#   并对 /status JSON 做 `nexus status` 的人读投影（render_text）。
+# 无 active engine 的路径不是本场景断言对象（这里 tun 关闭但出站已在启动时发布）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example outbound_warning_status -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "outbound_tag"
+equals = "ss-a"
+
+[[expect]]
+field = "outbound_kind"
+equals = "shadowsocks"
+
+[[expect]]
+field = "outbound_label"
+equals = "partial"
+
+[[expect]]
+field = "outbound_claim"
+equals = "USABLE_WITH_GAPS"
+
+[[expect]]
+field = "interop_warnings_partial"
+non_empty = true
+
+[[expect]]
+field = "status_matches_stats"
+equals = true
+
+[[expect]]
+field = "status_projection_has_label"
+equals = true
+
+[[expect]]
+field = "startup_log_has_partial"
+equals = true
+
+[[expect]]
+field = "startup_log_has_selected"
+equals = true
+
+[[expect]]
+field = "startup_warn_code"
+equals = "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT"

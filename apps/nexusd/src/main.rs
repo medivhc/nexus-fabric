@@ -401,12 +401,33 @@ fn assemble_dataplane(
     Ok(dp)
 }
 
+/// proxy.yaml 原文的 SHA-1（spec §7.6.2 `active_config_sha1` / `file_config_sha1`）。
+fn config_sha1(text: Option<&str>) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hash = Sha1::new();
+    hash.update(text.unwrap_or_default().as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+/// 发布 outbound `engine` / `dataplane` 启动事实（加法字段）。
+///
+/// no-tun 模式不构造 `ProxyEngine`；TUN 模式下 engine 由 dataplane 线程装配，
+/// 这里先标 `starting`，线程内 wiring 完成后更新为 `running`
+/// （TUN 创建/初始化失败 → `disabled`）。
+fn publish_engine_state(tun_enabled: bool) {
+    let state = if tun_enabled {
+        nexus::outbound_manifest::DataplaneState::Starting
+    } else {
+        nexus::outbound_manifest::DataplaneState::NotStarted
+    };
+    nexus::outbound_manifest::install_engine_state(false, state);
+}
+
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
 /// 为 None 时保持 D2 计数降级。
-/// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
-/// 否则 D2 计数降级。
+/// P1-P5：`proxy_yaml` 有可用出站时注入 `ProxyEngine`，Proxy 包真发；否则 D2 降级。
 /// S24：`rule_engine` 由组合根从同一份 `proxy.yaml` 构建并注入，分类走配置规则。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
 #[allow(clippy::too_many_arguments)]
@@ -439,6 +460,10 @@ fn run_dataplane(
                 eprintln!(
                     "[nexusd] dataplane: TUN creation failed ({e}); dataplane disabled, LocalAPI still serving"
                 );
+                nexus::outbound_manifest::install_engine_state(
+                    false,
+                    nexus::outbound_manifest::DataplaneState::Disabled,
+                );
                 return;
             }
         }
@@ -451,6 +476,10 @@ fn run_dataplane(
         Ok(dp) => dp,
         Err(e) => {
             eprintln!("[nexusd] dataplane: init failed ({e}); dataplane disabled");
+            nexus::outbound_manifest::install_engine_state(
+                false,
+                nexus::outbound_manifest::DataplaneState::Disabled,
+            );
             return;
         }
     };
@@ -618,6 +647,12 @@ fn run_dataplane(
     };
     #[cfg(not(target_os = "linux"))]
     let mut tproxy_frontend: Option<()> = None;
+
+    // 启动事实：dataplane 已进主循环（engine 构造与否如实）。
+    nexus::outbound_manifest::install_engine_state(
+        dp.proxy_engine_ready(),
+        nexus::outbound_manifest::DataplaneState::Running,
+    );
 
     eprintln!("[nexusd] dataplane: running");
     let _ = &mut os_assemble;
@@ -1552,6 +1587,25 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         return ExitCode::from(1);
     }
     log_enabled_subsystems(&loaded);
+
+    // 五载体（spec §7.7 载体 1/3/4）：manifest 解析失败 = 打包错误，fail-closed；
+    // 成功则打印逐出站启动面并发布进程内运行快照（stats/status 共用同一序列化）。
+    if let Err(error) = nexus::outbound_manifest::manifest() {
+        eprintln!(
+            "{}",
+            json!({"verdict":"FAIL","command":"nexusd","stage":"outbound_manifest","error":{"code":"CONFIG","message":error.to_string()}})
+        );
+        return ExitCode::from(1);
+    }
+    let outbound_surface = nexus::outbound_manifest::startup_surface(loaded.proxy_yaml.as_deref());
+    for line in &outbound_surface.lines {
+        eprintln!("{line}");
+    }
+    nexus::outbound_manifest::install_surface(
+        &outbound_surface,
+        &config_sha1(loaded.proxy_yaml.as_deref()),
+    );
+    publish_engine_state(loaded.daemon.tun.enabled);
 
     // F1：orphan FUSE 挂载收敛进 boot_reconcile 统一报告。挂载点在 reconcile
     // 之前解析，与 WorkspaceManager::start 共用 resolve_mountpoints，保证一致。
@@ -2683,12 +2737,16 @@ fn handle_localapi_request(
             let s = nexusd::dataplane::dataplane_stats_snapshot();
             let status = nexusd::dataplane::runtime_status_snapshot();
             let tproxy = nexusd::dataplane::tproxy_status_json();
-            Ok(nexusd::dataplane::dataplane_stats_json(
-                tun_enabled(),
-                &status,
-                &s,
-                tproxy,
-            ))
+            let (outbound, outbound_error) = nexus::outbound_manifest::runtime_outbound_json();
+            let mut body =
+                nexusd::dataplane::dataplane_stats_json(tun_enabled(), &status, &s, tproxy);
+            // 五载体（§7.7 载体 4）：顶层 `outbound` 块与 `nexus status` 同一序列化。
+            body["outbound"] = outbound;
+            body["interop_warnings"] = nexus::outbound_manifest::interop_warning_counts().to_json();
+            if let Some(error) = outbound_error {
+                body["outbound_error"] = error;
+            }
+            Ok(body)
         }
         "/localapi/v0/dns/status" => nexus::observability::dns_status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
