@@ -8,7 +8,7 @@ Shadowsocks 出站 crate。对外提供两套**线格式互不相同**的 API，
   `salt(32) || chunk*`，`chunk = AEAD(len 2B BE) || AEAD(payload)`，
   AEAD = `chacha20-ietf-poly1305`，AAD 恒为空。这是 `apps/nexus` SOCKS5 产品出口
   （ProductSocks5 carrier）与 `nexus-proxy-transport` 使用的线格式。
-- **离线自洽 adapter（`ShadowsocksAdapter`）**：`nexus-connectivity::OutboundAdapter`
+- **离线自洽 adapter（`ShadowsocksAdapter`）**：`nexus_proxy_config::outbound_seam::OutboundAdapter`
   面，key 由 HKDF-SHA256（盐=method 标签）派生，帧 `nonce(12B) || ct+tag`。
   **非 SIP004、无互操作证据、不在产品矩阵路径上**；线格式迁移另立 follow-up
   （spec §1.7）。本 crate 不声明它与真实 shadowsocks 服务器可互通。
@@ -36,11 +36,12 @@ method 冻结为 `chacha20-ietf-poly1305`（RustCrypto 纯 Rust 实现，wasm32-
 - `SsStream::seal(plaintext) -> Vec<u8>`（线字节增量，首非空调用含 32B salt）；
 - `SsStream::open(data) -> Vec<u8>`（当前可解出的明文，可为空）；
 - `ShadowsocksAdapter`：`OutboundHandoff`、`encrypt` / `decrypt`（离线自洽）；
+  错误类型为 `OutboundHandoffError`（当前无生产者，见 proxy-config MODULE）；
 - `OutboundCipherError { KeyDerivation, InvalidFrame, DecryptFailed }`。
 
 ## Allowed Dependencies
 
-- `nexus-connectivity`、`nexus-plugin`（既有内部边）。
+- `nexus-proxy-config`、`nexus-plugin`（既有内部边）。
 - RustCrypto 系：`chacha20poly1305`、`hkdf`、`sha2`（**仅 `ShadowsocksAdapter` 使用**）、
   `sha1`（HKDF-SHA1 内层 hash）、`md5`（EVP_BytesToKey）。
 - `ring`（`SystemRandom`，生产 salt 唯一来源；default features 关闭，仅
@@ -54,8 +55,9 @@ method 冻结为 `chacha20-ietf-poly1305`（RustCrypto 纯 Rust 实现，wasm32-
 - 平台专有拦截 API / TUN / FFI 实现（`ring` 的 cc 构建除外，已评审）。
 - 未在 `policies/architecture.toml` 声明的内部 crate。
 - `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
-  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
-  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
+  接缝 ② 已于 2026-10-28（P2）清除：出站身份/交接词汇定义于 `nexus-proxy-config`，
+  本 crate 对 `nexus-connectivity` 的直接边为 0
+  （见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`）。
 
 ## Invariants
 
@@ -115,7 +117,7 @@ impl ShadowsocksAdapter {
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, OutboundCipherError>;
     fn decrypt(&mut self, frame: &[u8]) -> Result<Vec<u8>, OutboundCipherError>;
 }
-impl nexus_connectivity::OutboundAdapter for ShadowsocksAdapter { ... }
+impl nexus_proxy_config::outbound_seam::OutboundAdapter for ShadowsocksAdapter { ... }
 
 fn write_record<W: Write + ?Sized>(&mut W, &[u8]) -> io::Result<()>;   // legacy，非 SIP004
 fn read_record<R: Read + ?Sized>(&mut R) -> io::Result<Vec<u8>>;       // legacy，非 SIP004

@@ -190,7 +190,7 @@ layer = "platform-adapter"
 
 [[crate]]
 name = "nexus-outbound-shadowsocks"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
