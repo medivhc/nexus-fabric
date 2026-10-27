@@ -4,6 +4,18 @@
 //! `RelayConnSink`s with a `ConnShared` the punch manager can signal over.
 //! Identity is **injected** (never random); seeding comes from the daemon's
 //! `[network.identity].seed_file` (BLOCKED-1 ruling (a), see evidence).
+//!
+//! Operational contract = per-peer attach + the errata in spec §4.7
+//! (O8-1..O8-12), not a literal §14.3 constructor subscription:
+//! - `subscribe(peer, sink)` per peer, `unsubscribe` explicit or via the
+//!   consumer's `RelaySubscriptionGuard`;
+//! - sink edges are `Weak` (O9), so the provider never keeps a subscriber
+//!   alive and no `NatSwitching -> provider -> NatSwitching` cycle exists;
+//! - the established relay is a **single slot** (CR-BLOCKED-3) that owns its
+//!   transport anchor (driver / listener) and is torn down outside locks;
+//! - no replay of already-established relays (O8-10): the feed asks
+//!   `established_relay_addr`, which avoids re-registering a path and dropping
+//!   the direct hot standby.
 
 use std::collections::HashMap;
 use std::fs;

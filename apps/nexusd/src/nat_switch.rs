@@ -16,11 +16,14 @@
 //! sw.shutdown();
 //! ```
 //!
-//! D5 生产触发（spec §14.3 / B15–B17）：`NatSwitching` 本身实现生产
-//! `RelayConnSink`，调用方以 `attach_relay_provider` 接入 provider，
-//! `on_relay_available` 直通 `on_relay_connected(auto_punch: true)`。
-//! loopback 验收（`nat_relay` 测试
-//! `d5_production_sink_triggers_on_relay_connected`）证明该路径。
+//! D5 生产触发：per-peer attach 模型 + 本 spec §4.7 errata（O8-1..O8-12）。
+//! `NatSwitching` 本身实现生产 `RelayConnSink`，调用方以
+//! `attach_relay_provider` 接入 provider，再按 peer `subscribe_relay_peer`
+//! 取得退订 guard；`on_relay_available` 直通
+//! `on_relay_connected(auto_punch: true)`。provider 是单槽（≤1 relay peer）、
+//! 持有 driver anchor，且**不**向新订阅者重放已建立的 relay（O8-9/O8-10：
+//! 重放会再次覆盖 `nat_conns` 并清掉 direct 热备）。loopback 验收
+//! （`nat_relay` 测试 `d5_production_sink_triggers_on_relay_connected`）证明该路径。
 //! 残留边界：生产侧按 peer 订阅（`subscribe_relay_peer`）与触发
 //! `on_turn_allocated` 需要 peer 来源（mesh 发现），daemon 内目前无 peer
 //! 源调用它们——接线与订阅机制已就位并经 loopback 证明，peer 发现触发是
