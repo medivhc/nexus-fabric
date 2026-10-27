@@ -10,7 +10,7 @@ use nexus_domain::NexusError;
 use nexus_nat_wireup::{PunchPeerStatus, RelaySource, TunnelProto};
 use serde_json::{Value, json};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatRuntimeState {
@@ -74,6 +74,32 @@ pub fn publish_nat_status_source(source: Box<dyn NatStatusSource>) {
     let _ = SOURCE.set(source);
 }
 
+static PEER_SOURCE: OnceLock<std::sync::Arc<crate::peer_source::PeerSourceStatus>> =
+    OnceLock::new();
+static DISCOVERY: OnceLock<std::sync::Arc<crate::discovery_runtime::DiscoveryPumpStatus>> =
+    OnceLock::new();
+/// OQ-2 ruling (a): the hub is registered separately so the frozen pump
+/// snapshot keeps its shape; metrics are read through `hub.metrics()`.
+static DISCOVERY_HUB: OnceLock<std::sync::Arc<nexus_discovery::hub::DiscoveryHub>> =
+    OnceLock::new();
+
+/// Register the peer-source status (first registration wins, like `SOURCE`).
+pub fn publish_peer_source_status(status: std::sync::Arc<crate::peer_source::PeerSourceStatus>) {
+    let _ = PEER_SOURCE.set(status);
+}
+
+/// Register the discovery pump status.
+pub fn publish_discovery_status(
+    status: std::sync::Arc<crate::discovery_runtime::DiscoveryPumpStatus>,
+) {
+    let _ = DISCOVERY.set(status);
+}
+
+/// Register the discovery hub (read-only metrics source for the JSON block).
+pub fn publish_discovery_hub(hub: std::sync::Arc<nexus_discovery::hub::DiscoveryHub>) {
+    let _ = DISCOVERY_HUB.set(hub);
+}
+
 pub fn nat_type_label(t: NatType) -> &'static str {
     match t {
         NatType::FullCone => "full_cone",
@@ -133,6 +159,72 @@ fn hex32(id: &[u8; 32]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `peer_source` block (spec §4.12.1).
+fn peer_source_json() -> Value {
+    let snap = PEER_SOURCE
+        .get()
+        .map(|s| s.snapshot())
+        .unwrap_or_else(|| crate::peer_source::PeerSourceStatus::default().snapshot());
+    json!({
+        "state": snap.state,
+        "enabled": snap.enabled,
+        "subscribed_peers": snap.subscribed_peers,
+        "sources": {
+            "static": snap.sources_static,
+            "paired": snap.sources_paired,
+            "lsa": snap.sources_lsa,
+            "mdns": snap.sources_mdns,
+            "n1": snap.sources_n1,
+        },
+        "invalid_peer_id_total": counter(snap.invalid_peer_id_total),
+        "subscribe_refused_total": counter(snap.subscribe_refused_total),
+        "trigger_attempts_total": counter(snap.trigger_attempts_total),
+        "trigger_ok_total": counter(snap.trigger_ok_total),
+        "trigger_fail_total": counter(snap.trigger_fail_total),
+        "trigger_capacity_parked_total": counter(snap.trigger_capacity_parked_total),
+        "trigger_parked_peers": snap.trigger_parked_peers,
+        "trigger_inflight_peers": snap.trigger_inflight_peers,
+        "book_reloads_total": counter(snap.book_reloads_total),
+        "book_errors_total": counter(snap.book_errors_total),
+        "book_last_success_ms": counter(snap.book_last_success_ms),
+        "last_error": snap.last_error,
+    })
+}
+
+/// `discovery` block (spec §4.12.1); read independently of the NAT source so a
+/// pump without a NAT stack still reports real values.
+fn discovery_json() -> Value {
+    let snap = DISCOVERY.get().map(|s| s.snapshot()).unwrap_or_default();
+    let metrics = DISCOVERY_HUB
+        .get()
+        .map(|hub| hub.metrics())
+        .unwrap_or_default();
+    json!({
+        "mdns": snap.mdns,
+        "lsa": snap.lsa,
+        "mdns_cached_peers": snap.mdns_cached_peers,
+        "lsa_lsdb_entries": snap.lsa_lsdb_entries,
+        "lsa_fresh_peers": snap.lsa_fresh_peers,
+        "mdns_queries_sent": counter(snap.mdns_queries_sent),
+        "mdns_announces_sent": counter(snap.mdns_announces_sent),
+        "lsa_hellos_sent": counter(snap.lsa_hellos_sent),
+        "lsa_adverts_sent": counter(snap.lsa_adverts_sent),
+        "lsa_adverts_recv": counter(snap.lsa_adverts_recv),
+        "lsa_floods_sent": counter(snap.lsa_floods_sent),
+        "lsa_floods_suppressed": counter(snap.lsa_floods_suppressed),
+        "lsa_decode_errors": counter(snap.lsa_decode_errors),
+        "lsa_frame_too_large": counter(snap.lsa_frame_too_large),
+        "discovery_metrics": {
+            "hits_paired": counter(metrics.hits_paired),
+            "hits_static": counter(metrics.hits_static),
+            "hits_lsa": counter(metrics.hits_lsa),
+            "hits_mdns": counter(metrics.hits_mdns),
+            "miss": counter(metrics.miss),
+        },
+        "last_error": snap.last_error,
+    })
+}
+
 pub fn connectivity_nat() -> Result<Value, NexusError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -146,6 +238,8 @@ pub fn connectivity_nat() -> Result<Value, NexusError> {
                 "runtime": NatRuntimeState::Enabled.as_str(),
                 "generated_at_ms": now,
                 "peers": peers,
+                "peer_source": peer_source_json(),
+                "discovery": discovery_json(),
             }))
         }
         None => Ok(json!({
@@ -153,6 +247,101 @@ pub fn connectivity_nat() -> Result<Value, NexusError> {
             "runtime": NatRuntimeState::Disabled.as_str(),
             "generated_at_ms": now,
             "peers": [],
+            // No NAT stack: the state row is `disabled:no-turn`, counters are
+            // all zero, and the discovery block still reports the real pump.
+            "peer_source": {
+                "state": "disabled:no-turn",
+                "enabled": false,
+                "subscribed_peers": 0,
+                "sources": { "static": 0, "paired": 0, "lsa": 0, "mdns": 0, "n1": 0 },
+                "invalid_peer_id_total": 0,
+                "subscribe_refused_total": 0,
+                "trigger_attempts_total": 0,
+                "trigger_ok_total": 0,
+                "trigger_fail_total": 0,
+                "trigger_capacity_parked_total": 0,
+                "trigger_parked_peers": 0,
+                "trigger_inflight_peers": 0,
+                "book_reloads_total": 0,
+                "book_errors_total": 0,
+                "book_last_success_ms": 0,
+                "last_error": Value::Null,
+            },
+            "discovery": discovery_json(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer_source::{PeerSourceStateInputs, decide_state};
+
+    fn inputs(
+        enabled: bool,
+        feed: bool,
+        nat: bool,
+        provider: bool,
+        hub: bool,
+        sessions: bool,
+    ) -> PeerSourceStateInputs {
+        PeerSourceStateInputs {
+            enabled,
+            feed,
+            has_nat_switch: nat,
+            has_provider: provider,
+            has_hub: hub,
+            has_sessions: sessions,
+        }
+    }
+
+    /// AC7: the six rows of §4.11.1, asserted exactly and in judgment order.
+    #[test]
+    fn peer_source_state_table() {
+        // 1. config off (enabled=false, then feed=false; both outrank no-turn).
+        assert_eq!(
+            decide_state(inputs(false, true, false, false, false, false)),
+            "disabled:config"
+        );
+        assert_eq!(
+            decide_state(inputs(true, false, false, false, false, false)),
+            "disabled:config"
+        );
+        // 2..5: the remaining disabled reasons, in order.
+        assert_eq!(
+            decide_state(inputs(true, true, false, true, true, true)),
+            "disabled:no-turn"
+        );
+        assert_eq!(
+            decide_state(inputs(true, true, true, false, true, true)),
+            "disabled:no-provider"
+        );
+        assert_eq!(
+            decide_state(inputs(true, true, true, true, false, false)),
+            "disabled:no-discovery"
+        );
+        assert_eq!(
+            decide_state(inputs(true, true, true, true, true, false)),
+            "disabled:no-sessions"
+        );
+        // 6. all preconditions met.
+        assert_eq!(
+            decide_state(inputs(true, true, true, true, true, true)),
+            "running"
+        );
+    }
+
+    #[test]
+    fn connectivity_nat_keeps_both_blocks_without_a_source() {
+        // No NatSwitching registered in this process.
+        let v = connectivity_nat().expect("snapshot");
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["peer_source"]["state"], "disabled:no-turn");
+        assert_eq!(v["peer_source"]["enabled"], false);
+        assert!(v["peer_source"]["last_error"].is_null());
+        // Discovery block is present and shaped even when the pump never ran.
+        assert!(v["discovery"]["mdns"].is_string());
+        assert_eq!(v["discovery"]["discovery_metrics"]["miss"], 0);
+        assert!(v["peers"].as_array().expect("peers array").is_empty());
     }
 }
