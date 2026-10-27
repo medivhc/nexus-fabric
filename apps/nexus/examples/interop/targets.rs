@@ -147,6 +147,14 @@ impl TargetSet {
                     resp.extend_from_slice(HTTP_BODY);
                     let _ = stream.write_all(&resp);
                     let _ = stream.flush();
+                    // Close our side, then drain what the peer still sends. Closing
+                    // with unread request bytes makes the kernel send RST, and the
+                    // RST makes the reference discard the unread 404: the negative
+                    // case then "passes" by losing the fallback page, not by the
+                    // client rejecting it (seen 2026-10-27 in the pcap).
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
                 });
             }
         }));
