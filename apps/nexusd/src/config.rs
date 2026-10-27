@@ -1420,6 +1420,11 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if old.daemon.turn != new.daemon.turn {
         return ChangeKind::NeedsRestart;
     }
+    // daemon.toml：[network.discovery] 小节变化需重启（pump/feed 生命周期
+    // 需重建；与 [network.turn] 同口径，spec §4.11.1）。
+    if old.daemon.discovery != new.daemon.discovery {
+        return ChangeKind::NeedsRestart;
+    }
     // daemon.toml：[network.proxy] 小节变化需重启（#3：代理客户端生命周期需重建）
     if old.daemon.proxy != new.daemon.proxy {
         return ChangeKind::NeedsRestart;
@@ -2598,6 +2603,88 @@ password=\"p\"\n\
         assert!(cfg.tun.exclude_server_routes_explicit);
         assert!(parse_daemon_toml("[tun]\ndefault_route = \"yes\"\n").is_err());
         assert!(parse_daemon_toml("[tun]\nexclude_server_routes = 1\n").is_err());
+    }
+    // ---------- [network.discovery]（AC1） ----------
+
+    #[test]
+    fn discovery_section_defaults() {
+        let d = DiscoverySection::default();
+        assert!(d.enabled);
+        assert!(d.mdns);
+        assert!(d.lsa);
+        assert!(d.feed);
+        assert_eq!(d.gossip_port, 19010);
+        assert_eq!(d.advertise_ip, None);
+        assert_eq!(d.lsa_refresh_sec, 30);
+        assert_eq!(d.lsa_stale_sec, 90);
+        assert_eq!(d.book_poll_ms, 5000);
+        assert_eq!(d.trigger_max_failures, 3);
+        // An absent section parses to exactly the defaults.
+        let parsed = parse_daemon_toml("").expect("empty daemon.toml");
+        assert_eq!(parsed.discovery, DiscoverySection::default());
+    }
+
+    #[test]
+    fn discovery_section_validation_rejects() {
+        let cases = [
+            "[network.discovery]\ngossip_port = 0\n",
+            "[network.discovery]\ngossip_port = 5353\n",
+            "[network.discovery]\nlsa_refresh_sec = 30\nlsa_stale_sec = 59\n",
+            "[network.discovery]\nlsa_refresh_sec = 31\nlsa_stale_sec = 61\n",
+            "[network.discovery]\nbook_poll_ms = 999\n",
+            "[network.discovery]\ntrigger_max_failures = 0\n",
+            "[network.discovery]\nadvertise_ip = \"not-an-ip\"\n",
+        ];
+        for text in cases {
+            assert!(
+                parse_daemon_toml(text).is_err(),
+                "expected CONFIG error for: {text}"
+            );
+        }
+        // Boundary values are accepted.
+        let ok = "[network.discovery]\ngossip_port = 19011\nadvertise_ip = \"10.1.2.3\"\n\
+                  lsa_refresh_sec = 5\nlsa_stale_sec = 60\nbook_poll_ms = 1000\n\
+                  trigger_max_failures = 10\n";
+        let parsed = parse_daemon_toml(ok).expect("boundary values must parse");
+        assert_eq!(parsed.discovery.gossip_port, 19011);
+        assert_eq!(
+            parsed.discovery.advertise_ip,
+            Some("10.1.2.3".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn relay_book_dir_validation() {
+        let base = "[network.turn]\nserver = \"127.0.0.1:3478\"\nrealm = \"nexus\"\n\
+                    username = \"u\"\npassword = \"p\"\n";
+        let absent = parse_daemon_toml(base).expect("turn without book dir");
+        assert_eq!(absent.turn.expect("turn").relay_book_dir, None);
+
+        let empty = format!("{base}relay_book_dir = \"\"\n");
+        assert!(parse_daemon_toml(&empty).is_err());
+
+        let explicit = format!("{base}relay_book_dir = \"/tmp/nexus-relay-book\"\n");
+        let parsed = parse_daemon_toml(&explicit).expect("explicit dir");
+        assert_eq!(
+            parsed.turn.expect("turn").relay_book_dir,
+            Some(std::path::PathBuf::from("/tmp/nexus-relay-book"))
+        );
+    }
+
+    #[test]
+    fn discovery_change_needs_restart() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-discovery");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, DAEMON_TOML, "[network.discovery]\nlsa = true\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        write(&d, DAEMON_TOML, "[network.discovery]\nlsa = false\n");
+        let new = load(&dir).unwrap();
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        let same = load(&dir).unwrap();
+        assert_eq!(classify_change(&new, &same), ChangeKind::Hot);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
