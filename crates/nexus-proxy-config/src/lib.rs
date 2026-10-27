@@ -3513,6 +3513,8 @@ mod config_error_matrix_tests {
         let err = parse(yaml).unwrap_err();
         assert_eq!(err.field, "outbounds[0].tag");
         assert!(err.reason.contains("whitespace"), "{err:?}");
+    }
+}
 
 #[cfg(test)]
 mod outbound_interop_warning_tests {
