@@ -1414,6 +1414,20 @@ mod feed_tests {
             std::thread::sleep(Duration::from_millis(60));
         }
 
+        /// Wait until the fake relay has recorded `n` trigger calls (the call is
+        /// made on a spawned thread, so it is observable only after a yield).
+        fn wait_calls(&self, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.relay.calls().len() < n && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                self.relay.calls().len() >= n,
+                "expected {n} trigger calls, saw {}",
+                self.relay.calls().len()
+            );
+        }
+
         fn run_until(
             &mut self,
             mut pred: impl FnMut(&PeerSourceStatusSnapshot) -> bool,
@@ -1724,7 +1738,8 @@ mod feed_tests {
         h.inject_lsa(0x31);
         h.book.set(peer(0x31), addr(5001));
         assert_eq!(h.tick().trigger_attempts_total, 1);
-        h.drain();
+        h.wait_calls(1);
+        h.run_until(|s| s.trigger_ok_total == 1, 10);
         for _ in 0..10 {
             h.tick();
         }
@@ -1739,13 +1754,13 @@ mod feed_tests {
         h.inject_lsa(0x32);
         h.book.set(peer(0x32), addr(5002));
         h.tick();
-        h.drain();
-        h.tick();
+        h.wait_calls(1);
+        h.run_until(|s| s.trigger_ok_total == 1, 10);
         assert_eq!(h.relay.calls().len(), 1);
         h.book.set(peer(0x32), addr(6002));
         h.tick();
-        h.drain();
-        h.tick();
+        h.wait_calls(2);
+        h.run_until(|s| s.trigger_ok_total == 2, 10);
         let calls = h.relay.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].1, addr(6002));
@@ -1762,8 +1777,9 @@ mod feed_tests {
         // Three failures with the frozen 1s/2s backoff -> Parked{MaxFailures}.
         h.run_until(|s| s.trigger_fail_total == 1, 20);
         h.run_until(|s| s.trigger_fail_total == 2, 20);
-        let snap = h.run_until(|s| s.trigger_parked_peers == 1, 20);
+        let snap = h.run_until(|s| s.trigger_parked_peers == 1, 30);
         assert_eq!(snap.trigger_fail_total, 3);
+        h.wait_calls(3);
         assert_eq!(h.relay.calls().len(), 3);
         // Parked and unchanged: no new attempts.
         for _ in 0..3 {
@@ -1773,8 +1789,8 @@ mod feed_tests {
 
         // Book address change re-arms and triggers again.
         h.book.set(peer(0x33), addr(6003));
-        h.run_until(|s| s.trigger_attempts_total == 4, 20);
-        h.drain();
+        h.run_until(|s| s.trigger_attempts_total == 4, 30);
+        h.wait_calls(4);
         assert_eq!(h.relay.calls().len(), 4);
         h.finish();
     }
@@ -1791,8 +1807,9 @@ mod feed_tests {
         let snap = h.tick_at(h.clock + Duration::from_millis(100));
         assert_eq!(snap.trigger_attempts_total, 1);
         // Keep ticking without changing the address: 3 attempts then parked.
-        let snap = h.run_until(|s| s.trigger_parked_peers == 1, 30);
+        let snap = h.run_until(|s| s.trigger_parked_peers == 1, 40);
         assert_eq!(snap.trigger_fail_total, 3);
+        h.wait_calls(3);
         assert_eq!(h.relay.calls().len(), 3);
         for _ in 0..5 {
             h.tick();
@@ -1814,7 +1831,7 @@ mod feed_tests {
         let snap = h.tick_at(t0 + Duration::from_secs(31));
         assert_eq!(snap.trigger_fail_total, 1);
         assert_eq!(snap.trigger_inflight_peers, 0);
-        h.drain();
+        h.wait_calls(1);
         assert_eq!(h.relay.calls().len(), 1);
         // Release the blocked thread so the test does not leak a waiter.
         let (lock, cv) = &*gate;
@@ -1837,12 +1854,11 @@ mod feed_tests {
         assert_eq!(snap.trigger_attempts_total, 1);
         assert_eq!(snap.trigger_capacity_parked_total, 1);
         assert_eq!(snap.trigger_parked_peers, 1);
-        h.drain();
+        h.wait_calls(1);
         let calls = h.relay.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, peer(0x0a), "hex-smaller peer wins the tie");
-        h.tick();
-        assert_eq!(h.status.snapshot().trigger_ok_total, 1);
+        h.run_until(|s| s.trigger_ok_total == 1, 10);
         // The loser stays parked without re-counting.
         for _ in 0..5 {
             h.tick();
@@ -1859,7 +1875,7 @@ mod feed_tests {
         let snap = h.tick_at(stale);
         assert_eq!(snap.trigger_attempts_total, 2);
         assert_eq!(snap.trigger_capacity_parked_total, 1);
-        h.drain();
+        h.wait_calls(2);
         let calls = h.relay.calls();
         assert_eq!(calls.last().unwrap().0, peer(0x0b));
         h.finish();
@@ -1872,6 +1888,7 @@ mod feed_tests {
         h.tick();
         h.inject_lsa(0x0a); // L subscribes later
         h.tick();
+        h.wait_calls(1);
         let calls = h.relay.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, peer(0x0b), "earlier subscription tick wins");

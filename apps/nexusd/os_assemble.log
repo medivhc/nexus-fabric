@@ -14,3 +14,11 @@
 {"ts":1793081619552,"op":"apply_dry_run","ifname":"lo","result":"ok"}
 {"ts":1793081619552,"op":"cleanup_start","ifname":"lo"}
 {"ts":1793081619552,"op":"cleanup_done","ifname":"lo","addrs_removed":"0","routes_removed":"0"}
+{"ts":1793082461219,"op":"apply_start","ifname":"lo","tun_ip":"10.99.0.1","dry_run":"true"}
+{"ts":1793082461220,"op":"apply_dry_run","ifname":"lo","result":"ok"}
+{"ts":1793082461220,"op":"cleanup_start","ifname":"lo"}
+{"ts":1793082461220,"op":"cleanup_done","ifname":"lo","addrs_removed":"0","routes_removed":"0"}
+{"ts":1793083410644,"op":"apply_start","ifname":"lo","tun_ip":"10.99.0.1","dry_run":"true"}
+{"ts":1793083410647,"op":"apply_dry_run","ifname":"lo","result":"ok"}
+{"ts":1793083410648,"op":"cleanup_start","ifname":"lo"}
+{"ts":1793083410648,"op":"cleanup_done","ifname":"lo","addrs_removed":"0","routes_removed":"0"}
