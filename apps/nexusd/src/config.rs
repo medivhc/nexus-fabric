@@ -226,7 +226,7 @@ impl DiscoverySection {
         let stale_min = std::cmp::max(60, self.lsa_refresh_sec.saturating_mul(2));
         if !(stale_min..=3600).contains(&self.lsa_stale_sec) {
             return Err(format!(
-                "[network.discovery].lsa_stale_sec must be {stale_min}..=3600                  (>= 2x lsa_refresh_sec), got {}",
+                "[network.discovery].lsa_stale_sec must be {stale_min}..=3600 (>= 2x lsa_refresh_sec), got {}",
                 self.lsa_stale_sec
             ));
         }
