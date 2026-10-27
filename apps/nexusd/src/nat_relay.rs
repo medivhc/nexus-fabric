@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use nexus_fabric::{ConnShared, Driver, FabricIdentity, FabricListener, PeerId as FabricPeerId};
@@ -178,7 +178,25 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], ()> {
 }
 
 /// Per-peer sink lists.
-type SinkMap = HashMap<[u8; 32], Vec<Arc<dyn RelayConnSink>>>;
+///
+/// O9: the provider must not own its subscribers. Strong `Arc`s here formed a
+/// cycle (`NatSwitching -> provider -> NatSwitching`) that made teardown
+/// impossible; a `Weak` edge plus the explicit unsubscribe guard breaks it.
+type SinkMap = HashMap<[u8; 32], Vec<Weak<dyn RelayConnSink>>>;
+
+/// Prune dead weak sinks for one peer; returns the live count.
+fn prune_peer(sinks: &mut SinkMap, peer: &[u8; 32]) -> usize {
+    if let Some(list) = sinks.get_mut(peer) {
+        list.retain(|w| w.strong_count() > 0);
+        let live = list.len();
+        if live == 0 {
+            sinks.remove(peer);
+        }
+        live
+    } else {
+        0
+    }
+}
 
 /// Production TURN relay provider.
 pub struct TurnRelayProvider {
@@ -273,12 +291,16 @@ impl TurnRelayProvider {
             relayed: peer_relayed,
             kind: RelayKind::Turn,
         };
-        if let Ok(sinks) = self.sinks.lock() {
+        if let Ok(mut sinks) = self.sinks.lock() {
             if let Some(list) = sinks.get(&peer.0) {
-                for sink in list {
-                    sink.on_relay_available(info.clone());
+                for weak in list.iter() {
+                    if let Some(sink) = weak.upgrade() {
+                        sink.on_relay_available(info.clone());
+                    }
                 }
             }
+            // Drop entries whose owner went away (prune after dispatch).
+            prune_peer(&mut sinks, &peer.0);
         }
         Ok(RelayConn {
             conn,
@@ -294,10 +316,42 @@ impl TurnRelayProvider {
     }
 }
 
+impl TurnRelayProvider {
+    /// Live sink count for one peer (prunes dead entries first).
+    pub fn sink_count(&self, peer: &FabricPeerId) -> usize {
+        match self.sinks.lock() {
+            Ok(mut g) => prune_peer(&mut g, &peer.0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Peers with at least one live sink (prunes dead entries first).
+    pub fn subscribed_peers(&self) -> Vec<FabricPeerId> {
+        let mut out = Vec::new();
+        if let Ok(mut g) = self.sinks.lock() {
+            let peers: Vec<[u8; 32]> = g.keys().copied().collect();
+            for peer in peers {
+                if prune_peer(&mut g, &peer) > 0 {
+                    out.push(FabricPeerId(peer));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
 impl RelayConnProvider for TurnRelayProvider {
     fn subscribe(&self, peer: FabricPeerId, sink: Arc<dyn RelayConnSink>) {
         if let Ok(mut g) = self.sinks.lock() {
-            g.entry(peer.0).or_default().push(sink);
+            let weak = Arc::downgrade(&sink);
+            let list = g.entry(peer.0).or_default();
+            // Same `Arc` subscribed twice for the same peer must not duplicate
+            // deliveries.
+            if list.iter().any(|existing| Weak::ptr_eq(existing, &weak)) {
+                return;
+            }
+            list.push(weak);
         }
     }
 }
@@ -407,8 +461,12 @@ mod tests {
         let pb = TurnRelayProvider::new(b_id, id_b, tb, book.clone());
         let (txa, rxa) = mpsc::channel();
         let (txb, rxb) = mpsc::channel();
-        pa.subscribe(b_id, Arc::new(Sink(txa)));
-        pb.subscribe(a_id, Arc::new(Sink(txb)));
+        // O9: the sink map holds `Weak` edges, so the owner keeps the sink
+        // alive for the duration of the subscription.
+        let sink_a = Arc::new(Sink(txa));
+        let sink_b = Arc::new(Sink(txb));
+        pa.subscribe(b_id, sink_a.clone());
+        pb.subscribe(a_id, sink_b.clone());
 
         let ha = {
             let pa = pa.clone();
@@ -427,6 +485,8 @@ mod tests {
         assert!(got_a.is_ok(), "sink on A not fed");
         assert!(got_b.is_ok(), "sink on B not fed");
         assert_eq!(got_a.unwrap().kind, RelayKind::Turn);
+        drop(sink_a);
+        drop(sink_b);
         let _ = std::fs::remove_file(&book_path);
     }
 
