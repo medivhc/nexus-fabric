@@ -176,6 +176,77 @@ mod tests {
         client.stream_finish(stream);
     }
 
+    /// Reads until EOF (or an error), giving up after `limit`.
+    fn read_to_end(client: &mut Hysteria2Client, stream: quinn_proto::StreamId) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        while std::time::Instant::now() < deadline {
+            match client.stream_read(stream, &mut buf, Duration::from_secs(2)) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(Hysteria2Error::Timeout) => {}
+                Err(e) => panic!("read failed after {got:?}: {e:?}"),
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn payload_arriving_with_the_response_is_returned() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let mut client = Hysteria2Adapter::new("hy2", test_target(&server))
+            .connect()
+            .unwrap();
+        let stream = client.open_tcp("banner.test:1").unwrap();
+        // Let the response and the server-first payload arrive together.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(read_to_end(&mut client, stream), b"banner");
+    }
+
+    #[test]
+    fn data_received_with_the_peer_close_is_still_read() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let mut client = Hysteria2Adapter::new("hy2", test_target(&server))
+            .connect()
+            .unwrap();
+        let stream = client.open_tcp("close.test:1").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let mut buf = [0u8; 64];
+        let n = client
+            .stream_read(stream, &mut buf, Duration::from_secs(2))
+            .expect("bytes delivered before the close must be readable");
+        assert_eq!(&buf[..n], b"last words");
+    }
+
+    #[test]
+    fn fin_before_the_response_is_an_invalid_frame() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let mut client = Hysteria2Adapter::new("hy2", test_target(&server))
+            .connect()
+            .unwrap();
+        let stream = client.open_tcp("fin.test:1").unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            client.stream_read(stream, &mut buf, Duration::from_secs(5)),
+            Err(Hysteria2Error::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn rejected_tcp_request_reports_the_reason() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let mut client = Hysteria2Adapter::new("hy2", test_target(&server))
+            .connect()
+            .unwrap();
+        let stream = client.open_tcp("reject.test:1").unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            client.stream_read(stream, &mut buf, Duration::from_secs(5)),
+            Err(Hysteria2Error::TcpRejected("denied".to_string()))
+        );
+    }
+
     #[test]
     fn loopback_tcp_stream_ids_step_by_4() {
         let server = TestServer::spawn("correct-password", true).unwrap();

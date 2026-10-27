@@ -74,7 +74,7 @@ impl TcpRequest {
 }
 
 /// `TCPResponse` 帧（状态 + 消息 + padding）的长度上限；超出视为非法帧。
-pub const MAX_TCP_RESPONSE_LEN: usize = 64 * 1024;
+pub(crate) const MAX_TCP_RESPONSE_LEN: usize = 64 * 1024;
 
 /// 前缀上的 varint：字节未到齐时 `Ok(None)`。
 fn varint_prefix(buf: &[u8]) -> Result<Option<(u64, usize)>, Hysteria2Error> {
@@ -120,8 +120,8 @@ impl TcpResponse {
     }
 
     /// 增量解码：`buf` 还只是帧的前缀时返回 `Ok(None)`（调用方继续读）；
-    /// 完整时同 [`TcpResponse::decode`]。声明的长度使帧超过
-    /// [`MAX_TCP_RESPONSE_LEN`] 时在数据到齐前即拒绝，不无界缓冲。
+    /// 完整时同 [`TcpResponse::decode`]。声明的长度使帧超过 64 KiB 时在数据
+    /// 到齐前即拒绝，不无界缓冲。
     ///
     /// # Errors
     ///

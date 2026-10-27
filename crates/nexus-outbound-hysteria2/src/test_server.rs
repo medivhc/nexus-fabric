@@ -11,6 +11,10 @@
 //!    → 回显），把 DATAGRAM 当 UDP 处理（解码 `UDPMessage` → 原样回显）。
 //!    目标为 [`SINK_TARGET`] 的 stream 改作吸收端：读 8 字节大端长度 `L`，
 //!    吸收 `L` 字节后回 8 字节大端实收字节数（上行吞吐测试用，无下行数据）。
+//!    crate 内测试另有四个目标：`banner.test:1`（TCPResponse 与 `banner` 同批
+//!    写出后 FIN）、`close.test:1`（TCPResponse + `last words` 后立即关闭连接）、
+//!    `fin.test:1`（不回 TCPResponse 直接 FIN）、`reject.test:1`（拒绝，消息
+//!    `denied`）。
 //!
 //! 不实现：完整 HTTP/3（无 QPACK 动态表、无 server SETTINGS）、拥塞协商的
 //! 实际限速、分片重组（测试只发不分片的包）。
@@ -241,6 +245,27 @@ fn run_server(
                 Ok(target)
             })();
             match req_ok {
+                Ok(target) if target == "banner.test:1" => {
+                    let mut resp = TcpResponse::encode(true, "", &[]);
+                    resp.extend_from_slice(b"banner");
+                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    driver.finish_stream(handle, &mut conn, id);
+                }
+                Ok(target) if target == "close.test:1" => {
+                    let mut resp = TcpResponse::encode(true, "", &[]);
+                    resp.extend_from_slice(b"last words");
+                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    driver.close(handle, &mut conn, 0, b"bye");
+                    return;
+                }
+                Ok(target) if target == "fin.test:1" => {
+                    driver.finish_stream(handle, &mut conn, id);
+                }
+                Ok(target) if target == "reject.test:1" => {
+                    let resp = TcpResponse::encode(false, "denied", &[]);
+                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    driver.finish_stream(handle, &mut conn, id);
+                }
                 Ok(target) if target == SINK_TARGET => {
                     let resp = TcpResponse::encode(true, "", &[]);
                     let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);

@@ -39,7 +39,9 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
   端点事件路由、stream 读写原语（`write_all` / `read_exact` / `read_some` /
   `read_varint`）、DATAGRAM 收发；client 与测试用 server 共用；
 - 测试用最小 server（`test_server.rs`，**仅测试**）：rcgen 自签证书、
-  密码校验、`:status: 233` 响应、TCP 回显、UDP 回显；
+  密码校验、`:status: 233` 响应、TCP 回显、UDP 回显；另有按目标地址选择的
+  TCP 测试模式：`SINK_TARGET`（吸收长度前缀的上行并回实收字节数）与 crate
+  内的 banner / 关闭前数据 / 无响应 FIN / 拒绝四种；
 - 结构化错误 `Hysteria2Error`（不以日志文本代替类型；`Display`/ `Debug`
   绝不回显密码；`Hysteria2Target` 的 `Debug` 对密码脱敏）。
 
@@ -89,6 +91,13 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 - QPACK 字符串解码支持 Huffman（`H` 位，RFC 7541 附录 B，见 crate 私有
   `huffman` 模块）；本端编码恒 `H`=0，不实现 Huffman 编码；
 - quinn-proto 默认拥塞控制为 Cubic（`TransportConfig` 默认值，源码确认）；
+- `TCPResponse`（fast-open 读侧剥离）上限 64 KiB（状态 + 消息 + padding）：
+  文档未规定上限，超出视为非法帧，防止按对端声明的长度无界缓冲；响应帧按
+  字节累积到完整才解码，读超时保留已读部分，帧后同批到达的载荷优先返回
+  （2026-10-27，interop T2 修复）；
+- driver 每次 `pump` 不阻塞地处理 socket 中已到达的包（每次至多 64 个），
+  零等待读也能收包；读侧在看到对端关闭后再读一次，同一次 `pump` 收到的
+  数据与关闭不会丢数据（2026-10-27）；
 - // 未确认：`max_datagram_frame_size` 的对端通告值未经真实 server 验证，
   loopback 测试中 client/server 均为本实现。
 

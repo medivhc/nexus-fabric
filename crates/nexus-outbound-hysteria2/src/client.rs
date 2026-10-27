@@ -158,7 +158,11 @@ impl Hysteria2Client {
         // fast-open：写侧已放行；读侧仍需剥离 TCPResponse（见 stream_read）。
         self.response_pending.insert(id, Vec::new());
         if !self.target.fast_open {
-            self.complete_tcp_response(id, deadline)?;
+            if let Err(e) = self.complete_tcp_response(id, deadline) {
+                // The caller never learns this stream id: drop its state.
+                self.forget_stream(id);
+                return Err(e);
+            }
         }
         Ok(id)
     }
@@ -208,6 +212,12 @@ impl Hysteria2Client {
         }
     }
 
+    /// 丢弃 stream 的读侧状态（流已读到 EOF，或调用方拿不到该 stream）。
+    fn forget_stream(&mut self, id: StreamId) {
+        self.response_pending.remove(&id);
+        self.early_payload.remove(&id);
+    }
+
     /// 先返回暂存的载荷（解出 TCPResponse 时一并读到的字节）。
     fn take_early_payload(&mut self, id: StreamId, buf: &mut [u8]) -> Option<usize> {
         if buf.is_empty() {
@@ -242,6 +252,10 @@ impl Hysteria2Client {
     /// # Errors
     ///
     /// 超时 → [`Hysteria2Error::Timeout`]；流被重置 → [`Hysteria2Error::StreamReset`]。
+    ///
+    /// # Panics
+    ///
+    /// `buf` 为空时 panic（与 [`Driver::read_some`] 一致）。
     pub fn stream_read(
         &mut self,
         id: StreamId,
@@ -255,8 +269,13 @@ impl Hysteria2Client {
         if let Some(n) = self.take_early_payload(id, buf) {
             return Ok(n);
         }
-        self.driver
-            .read_some(self.handle, &mut self.conn, id, buf, deadline)
+        let n = self
+            .driver
+            .read_some(self.handle, &mut self.conn, id, buf, deadline)?;
+        if n == 0 {
+            self.forget_stream(id);
+        }
+        Ok(n)
     }
 
     /// 关闭 stream 写端（FIN）。

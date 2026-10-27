@@ -204,6 +204,8 @@ impl Driver {
                 Err(_) => break,
             }
         }
+        // Restoring blocking mode only fails for an invalid fd; then every
+        // socket call fails and the connection times out, so it is not retried.
         let _ = self.socket.set_nonblocking(false);
     }
 

@@ -12243,6 +12243,9 @@ mod hysteria2_dataplane_tests {
         let started = Instant::now();
         let (up, _down) = hysteria2_pump_stream(&mut hy2, stream, &mut relayed);
         let elapsed = started.elapsed();
+        // Close the relayed end first: if the relay stopped early, the app
+        // thread then fails in write_all instead of blocking the join.
+        drop(relayed);
         assert_eq!(app.join().unwrap(), LEN as u64, "sink received every byte");
         assert_eq!(up, LEN + 8);
         assert!(
