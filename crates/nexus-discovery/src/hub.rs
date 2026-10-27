@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::aggregate::merge_ranked;
-use crate::lsa::Lsdb;
+use crate::lsa::{Lsa, Lsdb, SeenCache, UpdateOutcome};
 use crate::mdns::MdnsDiscovery;
 use crate::paired::PairedDiscovery;
 use crate::{
@@ -44,6 +44,14 @@ struct HubState {
     paired: Option<PairedDiscovery>,
     /// Last time any frame referencing a node was seen (Hello / LsaAdvert).
     lsa_heard: HashMap<PeerId, Instant>,
+    /// Flood dedup cache (`(node, incarnation, seq)`), owned with the LSDB.
+    seen: SeenCache,
+    /// This node's own LSA (kept out of `all_lsas`, served by `self_lsa`).
+    self_lsa: Option<Lsa>,
+    /// Most recent injected `now`. `all_lsas()` has no `now` parameter (frozen
+    /// signature), so it filters against the last observed time instead of
+    /// opening a second, implicit time source.
+    last_now: Option<Instant>,
     metrics: DiscoveryMetrics,
     lsa_stale_after: Duration,
 }
@@ -69,6 +77,9 @@ impl DiscoveryHub {
                 static_src: StaticDiscovery::new(static_peers),
                 paired: None,
                 lsa_heard: HashMap::new(),
+                seen: SeenCache::new(1024),
+                self_lsa: None,
+                last_now: None,
                 metrics: DiscoveryMetrics::default(),
                 lsa_stale_after,
             }),
@@ -227,6 +238,81 @@ impl DiscoveryHub {
     #[must_use]
     pub fn metrics(&self) -> DiscoveryMetricsSnapshot {
         self.read().metrics.snapshot()
+    }
+
+    // ---------- LSA state machine (§4.9) ----------
+
+    /// Upsert a received LSA and refresh its liveness stamp.
+    ///
+    /// Freshness is refreshed for **every** referenced frame, including a
+    /// `Stale` outcome: "it is still being advertised" is exactly the liveness
+    /// signal, and the LSDB never evicts.
+    pub fn upsert_lsa(&self, lsa: Lsa, now: Instant) -> UpdateOutcome {
+        let mut st = self.write();
+        st.last_now = Some(now);
+        let node = lsa.node_id.clone();
+        let outcome = st.lsdb.update(lsa);
+        st.lsa_heard.insert(node, now);
+        outcome
+    }
+
+    /// Record that a frame referencing `peer` arrived (Hello / Welcome entry).
+    pub fn note_lsa_heard(&self, peer: &PeerId, now: Instant) {
+        let mut st = self.write();
+        st.last_now = Some(now);
+        if peer != &st.self_id {
+            st.lsa_heard.insert(peer.clone(), now);
+        }
+    }
+
+    /// Publish this node's own LSA (into the LSDB and the self slot).
+    pub fn set_self_lsa(&self, lsa: Lsa, now: Instant) -> UpdateOutcome {
+        let mut st = self.write();
+        st.last_now = Some(now);
+        let outcome = st.lsdb.update_local(lsa.clone());
+        st.self_lsa = Some(lsa);
+        outcome
+    }
+
+    /// This node's own LSA (never part of [`Self::all_lsas`]).
+    #[must_use]
+    pub fn self_lsa(&self) -> Option<Lsa> {
+        self.read().self_lsa.clone()
+    }
+
+    /// Fresh remote LSAs, self excluded (Hello replies / flood fan-out).
+    #[must_use]
+    pub fn all_lsas(&self) -> Vec<Lsa> {
+        let st = self.read();
+        let Some(now) = st.last_now else {
+            return Vec::new();
+        };
+        let mut out: Vec<Lsa> = st
+            .lsdb
+            .all()
+            .into_iter()
+            .filter(|lsa| lsa.node_id != st.self_id)
+            .filter(|lsa| {
+                st.lsa_heard
+                    .get(&lsa.node_id)
+                    .map(|at| *at + st.lsa_stale_after > now)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
+        out
+    }
+
+    /// Current LSDB entry count (observable; includes stale entries).
+    #[must_use]
+    pub fn lsdb_len(&self) -> usize {
+        self.read().lsdb.len()
+    }
+
+    /// Flood dedup decision for `(node, incarnation, seq)`.
+    pub fn should_flood(&self, peer: &PeerId, incarnation: u64, seq: u64) -> bool {
+        self.write().seen.should_flood(peer, incarnation, seq)
     }
 
     // ---------- lock helpers (poison recovery, never panic) ----------
@@ -410,5 +496,69 @@ fn record_metrics(metrics: &DiscoveryMetrics, out: &[ResolvedAddr]) {
     }
     if mdns {
         metrics.hits_mdns();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(id: &str) -> PeerId {
+        PeerId(id.to_string())
+    }
+
+    fn lsa(id: &str, locator: Option<&str>) -> Lsa {
+        Lsa {
+            node_id: peer(id),
+            vip: "10.99.0.1".to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: locator.map(str::to_string),
+            neighbors: Vec::new(),
+        }
+    }
+
+    fn hub_with(peers: &[(&str, SocketAddr)]) -> DiscoveryHub {
+        DiscoveryHub::new(
+            peer("self"),
+            peers.iter().map(|(id, a)| (peer(id), *a)),
+            None,
+            Duration::from_secs(90),
+        )
+    }
+
+    #[test]
+    fn lsa_freshness_window_filters_stale() {
+        let hub = hub_with(&[]);
+        let t0 = Instant::now();
+        hub.upsert_lsa(lsa("n1", Some("udp://10.0.0.9:19010")), t0);
+        assert_eq!(hub.fresh_lsa_peers(t0), vec![peer("n1")]);
+        assert_eq!(hub.resolve(&peer("n1"), t0).len(), 1);
+
+        // Past the 90s window: the LSDB keeps the entry (no eviction) but the
+        // freshness surface hides it.
+        let stale = t0 + Duration::from_secs(91);
+        assert!(hub.fresh_lsa_peers(stale).is_empty());
+        assert!(hub.resolve(&peer("n1"), stale).is_empty());
+        assert_eq!(hub.lsdb_len(), 1);
+        // `all_lsas` filters with the last injected time.
+        hub.note_lsa_heard(&peer("n2"), stale);
+        assert!(hub.all_lsas().is_empty());
+    }
+
+    #[test]
+    fn self_lsa_excluded_from_all_lsas() {
+        let hub = hub_with(&[]);
+        let t0 = Instant::now();
+        hub.set_self_lsa(lsa("self", Some("udp://10.0.0.1:19010")), t0);
+        hub.upsert_lsa(lsa("n1", Some("udp://10.0.0.9:19010")), t0);
+        let all = hub.all_lsas();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].node_id, peer("n1"));
+        assert_eq!(hub.self_lsa().expect("self lsa").node_id, peer("self"));
+        // Self is never enumerated as a discovered peer.
+        assert!(hub.known_peers(t0).iter().all(|p| p != &peer("self")));
+        assert!(hub.resolve(&peer("self"), t0).is_empty());
     }
 }
