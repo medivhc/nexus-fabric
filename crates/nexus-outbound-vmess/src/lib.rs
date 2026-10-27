@@ -12,7 +12,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use sha2::{Digest, Sha256};
 
-use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
+use nexus_proxy_config::outbound_seam::{OutboundAdapter, OutboundHandoff, OutboundHandoffError};
 
 // ---------- 结构化错误 ----------
 
@@ -169,7 +169,7 @@ impl OutboundAdapter for VmessAdapter {
         &self.tag
     }
 
-    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError> {
+    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError> {
         let _ = &self.locator; // 离线交接不校验远端可达性。
         Ok(OutboundHandoff {
             kind: self.outbound_kind().to_string(),

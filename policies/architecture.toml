@@ -196,7 +196,7 @@ layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-vmess"
-allowed_internal_dependencies = ["nexus-connectivity"]
+allowed_internal_dependencies = ["nexus-proxy-config"]
 portable = false
 layer = "outbound"
 
