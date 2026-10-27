@@ -1177,7 +1177,10 @@ impl NatSwitchRuntime {
             .relay_book_dir
         {
             Some(dir) => match nexusd::nat_relay::DirRelayAddressBook::new(dir.clone(), my_id.0) {
-                Ok(book) => Some(Arc::new(book)),
+                Ok(book) => {
+                    eprintln!("[nat-relay] book mode=shared-dir path={}", dir.display());
+                    Some(Arc::new(book))
+                }
                 Err(e) => {
                     eprintln!(
                         "[nat-relay] WARN: shared relay book dir unavailable ({e}); relay provider not attached"
@@ -1189,7 +1192,13 @@ impl NatSwitchRuntime {
                 let hex: String = my_id.0.iter().map(|b| format!("{b:02x}")).collect();
                 let book_path = std::env::temp_dir().join(format!("nexus-relay-{hex}.toml"));
                 match nexusd::nat_relay::FileRelayAddressBook::new(&book_path) {
-                    Ok(book) => Some(Arc::new(book)),
+                    Ok(book) => {
+                        eprintln!(
+                            "[nat-relay] book mode=per-self path={}",
+                            book_path.display()
+                        );
+                        Some(Arc::new(book))
+                    }
                     Err(e) => {
                         eprintln!(
                             "[nat-relay] WARN: address book open failed ({e}); relay provider not attached"
@@ -1638,9 +1647,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // 本段是进程内**唯一**的 N1/hub 装配点（spec §4.10.2）：hub、sessions、
     // static_peers 与权威 N1Config 都由 `N1Assembly` 提供，NAT/发现段不再二次解析。
     let discovery_section = loaded.daemon.discovery.clone();
-    let advertise_ip = discovery_section
-        .advertise_ip
-        .or_else(discovery_runtime::select_advertise_ipv4);
+    // One resolved address, one source label: the summary below is the only
+    // operator-facing statement of what will actually be advertised.
+    let (advertise_ip, advertise_source) = match discovery_section.advertise_ip {
+        Some(ip) => (Some(ip), "config"),
+        None => (discovery_runtime::select_advertise_ipv4(), "auto"),
+    };
+    eprintln!(
+        "{}",
+        discovery_runtime::production_summary(&discovery_section, advertise_ip, advertise_source)
+    );
     let discovery_params = nexus::network::DiscoveryParams {
         mdns: match (discovery_section.mdns, advertise_ip) {
             (true, Some(ip)) => Some(nexus::network::MdnsParams {
@@ -1711,19 +1727,11 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 capabilities,
                 incarnation,
             };
-            let cfg = discovery_runtime::DiscoveryRuntimeConfig {
-                gossip_bind: std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    discovery_section.gossip_port,
-                ),
+            let cfg = discovery_runtime::production_config(
+                &discovery_section,
                 advertise_ip,
-                lsa_enabled: discovery_section.lsa,
-                mdns_enabled: discovery_section.mdns && advertise_ip.is_some(),
-                lsa_hello_interval: Duration::from_secs(30),
-                lsa_self_refresh: Duration::from_secs(discovery_section.lsa_refresh_sec),
-                mdns_announce_interval: Duration::from_secs(60),
                 static_gossip_addrs,
-            };
+            );
             Some(discovery_runtime::DiscoveryRuntime::start(
                 Arc::clone(&assembly.discovery),
                 cfg,

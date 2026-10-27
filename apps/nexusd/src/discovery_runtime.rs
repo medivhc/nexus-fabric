@@ -134,12 +134,79 @@ impl DiscoveryRuntime {
             };
         }
         let thread_status = Arc::clone(&status);
-        let thread = std::thread::Builder::new()
+        let thread = match std::thread::Builder::new()
             .name("nexusd-discovery".to_string())
             .spawn(move || run_pump(hub, cfg, self_lsa, stop, thread_status, addrs, faults))
-            .ok();
+        {
+            Ok(thread) => Some(thread),
+            Err(e) => {
+                eprintln!(
+                    "[discovery] WARN: pump thread spawn failed ({e}); discovery stays disabled"
+                );
+                None
+            }
+        };
         DiscoveryRuntimeHandle { thread, status }
     }
+}
+
+/// Production assembly: `[network.discovery]` + the resolved advertise address
+/// → the pump config. `main.rs` must call this (no inlined gating) so the
+/// composition-root behaviour is exactly what tests exercise.
+///
+/// `mdns_enabled` deliberately carries the *configured* switch, not
+/// `section.mdns && advertise_ip.is_some()`: the pump itself owns the frozen
+/// "no advertise IPv4" degradation (WARN + `last_error`), and gating it here
+/// made that branch unreachable in production (product-review r1 MAJOR-1).
+#[must_use]
+pub fn production_config(
+    section: &crate::config::DiscoverySection,
+    advertise_ip: Option<Ipv4Addr>,
+    static_gossip_addrs: Vec<SocketAddr>,
+) -> DiscoveryRuntimeConfig {
+    DiscoveryRuntimeConfig {
+        gossip_bind: SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            section.gossip_port,
+        ),
+        advertise_ip,
+        lsa_enabled: section.lsa,
+        mdns_enabled: section.mdns,
+        lsa_hello_interval: Duration::from_secs(30),
+        lsa_self_refresh: Duration::from_secs(section.lsa_refresh_sec),
+        mdns_announce_interval: Duration::from_secs(60),
+        static_gossip_addrs,
+    }
+}
+
+/// Operator-facing effective discovery summary (product-review r1 MAJOR-1/2).
+///
+/// `advertise_source` is `"config"` or `"auto"`; when auto-selection found
+/// nothing the address is rendered as `none` so a silent multi-NIC/empty-host
+/// failure becomes visible at start-up.
+#[must_use]
+pub fn production_summary(
+    section: &crate::config::DiscoverySection,
+    advertise_ip: Option<Ipv4Addr>,
+    advertise_source: &str,
+) -> String {
+    let advertise = advertise_ip.map_or_else(|| "none".to_string(), |ip| ip.to_string());
+    let mdns = if section.mdns && advertise_ip.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let lsa = if section.lsa { "enabled" } else { "disabled" };
+    let feed = if section.feed { "enabled" } else { "disabled" };
+    let lsa_locator = advertise_ip.map_or_else(
+        || "none".to_string(),
+        |ip| format!("udp://{ip}:{}", section.gossip_port),
+    );
+    format!(
+        "[discovery] advertise_ip={advertise} source={advertise_source} \
+         gossip_port={} mdns={mdns} lsa={lsa} lsa_locator={lsa_locator} feed={feed}",
+        section.gossip_port
+    )
 }
 
 /// Internal socket addresses (tests point them at scratch ports).
@@ -1101,6 +1168,51 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         handle.join(Duration::from_secs(2));
         status.snapshot()
+    }
+
+    /// MAJOR-1 root cause: the composition root used to gate `mdns_enabled`
+    /// on `advertise_ip.is_some()`, which made the pump's frozen
+    /// `AdvertiseIpUnavailable` branch unreachable in production. The
+    /// production builder must pass the configured switch through.
+    #[test]
+    fn production_config_keeps_mdns_enabled_without_advertise_ip() {
+        let section = crate::config::DiscoverySection::default();
+        let cfg = production_config(&section, None, Vec::new());
+        assert!(
+            cfg.mdns_enabled,
+            "pump must see the configured mdns switch so it can WARN + set last_error"
+        );
+        assert!(cfg.advertise_ip.is_none());
+        assert_eq!(cfg.gossip_bind.port(), section.gossip_port);
+        assert_eq!(cfg.lsa_self_refresh.as_secs(), section.lsa_refresh_sec);
+
+        // `mdns=false` stays off: no false-positive degradation.
+        let off = crate::config::DiscoverySection {
+            mdns: false,
+            ..section
+        };
+        assert!(!production_config(&off, None, Vec::new()).mdns_enabled);
+    }
+
+    #[test]
+    fn production_summary_names_address_source_and_empty_locator() {
+        let section = crate::config::DiscoverySection {
+            gossip_port: 19011,
+            ..crate::config::DiscoverySection::default()
+        };
+        let configured =
+            production_summary(&section, Some(Ipv4Addr::new(192, 168, 1, 5)), "config");
+        assert_eq!(
+            configured,
+            "[discovery] advertise_ip=192.168.1.5 source=config gossip_port=19011 \
+             mdns=enabled lsa=enabled lsa_locator=udp://192.168.1.5:19011 feed=enabled"
+        );
+        let missing = production_summary(&section, None, "auto");
+        assert_eq!(
+            missing,
+            "[discovery] advertise_ip=none source=auto gossip_port=19011 \
+             mdns=disabled lsa=enabled lsa_locator=none feed=enabled"
+        );
     }
 
     fn base_cfg() -> DiscoveryRuntimeConfig {
