@@ -12,8 +12,10 @@
 //!
 //! fast-open 语义（文档 §5 坑 #7）：`fast-open=true` 时请求帧发出后不等响应
 //! 即返回可用；但**读侧始终先剥离 TCPResponse**（`response_pending` 保证）。
+//! 响应帧按字节累积到完整才解码：读超时保留已读部分，下一次读接着累积，
+//! 帧字节不会交给调用方；与帧同包到达的载荷先暂存，下一次读优先返回。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,8 +44,10 @@ pub struct Hysteria2Client {
     cc_rx: CcRx,
     next_udp_session: u32,
     next_packet_id: u16,
-    /// 读侧尚未剥离 TCPResponse 的 stream（fast-open 下写侧已放行）。
-    response_pending: HashSet<StreamId>,
+    /// 读侧尚未剥离 TCPResponse 的 stream → 已读到的帧前缀字节。
+    response_pending: HashMap<StreamId, Vec<u8>>,
+    /// 解出 TCPResponse 时一并读到的载荷，下一次 `stream_read` 先返回。
+    early_payload: HashMap<StreamId, Vec<u8>>,
 }
 
 impl Hysteria2Client {
@@ -113,7 +117,8 @@ impl Hysteria2Client {
             cc_rx: resp.cc_rx,
             next_udp_session: 0,
             next_packet_id: 0,
-            response_pending: HashSet::new(),
+            response_pending: HashMap::new(),
+            early_payload: HashMap::new(),
         })
     }
 
@@ -150,48 +155,72 @@ impl Hysteria2Client {
         let frame = TcpRequest::encode(target, &padding);
         self.driver
             .write_all(self.handle, &mut self.conn, id, &frame, deadline)?;
-        if self.target.fast_open {
-            // fast-open：写侧已放行；读侧仍需剥离 TCPResponse（见 stream_read）。
-            self.response_pending.insert(id);
-        } else {
-            let resp = self.read_tcp_response(id, deadline)?;
-            if !resp.ok {
-                return Err(Hysteria2Error::TcpRejected(resp.message));
-            }
+        // fast-open：写侧已放行；读侧仍需剥离 TCPResponse（见 stream_read）。
+        self.response_pending.insert(id, Vec::new());
+        if !self.target.fast_open {
+            self.complete_tcp_response(id, deadline)?;
         }
         Ok(id)
     }
 
-    /// 从代理 stream 首部读取并剥离 `TCPResponse`。
-    fn read_tcp_response(
+    /// 读到 stream 首部的 `TCPResponse` 完整为止并剥离它。
+    ///
+    /// 超时等错误时已读的帧前缀留在 `response_pending`，下一次调用接着读；
+    /// 帧之后同批读到的载荷存入 `early_payload`。
+    ///
+    /// # Errors
+    ///
+    /// 服务端拒绝 → [`Hysteria2Error::TcpRejected`]；帧非法或响应前 FIN →
+    /// [`Hysteria2Error::InvalidFrame`]；超时 → [`Hysteria2Error::Timeout`]。
+    fn complete_tcp_response(
         &mut self,
         id: StreamId,
         deadline: Instant,
-    ) -> Result<TcpResponse, Hysteria2Error> {
-        let status = self
-            .driver
-            .read_exact(self.handle, &mut self.conn, id, 1, deadline)?;
-        let ok = match status[0] {
-            super::frames::TCP_STATUS_OK => true,
-            super::frames::TCP_STATUS_ERROR => false,
-            _ => return Err(Hysteria2Error::InvalidFrame),
-        };
-        let msg_len = self
-            .driver
-            .read_varint(self.handle, &mut self.conn, id, deadline)?;
-        let msg_len = usize::try_from(msg_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
-        let msg = self
-            .driver
-            .read_exact(self.handle, &mut self.conn, id, msg_len, deadline)?;
-        let message = String::from_utf8(msg).map_err(|_| Hysteria2Error::InvalidFrame)?;
-        let pad_len = self
-            .driver
-            .read_varint(self.handle, &mut self.conn, id, deadline)?;
-        let pad_len = usize::try_from(pad_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
-        let _ = self
-            .driver
-            .read_exact(self.handle, &mut self.conn, id, pad_len, deadline)?;
-        Ok(TcpResponse { ok, message })
+    ) -> Result<(), Hysteria2Error> {
+        loop {
+            let prefix = self
+                .response_pending
+                .get(&id)
+                .map_or(&[][..], Vec::as_slice);
+            if let Some((resp, used)) = TcpResponse::decode_prefix(prefix)? {
+                let read = self.response_pending.remove(&id).unwrap_or_default();
+                if used < read.len() {
+                    self.early_payload.insert(id, read[used..].to_vec());
+                }
+                return if resp.ok {
+                    Ok(())
+                } else {
+                    Err(Hysteria2Error::TcpRejected(resp.message))
+                };
+            }
+            let mut chunk = [0u8; 4096];
+            let n = self
+                .driver
+                .read_some(self.handle, &mut self.conn, id, &mut chunk, deadline)?;
+            if n == 0 {
+                self.response_pending.remove(&id);
+                return Err(Hysteria2Error::InvalidFrame);
+            }
+            self.response_pending
+                .entry(id)
+                .or_default()
+                .extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// 先返回暂存的载荷（解出 TCPResponse 时一并读到的字节）。
+    fn take_early_payload(&mut self, id: StreamId, buf: &mut [u8]) -> Option<usize> {
+        if buf.is_empty() {
+            return None;
+        }
+        let early = self.early_payload.get_mut(&id)?;
+        let n = early.len().min(buf.len());
+        buf[..n].copy_from_slice(&early[..n]);
+        early.drain(..n);
+        if early.is_empty() {
+            self.early_payload.remove(&id);
+        }
+        Some(n)
     }
 
     /// 在代理 stream 上写数据。
@@ -220,11 +249,11 @@ impl Hysteria2Client {
         timeout: Duration,
     ) -> Result<usize, Hysteria2Error> {
         let deadline = Instant::now() + timeout;
-        if self.response_pending.remove(&id) {
-            let resp = self.read_tcp_response(id, deadline)?;
-            if !resp.ok {
-                return Err(Hysteria2Error::TcpRejected(resp.message));
-            }
+        if self.response_pending.contains_key(&id) {
+            self.complete_tcp_response(id, deadline)?;
+        }
+        if let Some(n) = self.take_early_payload(id, buf) {
+            return Ok(n);
         }
         self.driver
             .read_some(self.handle, &mut self.conn, id, buf, deadline)

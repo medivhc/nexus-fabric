@@ -147,6 +147,36 @@ mod tests {
     }
 
     #[test]
+    fn fast_open_read_that_times_out_before_the_response_keeps_framing() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let adapter = Hysteria2Adapter::new("hy2", test_target(&server));
+        let mut client = adapter.connect().unwrap();
+        let stream = client.open_tcp("example.com:80").unwrap();
+        let mut buf = [0u8; 64];
+        // Nothing has been received yet: the first zero-wait read times out
+        // while the TCPResponse is still pending.
+        assert_eq!(
+            client.stream_read(stream, &mut buf, Duration::ZERO),
+            Err(Hysteria2Error::Timeout)
+        );
+        client.stream_write(stream, b"hello").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while got.len() < 5 && std::time::Instant::now() < deadline {
+            match client.stream_read(stream, &mut buf, Duration::ZERO) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(Hysteria2Error::Timeout) => {}
+                Err(e) => panic!("read failed: {e:?}"),
+            }
+        }
+        assert_eq!(
+            got, b"hello",
+            "TCPResponse bytes must never reach the caller"
+        );
+        client.stream_finish(stream);
+    }
+
+    #[test]
     fn loopback_tcp_stream_ids_step_by_4() {
         let server = TestServer::spawn("correct-password", true).unwrap();
         let adapter = Hysteria2Adapter::new("hy2", test_target(&server));

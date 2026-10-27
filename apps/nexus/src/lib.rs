@@ -4673,7 +4673,9 @@ fn vless_pump_stream<S: std::io::Read + std::io::Write>(
 ///
 /// 与 `vless_pump_stream` 同构；QUIC 侧用 `stream_read` 短超时（50ms）轮询，
 /// `Timeout` 为瞬态（继续轮询），其他 QUIC 错误视为节点侧关闭。client EOF 时
-/// 先对 stream 发 FIN 再结束双向（优雅半关闭）。
+/// 先对 stream 发 FIN 再结束双向（优雅半关闭）。本轮上行有进展时下行只做
+/// 零等待轮询：否则每 8 KiB 上行都要空等 50ms，纯上行被压到约 160 KB/s
+/// （interop T2 的 `E_TIMEOUT_HANG` 根因）。
 fn hysteria2_pump_stream(
     hy2: &mut nexus_outbound_hysteria2::Hysteria2Client,
     stream: quinn_proto::StreamId,
@@ -4725,7 +4727,12 @@ fn hysteria2_pump_stream(
             }
         }
         if s_open && c_open && down.ready_for_read() {
-            match hy2.stream_read(stream, &mut sbuf, std::time::Duration::from_millis(50)) {
+            let wait = if progressed {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_millis(50)
+            };
+            match hy2.stream_read(stream, &mut sbuf, wait) {
                 Ok(0) => s_open = false,
                 Ok(n) => {
                     down.enqueue(&sbuf[..n]);
@@ -12198,6 +12205,51 @@ mod hysteria2_dataplane_tests {
         assert_eq!(&buf[..n], b"hello-hy2");
         client.stream_finish(stream);
         client.close();
+    }
+
+    /// T2 interop root cause (Hysteria2 `E_TIMEOUT_HANG`): with no download
+    /// data, each relay iteration moved one 8 KiB upload chunk and then waited
+    /// 50 ms in `stream_read`, capping uploads near 160 KB/s (32 MiB took
+    /// minutes). A 4 MiB upload took ~26 s that way; it must take seconds.
+    #[test]
+    fn hysteria2_relay_upload_is_not_paced_by_download_polling() {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use nexus_outbound_hysteria2::test_server::{SINK_TARGET, TestServer};
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        const LEN: usize = 4 * 1024 * 1024;
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(server.addr.port())).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        let mut hy2 = Hysteria2Client::connect(&target).unwrap();
+        let stream = hy2.open_tcp(SINK_TARGET).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            s.write_all(&(LEN as u64).to_be_bytes()).unwrap();
+            s.write_all(&vec![0x5a; LEN]).unwrap();
+            let mut got = [0u8; 8];
+            s.read_exact(&mut got).unwrap();
+            u64::from_be_bytes(got)
+        });
+        let (mut relayed, _) = listener.accept().unwrap();
+        relayed.set_nonblocking(true).unwrap();
+
+        let started = Instant::now();
+        let (up, _down) = hysteria2_pump_stream(&mut hy2, stream, &mut relayed);
+        let elapsed = started.elapsed();
+        assert_eq!(app.join().unwrap(), LEN as u64, "sink received every byte");
+        assert_eq!(up, LEN + 8);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "4 MiB upload through the relay took {elapsed:?}"
+        );
+        hy2.close();
     }
 }
 

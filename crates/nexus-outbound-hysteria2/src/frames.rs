@@ -73,6 +73,30 @@ impl TcpRequest {
     }
 }
 
+/// `TCPResponse` 帧（状态 + 消息 + padding）的长度上限；超出视为非法帧。
+pub const MAX_TCP_RESPONSE_LEN: usize = 64 * 1024;
+
+/// 前缀上的 varint：字节未到齐时 `Ok(None)`。
+fn varint_prefix(buf: &[u8]) -> Result<Option<(u64, usize)>, Hysteria2Error> {
+    let Some(first) = buf.first() else {
+        return Ok(None);
+    };
+    let len = 1usize << (first >> 6);
+    if buf.len() < len {
+        return Ok(None);
+    }
+    varint::decode(buf).map(Some)
+}
+
+/// `start + len`，超过 [`MAX_TCP_RESPONSE_LEN`] 即非法。
+fn bounded_end(start: usize, len: u64) -> Result<usize, Hysteria2Error> {
+    usize::try_from(len)
+        .ok()
+        .and_then(|len| start.checked_add(len))
+        .filter(|end| *end <= MAX_TCP_RESPONSE_LEN)
+        .ok_or(Hysteria2Error::InvalidFrame)
+}
+
 /// TCP 建连响应（server → client，位于代理 stream 首部）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpResponse {
@@ -93,6 +117,34 @@ impl TcpResponse {
         varint::encode(padding.len() as u64, &mut out);
         out.extend_from_slice(padding);
         out
+    }
+
+    /// 增量解码：`buf` 还只是帧的前缀时返回 `Ok(None)`（调用方继续读）；
+    /// 完整时同 [`TcpResponse::decode`]。声明的长度使帧超过
+    /// [`MAX_TCP_RESPONSE_LEN`] 时在数据到齐前即拒绝，不无界缓冲。
+    ///
+    /// # Errors
+    ///
+    /// 状态字节非法、帧超上限、消息非 UTF-8 → [`Hysteria2Error::InvalidFrame`]。
+    pub fn decode_prefix(buf: &[u8]) -> Result<Option<(Self, usize)>, Hysteria2Error> {
+        let Some(&status) = buf.first() else {
+            return Ok(None);
+        };
+        if status != TCP_STATUS_OK && status != TCP_STATUS_ERROR {
+            return Err(Hysteria2Error::InvalidFrame);
+        }
+        let Some((msg_len, n)) = varint_prefix(&buf[1..])? else {
+            return Ok(None);
+        };
+        let pad_at = bounded_end(1 + n, msg_len)?;
+        let Some((pad_len, n)) = varint_prefix(buf.get(pad_at..).unwrap_or_default())? else {
+            return Ok(None);
+        };
+        let end = bounded_end(pad_at + n, pad_len)?;
+        if buf.len() < end {
+            return Ok(None);
+        }
+        Self::decode(buf).map(Some)
     }
 
     /// 解码响应帧，返回 `(响应, 消费字节数)`；之后剩余字节为代理载荷。
@@ -310,6 +362,46 @@ mod tests {
         // 取前 10 字节则地址不完整）。
         assert_eq!(
             UdpMessage::decode(&wire[..wire.len() - 6]),
+            Err(Hysteria2Error::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn tcp_response_decode_prefix_waits_for_the_whole_frame() {
+        let frame = TcpResponse::encode(true, "welcome", &[7u8; 300]);
+        for cut in 0..frame.len() {
+            assert_eq!(
+                TcpResponse::decode_prefix(&frame[..cut]),
+                Ok(None),
+                "prefix of {cut} bytes is not yet a frame"
+            );
+        }
+        let mut wire = frame.clone();
+        wire.extend_from_slice(b"payload");
+        let (resp, used) = TcpResponse::decode_prefix(&wire).unwrap().unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.message, "welcome");
+        assert_eq!(used, frame.len(), "payload after the frame is not consumed");
+    }
+
+    #[test]
+    fn tcp_response_decode_prefix_rejects_bad_or_oversized_frames() {
+        assert_eq!(
+            TcpResponse::decode_prefix(&[0x07]),
+            Err(Hysteria2Error::InvalidFrame)
+        );
+        // A message length past the cap is rejected before its bytes arrive.
+        let mut huge = vec![TCP_STATUS_OK];
+        varint::encode((MAX_TCP_RESPONSE_LEN + 1) as u64, &mut huge);
+        assert_eq!(
+            TcpResponse::decode_prefix(&huge),
+            Err(Hysteria2Error::InvalidFrame)
+        );
+        let mut padded = TcpResponse::encode(true, "", &[]);
+        padded.pop();
+        varint::encode(MAX_TCP_RESPONSE_LEN as u64, &mut padded);
+        assert_eq!(
+            TcpResponse::decode_prefix(&padded),
             Err(Hysteria2Error::InvalidFrame)
         );
     }

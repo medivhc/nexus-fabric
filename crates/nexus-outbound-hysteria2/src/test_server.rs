@@ -9,6 +9,8 @@
 //!    错误 → 回 `:status: 403` 并关闭连接；
 //! 4. 之后把 bidi stream 当 TCP 处理（读 `TCPRequest` → 回 `TCPResponse OK`
 //!    → 回显），把 DATAGRAM 当 UDP 处理（解码 `UDPMessage` → 原样回显）。
+//!    目标为 [`SINK_TARGET`] 的 stream 改作吸收端：读 8 字节大端长度 `L`，
+//!    吸收 `L` 字节后回 8 字节大端实收字节数（上行吞吐测试用，无下行数据）。
 //!
 //! 不实现：完整 HTTP/3（无 QPACK 动态表、无 server SETTINGS）、拥塞协商的
 //! 实际限速、分片重组（测试只发不分片的包）。
@@ -27,6 +29,9 @@ use super::driver::{self, Driver};
 use super::frames::{TcpResponse, UdpMessage};
 use super::qpack;
 use super::tls;
+
+/// 让测试 server 把 TCP stream 当吸收端的目标地址（见模块文档第 4 条）。
+pub const SINK_TARGET: &str = "sink.test:1";
 
 /// 测试 server 句柄。
 pub struct TestServer {
@@ -124,6 +129,36 @@ fn read_auth_request(
     qpack::decode_field_section(&body)
 }
 
+/// 吸收端：读 8 字节长度，吸收该长度后回实收字节数，再等对端 FIN。
+fn sink_stream(
+    driver: &mut Driver,
+    handle: ConnectionHandle,
+    conn: &mut Connection,
+    id: StreamId,
+    buf: &mut [u8],
+) {
+    let step = || Instant::now() + Duration::from_secs(5);
+    let Ok(len) = driver.read_exact(handle, conn, id, 8, step()) else {
+        return;
+    };
+    let mut len_be = [0u8; 8];
+    len_be.copy_from_slice(&len);
+    let want = u64::from_be_bytes(len_be);
+    let mut got = 0u64;
+    while got < want {
+        match driver.read_some(handle, conn, id, buf, step()) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n as u64,
+        }
+    }
+    let _ = driver.write_all(handle, conn, id, &got.to_be_bytes(), step());
+    while let Ok(n) = driver.read_some(handle, conn, id, buf, step()) {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
 fn run_server(
     mut driver: Driver,
     server_config: Arc<quinn_proto::ServerConfig>,
@@ -206,6 +241,12 @@ fn run_server(
                 Ok(target)
             })();
             match req_ok {
+                Ok(target) if target == SINK_TARGET => {
+                    let resp = TcpResponse::encode(true, "", &[]);
+                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    sink_stream(&mut driver, handle, &mut conn, id, &mut buf);
+                    driver.finish_stream(handle, &mut conn, id);
+                }
                 Ok(_target) => {
                     let resp = TcpResponse::encode(true, "", &[]);
                     let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);

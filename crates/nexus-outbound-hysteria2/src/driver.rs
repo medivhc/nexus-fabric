@@ -63,6 +63,9 @@ pub fn hysteria_endpoint_config() -> EndpointConfig {
     c
 }
 
+/// [`Driver::pump`] 每次不阻塞处理的已到达包上限（限制单次 pump 的耗时）。
+const MAX_DRAIN_PER_PUMP: usize = 64;
+
 /// 最小 QUIC 驱动：UDP socket + sans-IO endpoint + 收发缓冲。
 pub struct Driver {
     socket: UdpSocket,
@@ -143,7 +146,7 @@ impl Driver {
         }
     }
 
-    /// 推进一个连接：定时器 → 端点事件 → 待发包 → 丢弃已消费的连接事件。
+    /// 推进一个连接：定时器 → 已到达的 UDP 包 → 端点事件 → 待发包 → 丢弃已消费的连接事件。
     ///
     /// 连接丢失在这里只表现为 `is_closed()`；调用方通过 [`Driver::drive_until`]
     /// 或 `is_closed()` 感知。
@@ -152,6 +155,7 @@ impl Driver {
         if matches!(conn.poll_timeout(), Some(t) if t <= now) {
             conn.handle_timeout(now);
         }
+        self.drain_ready(handle, conn);
         while let Some(ev) = conn.poll_endpoint_events() {
             if let Some(cev) = self.endpoint.handle_event(handle, ev) {
                 conn.handle_event(cev);
@@ -178,10 +182,39 @@ impl Driver {
         if self.socket.set_read_timeout(Some(timeout)).is_err() {
             return false;
         }
-        let (n, remote) = match self.socket.recv_from(&mut self.rx_buf) {
-            Ok((n, remote)) => (n, normalize_remote(remote)),
-            Err(_) => return false,
-        };
+        match self.socket.recv_from(&mut self.rx_buf) {
+            Ok((n, remote)) => self.feed(handle, conn, n, normalize_remote(remote)),
+            Err(_) => false,
+        }
+    }
+
+    /// 不阻塞地处理 socket 里已到达的包（每次至多 [`MAX_DRAIN_PER_PUMP`] 个）。
+    ///
+    /// 没有它，只有在 [`Driver::recv_one`] 里等待的路径才会收包：零等待读永远
+    /// 拿不到数据，纯上行时 ACK 与流控额度积压在内核缓冲里（interop T2 根因之一）。
+    fn drain_ready(&mut self, handle: ConnectionHandle, conn: &mut Connection) {
+        if self.socket.set_nonblocking(true).is_err() {
+            return;
+        }
+        for _ in 0..MAX_DRAIN_PER_PUMP {
+            match self.socket.recv_from(&mut self.rx_buf) {
+                Ok((n, remote)) => {
+                    self.feed(handle, conn, n, normalize_remote(remote));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = self.socket.set_nonblocking(false);
+    }
+
+    /// 把 `rx_buf[..n]` 中的一个包解混淆后喂给 endpoint（语义见 [`Driver::recv_one`]）。
+    fn feed(
+        &mut self,
+        handle: ConnectionHandle,
+        conn: &mut Connection,
+        n: usize,
+        remote: SocketAddr,
+    ) -> bool {
         let plain: Vec<u8> = match &self.obfs_key {
             Some(key) => match obfs::deobfuscate(key, &self.rx_buf[..n]) {
                 Ok(p) => p,
@@ -407,6 +440,9 @@ impl Driver {
         deadline: Instant,
     ) -> Result<usize, Hysteria2Error> {
         assert!(!buf.is_empty(), "read_some needs a non-empty buffer");
+        // `pump` can take in data and the peer's close together: read once more
+        // after seeing the close before reporting it, or that data is lost.
+        let mut closed_seen = false;
         loop {
             let chunk_len = {
                 let mut recv = conn.recv_stream(id);
@@ -425,9 +461,13 @@ impl Driver {
                 }
                 Ok(None) => return Ok(0),
                 Err(ReadError::Blocked) => {
+                    if closed_seen {
+                        return Err(Hysteria2Error::Closed);
+                    }
                     self.pump(handle, conn);
                     if conn.is_closed() {
-                        return Err(Hysteria2Error::Closed);
+                        closed_seen = true;
+                        continue;
                     }
                     if Instant::now() >= deadline {
                         return Err(Hysteria2Error::Timeout);
