@@ -675,7 +675,8 @@ skip-verify + alpn）的 YAML，断言解析出 2 个 `OutboundConfig`、`kind=t
 - `nexusd` 的两条前端（TUN 与 TPROXY，共享同一 `OutboundRegistry`）**都不再支持明文 Trojan 出站**：
   首个 wired 出站是明文 Trojan → 启动硬失败（`stage=proxy_engine_init` + `exit 1`）；
   非首个 wired 的明文 Trojan → 启动 warn（`engine=unsupported cause=PLAINTEXT_TROJAN_UNSUPPORTED`），
-  规则选中该 tag 时 TCP 流当场 RST，不直连、不回退其他出站。
+  规则选中该 tag 时，TUN 侧 TCP 流当场 RST；TPROXY 侧由 `on_path_failure` 关闭/阻断、
+  不保证构造 RST；两条前端都不直连、不回退其他出站。
 - **没有配置开关可以回退**：不存在重新启用明文 Trojan 的字段。服务端只支持明文 Trojan 时，
   用户唯一出路是换服务端或换协议。
 - `nexus proxy`（`apps/nexus` 的 SOCKS5/HTTP 数据面）**不受影响**：该路径的 Trojan 数据面本来恒 TLS；
@@ -714,7 +715,7 @@ trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
 - `skip_cert_verify: false`：旧实现按「值」判定 → 视为**明文**；现在按「字段出现」判定 →
   视为 **TLS 声明**（走系统根证书校验）。对只支持明文的服务端会在运行期握手失败，而不是启动失败。
 - `alpn: []`：旧实现视为 **TLS**（`alpn.is_some()`）；现在视为**无声明**——该出站被选中时按
-  明文 Trojan 处理，启动硬失败。
+  明文 Trojan 处理（首个 wired 启动硬失败；非首个 wired 启动 warn + 运行期失败）。
 
 **UDP 不恢复（净损失）**
 

@@ -7,7 +7,7 @@
 #
 # TLS 声明：trojan 出站必须显式声明 TLS，判据是**字段出现**——`alpn` 非空，或
 # `skip_cert_verify` 字段出现（写 `false` 也算声明）。缺省（两个字段都不写）会被
-# 判为明文 Trojan，nexusd 启动失败（PRODUCT §11.9.3）。`tls: true` 对 trojan 无效
+# 判为明文 Trojan，nexusd 启动失败（PRODUCT §11.9.4）。`tls: true` 对 trojan 无效
 # （该字段只有 VLESS 语义）。
 # 下面只写 `alpn`：缺省走系统根证书校验。只有当服务端证书不在系统信任链内（自签 /
 # 企业内网 CA）时才显式写 `skip_cert_verify: true`。
