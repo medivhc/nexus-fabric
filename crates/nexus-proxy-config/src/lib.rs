@@ -17,6 +17,11 @@
 
 use std::collections::BTreeSet;
 
+/// 出站 UDP 能力声明（共享 DTO；CONTRACT：`UdpMode` 手写 `Debug` 脱敏）。
+pub mod udp;
+
+pub use udp::{UdpCapability, UdpMode, UdpUnsupportedReason};
+
 /// TPROXY 透明入站默认监听地址（spec §11.1 冻结端口 7895）。
 pub const TPROXY_DEFAULT_LISTEN: &str = "0.0.0.0:7895";
 

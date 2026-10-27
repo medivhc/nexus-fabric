@@ -19,7 +19,12 @@ nexus-network = { path = "../../crates/nexus-network" }
 nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
 nexus-proxy = { path = "../../crates/nexus-proxy" }
 nexus-proxy-transport = { path = "../../crates/nexus-proxy-transport" }
+# 出站 adapter（S1）：VLESS/AnyTLS 的 TLS 客户端；系统根经 rustls-native-certs。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = { version = "0.8", default-features = false }
 nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
+# 出站 adapter（S1）：五协议 dialer。SS TCP 生产路径的 SIP004 实现。
+nexus-outbound-shadowsocks = { path = "../../crates/nexus-outbound-shadowsocks" }
 nexus-outbound-anytls = { path = "../../crates/nexus-outbound-anytls" }
 nexus-outbound-vless = { path = "../../crates/nexus-outbound-vless" }
 nexus-outbound-hysteria2 = { path = "../../crates/nexus-outbound-hysteria2" }

@@ -9,6 +9,8 @@
 //! TUN 所有权仍在 dataplane（D1）：engine 只返回待写回 TUN 的包，
 //! 不直接持有/写 TUN。
 
+#[allow(dead_code)] // S2 起由 OutboundRegistry 使用，S1 仅建立编译闭环。
+pub(crate) mod adapter;
 pub mod ss_std;
 pub(crate) mod tcp_relay;
 pub(crate) mod udp_relay;

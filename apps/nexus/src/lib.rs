@@ -51,6 +51,9 @@ pub mod node_cli;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
+/// 出站互操作标注：`verdicts.json` 嵌入解析 + 五载体共享的 label/warning 派生，
+/// `is_wired` / `select_index` 唯一定义（spec §3.6.1 / N9）。
+pub mod outbound_manifest;
 pub mod pair_cli;
 /// N2 P0-3：`nexus plan` 只读预览 + `plan explain` 双模式（进程内，无 I/O）。
 pub mod plan_cli;

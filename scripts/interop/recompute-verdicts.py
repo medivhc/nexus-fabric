@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""机械复算 verdict + 渲染 MATRIX（AC-06/10/18/19；E1 规则 1–9 按序）。
+"""机械复算 verdict + 渲染 MATRIX（AC-06/10/18/19；E1 规则 1–9 按序），
+并派生仓库级 `docs/protocols/interop/verdicts.json`（outbound-adapter-wiring
+步骤 3.0；spec v1.4 §5.2）。
 
 输入：
   --run-dir <dir>      证据根（evidence/analysis/...）
   --run-meta <path>    run 元数据 JSON（run/baseline/spec/完成项/修复条目）；
                        省略时保持旧版叙述渲染，供前序 run 目录复算
   --matrix <path>      输出 MATRIX.md（仓库内唯一正本）
-  --check             不写盘，重算后与现有 MATRIX 比对
+  --repo-out [path]    写仓库级 verdicts.json（省略 path 时用仓库根默认路径）；
+                       只写该产物，不改 MATRIX / run-dir。仓库根由脚本位置推导，
+                       不依赖 cwd。
+  --check [path]       不带 path：旧语义（MATRIX + <run-dir>/analysis/verdicts.json
+                       零漂移）；带 path：只校验该仓库级 verdicts.json 零漂移
+                       （MATRIX 派生五条 + synthetic 两条全量）。
   --allow-partial     阶段提交用：只渲染已有证据的协议节
 
 规则实现顺序严格按 spec E1：首个命中即停。人工不得覆盖。
+
+仓库级 `verdicts.json` 的 `inputs_sha256` 算法（写死；改算法必须同步改
+`--check` 与步骤 3 的契约 hash 说明）：按 `REPO_INPUT_FILES` 固定顺序，对
+`sha256(相对路径字节 || b"\\0" || 文件内容字节)` 的 hex 串按顺序拼接，再对
+拼接结果做一次 sha256。文件名进 hash，防止换序；synthetic 常量文件进 hash，
+使合成条目/文案改动可被 `--check` 检出。
 """
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +37,23 @@ import labels  # noqa: E402
 
 REPO = SCRIPT_DIR.parents[1]
 DEFAULT_CELL_MATRIX = SCRIPT_DIR / "cell-matrix.json"
+
+# 仓库级 verdicts.json 的输入（固定顺序；相对仓库根）。
+REPO_MATRIX_PATH = REPO / "docs/protocols/interop/MATRIX.md"
+REPO_MANIFEST_PATH = REPO / "docs/protocols/interop/verdicts.json"
+SYNTHETIC_INPUT_PATH = SCRIPT_DIR / "verdicts-synthetic.json"
+REPO_INPUT_FILES = [
+    (REPO_MATRIX_PATH, "docs/protocols/interop/MATRIX.md"),
+    (DEFAULT_CELL_MATRIX, "scripts/interop/cell-matrix.json"),
+    (SYNTHETIC_INPUT_PATH, "scripts/interop/verdicts-synthetic.json"),
+]
+MATRIX_PROTOCOLS = ["vless", "anytls", "hysteria2", "trojan", "shadowsocks"]
+# MATRIX 协议表的 scope 只能落在协议级取值；合成条目另用钉死常量。
+MATRIX_SCOPES = {"PROTOCOL_SUBSET", "FULL", "TCP_ONLY"}
+SYNTHETIC_SCOPES = {"NOT_IN_MATRIX", "LOCAL_E4"}
+VERDICTS = {"VERIFIED", "PARTIAL", "BROKEN"}
+RUN_ID = "protocol-interop-fixes-1"
+SCHEMA_VERSION = 1
 
 NEXUS_CLASSES = {
     "E_NEXUS_HANDSHAKE_WIRE",
@@ -43,6 +74,20 @@ BLOCKING_CLASSES = {
 }
 BANNED_WORDS = ["probably", "maybe", "待观察", "应该支持", "完全支持", "fully supported"]
 FAILURE_CELLS = {"BadCredential", "BadConfig"}
+
+# spec v1.4 §5.2(a)：claim 映射是唯一实现，MATRIX 渲染与仓库级 verdicts.json
+# 派生都必须调用 `claim_for`，不得各写一套。
+CLAIM_MAP = {
+    "VERIFIED": "USABLE",
+    "BROKEN": "NOT_USABLE",
+}
+
+
+def claim_for(verdict, handshake_ok, tcp_small_ok):
+    """verdict + 两格状态 → claim（spec v1.4 §5.2(a) 冻结规则）。"""
+    if verdict == "PARTIAL":
+        return "USABLE_WITH_GAPS" if (handshake_ok and tcp_small_ok) else "NOT_CLAIMED"
+    return CLAIM_MAP.get(verdict, "NOT_CLAIMED")
 
 PROTOCOL_ORDER = ["Vless", "Anytls", "Hysteria2", "Trojan", "Shadowsocks"]
 RUN_META_REQUIRED = ("run_id", "baseline", "spec_version", "completed_items", "fix_branches")
@@ -250,18 +295,15 @@ def protocol_verdict(proto, rows, allow_partial):
         for r in non_diag:
             key = r["status"] if r["present"] else "MISSING"
             counts[key] = counts.get(key, 0) + 1
-        claim_map = {
-            "VERIFIED": "USABLE",
-            "BROKEN": "NOT_USABLE",
-        }
         if claim is None:
             if verdict == "PARTIAL":
                 h = by("Handshake")
                 t1 = by("TcpSmall")
-                ok = all(x is not None and x["status"] == "PASS" for x in (h, t1))
-                claim = "USABLE_WITH_GAPS" if ok else "NOT_CLAIMED"
+                handshake_ok = h is not None and h["status"] == "PASS"
+                tcp_small_ok = t1 is not None and t1["status"] == "PASS"
+                claim = claim_for(verdict, handshake_ok, tcp_small_ok)
             else:
-                claim = claim_map.get(verdict, "NOT_CLAIMED")
+                claim = claim_for(verdict, False, False)
         rc = root_cause
         if rc is None:
             rc = "NONE"
@@ -1031,15 +1073,270 @@ def build(run_dir, matrix_path, allow_partial, run_meta=None, run_meta_path=None
     return payload, text
 
 
+def repo_inputs_sha256(files=None):
+    """固定顺序 + 文件名 + 内容 → inputs_sha256（见模块 docstring）。"""
+    concat = []
+    for path, rel in files or REPO_INPUT_FILES:
+        path = Path(path)
+        if not path.is_file():
+            raise RecomputeError(f"missing manifest input: {path}")
+        digest = hashlib.sha256(rel.encode("utf-8") + b"\0" + path.read_bytes()).hexdigest()
+        concat.append(digest)
+    return hashlib.sha256("".join(concat).encode("ascii")).hexdigest()
+
+
+def rfc3339_utc(epoch_seconds):
+    import datetime
+
+    stamp = datetime.datetime.fromtimestamp(int(epoch_seconds), datetime.timezone.utc)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now_rfc3339():
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def matrix_baseline_revision(text):
+    for line in text.splitlines():
+        marker = "baseline `"
+        if marker in line:
+            rest = line.split(marker, 1)[1]
+            candidate = rest.split("`", 1)[0].strip()
+            if len(candidate) == 40 and all(ch in "0123456789abcdef" for ch in candidate):
+                return candidate
+            break
+    raise RecomputeError("MATRIX header has no baseline <40hex> revision")
+
+
+def parse_matrix(text):
+    """MATRIX → {proto: {verdict, scope, claim, cells{(variant, cell): status}}}。
+
+    MATRIX 是协议 verdict 与格状态的唯一正本；本函数只做文本读取，不重算规则。
+    """
+    protocols = {}
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            title = line[3:].strip()
+            section = title.lower() if title.lower() in MATRIX_PROTOCOLS else None
+            continue
+        if not line.startswith("|"):
+            continue
+        cols = [col.strip() for col in line.strip("|").split("|")]
+        if not cols or set(cols[0]) <= {"-", ":", " "} or cols[0] in ("Cell", "协议"):
+            continue
+        if section is not None:
+            if "/" not in cols[0] or len(cols) < 2:
+                continue
+            variant, cell = cols[0].split("/", 1)
+            entry = protocols.setdefault(section, {})
+            entry.setdefault("cells", {})[(variant.strip(), cell.strip())] = cols[1]
+            continue
+        proto_key = cols[0].lower()
+        if proto_key in MATRIX_PROTOCOLS and len(cols) >= 4:
+            verdict = cols[1]
+            scope = cols[2]
+            claim = cols[3]
+            if verdict not in VERDICTS:
+                continue
+            entry = protocols.setdefault(proto_key, {})
+            entry.update({"verdict": verdict, "scope": scope, "claim": claim})
+    return protocols
+
+
+def load_synthetic(path=SYNTHETIC_INPUT_PATH):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        raise RecomputeError(f"synthetic input unreadable: {err}") from err
+    for key in ("synthetic", "annotations", "messages"):
+        if key not in data:
+            raise RecomputeError(f"synthetic input missing '{key}'")
+    return data
+
+
+def build_repo_manifest(target_path, prompt_generated_at=None, revision=None,
+                        matrix_path=REPO_MATRIX_PATH,
+                        synthetic_path=SYNTHETIC_INPUT_PATH,
+                        files=None):
+    """从现行 MATRIX + synthetic 机器输入派生仓库级 verdicts.json（spec v1.4 §5.2）。"""
+    matrix_text = Path(matrix_path).read_text(encoding="utf-8")
+    baseline = revision or matrix_baseline_revision(matrix_text)
+    synthetic = load_synthetic(synthetic_path)
+    annotations = synthetic["annotations"]
+    messages = synthetic["messages"]
+    matrix = parse_matrix(matrix_text)
+
+    generated_at = prompt_generated_at
+    if not generated_at:
+        epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if epoch is not None:
+            generated_at = rfc3339_utc(epoch)
+        else:
+            existing = Path(target_path)
+            if existing.is_file():
+                try:
+                    generated_at = json.loads(existing.read_text(encoding="utf-8")).get("generated_at")
+                except (OSError, json.JSONDecodeError):
+                    generated_at = None
+        generated_at = generated_at or now_rfc3339()
+
+    entries = {}
+    for proto in MATRIX_PROTOCOLS:
+        row = matrix.get(proto)
+        if not row:
+            raise RecomputeError(f"MATRIX is missing protocol row: {proto}")
+        verdict = row["verdict"]
+        scope = row["scope"]
+        if scope not in MATRIX_SCOPES or "product" in scope.lower():
+            raise RecomputeError(
+                f"{proto}: matrix-derived scope must be protocol-level {sorted(MATRIX_SCOPES)}, got {scope}"
+            )
+        cells = row["cells"]
+        handshake_ok = cells.get(("Default", "Handshake")) == "PASS"
+        tcp_small_ok = cells.get(("Default", "TcpSmall")) == "PASS"
+        claim = claim_for(verdict, handshake_ok, tcp_small_ok)
+        if claim != row["claim"]:
+            raise RecomputeError(
+                f"{proto}: derived claim {claim} != MATRIX claim {row['claim']} "
+                "(MATRIX and claim_for disagree; fix the source, do not rewrite JSON)"
+            )
+        note = annotations.get(proto) or {}
+        entries[proto] = {
+            "origin": "matrix",
+            "verdict": verdict,
+            "scope": scope,
+            "claim": claim,
+            "boundaries": list(note.get("boundaries") or []),
+            "safety": list(note.get("safety") or []),
+        }
+
+    for proto, entry in (synthetic.get("synthetic") or {}).items():
+        scope = entry["scope"]
+        if scope not in SYNTHETIC_SCOPES:
+            raise RecomputeError(
+                f"{proto}: synthetic scope must be one of {sorted(SYNTHETIC_SCOPES)}, got {scope}"
+            )
+        expected_claim = claim_for(entry["verdict"], False, False)
+        if entry["claim"] != expected_claim:
+            raise RecomputeError(
+                f"{proto}: synthetic claim {entry['claim']} != claim_for({entry['verdict']}) {expected_claim}"
+            )
+        entries[proto] = {
+            "origin": "synthetic",
+            "verdict": entry["verdict"],
+            "scope": scope,
+            "claim": entry["claim"],
+            "boundaries": list(entry.get("boundaries") or []),
+            "safety": list(entry.get("safety") or []),
+        }
+
+    missing_codes = sorted(
+        {
+            code
+            for entry in entries.values()
+            for code in (*entry["boundaries"], *entry["safety"])
+            if code not in messages
+        }
+    )
+    if missing_codes:
+        raise RecomputeError("messages missing codes: " + ", ".join(missing_codes))
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_from_revision": baseline,
+        "generated_at": generated_at,
+        "run_id": RUN_ID,
+        "inputs_sha256": repo_inputs_sha256(files),
+        "protocols": {proto: entries[proto] for proto in sorted(entries)},
+        "messages": messages,
+    }
+
+
+def dump_manifest(manifest):
+    return json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+
+
+def normalize_manifest_text(text):
+    """`--check` 归一化：generated_at 是溯源元数据，不参与零漂移比较。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    data.pop("generated_at", None)
+    return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--matrix", required=True)
+    ap.add_argument("--run-dir", default=None)
+    ap.add_argument("--matrix", default=None)
     ap.add_argument("--cell-matrix", default=str(DEFAULT_CELL_MATRIX))
     ap.add_argument("--run-meta", default=None)
-    ap.add_argument("--check", action="store_true")
+    ap.add_argument(
+        "--check",
+        nargs="?",
+        const=True,
+        default=None,
+        help="无参数=旧语义（MATRIX+run-dir verdicts）；带 path=校验仓库级 verdicts.json",
+    )
+    ap.add_argument(
+        "--repo-out",
+        nargs="?",
+        const=str(REPO_MANIFEST_PATH),
+        default=None,
+        help="写仓库级 verdicts.json（省略 path 用仓库根默认路径）",
+    )
+    ap.add_argument("--generated-at", default=None)
+    ap.add_argument("--revision", default=None)
     ap.add_argument("--allow-partial", action="store_true")
     args = ap.parse_args()
+
+    repo_mode = isinstance(args.check, str) or args.repo_out is not None
+    if args.repo_out is None and isinstance(args.check, str):
+        # 只校验时不需要 --run-dir/--matrix；输出目标仅用于路径解析（不写盘）。
+        args.repo_out = isinstance(args.check, str) and args.check or str(REPO_MANIFEST_PATH)
+    if not repo_mode:
+        if not args.run_dir or not args.matrix:
+            print("recompute error: --run-dir and --matrix are required (legacy mode)", file=sys.stderr)
+            return 2
+        return run_legacy(args)
+
+    try:
+        repo = build_repo_manifest(args.repo_out, prompt_generated_at=args.generated_at,
+                                   revision=args.revision)
+    except RecomputeError as err:
+        print(f"recompute error: {err}", file=sys.stderr)
+        return 2
+    text = dump_manifest(repo)
+    target = Path(args.repo_out)
+    if isinstance(args.check, str):
+        existing_path = Path(args.check)
+        existing = existing_path.read_text(encoding="utf-8") if existing_path.exists() else ""
+        if normalize_manifest_text(existing) != normalize_manifest_text(text):
+            print(
+                f"verdicts.json drift: {existing_path} != derived manifest "
+                "(run --repo-out to regenerate)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"verdicts.json is up to date: {existing_path}")
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    print(
+        "wrote manifest: "
+        + json.dumps(
+            {k: v["verdict"] for k, v in repo["protocols"].items()}, ensure_ascii=False
+        )
+    )
+    return 0
+
+
+def run_legacy(args):
     try:
         run_meta = load_run_meta(args.run_meta) if args.run_meta else None
         payload, text = build(

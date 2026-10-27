@@ -58,6 +58,12 @@
   - workspace heads/conflicts 挂 `nexus-workspace` DAG（Head Set 分叉 / 三方合并冲突快照）。
   - compute jobs 挂 `nexus-compute` ComputeJobSession（内存帧通道提交，Active/Closed 阶段快照）。
   - diagnose 聚合各子系统快照输出健康报告（逐项 ready + overall）。
+- 出站互操作标注（`outbound_manifest` 模块，spec §7）：`verdicts.json` 经
+  `include_str!` 嵌入 + 反序列化，**不硬编码 verdict 文案**；`is_proxy_kind` /
+  `is_wired` / `select_index` / `trojan_tls_signal` / `has_unsupported_obfs` 的**唯一定义**
+  （daemon/CLI 复用，N9）；启动面 `startup_surface` / `startup_warnings`、
+  运行快照 `runtime_snapshot` / `runtime_outbound_json`（R2-F12：`update_file_side`
+  成功即清 `file_rejected`）。
   - 领域未就绪命令（connectivity trace 等）返回
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
   - CLI 前端（apps/nexus/src/main.rs + control_service.rs + localapi_client.rs）：thin-client，

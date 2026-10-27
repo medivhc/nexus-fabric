@@ -22,6 +22,17 @@
 - 结构化 `ProxyConfig`（typed structs）或 `ConfigError`（保留字段路径与原因）。
 - 校验错误必须结构化：`CONFIG_INVALID { field, reason }`，不以日志文本代替。
 
+## Public API（出站 UDP 能力 DTO，spec §7.1 / C14）
+
+- `udp::UdpCapability { Supported(UdpMode) | Unsupported { reason } }`
+- `udp::UdpMode { Socks5Associate, ShadowsocksAead, VlessOverTcp, AnytlsUot,
+  TrojanUdpOverTls, Hysteria2Datagram }` —— **手写 `Debug`**：`ShadowsocksAead.password`
+  渲染为 `***`；禁止回归到 `#[derive(Debug)]`（脱敏硬约束）。
+- `udp::UdpUnsupportedReason { NotWired, TlsVariantNotSupported, NoDatagramMode }`
+  其中 `NoDatagramMode` 与四个 additive `UdpMode` 变体**保留但无生产者**（N4）。
+- 三类型为共享 DTO（CLI/daemon 共用），**不进入** `OutboundConfig`/`OutboundKind`
+  字段集合（AC-CFG-1 不变）；本模块仍零第三方依赖、零 I/O。
+
 ## Allowed Dependencies
 
 - `nexus-domain`
