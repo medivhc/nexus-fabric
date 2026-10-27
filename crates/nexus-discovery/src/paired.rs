@@ -594,11 +594,21 @@ impl PairedDiscovery {
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
+
+    /// 枚举已配对设备的 peer id（顺序不保证）。
+    #[must_use]
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.peers.keys().cloned().collect()
+    }
 }
 
 impl Discovery for PairedDiscovery {
     fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr> {
         self.peers.get(peer).cloned().unwrap_or_default()
+    }
+
+    fn peers(&self) -> Vec<PeerId> {
+        PairedDiscovery::peers(self)
     }
 }
 

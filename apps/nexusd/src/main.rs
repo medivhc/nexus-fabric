@@ -260,10 +260,12 @@ use nexus_fabric::{Driver, FabricIdentity, PeerId as FabricPeerId};
 use nexus_nat_traversal::{LocalCandidates, PortSample};
 // C1：权威 fabric 身份来自 daemon 自己的 `network.toml`（`peer_id` = 64-hex
 // ed25519 公钥）；解析发生在组合根，不在 NAT 运行时内部。
-use nexus_network::n1::{N1PeerId, config::N1Config};
+use nexus_network::n1::N1PeerId;
 
 use nexusd::assembly;
-use nexusd::config::{self, ConfigDir, LoadedConfig, TurnSection};
+use nexusd::config::{self, ConfigDir, DiscoverySection, LoadedConfig, TurnSection};
+use nexusd::discovery_runtime;
+use nexusd::peer_source;
 
 /// Verify managed bindings before any startup operation can create durable state.
 fn validate_task_provider_startup(config_root: &std::path::Path) -> Result<bool, ExitCode> {
@@ -1046,10 +1048,10 @@ fn setup_tproxy_frontend(
 /// - D5 生产触发（spec §14.3 / B17）已接线：`start` 在 identity 就绪时构造
 ///   `TurnRelayProvider` 并 `attach_relay_provider` 到 `sw`；`NatSwitching`
 ///   实现生产 `RelayConnSink`，provider 事件直通 `on_relay_connected`
-///   （auto_punch: true），loopback 验收已证明该路径。残留边界：生产侧按
-///   peer 订阅与 `on_turn_allocated` 触发需要 peer 来源（mesh 发现），目前
-///   daemon 内无 peer 源调用它们——接线与订阅机制已就位，peer 发现触发是
-///   后续 mesh 集成工作，不在本轮静默模拟。
+///   （auto_punch: true），loopback 验收已证明该路径。生产 peer 源由
+///   `PeerSourceFeed` 提供（静态配置 ∪ 发现 ∪ N1 session），它在同一 worker
+///   线程内按 `feed_interval` tick，并在 relay 地址簿出现地址后触发
+///   `on_turn_allocated`。
 struct NatSwitchRuntime {
     turn: nat_turn::TurnManager,
     // B14 fix: the gatherer owns the sampling prober (probing goes through
@@ -1071,6 +1073,10 @@ struct NatSwitchRuntime {
     /// STUN 端口样本滚动历史（供 D2 有界端口预测的 Δ 稳定性判定；上限
     /// `MAX_PORT_SAMPLES`，由 5min 刷新循环追加）。
     port_samples: Vec<PortSample>,
+    /// Peer-source feed (owned by value; only this worker ticks it).
+    feed: Option<peer_source::PeerSourceFeed>,
+    /// Feed tick interval (from `[network.discovery]`).
+    feed_interval: Duration,
 }
 
 /// STUN 端口样本滚动历史上限（D2 判定最少需要 3 个；保留 8 个抗抖动）。
@@ -1086,12 +1092,17 @@ impl NatSwitchRuntime {
     /// `driver` 与 `my_id` 由组合根注入（见 [`NatSwitchRuntime`] 诚实边界）：
     /// `driver` 是 punch responder 的 fabric server 端点，`my_id` 是 daemon 的
     /// 权威 mesh 身份（来自 `network.toml` 的 `peer_id`）。
+    #[allow(clippy::too_many_arguments)]
     fn start(
         section: &TurnSection,
         shutdown: Arc<AtomicBool>,
         driver: Arc<Driver>,
         my_id: FabricPeerId,
         identity: Option<FabricIdentity>,
+        discovery: &DiscoverySection,
+        hub: Option<Arc<nexus_discovery::hub::DiscoveryHub>>,
+        sessions: Option<Arc<nexus_network::n1::session::N1SessionManager>>,
+        static_peers: Vec<N1PeerId>,
     ) -> Option<JoinHandle<()>> {
         if let Some(id) = &identity {
             eprintln!(
@@ -1159,34 +1170,34 @@ impl NatSwitchRuntime {
 
         nexusd::nat_status::publish_nat_status_source(Box::new(Arc::clone(&sw)));
 
-        // D5 (spec §14.3 / B17): when the relay provider path is enabled
-        // (identity present), construct the production TURN provider and
-        // attach it to the switch. The provider owns the identity from
-        // here (bind_with_transport_identity); the runtime keeps the
-        // provider handle for the self-publish book path in `run`.
-        // The provider gets its own TurnManager (its own TURN allocation);
-        // the runtime's manager stays the warm backup. Book path matches
-        // `run`'s self-publish path so both read the same address book.
-        // Book-open failure degrades to no provider (logged); the switch
-        // itself still runs for manually fed relays.
-        let provider = match identity {
-            Some(id) => {
-                let hex: String = id.peer_id().0.iter().map(|b| format!("{b:02x}")).collect();
+        // D5: one address book for the whole process (provider publish + feed
+        // poll). `relay_book_dir` selects the shared-directory book; otherwise
+        // the legacy per-self temp file.
+        let book: Option<Arc<dyn nexusd::nat_relay::RelayAddressBook>> = match &section
+            .relay_book_dir
+        {
+            Some(dir) => match nexusd::nat_relay::DirRelayAddressBook::new(dir.clone(), my_id.0) {
+                Ok(book) => {
+                    eprintln!("[nat-relay] book mode=shared-dir path={}", dir.display());
+                    Some(Arc::new(book))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[nat-relay] WARN: shared relay book dir unavailable ({e}); relay provider not attached"
+                    );
+                    None
+                }
+            },
+            None => {
+                let hex: String = my_id.0.iter().map(|b| format!("{b:02x}")).collect();
                 let book_path = std::env::temp_dir().join(format!("nexus-relay-{hex}.toml"));
                 match nexusd::nat_relay::FileRelayAddressBook::new(&book_path) {
                     Ok(book) => {
-                        let provider = nexusd::nat_relay::TurnRelayProvider::new(
-                            my_id,
-                            id,
-                            // NOTE: the bin has its own `nat_turn` module (same
-                            // file, separate compilation); the provider needs
-                            // the LIB's TurnManager type. `section` is already
-                            // the lib's TurnSection (via nexusd::config).
-                            nexusd::nat_turn::TurnManager::new(Some(section.clone())),
-                            Arc::new(book),
+                        eprintln!(
+                            "[nat-relay] book mode=per-self path={}",
+                            book_path.display()
                         );
-                        sw.attach_relay_provider(provider.clone());
-                        Some(provider)
+                        Some(Arc::new(book))
                     }
                     Err(e) => {
                         eprintln!(
@@ -1196,7 +1207,66 @@ impl NatSwitchRuntime {
                     }
                 }
             }
-            None => None,
+        };
+
+        // The provider consumes the identity when attached; it owns its own
+        // TURN allocation (the runtime's manager stays the warm backup).
+        let provider = match (identity, book.clone()) {
+            (Some(id), Some(book)) => {
+                let provider = nexusd::nat_relay::TurnRelayProvider::new(
+                    my_id,
+                    id,
+                    // NOTE: the bin has its own `nat_turn` module (same file,
+                    // separate compilation); the provider needs the LIB's
+                    // TurnManager type.
+                    nexusd::nat_turn::TurnManager::new(Some(section.clone())),
+                    book,
+                );
+                sw.attach_relay_provider(
+                    Arc::clone(&provider) as Arc<dyn nexusd::nat_relay::RelayConnProvider>
+                );
+                Some(provider)
+            }
+            _ => None,
+        };
+
+        // Peer-source state is decided (and published) *before* the feed is
+        // constructed; only `running` gets a feed (spec §4.11.1).
+        let peer_status = Arc::new(peer_source::PeerSourceStatus::default());
+        let state = peer_source::decide_state(peer_source::PeerSourceStateInputs {
+            enabled: discovery.enabled,
+            feed: discovery.feed,
+            has_nat_switch: true,
+            has_provider: provider.is_some(),
+            has_hub: hub.is_some(),
+            has_sessions: sessions.is_some(),
+        });
+        peer_status.set_state(state);
+        nexusd::nat_status::publish_peer_source_status(Arc::clone(&peer_status));
+        eprintln!("[peer-source] state={state}");
+
+        let feed_cfg = peer_source::PeerSourceConfig {
+            book_poll_interval: Duration::from_millis(discovery.book_poll_ms),
+            trigger_max_failures: discovery.trigger_max_failures,
+            ..peer_source::PeerSourceConfig::default()
+        };
+        let feed_interval = feed_cfg.feed_interval;
+        let feed = match (provider.as_ref(), book, hub, sessions) {
+            (Some(provider), Some(book), Some(hub), Some(sessions)) if state == "running" => {
+                Some(peer_source::PeerSourceFeed::new(
+                    Arc::clone(&sw),
+                    Arc::clone(provider) as Arc<dyn nexusd::nat_relay::RelayTrigger>,
+                    book,
+                    sessions,
+                    static_peers,
+                    hub,
+                    my_id,
+                    feed_cfg,
+                    Arc::clone(&peer_status),
+                    Arc::clone(&shutdown),
+                ))
+            }
+            _ => None,
         };
 
         let runtime = NatSwitchRuntime {
@@ -1207,6 +1277,8 @@ impl NatSwitchRuntime {
             provider,
             stop: shutdown,
             port_samples: Vec::new(),
+            feed,
+            feed_interval,
         };
 
         let stun_servers = stun_servers(section);
@@ -1226,35 +1298,22 @@ impl NatSwitchRuntime {
     /// 时做双服务器 NAT 类型检测（AC4），否则只做单服务器采样（`nat_type`
     /// 保持 `Unknown`）。
     fn run(mut self, servers: Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)>) {
-        // 1. 懒初始化 TURN 分配（失败 → WARN + Disabled，中继照常）。
+        // 1. 懒初始化 runtime 的 warm-backup TURN 分配（失败 → WARN，中继照常）。
         match self.turn.ensure_allocated() {
-            Ok(relayed) => {
-                eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)");
-                if let Some(provider) = &self.provider {
-                    let peer_id = provider.identity_peer_id();
-                    let hex: String = peer_id.0.iter().map(|b| format!("{b:02x}")).collect();
-                    let path = std::env::temp_dir().join(format!("nexus-relay-{hex}.toml"));
-                    match nexusd::nat_relay::FileRelayAddressBook::new(&path) {
-                        Ok(book) => {
-                            use nexusd::nat_relay::RelayAddressBook;
-                            if let Err(e) = book.publish(peer_id.0, relayed) {
-                                eprintln!(
-                                    "[nat-relay] WARN: publish own relayed address failed: {e}"
-                                );
-                            } else {
-                                eprintln!(
-                                    "[nat-relay] self_registered peer={hex} relayed={relayed}"
-                                );
-                            }
-                        }
-                        Err(e) => eprintln!("[nat-relay] WARN: address book open failed: {e}"),
-                    }
-                }
-            }
+            Ok(relayed) => eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)"),
             Err(e) => eprintln!(
                 "[nat-switch] WARN: {}; punch disabled",
                 nat_gather::GatherError::Turn(e)
             ),
+        }
+
+        // 1b. The provider allocates and publishes **its own** relayed address.
+        // The runtime's warm-backup allocation is never published (peers would
+        // dial an allocation nobody accepts).
+        if let Some(provider) = &self.provider {
+            if let Err(e) = provider.ensure_relay_ready() {
+                eprintln!("[nat-relay] WARN: relay not ready ({e}); provider stays attached");
+            }
         }
 
         // 2. 初始 STUN 采样（失败不阻断）。
@@ -1263,9 +1322,25 @@ impl NatSwitchRuntime {
             self.sample_and_update(s1, s2);
         }
 
-        // 3. 节奏循环：Refresh 保活 + 周期 STUN 重采样。
+        // 3. 节奏循环：Refresh 保活（runtime + provider）+ 周期 STUN + feed tick。
+        let mut last_feed: Option<std::time::Instant> = None;
+        let feed_interval = self.feed_interval;
         while !self.stop.load(Ordering::Relaxed) {
             self.turn.refresh_if_needed();
+            if let Some(provider) = &self.provider {
+                // `Lost` is fully handled inside the provider (slot cleared,
+                // sinks notified); the feed re-arms on the next book poll.
+                let _ = provider.refresh();
+            }
+            if let Some(feed) = &mut self.feed {
+                let due = last_feed
+                    .map(|at: std::time::Instant| at.elapsed() >= feed_interval)
+                    .unwrap_or(true);
+                if due {
+                    last_feed = Some(std::time::Instant::now());
+                    feed.tick(std::time::Instant::now());
+                }
+            }
             if let Some((s1, s2)) = servers {
                 if last_stun.elapsed() >= nat_stun::STUN_REFRESH_INTERVAL {
                     self.sample_and_update(s1, s2);
@@ -1275,7 +1350,10 @@ impl NatSwitchRuntime {
             std::thread::sleep(Duration::from_millis(500));
         }
 
-        // 4. 协作式退出：停止质量监控 + 释放 TURN 资源。
+        // 4. 协作式退出顺序（冻结）：feed → sw → turn。
+        if let Some(feed) = &mut self.feed {
+            feed.shutdown();
+        }
         self.sw.shutdown();
         self.turn.shutdown();
         eprintln!("[nat-switch] worker exited");
@@ -1564,14 +1642,41 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
     };
 
-    // 3. R1：装配 N1 网桥（失败 → 降级，dataplane 照常跑）。
-    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> = match loaded
-        .network_toml
-        .as_deref()
-    {
+    // 3. R1：装配 N1 网桥 + 单一 discovery hub（失败 → 降级，dataplane 照常跑）。
+    //
+    // 本段是进程内**唯一**的 N1/hub 装配点（spec §4.10.2）：hub、sessions、
+    // static_peers 与权威 N1Config 都由 `N1Assembly` 提供，NAT/发现段不再二次解析。
+    let discovery_section = loaded.daemon.discovery.clone();
+    // One resolved address, one source label: the summary below is the only
+    // operator-facing statement of what will actually be advertised.
+    let (advertise_ip, advertise_source) = match discovery_section.advertise_ip {
+        Some(ip) => (Some(ip), "config"),
+        None => (discovery_runtime::select_advertise_ipv4(), "auto"),
+    };
+    eprintln!(
+        "{}",
+        discovery_runtime::production_summary(&discovery_section, advertise_ip, advertise_source)
+    );
+    let discovery_params = nexus::network::DiscoveryParams {
+        mdns: match (discovery_section.mdns, advertise_ip) {
+            (true, Some(ip)) => Some(nexus::network::MdnsParams {
+                // CR-BLOCKED-1: SRV carries the discovery/gossip endpoint.
+                service_port: discovery_section.gossip_port,
+                announce_ip: ip,
+            }),
+            _ => None,
+        },
+        lsa_stale_after: Duration::from_secs(discovery_section.lsa_stale_sec),
+    };
+    let n1_assembly: Option<assembly::N1Assembly> = match loaded.network_toml.as_deref() {
         Some(text) => {
-            match assembly::assemble_n1(text, loaded.daemon.proxy.as_ref(), Arc::clone(&shutdown)) {
-                Ok(bridge) => Some(bridge),
+            match assembly::assemble_n1_with_discovery(
+                text,
+                loaded.daemon.proxy.as_ref(),
+                Arc::clone(&shutdown),
+                discovery_params,
+            ) {
+                Ok(assembly) => Some(assembly),
                 Err(e) => {
                     eprintln!(
                         "[nexusd] ERROR: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
@@ -1582,9 +1687,66 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
         None => None,
     };
+    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> =
+        n1_assembly.as_ref().map(|a| Arc::clone(&a.bridge));
     let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> = n1_bridge
         .clone()
         .map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
+
+    // 3b. 发现 pump：即使没有 `[network.turn]` 也启动（发现/状态面独立，
+    // 启动顺序冻结：装配 → DiscoveryRuntime::start → NatSwitchRuntime::start）。
+    let discovery_handle = match n1_assembly.as_ref() {
+        Some(assembly) if discovery_section.enabled => {
+            let static_gossip_addrs: Vec<std::net::SocketAddr> = assembly
+                .config
+                .peers
+                .iter()
+                .flat_map(|p| {
+                    p.addrs.iter().map(|addr| {
+                        std::net::SocketAddr::new(addr.ip(), discovery_section.gossip_port)
+                    })
+                })
+                .collect();
+            // CAP_RELAY is advertised when the daemon is configured to relay;
+            // the authoritative identity check stays fail-closed at NAT start.
+            let mut capabilities = nexus_discovery::lsa::CAP_TUN;
+            if loaded.daemon.punch.enabled
+                && loaded.daemon.punch.relay_provider_enabled
+                && loaded.daemon.identity.seed_file.is_some()
+            {
+                capabilities |= nexus_discovery::lsa::CAP_RELAY;
+            }
+            let incarnation = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                .max(1);
+            let self_lsa = discovery_runtime::SelfLsaConfig {
+                node_id: nexus_discovery::PeerId(assembly.config.peer_id.to_hex()),
+                vip: assembly.config.vpi.address.to_string(),
+                capabilities,
+                incarnation,
+            };
+            let cfg = discovery_runtime::production_config(
+                &discovery_section,
+                advertise_ip,
+                static_gossip_addrs,
+            );
+            Some(discovery_runtime::DiscoveryRuntime::start(
+                Arc::clone(&assembly.discovery),
+                cfg,
+                self_lsa,
+                Arc::clone(&shutdown),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(handle) = &discovery_handle {
+        nexusd::nat_status::publish_discovery_status(handle.status());
+    }
+    if let Some(assembly) = n1_assembly.as_ref() {
+        nexusd::nat_status::publish_discovery_hub(Arc::clone(&assembly.discovery));
+    }
 
     // 4. 统一数据面线程（D1：单个 TUN 由 nexusd 持有；TUN 创建失败则线程内降级）。
     //    T2：[tun].enabled=false 时跳过 TUN/数据面（no-tun 模式）。
@@ -1748,37 +1910,22 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     //      收到 SIGTERM/SIGINT 后协作式退出）；启动/绑定失败 → WARN + 降级，
     //      不阻断进程，LocalAPI 照常服务（诚实边界见 `NatSwitchRuntime` 文档）。
     //
-    // C1：权威 fabric 身份在组合根一次性解析——`network.toml` 的 `peer_id`
-    // （必需字段，64-hex ed25519 公钥）经 `N1Config::parse_toml` 取出并转换为
-    // `FabricPeerId`；punch `Driver` 也在组合根创建。`network.toml` 缺失或
-    // 解析失败 → WARN + 跳过 nat-switch（无权威身份时打洞无法关联 offer）。
+    // C1：权威 fabric 身份来自 `N1Assembly.config`（本 run 唯一的 N1Config
+    // 副本，不再二次解析 network.toml）；punch `Driver` 也在组合根创建。
+    // 装配缺失 → WARN + 跳过 nat-switch（无权威身份时打洞无法关联 offer）。
     let punch_section = loaded.daemon.punch.clone();
     let identity_section = loaded.daemon.identity.clone();
     let turn_section = loaded.daemon.turn.clone();
     let nat_switch_handle = match turn_section.as_ref() {
         None => None,
         Some(section) => match (|| -> Result<Option<std::thread::JoinHandle<()>>, ExitCode> {
-            let n1_peer_id = match loaded.network_toml.as_deref() {
-                Some(text) => match N1Config::parse_toml(text) {
-                    Ok(cfg) => {
-                        let n1_peer_id: N1PeerId = cfg.peer_id;
-                        n1_peer_id
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[nat-switch] WARN: network.toml parse failed ({e}); nat-switch disabled (no authoritative fabric identity)"
-                        );
-                        return Ok(None);
-                    }
-                },
-                None => {
-                    eprintln!(
-                        "[nat-switch] WARN: network.toml absent; nat-switch disabled (no authoritative fabric identity)"
-                    );
-                    return Ok(None);
-                }
+            let Some(n1) = n1_assembly.as_ref() else {
+                eprintln!(
+                    "[nat-switch] WARN: network.toml absent or unparsed; nat-switch disabled (no authoritative fabric identity)"
+                );
+                return Ok(None);
             };
-            let my_id = FabricPeerId(n1_peer_id.0);
+            let my_id = FabricPeerId(n1.config.peer_id.0);
             // BLOCKED-1 ruling (a): the relay provider needs the daemon's fabric
             // identity. There is no ed25519 seed in the node identity store, so
             // the seed comes from `[network.identity].seed_file` and MUST match
@@ -1824,6 +1971,10 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 driver,
                 my_id,
                 identity,
+                &discovery_section,
+                Some(Arc::clone(&n1.discovery)),
+                Some(Arc::clone(&n1.sessions)),
+                n1.static_peers.clone(),
             ))
         })() {
             Ok(handle) => handle,
@@ -1863,6 +2014,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         dataplane_handle,
         n1_bridge,
         n2_sweeper_handle,
+        discovery_handle,
         nat_switch_handle,
         &state_dir,
     );
@@ -1871,14 +2023,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
 /// R4：优雅关闭序列（§13.4）。
 ///
-/// 顺序：LocalAPI → N2 sweeper → NAT switch（5s）→ Workspace unmount（D7）→
-/// Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
+/// 顺序：LocalAPI → N2 sweeper → discovery pump（1s）→ NAT switch（5s，
+/// 内部 feed → switch → turn）→ Workspace unmount（D7）→ Dataplane（1s）→
+/// N1（5s）→ TUN（随 dataplane 线程退出）。
 /// 任一步超时 → warn 日志后强制继续，不无限等。
 fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
     n2_sweeper_handle: Option<std::thread::JoinHandle<()>>,
+    discovery_handle: Option<nexusd::discovery_runtime::DiscoveryRuntimeHandle>,
     nat_switch_handle: Option<std::thread::JoinHandle<()>>,
     state_dir: &std::path::Path,
 ) {
@@ -1889,6 +2043,12 @@ fn shutdown_sequence(
     // P1-1：N2 SessionManager 的唯一持有者（sweeper 线程）确认结束。
     if let Some(handle) = n2_sweeper_handle {
         assembly::join_with_timeout(handle, Duration::from_secs(2), "n2-session-sweeper");
+    }
+
+    // 发现 pump 先停：它的 socket 线程只读 hub，先于 NAT 订阅面退出。
+    if let Some(handle) = discovery_handle {
+        eprintln!("[nexusd] shutdown: stopping discovery pump");
+        handle.join(Duration::from_secs(1));
     }
 
     // AC5：NAT switching worker 共享 daemon shutdown 标志（协作式退出），

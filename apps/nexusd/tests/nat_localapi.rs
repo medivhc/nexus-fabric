@@ -86,7 +86,12 @@ fn g11_localapi_nat_route() {
     let _ = child.wait();
     assert_eq!(status, 200, "NAT snapshot route must exist: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
-    assert_eq!(v["schema_version"], 1);
+    // schema v2 (peer-source-discovery-wiring): additive peer_source /
+    // discovery blocks, peers[].paths still [].
+    assert_eq!(v["schema_version"], 2);
     assert_eq!(v["runtime"], "disabled");
     assert!(v["peers"].is_array());
+    assert_eq!(v["peer_source"]["state"], "disabled:no-turn");
+    assert!(v["peer_source"]["sources"].is_object());
+    assert!(v["discovery"]["mdns"].is_string());
 }

@@ -10,12 +10,14 @@
 #![forbid(unsafe_code)]
 
 pub mod aggregate;
+pub mod hub;
 pub mod lsa;
 pub mod mdns;
 pub mod paired;
 pub mod routing;
 
 pub use aggregate::AggregateDiscovery;
+pub use hub::DiscoveryHub;
 pub use paired::{
     NodeIdentity, PairedDiscovery, PairedPeer, PairingCode, PairingError, PairingFrame,
     decode_pairing_frame, decode_peer_file, encode_pairing_frame, encode_peer_file, hex_decode,
@@ -88,6 +90,12 @@ impl StaticDiscovery {
     pub fn register(&mut self, peer: PeerId, addr: SocketAddr) {
         self.peers.insert(peer, addr);
     }
+
+    /// 枚举静态表中的全部 peer（顺序不保证；排序责任在调用方）。
+    #[must_use]
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.peers.keys().cloned().collect()
+    }
 }
 
 // ---------- 三源发现 D1/D2/D5/D6（DESIGN §8.2） ----------
@@ -104,6 +112,14 @@ impl StaticDiscovery {
 pub trait Discovery {
     /// 解析 peer 当前已知的可达地址（可能为空）。
     fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr>;
+
+    /// 枚举本源当前知晓的 peer（默认空实现，不破坏既有实现）。
+    ///
+    /// 顺序不作保证；需要确定顺序的调用方自行排序（`DiscoveryHub` 按
+    /// PeerId 的 64-hex 升序输出）。
+    fn peers(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
 }
 
 impl Discovery for StaticDiscovery {
@@ -111,6 +127,10 @@ impl Discovery for StaticDiscovery {
     fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr> {
         // 显式调用 inherent（Result 版）冻结方法，再映射到 trait 的 Vec 语义。
         StaticDiscovery::resolve(self, peer).into_iter().collect()
+    }
+
+    fn peers(&self) -> Vec<PeerId> {
+        StaticDiscovery::peers(self)
     }
 }
 

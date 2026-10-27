@@ -44,38 +44,13 @@ impl<'a> AggregateDiscovery<'a> {
     /// 按优先级解析，返回带来源标注的地址（同地址去重，保留最高优先级）。
     #[must_use]
     pub fn resolve_with_sources(&self, peer: &PeerId) -> Vec<ResolvedAddr> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        // 优先级：Paired > Static > Lsa > Mdns（变体声明顺序）。
-        if let Some(paired) = &self.paired_src {
-            for addr in Discovery::resolve(paired, peer) {
-                if seen.insert(addr) {
-                    out.push(ResolvedAddr {
-                        addr,
-                        source: DiscoverySource::Paired,
-                    });
-                }
-            }
-        }
-        let sources: [(DiscoverySource, Vec<SocketAddr>); 3] = [
-            (
-                DiscoverySource::Static,
-                Discovery::resolve(&self.static_src, peer),
-            ),
-            (DiscoverySource::Lsa, self.lsa_src.resolve(peer)),
-            (
-                DiscoverySource::Mdns,
-                Discovery::resolve(&self.mdns_src, peer),
-            ),
-        ];
-        for (source, addrs) in sources {
-            for addr in addrs {
-                if seen.insert(addr) {
-                    out.push(ResolvedAddr { addr, source });
-                }
-            }
-        }
-        out
+        merge_ranked(
+            self.paired_src.as_ref().map(|p| p as &dyn Discovery),
+            &self.static_src,
+            &self.lsa_src,
+            &self.mdns_src,
+            peer,
+        )
     }
 
     /// 可观测计数器（D6）。
@@ -132,6 +107,68 @@ impl Discovery for AggregateDiscovery<'_> {
         }
         out
     }
+
+    /// 全部源的 peer 并集（去重；不含新鲜度过滤——`AggregateDiscovery` 没有时间参数）。
+    fn peers(&self) -> Vec<PeerId> {
+        let mut out: Vec<PeerId> = Vec::new();
+        let mut seen = HashSet::new();
+        let sources: [Option<&dyn Discovery>; 4] = [
+            self.paired_src.as_ref().map(|p| p as &dyn Discovery),
+            Some(&self.static_src),
+            Some(&self.lsa_src),
+            Some(&self.mdns_src),
+        ];
+        for src in sources.into_iter().flatten() {
+            for peer in src.peers() {
+                if seen.insert(peer.0.clone()) {
+                    out.push(peer);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 单一优先级实现：Paired > Static > Lsa > Mdns，同地址去重保留最高优先级。
+///
+/// `AggregateDiscovery` 与 `DiscoveryHub` 共用本函数（不复制优先级规则）。
+/// `static_src` / `lsa` / `mdns` 是必选源，`paired` 可选（D7 builder 加法）。
+pub(crate) fn merge_ranked(
+    paired: Option<&dyn Discovery>,
+    static_src: &dyn Discovery,
+    lsa: &dyn Discovery,
+    mdns: &dyn Discovery,
+    peer: &PeerId,
+) -> Vec<ResolvedAddr> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    // 优先级：Paired > Static > Lsa > Mdns（变体声明顺序）。
+    if let Some(paired) = paired {
+        for addr in Discovery::resolve(paired, peer) {
+            if seen.insert(addr) {
+                out.push(ResolvedAddr {
+                    addr,
+                    source: DiscoverySource::Paired,
+                });
+            }
+        }
+    }
+    let sources: [(DiscoverySource, Vec<SocketAddr>); 3] = [
+        (
+            DiscoverySource::Static,
+            Discovery::resolve(static_src, peer),
+        ),
+        (DiscoverySource::Lsa, lsa.resolve(peer)),
+        (DiscoverySource::Mdns, Discovery::resolve(mdns, peer)),
+    ];
+    for (source, addrs) in sources {
+        for addr in addrs {
+            if seen.insert(addr) {
+                out.push(ResolvedAddr { addr, source });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
