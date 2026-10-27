@@ -96,8 +96,9 @@ pub fn exchange(addr: &str, raw: &[u8], half_close: bool) -> (u16, TaskEnvelope)
         .unwrap();
     stream.write_all(raw).unwrap();
     if half_close {
-        // The daemon may refuse early and close first; its complete response is
-        // still readable below, so a lost half-close is not a failure.
+        // An early refusal writes the full response and closes with the request
+        // body unread, so the kernel may RST before this half-close (ENOTCONN);
+        // the response is still read and checked in full below.
         if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
             assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "{e}");
         }

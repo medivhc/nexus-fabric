@@ -1066,9 +1066,10 @@ mod tests {
             "flow-accept-* thread count difference must be 0"
         );
         // Process-level `flow-accept-<peer>` thread count returns to baseline.
-        // comm is truncated to 3 hex chars of the peer id, so a concurrently
-        // running test's thread can share the name for a moment; poll (bounded)
-        // so only a thread that never exits fails the check.
+        // A joined thread can stay listed in /proc/self/task for a moment after
+        // join() returns (wider under coverage instrumentation), and comm keeps
+        // only 3 hex chars of the peer id, so a concurrent test's thread may
+        // share the name. Poll (bounded) so only a thread that never exits fails.
         let mut after = count_flow_accept();
         for _ in 0..250 {
             if after == baseline {
