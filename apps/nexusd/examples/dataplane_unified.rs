@@ -13,6 +13,7 @@ use std::time::Duration;
 use nexus_network::n1::N1Error;
 use nexus_network::n1::bridge::N1Sender;
 use nexus_projection::MockTun;
+use nexus_proxy::domain_engine::DomainRuleEngine;
 use nexusd::dataplane::{Dataplane, DataplaneConfig};
 use serde_json::json;
 
@@ -105,6 +106,11 @@ fn run() -> serde_json::Value {
     let proxy_engine =
         nexusd::proxy_fwd::ProxyEngine::new(&proxy_yaml).expect("proxy engine from stub socks5");
     dp.set_proxy_engine(proxy_engine);
+    // P3：`Dataplane::new` 初始规则为空（fail-closed），须显式注入与
+    // ProxyEngine 同源的规则引擎，否则 198.18.1.1 会被判 Drop。
+    dp.set_rule_engine(Box::new(
+        DomainRuleEngine::from_yaml(&proxy_yaml).expect("dataplane rule engine from stub socks5"),
+    ));
 
     // 3. 处理所有包。
     let mut processed = 0;
