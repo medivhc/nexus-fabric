@@ -62,6 +62,21 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
+# Test builds only (`cargo test`, cargo llvm-cov); `cargo build`/`check`/
+# `clippy` keep the plain dev profile. These crates carry the hot loops of the
+# snapshot-staging tests (per-request blob re-hash, canonical ledger codec,
+# sha256_reader): unoptimized, the 64 MiB pressure test alone took ~12 of the
+# ~16 coverage minutes. opt-level 1 runs it ~4.4x faster for +10-20 s of
+# non-incremental compile.
+[profile.test.package.nexusd]
+opt-level = 1
+
+[profile.test.package.nexus]
+opt-level = 1
+
+[profile.test.package.nexus-domain]
+opt-level = 1
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
