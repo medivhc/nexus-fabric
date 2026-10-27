@@ -97,7 +97,10 @@ jobs:
             fi
           done
           echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
-          echo "crates=${CHANGED}" >> "$GITHUB_OUTPUT"
+          # CHANGED is newline-separated; a multi-line value without a heredoc
+          # delimiter makes GITHUB_OUTPUT invalid and fails the job whenever a PR
+          # touches 2+ crates. The unquoted expansion joins them with spaces.
+          echo "crates=$(echo ${CHANGED})" >> "$GITHUB_OUTPUT"
           exit $STATUS
 
       # 上传 quick-check 日志（即使成功也保留，便于排查环境差异）
