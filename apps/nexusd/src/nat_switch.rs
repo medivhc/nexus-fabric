@@ -24,10 +24,10 @@
 //! 持有 driver anchor，且**不**向新订阅者重放已建立的 relay（O8-9/O8-10：
 //! 重放会再次覆盖 `nat_conns` 并清掉 direct 热备）。loopback 验收
 //! （`nat_relay` 测试 `d5_production_sink_triggers_on_relay_connected`）证明该路径。
-//! 残留边界：生产侧按 peer 订阅（`subscribe_relay_peer`）与触发
-//! `on_turn_allocated` 需要 peer 来源（mesh 发现），daemon 内目前无 peer
-//! 源调用它们——接线与订阅机制已就位并经 loopback 证明，peer 发现触发是
-//! 后续 mesh 集成工作，不在本轮静默模拟。
+//! 残留边界：peer 来源由 `PeerSourceFeed` 提供并在 NAT worker 内 tick
+//! （`main.rs` 的 `feed.tick`）：`peer_source.rs` 负责 `subscribe_relay_peer`
+//! / 退订与 `spawn_trigger`（`trigger_relay`），本模块只消费 provider 事件。
+//! 该接线的验收仍是 loopback / E4（fake doubles），**不是真机**证据。
 //! E4（`crates/nexus-nat-wireup/examples/e4_prod_switch.rs`）用真实
 //! TURN + NAT 模拟证明整条链路。
 
@@ -473,8 +473,11 @@ impl RelayConnSink for NatSwitching {
     fn on_relay_lost(&self, peer: FabricPeerId) {
         // Spec section 14.3: only update state. The relay is already gone,
         // so there is nothing to close, and a lost relay must never
-        // trigger a punch.
+        // trigger a punch. Clearing `relay_source` keeps the API from
+        // reporting `turn` after the loss (R-18 allows the residual *path*
+        // state; the relay source itself must not lie).
         self.relay_lost.lock().unwrap().insert(peer.0);
+        self.punch.set_relay_source(peer, None);
         eprintln!(
             "[nat-switch] relay lost for peer {} (state only; relay not closed, no punch triggered)",
             peer_name(&peer)
@@ -642,6 +645,20 @@ mod gap_tests {
             status.relay_source,
             Some(nexus_nat_wireup::RelaySource::Turn)
         );
+        // MINOR-5: a later loss must not leave `relay_source="turn"` behind in
+        // the API (the relay really is gone). Path state stays untouched (R-18).
+        RelayConnSink::on_relay_lost(sw.as_ref(), peer);
+        let status = sw
+            .punch
+            .all_status()
+            .into_iter()
+            .find(|s| s.peer == peer)
+            .expect("peer status registered");
+        assert_eq!(
+            status.relay_source, None,
+            "provider_lost/unsubscribe must clear the stale relay source"
+        );
+        assert_eq!(status.tunnel_proto, nexus_nat_wireup::TunnelProto::Turn);
         sw.shutdown();
     }
 
