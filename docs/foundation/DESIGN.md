@@ -144,7 +144,7 @@ struct Stats {
 mesh 流量跑在代理隧道里。
 
 > **互操作状态注记（2026-10-25）**：本节 P1 假设所依赖的 Trojan/Shadowsocks 尚未就绪：
-> Trojan 为 `BROKEN / NOT_USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
+> Trojan 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（TCP 产品路径可用；产品 UDP 未实现、success 之后到达的 fallback 在承诺边界外）；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
 > （SIP004 互操作已通、产品 UDP 未实现、nexusd TUN 路径不在覆盖内）。状态与本 run 的证据
 > 边界以 [出站协议互操作证据总表](../protocols/interop/MATRIX.md) 为准；本注记不改变本节
 > 的设计假设，只提示规划读者该能力尚未就绪。

@@ -38,6 +38,8 @@ pub enum ReloadEvent {
     },
     /// 需要重启 daemon（配置已校验但需重启才生效）。
     NeedsRestart {
+        /// 触发本次事件的变更文件。
+        files: Vec<String>,
         /// 原因描述。
         reason: String,
     },
@@ -101,8 +103,9 @@ fn watch_loop(dir: ConfigDir, mut current: LoadedConfig, tx: Sender<ReloadEvent>
                         current.meta.remove(f);
                     }
                 }
+                // 写点 2（spec §9.1）：构造点即脱敏（口令不落 stderr）。
                 let _ = tx.send(ReloadEvent::Rejected {
-                    error: format!("files {changed:?}: {e}"),
+                    error: nexus::redact::redact_secrets(&format!("files {changed:?}: {e}")),
                 });
                 continue;
             }
@@ -117,12 +120,18 @@ fn watch_loop(dir: ConfigDir, mut current: LoadedConfig, tx: Sender<ReloadEvent>
             ChangeKind::NeedsRestart => {
                 // 不更新 current（旧配置继续生效），提示重启。
                 // 注意：若用户后续又改回，meta 对比会再次触发，这是预期的。
+                let reason = if changed.iter().any(|f| f == config::PROXY_YAML) {
+                    // Q-7=B：proxy.yaml 固定句式（§7.6.1）。
+                    "proxy.yaml changed: outbound engine requires daemon restart".to_string()
+                } else {
+                    format!(
+                        "files {changed:?} require daemon restart to take effect; \
+                         current config remains active"
+                    )
+                };
                 let _ = tx.send(ReloadEvent::NeedsRestart {
-                    reason: format!(
-                        "files {:?} require daemon restart to take effect; \
-                         current config remains active",
-                        changed
-                    ),
+                    files: changed,
+                    reason,
                 });
                 // 更新 meta 基准，避免对同一变更重复 warning。
                 // 但保留旧配置内容（current 的各字段不动，只换 meta）。
@@ -158,17 +167,25 @@ mod tests {
         let yaml_v1 = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         let yaml_v2 = "schema_version: 1\nrules:\n  - tag: r2\n    kind: domain\n    match: x.com\n    action:\n      - kind: select_outbound\n        tag: d\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         write(&d, config::PROXY_YAML, yaml_v1);
+        write(&d, config::DNS_TOML, "servers = [\"1.1.1.1\"]\n");
         let dir = ConfigDir::new(&d).unwrap();
         let current = config::load(&dir).unwrap();
         let (tx, rx) = channel();
         let _h = spawn(dir.clone(), current, tx);
 
-        // 有效变更 → Applied
+        // Hot 路径仍存在：已有 dns.toml 的**内容**变更 → Applied
+        write(&d, config::DNS_TOML, "servers = [\"8.8.8.8\"]\n");
+        let ev = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("expected Applied event for dns.toml");
+        assert!(matches!(ev, ReloadEvent::Applied { .. }), "got {ev:?}");
+
+        // proxy.yaml 内容变更 → NeedsRestart（Q-7=B：engine 只在启动构造）
         write(&d, config::PROXY_YAML, yaml_v2);
         let ev = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("expected Applied event");
-        assert!(matches!(ev, ReloadEvent::Applied { .. }), "got {ev:?}");
+            .expect("expected NeedsRestart event");
+        assert!(matches!(ev, ReloadEvent::NeedsRestart { .. }), "got {ev:?}");
 
         // 无效变更 → Rejected（TOML 语法错误）
         write(&d, config::NETWORK_TOML, "[[[broken");

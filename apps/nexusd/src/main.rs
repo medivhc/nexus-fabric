@@ -28,6 +28,12 @@
 
 #![forbid(unsafe_code)]
 
+// D1 硬约束 3：ProxyEngine 在主线程构造、移入 dataplane 线程 → 必须 Send。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<nexusd::proxy_fwd::ProxyEngine>();
+};
+
 // T4：tun_enabled 状态供 LocalAPI 查询（no-tun 模式可观测）。
 static TUN_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -401,12 +407,135 @@ fn assemble_dataplane(
     Ok(dp)
 }
 
+/// proxy.yaml 原文的 SHA-1（spec §7.6.2 `active_config_sha1` / `file_config_sha1`）。
+fn config_sha1(text: Option<&str>) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hash = Sha1::new();
+    hash.update(text.unwrap_or_default().as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+/// 发布 outbound `engine` / `dataplane` 启动事实（加法字段）。
+///
+/// no-tun 模式不构造 `ProxyEngine`；TUN 模式下 engine 由 dataplane 线程装配，
+/// 这里先标 `starting`，线程内 wiring 完成后更新为 `running`
+/// （TUN 创建/初始化失败 → `disabled`）。
+fn publish_engine_state(tun_enabled: bool) {
+    let state = if tun_enabled {
+        nexus::outbound_manifest::DataplaneState::Starting
+    } else {
+        nexus::outbound_manifest::DataplaneState::NotStarted
+    };
+    nexus::outbound_manifest::install_engine_state(false, state);
+}
+
+/// D1：spawn **之前**构造 ProxyEngine（spec §3.3 定稿顺序）。
+///
+/// - `Err(Yaml | SelectedInvalid)` → 打印 `stage=proxy_engine_init` JSON 并返回 exit 1；
+/// - `Err(NoUsableOutbound)` → warn 一行（§12.1）+ 无 engine（降级，非错误态）；
+/// - 门槛 `tun_enabled() || has_tproxy`：no-tun 模式不构造、不产生该 stage 失败。
+fn build_proxy_engine_for_startup(
+    proxy_yaml: Option<&str>,
+    tun_enabled: bool,
+    has_tproxy: bool,
+) -> Result<
+    (
+        Option<nexusd::proxy_fwd::ProxyEngine>,
+        Option<Arc<nexusd::proxy_fwd::OutboundRegistry>>,
+    ),
+    ExitCode,
+> {
+    if !(tun_enabled || has_tproxy) {
+        return Ok((None, None));
+    }
+    match nexusd::proxy_fwd::OutboundRegistry::build(proxy_yaml) {
+        Ok(None) => Ok((None, None)),
+        Ok(Some(registry)) => {
+            // §12.1：非首个 wired 非法出站的启动 warn 行（不静默）。
+            for line in registry.unsupported_warnings() {
+                eprintln!("{line}");
+            }
+            let engine = nexusd::proxy_fwd::ProxyEngine::from_registry(Arc::clone(&registry));
+            Ok((engine, Some(registry)))
+        }
+        Err(nexusd::proxy_fwd::EngineInitError::NoUsableOutbound { .. }) => {
+            eprintln!(
+                "[nexusd] dataplane: ProxyEngine unavailable (NO_USABLE_OUTBOUND); proxy flows answered with RST"
+            );
+            Ok((None, None))
+        }
+        Err(error) => {
+            eprintln!("{}", proxy_engine_init_failure_json(&error));
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// `stage=proxy_engine_init` 的启动失败 JSON（spec §12.2-A 逐字模板）。
+fn proxy_engine_init_failure_json(error: &nexusd::proxy_fwd::EngineInitError) -> serde_json::Value {
+    use nexusd::proxy_fwd::OutboundConfigError;
+    match error {
+        nexusd::proxy_fwd::EngineInitError::Yaml(config) => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "proxy_engine_init",
+            "error": {
+                "code": "CONFIG",
+                "variant": error.variant(),
+                "cause": "CONFIG_INVALID",
+                "field": nexus::redact::sanitize(&config.field),
+                "tag": "-",
+                "kind": "-",
+                "detail": nexus::redact::sanitize(&config.reason),
+            }
+        }),
+        nexusd::proxy_fwd::EngineInitError::SelectedInvalid { tag, source } => {
+            let mut body = json!({
+                "verdict": "FAIL",
+                "command": "nexusd",
+                "stage": "proxy_engine_init",
+                "error": {
+                    "code": "CONFIG",
+                    "variant": error.variant(),
+                    "cause": source.name(),
+                    "tag": tag,
+                    "kind": "-",
+                    "detail": nexus::redact::sanitize(source.detail()),
+                }
+            });
+            if matches!(source, OutboundConfigError::PlaintextTrojanUnsupported) {
+                // `tls: true` 对 trojan 被静默忽略（该字段仅 VLESS 语义），不能作为
+                // 建议动作：否则「照 hint 改 → 仍报同一错」形成循环。
+                body["error"]["hint"] = json!(
+                    "trojan requires an explicit TLS signal: add alpn (e.g. alpn: [h2]) or \
+                     skip_cert_verify (true or false both declare TLS; false validates against \
+                     system roots). tls: true does not enable TLS for trojan."
+                );
+            }
+            body
+        }
+        // 防御：NoUsableOutbound 在格式化之前已转入降级（§12.2-A）。
+        nexusd::proxy_fwd::EngineInitError::NoUsableOutbound { .. } => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "proxy_engine_init",
+            "error": {
+                "code": "CONFIG",
+                "variant": error.variant(),
+                "cause": "CONFIG_INVALID",
+                "tag": "-",
+                "kind": "-",
+                "detail": "no usable outbound (should have degraded before JSON)",
+            }
+        }),
+    }
+}
+
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
 /// 为 None 时保持 D2 计数降级。
-/// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
-/// 否则 D2 计数降级。
+/// P1-P5：`proxy_yaml` 有可用出站时注入 `ProxyEngine`，Proxy 包真发；否则 D2 降级。
 /// S24：`rule_engine` 由组合根从同一份 `proxy.yaml` 构建并注入，分类走配置规则。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
 #[allow(clippy::too_many_arguments)]
@@ -417,6 +546,8 @@ fn run_dataplane(
     tun_name: &str,
     tun_mtu: u32,
     rule_engine: Option<ErasedRuleEngine>,
+    proxy_engine: Option<nexusd::proxy_fwd::ProxyEngine>,
+    outbound_registry: Option<Arc<nexusd::proxy_fwd::OutboundRegistry>>,
     proxy_yaml: Option<String>,
     network_toml: Option<String>,
     flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
@@ -439,6 +570,10 @@ fn run_dataplane(
                 eprintln!(
                     "[nexusd] dataplane: TUN creation failed ({e}); dataplane disabled, LocalAPI still serving"
                 );
+                nexus::outbound_manifest::install_engine_state(
+                    false,
+                    nexus::outbound_manifest::DataplaneState::Disabled,
+                );
                 return;
             }
         }
@@ -451,6 +586,10 @@ fn run_dataplane(
         Ok(dp) => dp,
         Err(e) => {
             eprintln!("[nexusd] dataplane: init failed ({e}); dataplane disabled");
+            nexus::outbound_manifest::install_engine_state(
+                false,
+                nexus::outbound_manifest::DataplaneState::Disabled,
+            );
             return;
         }
     };
@@ -586,19 +725,10 @@ fn run_dataplane(
         }
     }
 
-    // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
-    if let Some(yaml) = proxy_yaml.as_deref() {
-        match nexusd::proxy_fwd::ProxyEngine::new(yaml) {
-            Ok(engine) => {
-                dp.set_proxy_engine(engine);
-                eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
-            }
-            Err(e) => {
-                eprintln!(
-                    "[nexusd] dataplane: ProxyEngine unavailable ({e}); proxy packets counted"
-                );
-            }
-        }
+    // P1-P5 / D1：engine 已在 spawn 之前构造（组合根移入），这里只注入。
+    if let Some(engine) = proxy_engine {
+        dp.set_proxy_engine(engine);
+        eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
     }
 
     #[cfg(target_os = "linux")]
@@ -607,6 +737,7 @@ fn run_dataplane(
             &config,
             &tproxy_listen,
             proxy_yaml.as_deref(),
+            outbound_registry.clone(),
             &mut dp,
             Arc::clone(&shutdown),
         ),
@@ -614,6 +745,12 @@ fn run_dataplane(
     };
     #[cfg(not(target_os = "linux"))]
     let mut tproxy_frontend: Option<()> = None;
+
+    // 启动事实：dataplane 已进主循环（engine 构造与否如实）。
+    nexus::outbound_manifest::install_engine_state(
+        dp.proxy_engine_ready(),
+        nexus::outbound_manifest::DataplaneState::Running,
+    );
 
     eprintln!("[nexusd] dataplane: running");
     let _ = &mut os_assemble;
@@ -757,6 +894,7 @@ fn setup_tproxy_frontend(
     config: &nexus_proxy_config::TproxyInboundConfig,
     listen: &str,
     proxy_yaml: Option<&str>,
+    outbound_registry: Option<Arc<nexusd::proxy_fwd::OutboundRegistry>>,
     dp: &mut nexusd::dataplane::Dataplane,
     shutdown: Arc<AtomicBool>,
 ) -> Option<TproxyFrontend> {
@@ -927,8 +1065,9 @@ fn setup_tproxy_frontend(
         );
         return None;
     };
-    let proxy_egress: Option<Box<dyn ProxyFlowEgress>> = proxy_yaml
-        .and_then(nexusd::tproxy_egress::StreamProxyEgress::from_yaml)
+    // Q-5=B：TPROXY 与 TUN 共享同一批 dialer（同一份 registry）。
+    let proxy_egress: Option<Box<dyn ProxyFlowEgress>> = outbound_registry
+        .and_then(nexusd::tproxy_egress::StreamProxyEgress::from_registry)
         .map(|egress| Box::new(egress) as Box<dyn ProxyFlowEgress>);
     let transparent_config = TransparentConfig {
         udp_table_capacity: config.udp_table_capacity,
@@ -1156,7 +1295,7 @@ impl NatSwitchRuntime {
                     // Computed, not hardcoded: no TURN allocation exists yet,
                     // so this is None by rule (same as the gather path).
                     srflx_turn: turn.mapped_addr(),
-                    nat_type: nexus_connectivity::nat::NatType::Unknown,
+                    nat_type: nexus_domain::nat::NatType::Unknown,
                 }
             }
         };
@@ -1387,7 +1526,7 @@ impl NatSwitchRuntime {
                 self.gatherer
                     .stun_prober()
                     .probe_once(server1, nat_stun::STUN_PROBE_TIMEOUT)
-                    .map(|m| (m, nexus_connectivity::nat::NatType::Unknown))
+                    .map(|m| (m, nexus_domain::nat::NatType::Unknown))
             }
         };
         match probed {
@@ -1483,22 +1622,86 @@ fn stun_servers(
     Some((s1, s2))
 }
 
+/// `stage=config_load` 失败行（spec §12.2-B）；proxy.yaml 解析失败时补四字段。
+///
+/// 全部字段经 `redact_secrets`/`sanitize`（写点 1/6，spec §9.1），并用
+/// `serde_json::json!` 构造（禁止手拼转义回归）。
+fn config_load_failure_json(error: &str, dir: Option<&ConfigDir>) -> serde_json::Value {
+    let parse_error = dir
+        .and_then(|dir| std::fs::read_to_string(dir.file(config::PROXY_YAML)).ok())
+        .and_then(|text| nexus_proxy_config::parse(&text).err());
+    match parse_error {
+        Some(parse) => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "config_load",
+            "error": {
+                "code": "CONFIG",
+                "message": nexus::redact::sanitize(error),
+                "variant": "PROXY_YAML_INVALID",
+                "field": nexus::redact::sanitize(&parse.field),
+                "detail": nexus::redact::sanitize(&parse.reason),
+            }
+        }),
+        None => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "config_load",
+            "error": {"code": "CONFIG", "message": nexus::redact::sanitize(error)}
+        }),
+    }
+}
+
 /// Daemon 主流程：加载配置 → 装配子系统 → 启动线程 → 事件循环 → 优雅关闭。
 ///
 /// 启动顺序（§13.3）：配置加载 → 校验 → TUN（致命）→ Dataplane → N1（可降级）
-/// → Proxy（可降级）→ LocalAPI → 主循环。
+/// → Proxy（分层：配置错误致命 / 无可用出口降级）→ LocalAPI → 主循环。
+/// D1：ProxyEngine 在 dataplane 线程 `spawn` **之前**构造（硬失败 → stderr JSON +
+/// exit 1；仅 `NoUsableOutbound` 降级为无 engine）。
 /// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
 /// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
+/// 按磁盘现状刷新 proxy.yaml 的 file 侧（Applied / NeedsRestart / Rejected 共用，Q-7=B）。
+///
+/// 只描述磁盘现状：解析失败 → `mark_file_rejected`（带脱敏原因）；成功 →
+/// `update_file_side`（R2-F12：成功即无条件清 `file_rejected`）。
+/// 返回 `stale`（无快照 → `None`）。
+fn refresh_proxy_file_side(dir: &ConfigDir, rejected_reason: Option<&str>) -> Option<bool> {
+    use nexus::outbound_manifest;
+    let text = std::fs::read_to_string(dir.file(config::PROXY_YAML)).ok();
+    let surface = outbound_manifest::startup_surface(text.as_deref());
+    let (file_tag, file_kind) = surface
+        .selected
+        .and_then(|index| surface.labels.get(index))
+        .map(|label| (Some(label.tag.clone()), Some(label.kind.clone())))
+        .unwrap_or((None, None));
+    let sha1 = config_sha1(text.as_deref());
+    match rejected_reason {
+        Some(reason) if surface.error.is_some() => outbound_manifest::mark_file_rejected(
+            file_tag,
+            file_kind,
+            &sha1,
+            &nexus::redact::redact_secrets(reason),
+        ),
+        _ => outbound_manifest::update_file_side(file_tag, file_kind, &sha1),
+    }
+}
+
+/// spec §12.1 stale 行（`some(true)` 时打印）。
+fn log_stale_line(stale: Option<bool>) {
+    if stale == Some(true)
+        && let Some(line) = nexus::outbound_manifest::stale_line()
+    {
+        eprintln!("{line}");
+    }
+}
+
 fn run_daemon(config_dir: &str) -> ExitCode {
     // Anchor relative daemon input once without resolving symlinks or removing
     // parent components: managed preflight must retain its path safety checks.
     let config_root = match std::path::absolute(config_dir) {
         Ok(root) => root,
         Err(error) => {
-            eprintln!(
-                "{}",
-                json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":error.to_string()}})
-            );
+            eprintln!("{}", config_load_failure_json(&error.to_string(), None));
             return ExitCode::from(1);
         }
     };
@@ -1513,9 +1716,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let dir = match ConfigDir::new(&config_root) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
-            );
+            eprintln!("{}", config_load_failure_json(&e.to_string(), None));
             return ExitCode::from(1);
         }
     };
@@ -1528,9 +1729,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let loaded = match config::load(&dir) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
-            );
+            eprintln!("{}", config_load_failure_json(&e.to_string(), Some(&dir)));
             return ExitCode::from(1);
         }
     };
@@ -1548,6 +1747,25 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         return ExitCode::from(1);
     }
     log_enabled_subsystems(&loaded);
+
+    // 五载体（spec §7.7 载体 1/3/4）：manifest 解析失败 = 打包错误，fail-closed；
+    // 成功则打印逐出站启动面并发布进程内运行快照（stats/status 共用同一序列化）。
+    if let Err(error) = nexus::outbound_manifest::manifest() {
+        eprintln!(
+            "{}",
+            json!({"verdict":"FAIL","command":"nexusd","stage":"outbound_manifest","error":{"code":"CONFIG","message":nexus::redact::sanitize(&error.to_string())}})
+        );
+        return ExitCode::from(1);
+    }
+    let outbound_surface = nexus::outbound_manifest::startup_surface(loaded.proxy_yaml.as_deref());
+    for line in &outbound_surface.lines {
+        eprintln!("{line}");
+    }
+    nexus::outbound_manifest::install_surface(
+        &outbound_surface,
+        &config_sha1(loaded.proxy_yaml.as_deref()),
+    );
+    publish_engine_state(loaded.daemon.tun.enabled);
 
     // F1：orphan FUSE 挂载收敛进 boot_reconcile 统一报告。挂载点在 reconcile
     // 之前解析，与 WorkspaceManager::start 共用 resolve_mountpoints，保证一致。
@@ -1635,9 +1853,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
-            );
+            eprintln!("{}", config_load_failure_json(&e.to_string(), Some(&dir)));
             return ExitCode::from(1);
         }
     };
@@ -1802,15 +2018,33 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         match build_dataplane_rule_engine(parsed_proxy.as_ref()) {
             Ok(engine) => engine,
             Err(e) => {
+                // §12.2-C：stage 按阶段定死（rule_engine_init），message 脱敏。
                 eprintln!(
                     "{}",
-                    json!({"verdict":"FAIL","error":{"code":"CONFIG","message":e}})
+                    json!({
+                        "verdict": "FAIL",
+                        "command": "nexusd",
+                        "stage": "rule_engine_init",
+                        "error": {
+                            "code": "CONFIG",
+                            "message": nexus::redact::sanitize(&e),
+                        }
+                    })
                 );
                 return ExitCode::from(1);
             }
         }
     } else {
         None
+    };
+    // D1（spec §3.3 步骤 4）：spawn 之前构造；硬失败在此返回 exit 1（不 process::exit）。
+    let (proxy_engine, outbound_registry) = match build_proxy_engine_for_startup(
+        loaded.proxy_yaml.as_deref(),
+        tun_enabled(),
+        has_tproxy,
+    ) {
+        Ok(pair) => pair,
+        Err(code) => return code,
     };
     let dataplane_handle = if tun_enabled() || has_tproxy {
         let dp_shutdown = Arc::clone(&shutdown);
@@ -1825,6 +2059,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         &tun_name,
                         tun_mtu,
                         rule_engine,
+                        proxy_engine,
+                        outbound_registry,
                         proxy_yaml,
                         network_toml,
                         flow_sessions_mode,
@@ -1993,13 +2229,28 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
         match ev_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(watcher::ReloadEvent::Applied { files }) => {
-                eprintln!("[nexusd] config hot-reloaded: {files:?}");
+                // §7.6.2：只对 Hot 文件宣告「已生效」；proxy.yaml 走 NeedsRestart。
+                eprintln!("[nexusd] config applied: {files:?}");
+                if files.iter().any(|f| f == config::PROXY_YAML) {
+                    log_stale_line(refresh_proxy_file_side(&dir, None));
+                }
             }
-            Ok(watcher::ReloadEvent::NeedsRestart { reason }) => {
+            Ok(watcher::ReloadEvent::NeedsRestart { files, reason }) => {
                 eprintln!("[nexusd] WARN: {reason}");
+                if files.iter().any(|f| f == config::PROXY_YAML) {
+                    // §12.1：active/file 对照 + stale=true（磁盘改了但未生效）。
+                    log_stale_line(refresh_proxy_file_side(&dir, None));
+                }
             }
             Ok(watcher::ReloadEvent::Rejected { error }) => {
-                eprintln!("[nexusd] ERROR: config reload rejected: {error} (keeping old config)");
+                // 写点 3：打印点再脱敏（幂等；双写点漏网防护）。
+                eprintln!(
+                    "[nexusd] ERROR: config reload rejected: {} (keeping old config)",
+                    nexus::redact::redact_secrets(&error)
+                );
+                // R2-F12/PR2R1-02：拒绝后按磁盘现状刷新 file 侧，避免观测面继续
+                // 报「文件与 active 同步」；proxy.yaml 自身解析失败才标 file_rejected。
+                let _ = refresh_proxy_file_side(&dir, Some(&error));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2679,12 +2930,16 @@ fn handle_localapi_request(
             let s = nexusd::dataplane::dataplane_stats_snapshot();
             let status = nexusd::dataplane::runtime_status_snapshot();
             let tproxy = nexusd::dataplane::tproxy_status_json();
-            Ok(nexusd::dataplane::dataplane_stats_json(
-                tun_enabled(),
-                &status,
-                &s,
-                tproxy,
-            ))
+            let (outbound, outbound_error) = nexus::outbound_manifest::runtime_outbound_json();
+            let mut body =
+                nexusd::dataplane::dataplane_stats_json(tun_enabled(), &status, &s, tproxy);
+            // 五载体（§7.7 载体 4）：顶层 `outbound` 块与 `nexus status` 同一序列化。
+            body["outbound"] = outbound;
+            body["interop_warnings"] = nexus::outbound_manifest::interop_warning_counts().to_json();
+            if let Some(error) = outbound_error {
+                body["outbound_error"] = error;
+            }
+            Ok(body)
         }
         "/localapi/v0/dns/status" => nexus::observability::dns_status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
@@ -3001,5 +3256,149 @@ outbounds:
         let (mut dp, pkt) = assemble(None);
         let outbound = dp.cached_outbound(&pkt).expect("decision cached");
         assert_eq!(outbound, "proxy");
+    }
+}
+
+/// S7：脱敏 parity（daemon 启动行 / CLI `config check` detail 同一份实现）。
+#[cfg(test)]
+mod redact_parity_tests {
+    use super::config_load_failure_json;
+    use nexusd::config::ConfigDir;
+
+    const MARKER: &str = "r2f3redactmarker9a1b";
+
+    fn temp_config_dir(tag: &str) -> (std::path::PathBuf, ConfigDir) {
+        let dir = std::env::temp_dir().join(format!(
+            "nexusd-redact-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp config dir");
+        let conversation = ConfigDir::new(&dir).expect("config dir");
+        (dir, conversation)
+    }
+
+    #[test]
+    fn parity_daemon_and_cli_detail_hide_password_marker() {
+        let (path, dir) = temp_config_dir("parity");
+        // 畸形输入：引号紧凑形态 + 多词口令。
+        let broken = format!(
+            "schema_version: 1\noutbounds:\n  - tag: a\n    kind: shadowsocks\n    locator: 1.2.3.4:1\n    password={MARKER} alpha beta\n"
+        );
+        std::fs::write(path.join("proxy.yaml"), &broken).expect("write");
+
+        let error = "parse proxy.yaml failed";
+        let daemon = config_load_failure_json(error, Some(&dir));
+        let daemon_text = serde_json::to_string(&daemon).expect("json");
+        assert!(
+            !daemon_text.contains(MARKER),
+            "daemon leaked: {daemon_text}"
+        );
+
+        // CLI 同一份实现（`config check` 的 detail 字段路径）。
+        let cli_detail = nexus::redact::sanitize(&err_text(&dir));
+        assert!(!cli_detail.contains(MARKER), "cli leaked: {cli_detail}");
+        assert!(cli_detail.contains("***"), "mask missing: {cli_detail}");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// 取与 CLI detail 同源的解析错误文本（含原始回显）。
+    fn err_text(dir: &ConfigDir) -> String {
+        let text = std::fs::read_to_string(dir.file(nexusd::config::PROXY_YAML)).expect("read");
+        nexus_proxy_config::parse(&text)
+            .expect_err("must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn redact_double_application_is_idempotent() {
+        let raw = format!("files [\"proxy.yaml\"]: got 'password={MARKER}'");
+        let once = nexus::redact::redact_secrets(&raw);
+        let twice = nexus::redact::redact_secrets(&once);
+        assert_eq!(once, twice, "double application must be idempotent");
+        assert!(!once.contains("*** ***"), "double mask: {once}");
+    }
+
+    #[test]
+    fn config_failure_json_is_parseable() {
+        let (path, dir) = temp_config_dir("parseable");
+        std::fs::write(path.join("proxy.yaml"), "not: [valid").expect("write");
+        let value = config_load_failure_json("parse proxy.yaml failed", Some(&dir));
+        let text = serde_json::to_string(&value).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("parseable");
+        assert_eq!(parsed["verdict"], "FAIL");
+        assert_eq!(parsed["stage"], "config_load");
+        assert_eq!(parsed["error"]["variant"], "PROXY_YAML_INVALID");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn error_debug_hides_secrets() {
+        use nexus_proxy_config::UdpMode;
+        let mode = UdpMode::ShadowsocksAead {
+            server: "127.0.0.1:8388".parse().expect("addr"),
+            password: MARKER.to_string(),
+        };
+        let text = format!("{mode:?}");
+        assert!(!text.contains(MARKER), "UdpMode leaked: {text}");
+        assert!(text.contains("***"), "mask missing: {text}");
+    }
+}
+
+/// S9 / A10：reload 拒绝后原样恢复，status 清标记（R2-F12）。
+#[cfg(test)]
+mod reload_restore_tests {
+    use super::{config_sha1, refresh_proxy_file_side};
+    use nexusd::config::ConfigDir;
+
+    const GOOD: &str = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: ss-a\noutbounds:\n  - tag: ss-a\n    kind: shadowsocks\n    method: chacha20-ietf-poly1305\n    locator: 127.0.0.1:8388\n    password: secret\n";
+
+    fn temp_dir(tag: &str) -> (std::path::PathBuf, ConfigDir) {
+        let path = std::env::temp_dir().join(format!(
+            "nexusd-reload-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp dir");
+        let dir = ConfigDir::new(&path).expect("config dir");
+        (path, dir)
+    }
+
+    #[test]
+    fn rejected_then_restored_clears_file_rejected() {
+        let (path, dir) = temp_dir("restore");
+        std::fs::write(dir.file(nexusd::config::PROXY_YAML), GOOD).expect("good yaml");
+        let surface = nexus::outbound_manifest::startup_surface(Some(GOOD));
+        nexus::outbound_manifest::install_surface(&surface, &config_sha1(Some(GOOD)));
+
+        // 1) 磁盘被覆盖为畸形文件 → 拒绝分支刷新 file 侧并标 rejected。
+        let broken = format!("{GOOD}    password r2f12marker multi word\n");
+        std::fs::write(dir.file(nexusd::config::PROXY_YAML), &broken).expect("broken yaml");
+        let stale = refresh_proxy_file_side(&dir, Some("parse proxy.yaml failed"));
+        assert_eq!(stale, Some(true), "rejected disk config must look stale");
+        let snapshot = nexus::outbound_manifest::runtime_snapshot().expect("snapshot");
+        assert!(snapshot.file_rejected, "rejection must be visible");
+
+        // 2) 原样改回（与 active 逐字节相同）→ Applied 分支刷新 → 标记清空。
+        std::fs::write(dir.file(nexusd::config::PROXY_YAML), GOOD).expect("restore");
+        let stale = refresh_proxy_file_side(&dir, None);
+        assert_eq!(
+            stale,
+            Some(false),
+            "restored file equals active → not stale"
+        );
+        let snapshot = nexus::outbound_manifest::runtime_snapshot().expect("snapshot");
+        assert!(
+            !snapshot.file_rejected,
+            "R2-F12: restored file clears rejection"
+        );
+        assert_eq!(
+            snapshot.file_config_sha1, snapshot.active_config_sha1,
+            "file sha must match active sha after restore"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -31,6 +31,8 @@ std-only，无第三方依赖。
 - 第三方新依赖；tokio（std thread 足够）。
 - `nexus-fabric` driver/quinn 内部（只用公开 API）。
 - 冻结的 P2 信令合同（探针帧是 wireup 层内部帧格式，不进 `signal.rs`）。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 - 探针帧格式（25B）：`[8B magic "NXQPROB!"][1B type 0x01=ping/0x02=pong][8B nonce BE][8B sent_ms BE]`。

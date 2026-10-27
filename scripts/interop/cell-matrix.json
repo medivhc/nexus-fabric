@@ -411,6 +411,22 @@
     },
     {
       "protocol": "Hysteria2",
+      "variant": "Hy2Salamander",
+      "cell": "TcpSmall",
+      "ref_variant": "hysteria2-salamander",
+      "impl": "sing-box",
+      "target_kind": "TcpEcho",
+      "target_port": 26200,
+      "carrier": "ProductSocks5",
+      "scope": "ProductPath",
+      "required": true,
+      "synthetic": false,
+      "diag": false,
+      "t2": false,
+      "note": ""
+    },
+    {
+      "protocol": "Hysteria2",
       "variant": "Default",
       "cell": "QpackDiag",
       "ref_variant": "hysteria2-plain",

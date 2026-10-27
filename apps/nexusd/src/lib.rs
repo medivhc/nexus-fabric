@@ -6,6 +6,8 @@ pub mod assembly;
 pub mod config;
 pub mod dataplane;
 pub mod discovery_runtime;
+/// 热路径日志限频（per `(tag, cause)`；PRODUCT hot-path 契约）。
+mod log_throttle;
 pub mod nat_gather;
 pub mod nat_relay;
 pub mod nat_status;

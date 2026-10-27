@@ -2,28 +2,38 @@
 //!
 //! 设计：
 //! - `UdpForwarder` 持有 per-protocol 中继会话（惰性初始化）；
-//! - 出站：解析 IP/UDP 头 → 按协议封装 → 发送；
+//! - 出站：解析 IP/UDP 头 → 按 `dialer.udp_capability()` 分派 → 发送；
 //! - 入站：后台线程收回包 → 解包 → 经 mpsc 发给 dataplane → 重构 IP 包写回 TUN；
 //! - 流表 `(remote → (local, last_seen))`，60s 回收（P5）。
 //!
-//! 三种协议：
+//! 本 run 的 UDP 实现不变（spec §1.3）：
 //! - SOCKS5：UDP ASSOCIATE（RFC 1928 §7）；
-//! - ss：标准 AEAD UDP（`ss_std::SsUdp`）；
-//! - trojan：TCP 上的 UDP（握手命令 0x03）。
+//! - ss：AEAD UDP（`ss_std::SsUdp`；派生非 SIP004，见步骤 1.5 证据
+//!   `.evidence/outbound-adapter-wiring/ss-std-sip004/`）；
+//! - Trojan：不建 relay，统一 `Unsupported { TlsVariantNotSupported }`（§3.5）。
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use nexus_proxy_config::OutboundKind;
+
+use super::ProxyFwdStats;
+use super::adapter::{OutboundDialer, UdpCapability, UdpMode, UdpUnsupportedReason};
+// TODO(deletion-gate: fixes-6): SS UDP 仍走 `ss_std::SsUdp`（crate 无标准 UDP
+// 包 API，spec §3.3 / §4.5）。删除触发条件 = fixes-6 或 crate 提供标准 UDP API，
+// 且同一 PR 内把 `UdpMode::ShadowsocksAead` 切换到 crate 实现。
 use super::ss_std::SsUdp;
-use super::{ProxyDialConfig, ProxyFwdStats};
 
 /// UDP 流表回收超时（P5）。
 const UDP_FLOW_TIMEOUT: Duration = Duration::from_secs(60);
 /// UDP 流表上限（P5）。
 const MAX_UDP_FLOWS: usize = 1024;
+/// UDP 未接线的限频日志间隔（spec §2.2）。
+const UDP_UNSUPPORTED_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 入站 UDP 包（回包）→ dataplane。
 /// `local` 由 dataplane 经 `lookup_local(remote)` 查流表得到，此处不携带。
@@ -37,7 +47,10 @@ pub struct UdpInbound {
 
 /// UDP 转发器（dataplane 线程拥有）。
 pub struct UdpForwarder {
-    dial_config: ProxyDialConfig,
+    dialer: Arc<dyn OutboundDialer>,
+    /// 选中出站的 kind/tag（仅日志用；spec §6.5）。
+    kind: OutboundKind,
+    tag: String,
     /// 惰性初始化的中继会话。
     relay: Option<UdpRelay>,
     inbound_rx: Receiver<UdpInbound>,
@@ -45,25 +58,31 @@ pub struct UdpForwarder {
     /// remote → (local, last_seen)。
     flows: HashMap<SocketAddr, (SocketAddr, Instant)>,
     stats: ProxyFwdStats,
+    /// 上一次实际输出的 udp_unsupported 日志时间（限频用）。
+    last_unsupported_log: Option<Instant>,
 }
 
 /// 具体协议的中继会话。
 enum UdpRelay {
     Socks5(Socks5UdpRelay),
     Ss(SsUdpRelay),
-    Trojan(TrojanUdpRelay),
 }
 
 impl UdpForwarder {
-    pub fn new(dial_config: ProxyDialConfig) -> Self {
+    pub fn new(dialer: Arc<dyn OutboundDialer>) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel();
+        let kind = dialer.kind();
+        let tag = dialer.tag().to_string();
         Self {
-            dial_config,
+            dialer,
+            kind,
+            tag,
             relay: None,
             inbound_rx,
             inbound_tx,
             flows: HashMap::new(),
             stats: ProxyFwdStats::default(),
+            last_unsupported_log: None,
         }
     }
 
@@ -78,10 +97,18 @@ impl UdpForwarder {
         };
         // 确保中继已建立。
         if self.relay.is_none() {
-            match self.establish() {
-                Ok(r) => self.relay = Some(r),
-                Err(e) => {
-                    eprintln!("[proxy-fwd] udp relay establish failed: {e}");
+            match self.dialer.udp_capability() {
+                UdpCapability::Supported(mode) => match self.establish(mode) {
+                    Ok(r) => self.relay = Some(r),
+                    Err(e) => {
+                        eprintln!("[proxy-fwd] udp relay establish failed: {e}");
+                        return false;
+                    }
+                },
+                UdpCapability::Unsupported { reason } => {
+                    // §2.6.2：该 UDP 包丢弃；udp_send_failed + udp_unsupported；
+                    // 限频日志；绝不直连。
+                    self.record_unsupported(reason);
                     return false;
                 }
             }
@@ -93,7 +120,6 @@ impl UdpForwarder {
         let ok = match relay {
             UdpRelay::Socks5(r) => r.send(remote, &payload).is_ok(),
             UdpRelay::Ss(r) => r.send(remote, &payload).is_ok(),
-            UdpRelay::Trojan(r) => r.send(remote, &payload).is_ok(),
         };
         if ok {
             // 记录流映射（last-write-wins）。
@@ -137,38 +163,60 @@ impl UdpForwarder {
             .retain(|_, (_, t)| now.duration_since(*t) < UDP_FLOW_TIMEOUT);
     }
 
-    /// 建立中继会话（惰性）。
-    fn establish(&self) -> Result<UdpRelay, String> {
+    /// 建立中继会话（惰性）。UDP 实现不变，只按能力声明分派。
+    fn establish(&self, mode: UdpMode) -> Result<UdpRelay, String> {
         let tx = self.inbound_tx.clone();
-        match &self.dial_config {
-            ProxyDialConfig::Socks5 { server } => Socks5UdpRelay::establish(*server, tx)
+        match mode {
+            UdpMode::Socks5Associate { server } => Socks5UdpRelay::establish(server, tx)
                 .map(UdpRelay::Socks5)
                 .map_err(|e| e.to_string()),
-            ProxyDialConfig::Shadowsocks {
-                server, password, ..
-            } => SsUdpRelay::establish(*server, password.clone(), tx)
-                .map(UdpRelay::Ss)
-                .map_err(|e| e.to_string()),
-            ProxyDialConfig::Trojan { server, password } => {
-                TrojanUdpRelay::establish(*server, password.clone(), false, tx)
-                    .map(UdpRelay::Trojan)
+            UdpMode::ShadowsocksAead { server, password } => {
+                SsUdpRelay::establish(server, password, tx)
+                    .map(UdpRelay::Ss)
                     .map_err(|e| e.to_string())
             }
-            ProxyDialConfig::TrojanTls {
-                server: _,
-                password: _,
-                sni: _,
-                skip_verify: _,
-            } => {
-                // trojan-tls 的 UDP：本期经明文 trojan UDP 逻辑走 TLS 流。
-                // 诚实：P2 只实现明文 trojan UDP；TLS 变体返回错误走降级。
-                Err("trojan-tls udp not in P2 scope (use plaintext trojan)".to_string())
-            }
+            other => Err(format!("udp mode not wired: {other:?}")),
+        }
+    }
+
+    /// `UdpCapability::Unsupported`：计数 + 限频日志（spec §2.6.2 / §6.4）。
+    fn record_unsupported(&mut self, reason: UdpUnsupportedReason) {
+        self.stats.udp_unsupported += 1;
+        self.stats.udp_send_failed += 1;
+        match self.kind {
+            OutboundKind::Vless => self.stats.udp_unsupported_vless += 1,
+            OutboundKind::Anytls => self.stats.udp_unsupported_anytls += 1,
+            _ => self.stats.udp_unsupported_other += 1,
+        }
+        let now = Instant::now();
+        let due = self
+            .last_unsupported_log
+            .is_none_or(|last| now.duration_since(last) >= UDP_UNSUPPORTED_LOG_INTERVAL);
+        if due {
+            let suppressed = self.stats.udp_unsupported_log_suppressed;
+            eprintln!(
+                "[proxy-fwd] event=udp_unsupported kind={} tag={} reason={} suppressed={suppressed}",
+                self.kind.as_str(),
+                self.tag,
+                unsupported_reason_str(reason)
+            );
+            self.last_unsupported_log = Some(now);
+            self.stats.udp_unsupported_log_suppressed = 0;
+        } else {
+            self.stats.udp_unsupported_log_suppressed += 1;
         }
     }
 
     pub fn stats(&self) -> ProxyFwdStats {
         self.stats.clone()
+    }
+}
+
+fn unsupported_reason_str(reason: UdpUnsupportedReason) -> &'static str {
+    match reason {
+        UdpUnsupportedReason::NotWired => "not_wired",
+        UdpUnsupportedReason::TlsVariantNotSupported => "tls_variant_not_supported",
+        UdpUnsupportedReason::NoDatagramMode => "no_datagram_mode",
     }
 }
 
@@ -377,7 +425,7 @@ fn parse_socks5_udp(buf: &[u8]) -> Option<(SocketAddr, Vec<u8>)> {
 }
 
 // ---------------------------------------------------------------------------
-// 标准 ss UDP
+// 标准 ss UDP（ss_std 保留面；TODO(deletion-gate: fixes-6) 见文件头 use 处）
 // ---------------------------------------------------------------------------
 
 struct SsUdpRelay {
@@ -429,122 +477,121 @@ impl SsUdpRelay {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trojan UDP（TCP 上的 UDP，命令 0x03）
-// ---------------------------------------------------------------------------
-
-struct TrojanUdpRelay {
-    /// 写锁（读由后台线程独占）。
-    writer: std::sync::Mutex<TcpStream>,
-}
-
-impl TrojanUdpRelay {
-    fn establish(
-        server: SocketAddr,
-        password: String,
-        _tls: bool,
-        tx: Sender<UdpInbound>,
-    ) -> io::Result<Self> {
-        let mut tcp = TcpStream::connect_timeout(&server, Duration::from_secs(10))?;
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-        // trojan 握手（UDP 命令 0x03；复用 nexus-outbound-trojan 的 auth_hash）。
-        let hash = nexus_outbound_trojan::auth_hash(&password);
-        // 用 0.0.0.0:0 占位（UDP 模式地址在每包中携带）。
-        let mut req = Vec::new();
-        req.extend_from_slice(hash.as_bytes());
-        req.extend_from_slice(b"\r\n");
-        req.push(0x03); // CMD = UDP ASSOCIATE
-        req.push(0x01); // ATYP = IPv4
-        req.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // 0.0.0.0:0
-        req.extend_from_slice(b"\r\n");
-        tcp.write_all(&req)?;
-        tcp.flush()?;
-        tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
-
-        let mut reader = tcp.try_clone()?;
-        std::thread::spawn(move || {
-            loop {
-                match read_trojan_udp(&mut reader) {
-                    Ok(Some((src, payload))) => {
-                        let _ = tx.send(UdpInbound {
-                            remote: src,
-                            payload,
-                        });
-                    }
-                    Ok(None) => break,  // EOF
-                    Err(_) => continue, // 超时/分片，继续。
-                }
-            }
-        });
-
-        Ok(Self {
-            writer: std::sync::Mutex::new(tcp),
-        })
-    }
-
-    fn send(&self, target: SocketAddr, payload: &[u8]) -> io::Result<()> {
-        // trojan UDP 包：ATYP ADDR PORT LEN(2B) PAYLOAD CRLF。
-        let mut pkt = encode_socks5_addr(target); // ATYP 格式与 trojan 兼容（IPv4）。
-        pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        pkt.extend_from_slice(payload);
-        pkt.extend_from_slice(b"\r\n");
-        let mut w = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::other("trojan udp writer poisoned"))?;
-        w.write_all(&pkt)?;
-        w.flush()?;
-        Ok(())
-    }
-}
-
-/// 从 trojan TCP 流读一个 UDP 包；返回 (源地址, 载荷)。
-/// Ok(None) = EOF；Err = 超时/可恢复（调用方继续）。
-fn read_trojan_udp(reader: &mut TcpStream) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
-    // 读 ATYP。
-    let mut atyp = [0u8; 1];
-    match reader.read_exact(&mut atyp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let (addr, addr_len) = match atyp[0] {
-        0x01 => {
-            let mut b = [0u8; 6];
-            reader.read_exact(&mut b)?;
-            let ip = IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]));
-            let port = u16::from_be_bytes([b[4], b[5]]);
-            (SocketAddr::new(ip, port), 7)
-        }
-        0x04 => {
-            let mut b = [0u8; 18];
-            reader.read_exact(&mut b)?;
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&b[..16]);
-            let ip = IpAddr::V6(octets.into());
-            let port = u16::from_be_bytes([b[16], b[17]]);
-            (SocketAddr::new(ip, port), 19)
-        }
-        _ => {
-            return Err(io::Error::other("trojan udp: bad atyp"));
-        }
-    };
-    let _ = addr_len;
-    let mut len_b = [0u8; 2];
-    reader.read_exact(&mut len_b)?;
-    let len = u16::from_be_bytes(len_b) as usize;
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
-    let mut crlf = [0u8; 2];
-    reader.read_exact(&mut crlf)?;
-    Ok(Some((addr, payload)))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::adapter::{OutboundError, TunnelStream};
     use super::*;
+
+    struct TrojanUnsupportedDialer;
+
+    impl OutboundDialer for TrojanUnsupportedDialer {
+        fn kind(&self) -> OutboundKind {
+            OutboundKind::Trojan
+        }
+
+        fn tag(&self) -> &str {
+            "trojan-a"
+        }
+
+        fn dial_tcp(&self, _target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError> {
+            Err(OutboundError::UdpUnsupported)
+        }
+
+        fn udp_capability(&self) -> UdpCapability {
+            UdpCapability::Unsupported {
+                reason: UdpUnsupportedReason::TlsVariantNotSupported,
+            }
+        }
+    }
+
+    fn udp_packet(payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20 + 8 + payload.len()];
+        pkt[0] = 0x45;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        pkt[20..22].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt[28..].copy_from_slice(payload);
+        pkt
+    }
+
+    #[test]
+    fn trojan_udp_is_unsupported_and_rate_limited() {
+        let mut forwarder = UdpForwarder::new(Arc::new(TrojanUnsupportedDialer));
+        let packet = udp_packet(b"dns-ish");
+        assert!(!forwarder.handle_packet(&packet));
+        assert!(!forwarder.handle_packet(&packet));
+        let stats = forwarder.stats();
+        assert_eq!(stats.udp_unsupported, 2);
+        assert_eq!(stats.udp_send_failed, 2);
+        assert_eq!(stats.udp_unsupported_other, 2);
+        assert_eq!(stats.udp_unsupported_vless, 0);
+        assert_eq!(stats.udp_unsupported_anytls, 0);
+        assert_eq!(stats.udp_sent, 0);
+        // 首条必打；第二条在 10s 窗口内被抑制。
+        assert_eq!(stats.udp_unsupported_log_suppressed, 1);
+    }
+
+    #[test]
+    fn vless_and_anytls_udp_fail_closed_with_per_protocol_counters() {
+        struct NotWiredDialer {
+            kind: OutboundKind,
+            tag: &'static str,
+        }
+
+        impl OutboundDialer for NotWiredDialer {
+            fn kind(&self) -> OutboundKind {
+                self.kind
+            }
+
+            fn tag(&self) -> &str {
+                self.tag
+            }
+
+            fn dial_tcp(
+                &self,
+                _target: SocketAddr,
+            ) -> Result<Box<dyn TunnelStream>, OutboundError> {
+                Err(OutboundError::UdpUnsupported)
+            }
+
+            fn udp_capability(&self) -> UdpCapability {
+                UdpCapability::Unsupported {
+                    reason: UdpUnsupportedReason::NotWired,
+                }
+            }
+        }
+
+        for (kind, tag) in [
+            (OutboundKind::Vless, "vless-a"),
+            (OutboundKind::Anytls, "anytls-a"),
+        ] {
+            let mut forwarder = UdpForwarder::new(Arc::new(NotWiredDialer { kind, tag }));
+            let packet = udp_packet(b"business-udp");
+            assert!(!forwarder.handle_packet(&packet));
+            assert!(!forwarder.handle_packet(&packet));
+            let stats = forwarder.stats();
+            assert_eq!(stats.udp_unsupported, 2, "{tag}");
+            assert_eq!(stats.udp_send_failed, 2, "{tag}");
+            assert_eq!(stats.udp_sent, 0, "{tag}");
+            match kind {
+                OutboundKind::Vless => {
+                    assert_eq!(stats.udp_unsupported_vless, 2);
+                    assert_eq!(stats.udp_unsupported_anytls, 0);
+                }
+                OutboundKind::Anytls => {
+                    assert_eq!(stats.udp_unsupported_anytls, 2);
+                    assert_eq!(stats.udp_unsupported_vless, 0);
+                }
+                other => panic!("unexpected kind {other:?}"),
+            }
+            assert_eq!(stats.udp_unsupported_other, 0, "{tag}");
+            // 首条必打；第二条在 10s 窗口内被抑制。
+            assert_eq!(stats.udp_unsupported_log_suppressed, 1, "{tag}");
+        }
+    }
 
     #[test]
     fn udp_packet_parse_and_build() {
@@ -583,5 +630,21 @@ mod tests {
         let (a, p) = parse_socks5_udp(&pkt).unwrap();
         assert_eq!(a, addr);
         assert_eq!(p, payload);
+    }
+
+    #[test]
+    fn unsupported_reason_strings_match_log_enum() {
+        assert_eq!(
+            unsupported_reason_str(UdpUnsupportedReason::NotWired),
+            "not_wired"
+        );
+        assert_eq!(
+            unsupported_reason_str(UdpUnsupportedReason::TlsVariantNotSupported),
+            "tls_variant_not_supported"
+        );
+        assert_eq!(
+            unsupported_reason_str(UdpUnsupportedReason::NoDatagramMode),
+            "no_datagram_mode"
+        );
     }
 }

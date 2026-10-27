@@ -1429,6 +1429,11 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if old.daemon.proxy != new.daemon.proxy {
         return ChangeKind::NeedsRestart;
     }
+    // Q-7=B（spec §7.6.1）：proxy.yaml **内容变更** → NeedsRestart（engine 只在
+    // 启动构造；不允许再谎报 hot-reloaded）。
+    if old.proxy_yaml != new.proxy_yaml {
+        return ChangeKind::NeedsRestart;
+    }
     // R5：network.toml 内容变更 → NeedsRestart（mesh CIDR 可能变化）。
     if old.network_toml != new.network_toml {
         return ChangeKind::NeedsRestart;
@@ -1438,7 +1443,8 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
         return ChangeKind::NeedsRestart;
     }
     // proxy.yaml 的 tun/tproxy 入站增删或参数（端口/设备/MTU/默认路由）变化 →
-    // NeedsRestart；规则/组/出站仍按 Hot 处理（spec §10.8）。
+    // NeedsRestart。Q-7=B 之后本特判已被上方的「内容变更 → NeedsRestart」覆盖，
+    // 保留无害（防御未来把内容变更改回 Hot 的回归）。
     if inbound_signatures(old.proxy_yaml.as_deref())
         != inbound_signatures(new.proxy_yaml.as_deref())
     {
@@ -1850,10 +1856,12 @@ mod tests {
         write(&d, PROXY_YAML, yaml_v1);
         let dir = ConfigDir::new(&d).unwrap();
         let old = load(&dir).unwrap();
-        // proxy.yaml 内容变更 → Hot
+        // proxy.yaml 内容变更 → NeedsRestart（Q-7=B：engine 只在启动构造）
         write(&d, PROXY_YAML, yaml_v2);
         let new = load(&dir).unwrap();
-        assert_eq!(classify_change(&old, &new), ChangeKind::Hot);
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        // 「只有规则/出站变化」也不再是 Hot（同一判据，术语保留以便审计）
+        assert_ne!(classify_change(&old, &new), ChangeKind::Hot);
         // daemon addr 变更 → NeedsRestart
         write(&d, DAEMON_TOML, "[localapi]\naddr = \"127.0.0.1:19999\"\n");
         let new2 = load(&dir).unwrap();
@@ -2511,12 +2519,13 @@ password=\"p\"\n\
     }
 
     #[test]
-    fn classify_change_outbound_only_is_hot() {
+    fn classify_change_outbound_only_is_needs_restart() {
         let old_yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         let new_yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d2\noutbounds:\n  - tag: d2\n    kind: direct\n";
+        // Q-7=B（§7.6.1）：proxy.yaml 内容变更 = NeedsRestart（engine 只在启动构造）。
         assert_eq!(
             classify_pair("nexusd-cfg-test-classify-outbound-hot", old_yaml, new_yaml),
-            ChangeKind::Hot
+            ChangeKind::NeedsRestart
         );
     }
 

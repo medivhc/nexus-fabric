@@ -8,19 +8,19 @@
 //! 3. 密码正确 → 回 `:status: 233` + `hysteria-udp` + `hysteria-cc-rx: 0`；
 //!    错误 → 回 `:status: 403` 并关闭连接；
 //! 4. 之后把 bidi stream 当 TCP 处理（读 `TCPRequest` → 回 `TCPResponse OK`
-//!    → 回显），把 DATAGRAM 当 UDP 处理（解码 `UDPMessage` → 原样回显）。
-//!    目标为 [`SINK_TARGET`] 的 stream 改作吸收端：读 8 字节大端长度 `L`，
-//!    吸收 `L` 字节后回 8 字节大端实收字节数（上行吞吐测试用，无下行数据）。
-//!    crate 内测试另有四个目标：`banner.test:1`（TCPResponse 与 `banner` 同批
-//!    写出后 FIN）、`close.test:1`（TCPResponse + `last words` 后立即关闭连接）、
-//!    `fin.test:1`（不回 TCPResponse 直接 FIN）、`reject.test:1`（拒绝，消息
-//!    `denied`）。
+//!    → 按 [`EchoMode`] 回显或 sink 丢弃），把 DATAGRAM 当 UDP 处理
+//!    （解码 `UDPMessage` → 原样回显）。[`EchoMode`] 仅测试使用。
+//!    crate 内测试另有四个按目标地址选择的 TCP 行为：`banner.test:1`
+//!    （TCPResponse 与 `banner` 同批写出后 FIN）、`close.test:1`（TCPResponse +
+//!    `last words` 后立即关闭连接）、`fin.test:1`（不回 TCPResponse 直接 FIN）、
+//!    `reject.test:1`（拒绝，消息 `denied`）。
 //!
 //! 不实现：完整 HTTP/3（无 QPACK 动态表、无 server SETTINGS）、拥塞协商的
 //! 实际限速、分片重组（测试只发不分片的包）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -34,8 +34,14 @@ use super::frames::{TcpResponse, UdpMessage};
 use super::qpack;
 use super::tls;
 
-/// 让测试 server 把 TCP stream 当吸收端的目标地址（见模块文档第 4 条）。
-pub const SINK_TARGET: &str = "sink.test:1";
+/// TCP 代理 stream 的测试行为（**仅测试**，不进入产品路径）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchoMode {
+    /// 回显收到的载荷（既有行为）。
+    Echo,
+    /// 只读丢弃载荷（sink；用于上传-only 场景），不写回任何载荷。
+    Sink,
+}
 
 /// 测试 server 句柄。
 pub struct TestServer {
@@ -43,17 +49,32 @@ pub struct TestServer {
     pub addr: SocketAddr,
     /// 服务端证书 DER 的 SHA-256（client 用 `pin-sha256` 校验）。
     pub pin_sha256: [u8; 32],
+    /// TCP stream 收到的载荷字节数（测试诊断用）。
+    received_bytes: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl TestServer {
     /// 启动 server（后台线程）：`expected_password` 为期望的 `hysteria-auth`，
-    /// `udp_enabled` 控制响应中的 `hysteria-udp`。
+    /// `udp_enabled` 控制响应中的 `hysteria-udp`。TCP stream 回显。
     ///
     /// # Errors
     ///
     /// 证书生成 / socket 绑定失败 → [`Hysteria2Error`]。
     pub fn spawn(expected_password: &str, udp_enabled: bool) -> Result<Self, Hysteria2Error> {
+        Self::spawn_with_mode(expected_password, udp_enabled, EchoMode::Echo)
+    }
+
+    /// 启动 server 并指定 TCP stream 测试行为（**仅测试**）。
+    ///
+    /// # Errors
+    ///
+    /// 证书生成 / socket 绑定失败 → [`Hysteria2Error`]。
+    pub fn spawn_with_mode(
+        expected_password: &str,
+        udp_enabled: bool,
+        mode: EchoMode,
+    ) -> Result<Self, Hysteria2Error> {
         let (cert_der, key_der) = tls::generate_test_identity()?;
         let pin_sha256 = tls::sha256_of(&cert_der);
         // quinn-proto 的 ServerConfig::with_single_cert（随机握手 token key，
@@ -73,18 +94,34 @@ impl TestServer {
         let port = driver.local_addr()?.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let expected = expected_password.to_string();
+        let received_bytes = Arc::new(AtomicU64::new(0));
+        let received_for_thread = Arc::clone(&received_bytes);
 
         let handle = thread::Builder::new()
             .name("hy2-test-server".to_string())
             .spawn(move || {
-                run_server(driver, server_config, &expected, udp_enabled);
+                run_server(
+                    driver,
+                    server_config,
+                    &expected,
+                    udp_enabled,
+                    mode,
+                    received_for_thread,
+                );
             })
             .map_err(|e| Hysteria2Error::Io(e.to_string()))?;
         Ok(Self {
             addr,
             pin_sha256,
+            received_bytes,
             handle: Some(handle),
         })
+    }
+
+    /// TCP stream 累计收到的载荷字节数（测试诊断用）。
+    #[must_use]
+    pub fn received_bytes(&self) -> u64 {
+        self.received_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -133,41 +170,13 @@ fn read_auth_request(
     qpack::decode_field_section(&body)
 }
 
-/// 吸收端：读 8 字节长度，吸收该长度后回实收字节数，再等对端 FIN。
-fn sink_stream(
-    driver: &mut Driver,
-    handle: ConnectionHandle,
-    conn: &mut Connection,
-    id: StreamId,
-    buf: &mut [u8],
-) {
-    let step = || Instant::now() + Duration::from_secs(5);
-    let Ok(len) = driver.read_exact(handle, conn, id, 8, step()) else {
-        return;
-    };
-    let mut len_be = [0u8; 8];
-    len_be.copy_from_slice(&len);
-    let want = u64::from_be_bytes(len_be);
-    let mut got = 0u64;
-    while got < want {
-        match driver.read_some(handle, conn, id, buf, step()) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => got += n as u64,
-        }
-    }
-    let _ = driver.write_all(handle, conn, id, &got.to_be_bytes(), step());
-    while let Ok(n) = driver.read_some(handle, conn, id, buf, step()) {
-        if n == 0 {
-            break;
-        }
-    }
-}
-
 fn run_server(
     mut driver: Driver,
     server_config: Arc<quinn_proto::ServerConfig>,
     expected_password: &str,
     udp_enabled: bool,
+    mode: EchoMode,
+    received_bytes: Arc<AtomicU64>,
 ) {
     let Some((handle, mut conn)) = driver.accept_one(&server_config, Duration::from_secs(30))
     else {
@@ -266,16 +275,10 @@ fn run_server(
                     let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
                     driver.finish_stream(handle, &mut conn, id);
                 }
-                Ok(target) if target == SINK_TARGET => {
-                    let resp = TcpResponse::encode(true, "", &[]);
-                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
-                    sink_stream(&mut driver, handle, &mut conn, id, &mut buf);
-                    driver.finish_stream(handle, &mut conn, id);
-                }
                 Ok(_target) => {
                     let resp = TcpResponse::encode(true, "", &[]);
                     let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
-                    // 回显直到对端 FIN。
+                    // Echo 回显 / Sink 只读丢弃，直到对端 FIN。
                     loop {
                         match driver.read_some(
                             handle,
@@ -285,15 +288,20 @@ fn run_server(
                             Instant::now() + Duration::from_secs(5),
                         ) {
                             Ok(0) => break,
-                            Ok(n) => {
-                                let _ = driver.write_all(
-                                    handle,
-                                    &mut conn,
-                                    id,
-                                    &buf[..n],
-                                    Instant::now() + Duration::from_secs(5),
-                                );
-                            }
+                            Ok(n) => match mode {
+                                EchoMode::Echo => {
+                                    let _ = driver.write_all(
+                                        handle,
+                                        &mut conn,
+                                        id,
+                                        &buf[..n],
+                                        Instant::now() + Duration::from_secs(5),
+                                    );
+                                }
+                                EchoMode::Sink => {
+                                    received_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                            },
                             Err(_) => break,
                         }
                     }
@@ -308,7 +316,7 @@ fn run_server(
             continue;
         }
         // UDP 回显。
-        if let Some(d) = driver.recv_datagram(handle, &mut conn, Duration::from_millis(20)) {
+        if let Some(d) = driver.recv_datagram(handle, &mut conn, Duration::ZERO) {
             if udp_enabled {
                 if let Ok(msg) = UdpMessage::decode(&d) {
                     let echo = UdpMessage {
@@ -324,7 +332,7 @@ fn run_server(
             }
             continue;
         }
-        driver.recv_one(handle, &mut conn, Duration::from_millis(20));
+        driver.recv_one(handle, &mut conn, Duration::from_millis(2));
     }
     driver.close(handle, &mut conn, 0, b"server done");
 }

@@ -1,0 +1,34 @@
+schema_version = 1
+id = "product.proxy-fwd-fail-closed"
+title = "Proxy 出站不可达：dial 失败 → RST，不直连、不黑洞（E4）"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+
+[given]
+# 可执行 E4（example proxy_fwd_fail_closed --json，进程内闭环，mock TUN）：
+# - Dataplane::process_one() 真实装配 + engine 指向已关闭的 SOCKS5 端口；
+# - 注入 SYN/ACK 后等待 dial 失败，TUN 写回须含 RST；
+# - 目标侧零字节、无 direct 转发（绝不回退直连）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_fwd_fail_closed -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "rst_received"
+equals = true
+
+[[expect]]
+field = "tcp_dials_failed"
+non_empty = true
+
+[[expect]]
+field = "target_bytes"
+equals = 0
+
+[[expect]]
+field = "direct_forwarded"
+equals = 0

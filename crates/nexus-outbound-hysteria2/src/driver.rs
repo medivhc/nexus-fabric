@@ -354,10 +354,15 @@ impl Driver {
                 Ok(n) => data = &data[n..],
                 Err(WriteError::Blocked) => {
                     self.pump(handle, conn);
-                    if Instant::now() >= deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
                         return Err(Hysteria2Error::Timeout);
                     }
-                    self.recv_one(handle, conn, Duration::from_millis(50));
+                    let wait = deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(50))
+                        .max(Duration::from_millis(1));
+                    self.recv_one(handle, conn, wait);
                 }
                 Err(_) => return Err(Hysteria2Error::Closed),
             }
@@ -471,10 +476,15 @@ impl Driver {
                         closed_seen = true;
                         continue;
                     }
-                    if Instant::now() >= deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
                         return Err(Hysteria2Error::Timeout);
                     }
-                    self.recv_one(handle, conn, Duration::from_millis(50));
+                    let wait = deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(50))
+                        .max(Duration::from_millis(1));
+                    self.recv_one(handle, conn, wait);
                 }
                 Err(ReadError::Reset(code)) => {
                     return Err(Hysteria2Error::StreamReset {

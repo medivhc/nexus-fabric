@@ -1,6 +1,6 @@
 //! 数据压缩（算法选择 + 自适应门控 + 帧头封装 + 压缩统计，内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的数据压缩：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的数据压缩：
 //! - **算法选择**：`CompressionAlgorithm` 三态--`None`（不压缩）/ `Gzip` / `Lz4`；
 //!   Gzip 经 flate2（rust_backend）、Lz4 经 lz4_flex 做真实编解码（PRODUCT §12.41）；
 //! - **自适应门控**：`CompressionCodec::should_compress(data_len)` 在

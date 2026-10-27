@@ -11,7 +11,7 @@
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 
 use crate::candidate::{CandidateKind, PunchCandidate};
 

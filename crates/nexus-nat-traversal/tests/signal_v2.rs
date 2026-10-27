@@ -1,4 +1,4 @@
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::{
     CandidateKind, MAX_CANDIDATES, PredictionHint, PunchAnswer, PunchCandidate, PunchOffer,
     SIGNAL_VERSION, SignalError, decode_answer, decode_answer_v1, decode_offer, decode_offer_v1,

@@ -233,6 +233,30 @@ impl Hysteria2Client {
         Some(n)
     }
 
+    /// 等待并剥离该 stream 的 `TCPResponse`（至多 `timeout`）。
+    ///
+    /// `fast_open=true` 时 `open_tcp` 只把 stream 标记为「读侧待剥离响应」；
+    /// 本方法让调用方在不把响应字节当载荷的前提下显式等待并校验该响应。
+    /// 响应已剥离时直接返回 `Ok(())`。超时返回 [`Hysteria2Error::Timeout`]
+    /// 但保留已读的帧前缀，再次调用（或 `stream_read`）接着读，帧字节不会
+    /// 交给调用方；与帧同批到达的载荷留给下一次 `stream_read`。
+    ///
+    /// # Errors
+    ///
+    /// 超时 → [`Hysteria2Error::Timeout`]；服务端拒绝 →
+    /// [`Hysteria2Error::TcpRejected`]；帧非法或响应前 FIN →
+    /// [`Hysteria2Error::InvalidFrame`]。
+    pub fn await_tcp_response(
+        &mut self,
+        id: StreamId,
+        timeout: Duration,
+    ) -> Result<(), Hysteria2Error> {
+        if !self.response_pending.contains_key(&id) {
+            return Ok(());
+        }
+        self.complete_tcp_response(id, Instant::now() + timeout)
+    }
+
     /// 在代理 stream 上写数据。
     ///
     /// # Errors

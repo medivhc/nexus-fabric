@@ -72,7 +72,8 @@ outbounds:
 # --- 节点型出站（等 CLI 数据面接入后启用，示例结构） ---
 # outbounds:
 #   - tag: node-jp
-#     kind: shadowsocks        # 或 trojan / vmess
+#     kind: shadowsocks        # trojan 需显式声明 TLS（alpn 或 skip_cert_verify），
+#                              # 否则 nexusd 启动失败；vmess 本 run 未接线
 #     locator: "1.2.3.4:8388"
 #     method: aes-128-gcm
 #     password: "xxxx"

@@ -30,7 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_fabric::{Cmd, ConnShared, Driver, PeerId as FabricPeerId, StreamShared};
 use nexus_nat_traversal::{
     DefaultPredictor, LocalCandidates, PortSample, Predictability, PredictionHint, PunchAnswer,

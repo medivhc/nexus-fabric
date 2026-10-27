@@ -321,6 +321,8 @@ cargo build --workspace
 
   * SDK：`nexus_connectivity::nat::{NatEvent, NatType, StunMapping}`（canonical codec：`nexus_turn::stun`；`StunClient`/`HolePuncher` 已随 #1 退役）
 
+  > 该 SDK 面属 v9 CLI 运行时（frozen）；新栈请用 `nexus_domain::nat`。
+
 * **代码级校验**：`nexus-harness run nat-hole-punching` → PASS（2026-10-18：RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析确定性自检）；单元测试 `cargo test -p nexusd nat_stun` 12/12。真实 STUN 服务器集成测试待完善。
 
 #### 4.1.9 Proxy 节点测速（tcp /http204，§11.10）
@@ -361,8 +363,57 @@ cargo build --workspace
 > 互操作状态以 [出站协议互操作证据总表](protocols/interop/MATRIX.md) 为准：VLESS、AnyTLS
 > 为 `VERIFIED / USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
 > （SIP004 互操作已通、产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；
-> Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`。
+> Hysteria2 为 `BROKEN / NOT_USABLE`；Trojan 为 `PARTIAL / TCP_ONLY /
+> USABLE_WITH_GAPS`（fallback fail-closed 已交付，产品 UDP 未实现、success 之后到达的
+> fallback 仍在承诺边界外，见下方「Trojan fallback 行为变更」）。
 > 五协议均可在配置面选择但无「实验性/未验证」标注。
+
+**Trojan fallback 守卫字段（proxy.yaml，2026-10-26）**
+
+`outbounds[]` 中 `kind: trojan` 的出站新增两个可选字段（仅 trojan 生效；非 trojan
+出站上写**合法值**会被忽略、写**非法值**会 `CONFIG_INVALID` 硬失败）：
+
+```yaml
+outbounds:
+  - tag: trojan-node
+    kind: trojan
+    locator: node.example.com:443
+    password: "CHANGE_ME"
+    fallback_guard: strict      # 缺省 strict；可选 signature（安全降级）
+    ready_window_ms: 0          # 0/缺省 = 自适应；1..=5000 = 显式窗口
+```
+
+- `fallback_guard: strict`（默认）：在本地 CONNECT 应答写出前，用「目标端口 + 首包」
+  判定节点是否接受了本次连接；只放行端口绑定的 server-first greeting 白名单
+  （22 `SSH-`、21/25/587 `220`、110 `+OK`、143 `* OK`、5900 `RFB `），其余首包
+  （含 HTTP 404 页面）在客户端看到任何隧道数据之前判失败。
+- `fallback_guard: signature`：**明确标注的安全降级（官方逃生口）**，只拒绝 HTTP
+  状态行，其余首包放行；代价是非 HTTP fallback 全部漏报。没有 `off`（不存在完全关闭
+  守卫的官方开关）。
+- `ready_window_ms`：把「等待首包」的时长显式设为 `n` 毫秒（上限 5000），只改等待时长、
+  不改判据；缺省用自适应窗口 `clamp(节点建连耗时 + 50ms, 50ms, 600ms)`。
+- 失败形态：SOCKS5 客户端在 CONNECT 应答阶段得到 `REP≠0`，HTTP 代理客户端得到
+  `HTTP/1.1 502 Bad Gateway`；失败后 500ms 内连接关闭，隧道字节为 0。
+
+**strict 模式的已知误杀面（M-1~M-8）**：MySQL 3306 二进制握手、非规范端口的 SSH
+（如 2222）、telnet IAC、自定义 banner、SMTP 非 `220` 应答（554/421）、非规范端口的
+VNC/FTP/POP3/IMAP、白名单前缀被 TCP 分片且 50ms 内未补齐、白名单端口但首包被中间盒
+改写 —— 这些合法 server-first 目标在 `strict` 下会被当成 fallback 拒绝。需要这类目标时
+请显式切换该出站为 `fallback_guard: signature`。
+
+**Trojan fallback 行为变更（发布说明面）**
+
+- **无 fallback 的坏凭据**（密码错、服务端直接关闭）：以前是「先回 SOCKS5 success，
+  随后隧道 EOF」，现在是「CONNECT 应答阶段直接失败（`REP≠0` / HTTP 502）」。客户端不再
+  把失败误认为已建立的隧道；MATRIX 判定与错误分类不变。
+- **有 fallback 的坏凭据**：fallback 页面（如 404）不再被当作隧道数据交给应用。
+- **非 CONNECT 绝对形式**：建连/握手失败由「直接断连」变为「HTTP 502」。
+- **承诺边界**：只保证「在 success 之前到达的 fallback 首包零字节投递」；若 fallback
+  响应慢于窗口（默认最多 600ms）或等到客户端先发数据后才响应，仍可能漏报；HTTP 绝对
+  形式转发（非 CONNECT）不在守卫的 fallback 识别范围内。建连/握手硬失败时仍回
+  `HTTP/1.1 502 Bad Gateway`（与 CONNECT 一致）。残余项登记在
+  [Trojan 注记](protocols/interop/notes/trojan-fallback.md) 与
+  [MATRIX](protocols/interop/MATRIX.md)。
 
 * **用户用法**：
 
@@ -376,7 +427,9 @@ cargo build --workspace
 > **互操作状态注记**：上述 `proxy-*` 是代码级/自洽校验，不等于对参照实现的互操作。
 > 互操作结论以 [出站协议互操作证据总表](protocols/interop/MATRIX.md) 为准：VLESS、AnyTLS
 > 为 `VERIFIED / USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
-> （产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`。
+> （产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；Hysteria2 为 `BROKEN / NOT_USABLE`；
+> Trojan 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（fallback fail-closed 已交付、
+> 产品 UDP 未实现；不写成 `VERIFIED`）。
 
 #### 4.1.11 规则数据注入（geoip.nex/geosite.nex）
 

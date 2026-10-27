@@ -67,6 +67,8 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 - `nexus-proxy`（旧规则引擎；新决策经 `nexus-domain::RuleEngine` trait）
 - 手写平台 TUN FFI（用户决策 2026-09-30：用 `tun-rs` v2 跨平台库，
   不重复造轮子。`TunDevice` trait 保留，`TunRsDevice` 包装 `tun-rs::SyncDevice`）
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 

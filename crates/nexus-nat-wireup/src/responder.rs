@@ -10,7 +10,7 @@ use std::io;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::{
     PredictionHint, PunchAnswer, PunchCandidate, PunchChannel, PunchOffer, SIGNAL_VERSION,
 };

@@ -43,6 +43,9 @@
 - `nexus-proxy` / 选路 / 策略组 / 系统根证书（webpki-root-certs 类 CDLA 包）；
 - tokio / 异步运行时（与仓库 loopback blocking+thread 模式一致）；
 - 任何 wasm 不可移植但未隔离的依赖。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants
 

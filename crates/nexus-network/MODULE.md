@@ -32,6 +32,8 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 
@@ -170,7 +172,9 @@ Out of scope：广播/组播、DNS 劫持、系统代理（后置，不在本契
 - 建连时序：`Resolve Candidate Providers → Plan Placement + Path → Create Session →
   Establish Connectivity → Execute`；禁止先对所有候选打洞再定 Plan。
 - 全系统唯一 Core Planner；领域特定数据只进类型化、版本化的 `NetworkPlanExtension`。
-- Connectivity/Transport 是共享 Delivery Infrastructure；禁止反向依赖 Workspace/Compute/Service 业务逻辑。
+- Delivery Infrastructure 是分层词（`ARCHITECTURE.md` §6）：v9 侧由 `nexus-connectivity`
+  实现（frozen），N1 侧由 `nexus-fabric` / `nexus-path` 实现；禁止反向依赖
+  Workspace/Compute/Service 业务逻辑。
 - Portable Core 禁止直接调用平台 API；`LinuxTunAdapter`（`TunVpi`）只存在于 `nexus-platform-linux`；
   跨平台统一抽象是 `VirtualPacketInterface`（`nexus-platform`），不是 Linux TUN（v9 §12）。
 - `nexus-network` 不编译依赖 `nexus-ingress`；Ingress 与 Network Runtime 由 Composition Root 同时装配

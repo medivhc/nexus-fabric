@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.proxy-fwd-trojan-plaintext-rejected"
+title = "Trojan 无显式 TLS 声明：daemon 启动硬失败（exit 1 + cause=PLAINTEXT_TROJAN_UNSUPPORTED）"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+
+[given]
+# 可执行 E4（example proxy_fwd_trojan_plaintext_rejected --json，daemon 级）：
+# - 临时配置目录：daemon.toml（TUN 启用 + 空闲 LocalAPI 端口）+ proxy.yaml
+#   （trojan 出站缺 skip_cert_verify / alpn，即无显式 TLS 声明）；
+# - 启动真实 nexusd 二进制；
+# - 断言 daemon exit 1、stderr JSON variant=SELECTED_OUTBOUND_INVALID +
+#   cause=PLAINTEXT_TROJAN_UNSUPPORTED、LocalAPI 无监听、TUN 未创建。
+# `nexus config check` 的同类断言（errors[].code + static_valid=false）属步骤 3。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_fwd_trojan_plaintext_rejected -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "exit_code"
+equals = 1
+
+[[expect]]
+field = "error.variant"
+equals = "SELECTED_OUTBOUND_INVALID"
+
+[[expect]]
+field = "error.cause"
+equals = "PLAINTEXT_TROJAN_UNSUPPORTED"
+
+[[expect]]
+field = "socket_open"
+equals = false
+
+[[expect]]
+field = "tun_created"
+equals = false
