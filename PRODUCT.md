@@ -777,8 +777,12 @@ trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
   `Unsupported{TlsVariantNotSupported}`：运行期 UDP 包全部丢弃（永久丢包），不直连、不伪造回包，
   只计数 + 限频 `event=udp_unsupported`。退出前可用的是**明文** Trojan 的 UDP，因此
   **Trojan 的 UDP 能力整体归零且不可通过配置迁移恢复**。
-- **TLS Trojan 仍为 `BROKEN` / `NOT_USABLE`**（`docs/protocols/interop/verdicts.json`）：迁移只让
-  TCP 能被建连，不改变产品可用性判定；`TROJAN_FALLBACK_FAIL_OPEN` 安全警示未消除。
+- **TLS Trojan 的互操作判定**（`docs/protocols/interop/verdicts.json` 与 MATRIX）：fixes-5
+  合入后为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`——协议层证据（ProductSocks5 路径全 TCP
+  格 PASS、fallback fail-closed 已交付）成立，上限由 `UdpEcho` 未实现钉死。该判定不覆盖
+  nexusd 路径：迁移只让 TLS Trojan 的 TCP 能被引擎建连，nexusd 侧不因此获得产品级可用
+  结论；`TROJAN_FALLBACK_FAIL_OPEN` 安全警示（success 之后到达的 fallback 仍在承诺边界
+  外）未消除。
 
 **启动失败与静态检查（排障入口）**
 
