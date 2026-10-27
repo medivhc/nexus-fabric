@@ -393,7 +393,19 @@ def proto_scope(proto, verdict):
     return "FULL" if verdict == "VERIFIED" else "PROTOCOL_SUBSET"
 
 
-def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_meta=None, run_meta_path=None):
+def render_matrix(
+    run_dir,
+    matrix,
+    verdicts,
+    rows,
+    findings,
+    allow_partial,
+    run_meta=None,
+    run_meta_path=None,
+    notes=None,
+    notes_path=None,
+    notes_sha256=None,
+):
     run_dir = Path(run_dir)
     env = run_dir / "evidence/env"
     ref = run_dir / "evidence/ref"
@@ -442,6 +454,12 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         + (", ".join(f"`{p}`" for p in archive) if archive else "（S30 归档后追加）")
         + "。"
     )
+    if notes is not None:
+        # AC-14.3 的机器路径：Trojan 注记只经 --notes 注入，人工零编辑。
+        lines.append(
+            f"- 注记：`{notes_path}`（sha256 `{notes_sha256}`）；"
+            "本节由 `recompute-verdicts.py --notes` 注入，禁止手工编辑 MATRIX。"
+        )
     lines.append("")
     lines.append("## 先读：范围 / 结论 / 图例")
     lines.append("")
@@ -473,7 +491,18 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     if not_run:
         counts += f"，未运行 {len(not_run)} 个（{'、'.join(not_run)}）"
     if verdict_names["VERIFIED"]:
-        usable = f"当前可宣称可用（`VERIFIED`）的协议为 {'、'.join(verdict_names['VERIFIED'])}。"
+        usable = (
+            "当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 "
+            f"{'、'.join(verdict_names['VERIFIED'])}"
+        )
+        with_gaps = [
+            p
+            for p in PROTOCOL_ORDER
+            if verdicts.get(p, {}).get("claim") == "USABLE_WITH_GAPS"
+        ]
+        if with_gaps:
+            usable += f"；另有 {len(with_gaps)} 个 `USABLE_WITH_GAPS`（{'、'.join(with_gaps)}）"
+        usable += "。"
     else:
         usable = "当前无任何协议可宣称可用。"
     lines.append(f"- **结论 1**：本次复算：{counts}；{usable}")
@@ -530,9 +559,13 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         )
     if run_meta:
         lines.append(
-            "- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
-            "配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地"
-            "（本 run 不改产品代码）。"
+            "- **结论 5**："
+            + narrative.get("conclusions", {}).get(
+                "5",
+                "五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
+                "配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地"
+                "（本 run 不改产品代码）。",
+            )
         )
     else:
         lines.append(
@@ -612,33 +645,42 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
             "（含 REALITY、ws/grpc）未测。"
         )
     lines.append("")
-    lines.append("## ⚠ 安全警示：Trojan fallback fail-open")
-    lines.append("")
-    lines.append(
-        "- **触发条件**：Trojan 密码错误、服务端被劫持，或服务端配置了 fallback"
-        "（本 run 参照端 fallback → HTTP 404）。"
-    )
-    lines.append(
-        "- **用户所见**：SOCKS5 CONNECT 已回 success，服务端 fallback 的 HTTP 响应被当作"
-        "隧道数据交给应用（404 页面内容），用户误以为代理成功。"
-    )
-    lines.append(
-        "- **白皮书映射**：违背 §6.2「路径失效时按配置阻断或回退，并向用户显示实际行为」"
-        "与 §16.1 N1「失败与恢复可观察」。"
-    )
-    lines.append(
-        "- **当前临时缓解（仅文档层）**：把含 fallback 的 Trojan 出站视为实验性/不安全；"
-        "产品负责人决定是否默认禁用。本 run 不改产品代码。"
-    )
-    lines.append(
-        "- **完整修复成本**：延迟 SOCKS5 success 至上游就绪或等价 fail-closed 方案，"
-        ">400 行 / >2 人日，触及 `proxy_serve_once` 全部出站路径，应另立 run。"
-    )
-    lines.append(
-        "- **证据**：`TrojanFallback/BadCredential`（FAIL，`E_NEXUS_FRAMING`），"
-        "根因见 [fix/trojan/root-cause.md](fix/trojan/root-cause.md)。"
-    )
-    lines.append("")
+    if notes is None:
+        # 无 --notes：保持历史 run 目录复算的逐字节输出（R-7 兼容口径）。
+        lines.append("## ⚠ 安全警示：Trojan fallback fail-open")
+        lines.append("")
+        lines.append(
+            "- **触发条件**：Trojan 密码错误、服务端被劫持，或服务端配置了 fallback"
+            "（本 run 参照端 fallback → HTTP 404）。"
+        )
+        lines.append(
+            "- **用户所见**：SOCKS5 CONNECT 已回 success，服务端 fallback 的 HTTP 响应被当作"
+            "隧道数据交给应用（404 页面内容），用户误以为代理成功。"
+        )
+        lines.append(
+            "- **白皮书映射**：违背 §6.2「路径失效时按配置阻断或回退，并向用户显示实际行为」"
+            "与 §16.1 N1「失败与恢复可观察」。"
+        )
+        lines.append(
+            "- **当前临时缓解（仅文档层）**：把含 fallback 的 Trojan 出站视为实验性/不安全；"
+            "产品负责人决定是否默认禁用。本 run 不改产品代码。"
+        )
+        lines.append(
+            "- **完整修复成本**：延迟 SOCKS5 success 至上游就绪或等价 fail-closed 方案，"
+            ">400 行 / >2 人日，触及 `proxy_serve_once` 全部出站路径，应另立 run。"
+        )
+        lines.append(
+            "- **证据**：`TrojanFallback/BadCredential`（FAIL，`E_NEXUS_FRAMING`），"
+            "根因见 [fix/trojan/root-cause.md](fix/trojan/root-cause.md)。"
+        )
+        lines.append("")
+    else:
+        lines.append(f"## Trojan 注记（机器注入自 `{notes_path}`）")
+        lines.append("")
+        lines.append(f"<!-- notes_sha256={notes_sha256} -->")
+        lines.append("")
+        lines.append(notes.rstrip())
+        lines.append("")
     lines.append("## 协议 verdict（按 spec E1 复算）")
     lines.append("")
     lines.append("| 协议 | verdict | scope | claim | root_cause_class | missing_cells | 命中规则 |")
@@ -684,8 +726,8 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
                 "否，依赖产品 UDP / fallback 架构",
             ),
             "Shadowsocks": (
-                "线格式/SIP004 AEAD + 产品 UDP 未实现",
-                "协议实现错误 + 产品 UDP 能力缺口",
+                "产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复）",
+                "产品 UDP 能力缺口（fixes-6）",
                 "否，依赖产品 UDP",
             ),
         }
@@ -854,17 +896,23 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     lines.append("")
     lines.append("## 产品能力缺口")
     lines.append("")
-    lines.append("- 产品级 UDP：未实现（上节）。")
-    lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
-    lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
-    lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")
-    lines.append(
-        "- Trojan fallback fail-open（安全语义）：错凭据/被劫持/服务端 fallback 时，"
-        "SOCKS5 仍回 success，fallback 的 HTTP 内容被当隧道数据。"
-    )
-    lines.append(
-        "- 代理失败可观察性：上述场景下产品不显示实际行为，不满足白皮书 §6.2/§16.1。"
-    )
+    gaps_override = narrative.get("capability_gaps")
+    if gaps_override:
+        # 数据驱动的能力缺口清单（run-meta 覆盖）：避免历史硬编码条目在新 run 里腐烂。
+        for item in gaps_override:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- 产品级 UDP：未实现（上节）。")
+        lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
+        lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
+        lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")
+        lines.append(
+            "- Trojan fallback fail-open（安全语义）：错凭据/被劫持/服务端 fallback 时，"
+            "SOCKS5 仍回 success，fallback 的 HTTP 内容被当隧道数据。"
+        )
+        lines.append(
+            "- 代理失败可观察性：上述场景下产品不显示实际行为，不满足白皮书 §6.2/§16.1。"
+        )
     lines.append("")
     lines.append("## fix 支线与复验")
     lines.append("")
@@ -1038,7 +1086,15 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     return text
 
 
-def build(run_dir, matrix_path, allow_partial, run_meta=None, run_meta_path=None):
+def build(
+    run_dir,
+    matrix_path,
+    allow_partial,
+    run_meta=None,
+    run_meta_path=None,
+    notes=None,
+    notes_path=None,
+):
     matrix = json.loads(Path(matrix_path).read_text(encoding="utf-8"))
     rows, findings = load_rows(run_dir, matrix)
     verdicts = {}
@@ -1063,6 +1119,9 @@ def build(run_dir, matrix_path, allow_partial, run_meta=None, run_meta_path=None
         allow_partial,
         run_meta=run_meta,
         run_meta_path=run_meta_path,
+        notes=notes,
+        notes_path=notes_path,
+        notes_sha256=(hashlib.sha256(notes.encode("utf-8")).hexdigest() if notes is not None else None),
     )
     payload = {
         "schema_version": 1,
@@ -1292,6 +1351,11 @@ def main():
     )
     ap.add_argument("--generated-at", default=None)
     ap.add_argument("--revision", default=None)
+    ap.add_argument(
+        "--notes",
+        default=None,
+        help="Trojan 注记 Markdown（随仓库 check-in）；注入 MATRIX 的安全警示段（AC-14.3）",
+    )
     ap.add_argument("--allow-partial", action="store_true")
     args = ap.parse_args()
 
@@ -1339,12 +1403,17 @@ def main():
 def run_legacy(args):
     try:
         run_meta = load_run_meta(args.run_meta) if args.run_meta else None
+        notes = None
+        if args.notes:
+            notes = Path(args.notes).read_text(encoding="utf-8")
         payload, text = build(
             args.run_dir,
             args.cell_matrix,
             args.allow_partial,
             run_meta=run_meta,
             run_meta_path=args.run_meta,
+            notes=notes,
+            notes_path=args.notes,
         )
     except RecomputeError as err:
         print(f"recompute error: {err}", file=sys.stderr)
@@ -1357,6 +1426,14 @@ def run_legacy(args):
     )
     if args.check:
         existing = Path(args.matrix).read_text(encoding="utf-8") if Path(args.matrix).exists() else ""
+        if args.notes and existing != text:
+            # 注记漂移同样是 drift（AC-14.3）：显式给出 notes_sha256 诊断。
+            want = hashlib.sha256(Path(args.notes).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+            if want not in existing:
+                print(
+                    f"notes drift: notes_sha256={want} not present in {args.matrix}",
+                    file=sys.stderr,
+                )
         if existing != text:
             print("MATRIX drift: run recompute without --check", file=sys.stderr)
             return 1
