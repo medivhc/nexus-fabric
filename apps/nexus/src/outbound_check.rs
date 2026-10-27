@@ -134,7 +134,7 @@ fn static_errors(outbound: &OutboundConfig) -> Vec<CheckError> {
             if !outbound_manifest::trojan_tls_signal(outbound) {
                 errors.push(CheckError::new(
                     "PLAINTEXT_TROJAN_UNSUPPORTED",
-                    "tls",
+                    "skip_cert_verify",
                     "trojan requires an explicit TLS declaration (skip_cert_verify or alpn)",
                 ));
             }
@@ -540,6 +540,15 @@ mod tests {
             .filter_map(|e| e["code"].as_str())
             .collect();
         assert!(codes.contains(&"PLAINTEXT_TROJAN_UNSUPPORTED"), "{codes:?}");
+        // MINOR-3：field 必须指向真实信号字段（`tls` 对 trojan 无效）。
+        let field = outcome.json["outbounds"][0]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["code"] == "PLAINTEXT_TROJAN_UNSUPPORTED")
+            .map(|e| e["field"].clone())
+            .unwrap_or(Value::Null);
+        assert_eq!(field, "skip_cert_verify");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

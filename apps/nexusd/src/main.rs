@@ -504,8 +504,13 @@ fn proxy_engine_init_failure_json(error: &nexusd::proxy_fwd::EngineInitError) ->
                 }
             });
             if matches!(source, OutboundConfigError::PlaintextTrojanUnsupported) {
-                body["error"]["hint"] =
-                    json!("add tls: true (or alpn / skip_cert_verify) to use this trojan outbound");
+                // `tls: true` 对 trojan 被静默忽略（该字段仅 VLESS 语义），不能作为
+                // 建议动作：否则「照 hint 改 → 仍报同一错」形成循环。
+                body["error"]["hint"] = json!(
+                    "trojan requires an explicit TLS signal: add alpn (e.g. alpn: [h2]) or \
+                     skip_cert_verify (true or false both declare TLS; false validates against \
+                     system roots). tls: true does not enable TLS for trojan."
+                );
             }
             body
         }

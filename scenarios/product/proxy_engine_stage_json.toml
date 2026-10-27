@@ -1,16 +1,21 @@
 schema_version = 1
 id = "product.proxy-engine-stage-json"
-title = "A4：启动失败按阶段（config_load / rule_engine_init / proxy_engine_init）输出 JSON + exit 1"
+title = "A4：启动失败按阶段（config_load / rule_engine_init / proxy_engine_init）输出 JSON + exit 1；按 hint 修复后必须能启动"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#统一数据面装配"
 
 [given]
 # 可执行 E4（example proxy_engine_stage_json --json）：真实 `nexusd <config-dir>`
-# 子进程三次，各触发一个 stage：
+# 子进程四次：
 # - config_load：proxy.yaml 语法错误（config::load 先失败）；
 # - rule_engine_init：配置可解析但 urltest 组缺 measurement（rule engine 构建失败）；
-# - proxy_engine_init：首个 wired 出站非法（Trojan 未声明 TLS → SelectedInvalid）。
-# 断言只看结构化 stage 字段与 exit code，不读文案。
+# - proxy_engine_init：首个 wired 出站非法（Trojan 未声明 TLS → SelectedInvalid）；
+# - hint_repair（MAJOR-1/C1 + MINOR-3）：同一明文 Trojan 配置 → `hint` 字段必须
+#   存在且**不得**把对 Trojan 无效的 `tls: true` 列为建议动作（`add tls: true`），
+#   必须点名 `alpn` 与 `skip_cert_verify`；再按 hint 的真实信号补
+#   `skip_cert_verify: false`（字段出现即 TLS 声明）→ 同一 daemon 必须真正启动
+#   （观察窗口内进程存活、不再输出 `stage=proxy_engine_init` 失败 JSON）。
+# 断言只看结构化 stage 字段、exit code 与 hint 关键词，不读文案原文。
 
 [when]
 command = "cargo run --quiet -p nexusd --example proxy_engine_stage_json -- --json"
@@ -26,3 +31,31 @@ equals = "rule_engine_init"
 [[expect]]
 field = "proxy_engine_init.stage"
 equals = "proxy_engine_init"
+
+[[expect]]
+field = "hint_repair.plaintext.cause"
+equals = "PLAINTEXT_TROJAN_UNSUPPORTED"
+
+[[expect]]
+field = "hint_repair.plaintext.hint_present"
+equals = true
+
+[[expect]]
+field = "hint_repair.plaintext.hint_suggests_tls_true"
+equals = false
+
+[[expect]]
+field = "hint_repair.plaintext.hint_mentions_alpn"
+equals = true
+
+[[expect]]
+field = "hint_repair.plaintext.hint_mentions_skip_cert_verify"
+equals = true
+
+[[expect]]
+field = "hint_repair.repaired_start_ok"
+equals = true
+
+[[expect]]
+field = "hint_repair.repaired_startup_failure_json"
+equals = false
