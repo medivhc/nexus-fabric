@@ -1232,6 +1232,7 @@ dependencies = [
  "nexus-domain",
  "nexus-measurement",
  "nexus-platform",
+ "nexus-proxy-config",
  "rand 0.8.8",
  "ring",
  "x25519-dalek",

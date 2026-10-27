@@ -15,6 +15,9 @@ nexus-platform = { path = "../nexus-platform" }
 # 不引入业务逻辑层依赖（见 MODULE.md Allowed Dependencies）。
 nexus-domain = { path = "../nexus-domain" }
 nexus-measurement = { path = "../nexus-measurement" }
+# 出站身份/离线交接词汇（接缝 ②）：定义已下沉 nexus-proxy-config，
+# 本 crate 只做 pub use 重导出保持旧路径源码兼容。
+nexus-proxy-config = { path = "../nexus-proxy-config" }
 # 链路加密基元（X25519 身份密钥 / HKDF-SHA256 / ChaCha20Poly1305 AEAD）。
 # P4.1 §12.39：ring 0.17 不公开私钥序列化，长期身份密钥改用 x25519-dalek
 # （纯 Rust、no_std 兼容、Apache-2.0/MIT，WireGuard/Noise 生态标准实现）；

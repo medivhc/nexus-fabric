@@ -650,32 +650,12 @@ impl<P: LinkProbe> LinkActivator<P> {
     }
 }
 
-// ---------- OutboundAdapter 接缝（PRODUCT §11.6） ----------
+// ---------- OutboundAdapter 接缝（PRODUCT §11.6；定义已下沉 nexus-proxy-config） ----------
 
-/// 出站交接结果（离线 DTO，零真实网络）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboundHandoff {
-    /// 出站 kind 标签（"direct" / "relay" / "shadowsocks"）。
-    pub kind: String,
-    /// 出站 tag。
-    pub tag: String,
-    /// 物理目标 locator。
-    pub locator: String,
-}
-
-/// 出站 adapter：一种真实的出站协议实现（Direct / Relay / Shadowsocks）。
-///
-/// 领域中立接缝：只暴露出站标识与离线交接语义；真实加密/建连由各实现与
-/// Composition Root 完成。Deletion Test（AGENTS.md §12）：Shadowsocks 是首个带
-/// 真实 AEAD 加解密的出站，与仅做可达性探测的 Direct/Relay 构成独立变化维度。
-pub trait OutboundAdapter {
-    /// 稳定出站 kind 标签。
-    fn outbound_kind(&self) -> &'static str;
-    /// 出站标识 tag。
-    fn tag(&self) -> &str;
-    /// 离线交接：确认该 adapter 可承接目标 locator（不发起真实网络）。
-    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError>;
-}
+// 路径别名：CLI example 与仓内消费者源码零改动（spec §2.2）。
+pub use nexus_proxy_config::outbound_seam::{
+    OutboundAdapter, OutboundHandoff, OutboundHandoffError,
+};
 
 #[cfg(test)]
 mod tests {
