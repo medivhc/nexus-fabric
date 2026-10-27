@@ -315,6 +315,58 @@ impl DiscoveryHub {
         self.write().seen.should_flood(peer, incarnation, seq)
     }
 
+    // ---------- mDNS state machine (§4.8, delegated) ----------
+
+    /// Whether an mDNS state machine is attached.
+    #[must_use]
+    pub fn mdns_enabled(&self) -> bool {
+        self.read().mdns.is_some()
+    }
+
+    /// PTR query payload for the pump (`None` when mDNS is not attached).
+    #[must_use]
+    pub fn mdns_query(&self) -> Option<Vec<u8>> {
+        self.read().mdns.as_ref().map(MdnsDiscovery::encode_query)
+    }
+
+    /// Unsolicited announce payload for the pump.
+    #[must_use]
+    pub fn mdns_announce(&self) -> Option<Vec<u8>> {
+        self.read()
+            .mdns
+            .as_ref()
+            .map(MdnsDiscovery::encode_announce)
+    }
+
+    /// Feed one received datagram; returns the replies to send back.
+    pub fn mdns_handle_datagram(&self, data: &[u8], now: Instant) -> Vec<Vec<u8>> {
+        let mut st = self.write();
+        st.last_now = Some(now);
+        match st.mdns.as_mut() {
+            Some(mdns) => mdns.handle_datagram(data, now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Prune expired mDNS cache entries.
+    pub fn mdns_prune(&self, now: Instant) {
+        let mut st = self.write();
+        st.last_now = Some(now);
+        if let Some(mdns) = st.mdns.as_mut() {
+            mdns.prune_expired(now);
+        }
+    }
+
+    /// Cached mDNS peer count (observable; includes not-yet-pruned entries).
+    #[must_use]
+    pub fn mdns_cached_peers(&self) -> usize {
+        self.read()
+            .mdns
+            .as_ref()
+            .map(MdnsDiscovery::cached_peer_count)
+            .unwrap_or(0)
+    }
+
     // ---------- lock helpers (poison recovery, never panic) ----------
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HubState> {
@@ -545,6 +597,19 @@ mod tests {
         // `all_lsas` filters with the last injected time.
         hub.note_lsa_heard(&peer("n2"), stale);
         assert!(hub.all_lsas().is_empty());
+    }
+
+    #[test]
+    fn mdns_none_is_inert() {
+        let hub = hub_with(&[]);
+        let t0 = Instant::now();
+        assert!(!hub.mdns_enabled());
+        assert!(hub.mdns_query().is_none());
+        assert!(hub.mdns_announce().is_none());
+        assert!(hub.mdns_handle_datagram(b"garbage", t0).is_empty());
+        hub.mdns_prune(t0);
+        assert_eq!(hub.mdns_cached_peers(), 0);
+        assert!(hub.known_peers(t0).is_empty());
     }
 
     #[test]
