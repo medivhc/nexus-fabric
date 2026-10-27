@@ -22,6 +22,9 @@ pub mod udp;
 
 pub use udp::{UdpCapability, UdpMode, UdpUnsupportedReason};
 
+/// 出站身份/离线交接词汇（接缝 ②；原 `nexus-connectivity` 定义下沉至此）。
+pub mod outbound_seam;
+
 /// TPROXY 透明入站默认监听地址（spec §11.1 冻结端口 7895）。
 pub const TPROXY_DEFAULT_LISTEN: &str = "0.0.0.0:7895";
 
