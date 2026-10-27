@@ -1,10 +1,12 @@
-//! E4: VLESS / AnyTLS 作为 active outbound 时 UDP fail-closed。
+//! E4: VLESS / AnyTLS / TLS Trojan 作为 active outbound 时 UDP fail-closed。
 //!
 //! 场景 `scenarios/product/proxy_fwd_udp_unsupported.toml`：
 //! - 生产 `Dataplane::process_one()` + MockTun（无真实 TUN 权限也可跑）；
-//! - VLESS / AnyTLS 各注入 2 个业务 UDP 包；
+//! - VLESS / AnyTLS / TLS Trojan 各注入 2 个业务 UDP 包；
 //! - 断言：包全部丢弃、`udp_unsupported` 与分协议计数 > 0、`udp_sent == 0`、
 //!   限频日志抑制计数 > 0、无直连（`direct_forwarded == 0`）。
+//! - Trojan 轮（MAJOR-5）：TLS Trojan 的 `udp_capability` 恒为
+//!   `Unsupported{TlsVariantNotSupported}` → 落 `udp_unsupported_other`。
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -56,6 +58,10 @@ fn proxy_yaml(kind: &str) -> String {
         "anytls" => {
             "  - tag: proxy\n    kind: anytls\n    locator: 127.0.0.1:18444\n    password: e4-password\n    skip_cert_verify: true\n"
         }
+        // TLS Trojan：`skip_cert_verify` 字段出现即 TLS 声明（不是明文 Trojan）。
+        "trojan" => {
+            "  - tag: proxy\n    kind: trojan\n    locator: 127.0.0.1:18445\n    password: e4-password\n    skip_cert_verify: true\n"
+        }
         other => panic!("unexpected kind {other}"),
     };
     format!(
@@ -69,6 +75,7 @@ struct Phase {
     dropped_no_proxy: u64,
     direct_forwarded: u64,
     log_suppressed: u64,
+    unsupported_other: u64,
     active_kind: String,
 }
 
@@ -125,6 +132,7 @@ fn run_phase(kind: &str) -> Result<Phase, String> {
         dropped_no_proxy: stats.proxy_dropped_no_proxy,
         direct_forwarded: stats.direct_forwarded,
         log_suppressed: proxy.udp_unsupported_log_suppressed,
+        unsupported_other: proxy.udp_unsupported_other,
         active_kind: active_kind.as_str().to_string(),
     })
 }
@@ -132,6 +140,7 @@ fn run_phase(kind: &str) -> Result<Phase, String> {
 fn main() {
     let mut vless = None;
     let mut anytls = None;
+    let mut trojan = None;
     let mut error = None;
     match run_phase("vless") {
         Ok(phase) => vless = Some(phase),
@@ -139,6 +148,10 @@ fn main() {
     }
     match run_phase("anytls") {
         Ok(phase) => anytls = Some(phase),
+        Err(e) => error = Some(e),
+    }
+    match run_phase("trojan") {
+        Ok(phase) => trojan = Some(phase),
         Err(e) => error = Some(e),
     }
 
@@ -156,21 +169,32 @@ fn main() {
         );
         std::process::exit(1);
     };
+    let Some(trojan) = trojan else {
+        println!(
+            "{}",
+            json!({"verdict": "FAIL", "error": error.unwrap_or_default()})
+        );
+        std::process::exit(1);
+    };
 
-    let total_unsupported = vless.unsupported + anytls.unsupported;
-    let total_sent = vless.sent + anytls.sent;
-    let total_direct = vless.direct_forwarded + anytls.direct_forwarded;
-    let suppressed = vless.log_suppressed + anytls.log_suppressed;
-    let dropped = vless.dropped_no_proxy + anytls.dropped_no_proxy;
+    let total_unsupported = vless.unsupported + anytls.unsupported + trojan.unsupported;
+    let total_sent = vless.sent + anytls.sent + trojan.sent;
+    let total_direct = vless.direct_forwarded + anytls.direct_forwarded + trojan.direct_forwarded;
+    let suppressed = vless.log_suppressed + anytls.log_suppressed + trojan.log_suppressed;
+    let dropped = vless.dropped_no_proxy + anytls.dropped_no_proxy + trojan.dropped_no_proxy;
 
-    let verdict = total_unsupported >= 4
+    let verdict = total_unsupported >= 6
         && vless.unsupported > 0
         && anytls.unsupported > 0
+        && trojan.unsupported > 0
+        && trojan.unsupported_other > 0
         && total_sent == 0
         && total_direct == 0
-        && dropped >= 4
+        && dropped >= 6
+        && suppressed >= 3
         && vless.active_kind == "vless"
-        && anytls.active_kind == "anytls";
+        && anytls.active_kind == "anytls"
+        && trojan.active_kind == "trojan";
 
     let output = json!({
         "verdict": if verdict { "PASS" } else { "FAIL" },
@@ -180,6 +204,10 @@ fn main() {
         "udp.unsupported_positive": total_unsupported > 0,
         "udp.unsupported_vless_positive": vless.unsupported > 0,
         "udp.unsupported_anytls_positive": anytls.unsupported > 0,
+        "udp.unsupported_trojan": trojan.unsupported,
+        "udp.unsupported_trojan_positive": trojan.unsupported > 0,
+        "udp.unsupported_trojan_other": trojan.unsupported_other,
+        "udp.unsupported_trojan_other_positive": trojan.unsupported_other > 0,
         "udp.sent": total_sent,
         "udp.direct_forwarded": total_direct,
         "udp.log_suppressed": suppressed,
@@ -187,6 +215,7 @@ fn main() {
         "proxy.dropped_no_proxy": dropped,
         "outbound.vless_kind": vless.active_kind,
         "outbound.anytls_kind": anytls.active_kind,
+        "outbound.trojan_kind": trojan.active_kind,
     });
     println!("{}", serde_json::to_string(&output).expect("json"));
     if !verdict {

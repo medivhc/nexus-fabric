@@ -1,0 +1,59 @@
+schema_version = 1
+id = "product.proxy-fwd-trojan-tls-engine"
+title = "TLS Trojan 经 nexusd 引擎（Dataplane::tick + ProxyEngine + MockTun）真实 TCP 中继"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+
+[given]
+# 可执行 E4（example proxy_fwd_trojan_tls_engine --json）：
+# - loopback Trojan **TLS** 节点（`nexus_outbound_trojan::server_config` 自签，
+#   解析 trojan 请求头 + 连到本地 echo 目标）；
+# - 生产装配 `Dataplane` + `ProxyEngine`，trojan 出站以 `skip_cert_verify: true`
+#   声明 TLS（字段出现即声明），规则选中 `trojan-node`；
+# - 注入 SYN/ACK/DATA 后不再注入上行包，下行 echo 必须经隧道回写 TUN。
+# 断言引擎面（不是 `nexus proxy` 前端）：trojan 节点实际收到 TLS 连接、请求头目标
+# 送达、TCP 往返成功，且引擎 stats 佐证（proxy_tcp_streams_ok / proxy_tcp_bytes /
+# proxy_forwarded）、无直连。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_fwd_trojan_tls_engine -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "selected_tag"
+equals = "trojan-node"
+
+[[expect]]
+field = "outbound.kind"
+equals = "trojan"
+
+[[expect]]
+field = "trojan_server.connected"
+equals = true
+
+[[expect]]
+field = "trojan_server.target_delivered_ok"
+equals = true
+
+[[expect]]
+field = "tcp.roundtrip_ok"
+equals = true
+
+[[expect]]
+field = "stats.proxy_tcp_bytes"
+equals = 27
+
+[[expect]]
+field = "stats.proxy_tcp_streams_ok"
+equals = 1
+
+[[expect]]
+field = "stats.proxy_forwarded"
+equals = 1
+
+[[expect]]
+field = "direct_forwarded"
+equals = 0
