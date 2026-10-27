@@ -11,8 +11,9 @@ requirement = "apps/nexusd/MODULE.md#统一数据面装配"
 # 2) MockTun + 真实 Dataplane：规则选中坏 tag → 恰好一个 RST、无 SYN-ACK、
 #    `direct_forwarded == 0`（不回退 direct / 不回退其他出站）；
 # 3) Q-2（灾备/合法 TUN 分流场景）：只有 direct 的 proxy.yaml → daemon 存活、
-#    不输出 `stage=proxy_engine_init` 失败 JSON、`ProxyEngine unavailable
-#    (NO_USABLE_OUTBOUND)` warn，且无 engine 的 Proxy SYN 仍按 D2 回 RST。
+#    不输出 `stage=proxy_engine_init` 失败 JSON（`no_startup_failure_json`）、
+#    `ProxyEngine unavailable (NO_USABLE_OUTBOUND)` warn，且无 engine 的 Proxy
+#    SYN 仍按 D2 回 RST（`proxy_rst_on_no_engine`）。
 
 [when]
 command = "cargo run --quiet -p nexusd --example proxy_engine_unsupported_outbound -- --json"
@@ -35,4 +36,12 @@ equals = 0
 
 [[expect]]
 field = "degraded.alive_without_engine"
+equals = true
+
+[[expect]]
+field = "degraded.no_startup_failure_json"
+equals = true
+
+[[expect]]
+field = "degraded.proxy_rst_on_no_engine"
 equals = true
