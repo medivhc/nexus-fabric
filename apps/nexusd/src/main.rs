@@ -1528,16 +1528,43 @@ fn stun_servers(
 /// → Proxy（可降级）→ LocalAPI → 主循环。
 /// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
 /// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
+/// `stage=config_load` 失败行（spec §12.2-B）；proxy.yaml 解析失败时补四字段。
+///
+/// 全部字段经 `redact_secrets`/`sanitize`（写点 1/6，spec §9.1），并用
+/// `serde_json::json!` 构造（禁止手拼转义回归）。
+fn config_load_failure_json(error: &str, dir: Option<&ConfigDir>) -> serde_json::Value {
+    let parse_error = dir
+        .and_then(|dir| std::fs::read_to_string(dir.file(config::PROXY_YAML)).ok())
+        .and_then(|text| nexus_proxy_config::parse(&text).err());
+    match parse_error {
+        Some(parse) => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "config_load",
+            "error": {
+                "code": "CONFIG",
+                "message": nexus::redact::sanitize(error),
+                "variant": "PROXY_YAML_INVALID",
+                "field": nexus::redact::sanitize(&parse.field),
+                "detail": nexus::redact::sanitize(&parse.reason),
+            }
+        }),
+        None => json!({
+            "verdict": "FAIL",
+            "command": "nexusd",
+            "stage": "config_load",
+            "error": {"code": "CONFIG", "message": nexus::redact::sanitize(error)}
+        }),
+    }
+}
+
 fn run_daemon(config_dir: &str) -> ExitCode {
     // Anchor relative daemon input once without resolving symlinks or removing
     // parent components: managed preflight must retain its path safety checks.
     let config_root = match std::path::absolute(config_dir) {
         Ok(root) => root,
         Err(error) => {
-            eprintln!(
-                "{}",
-                json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":error.to_string()}})
-            );
+            eprintln!("{}", config_load_failure_json(&error.to_string(), None));
             return ExitCode::from(1);
         }
     };
@@ -1552,9 +1579,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let dir = match ConfigDir::new(&config_root) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
-            );
+            eprintln!("{}", config_load_failure_json(&e.to_string(), None));
             return ExitCode::from(1);
         }
     };
@@ -1567,9 +1592,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let loaded = match config::load(&dir) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
-            );
+            eprintln!("{}", config_load_failure_json(&e.to_string(), Some(&dir)));
             return ExitCode::from(1);
         }
     };
@@ -1593,7 +1616,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     if let Err(error) = nexus::outbound_manifest::manifest() {
         eprintln!(
             "{}",
-            json!({"verdict":"FAIL","command":"nexusd","stage":"outbound_manifest","error":{"code":"CONFIG","message":error.to_string()}})
+            json!({"verdict":"FAIL","command":"nexusd","stage":"outbound_manifest","error":{"code":"CONFIG","message":nexus::redact::sanitize(&error.to_string())}})
         );
         return ExitCode::from(1);
     }
@@ -1693,9 +1716,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
-            );
+            eprintln!("{}", config_load_failure_json(&e.to_string(), Some(&dir)));
             return ExitCode::from(1);
         }
     };
@@ -2057,7 +2078,11 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 eprintln!("[nexusd] WARN: {reason}");
             }
             Ok(watcher::ReloadEvent::Rejected { error }) => {
-                eprintln!("[nexusd] ERROR: config reload rejected: {error} (keeping old config)");
+                // 写点 3：打印点再脱敏（幂等；双写点漏网防护）。
+                eprintln!(
+                    "[nexusd] ERROR: config reload rejected: {} (keeping old config)",
+                    nexus::redact::redact_secrets(&error)
+                );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3063,5 +3088,93 @@ outbounds:
         let (mut dp, pkt) = assemble(None);
         let outbound = dp.cached_outbound(&pkt).expect("decision cached");
         assert_eq!(outbound, "proxy");
+    }
+}
+
+/// S7：脱敏 parity（daemon 启动行 / CLI `config check` detail 同一份实现）。
+#[cfg(test)]
+mod redact_parity_tests {
+    use super::config_load_failure_json;
+    use nexusd::config::ConfigDir;
+
+    const MARKER: &str = "r2f3redactmarker9a1b";
+
+    fn temp_config_dir(tag: &str) -> (std::path::PathBuf, ConfigDir) {
+        let dir = std::env::temp_dir().join(format!(
+            "nexusd-redact-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp config dir");
+        let conversation = ConfigDir::new(&dir).expect("config dir");
+        (dir, conversation)
+    }
+
+    #[test]
+    fn parity_daemon_and_cli_detail_hide_password_marker() {
+        let (path, dir) = temp_config_dir("parity");
+        // 畸形输入：引号紧凑形态 + 多词口令。
+        let broken = format!(
+            "schema_version: 1\noutbounds:\n  - tag: a\n    kind: shadowsocks\n    locator: 1.2.3.4:1\n    password={MARKER} alpha beta\n"
+        );
+        std::fs::write(path.join("proxy.yaml"), &broken).expect("write");
+
+        let error = "parse proxy.yaml failed";
+        let daemon = config_load_failure_json(error, Some(&dir));
+        let daemon_text = serde_json::to_string(&daemon).expect("json");
+        assert!(
+            !daemon_text.contains(MARKER),
+            "daemon leaked: {daemon_text}"
+        );
+
+        // CLI 同一份实现（`config check` 的 detail 字段路径）。
+        let cli_detail = nexus::redact::sanitize(&err_text(&dir));
+        assert!(!cli_detail.contains(MARKER), "cli leaked: {cli_detail}");
+        assert!(cli_detail.contains("***"), "mask missing: {cli_detail}");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// 取与 CLI detail 同源的解析错误文本（含原始回显）。
+    fn err_text(dir: &ConfigDir) -> String {
+        let text = std::fs::read_to_string(dir.file(nexusd::config::PROXY_YAML)).expect("read");
+        nexus_proxy_config::parse(&text)
+            .expect_err("must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn redact_double_application_is_idempotent() {
+        let raw = format!("files [\"proxy.yaml\"]: got 'password={MARKER}'");
+        let once = nexus::redact::redact_secrets(&raw);
+        let twice = nexus::redact::redact_secrets(&once);
+        assert_eq!(once, twice, "double application must be idempotent");
+        assert!(!once.contains("*** ***"), "double mask: {once}");
+    }
+
+    #[test]
+    fn config_failure_json_is_parseable() {
+        let (path, dir) = temp_config_dir("parseable");
+        std::fs::write(path.join("proxy.yaml"), "not: [valid").expect("write");
+        let value = config_load_failure_json("parse proxy.yaml failed", Some(&dir));
+        let text = serde_json::to_string(&value).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("parseable");
+        assert_eq!(parsed["verdict"], "FAIL");
+        assert_eq!(parsed["stage"], "config_load");
+        assert_eq!(parsed["error"]["variant"], "PROXY_YAML_INVALID");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn error_debug_hides_secrets() {
+        use nexus_proxy_config::UdpMode;
+        let mode = UdpMode::ShadowsocksAead {
+            server: "127.0.0.1:8388".parse().expect("addr"),
+            password: MARKER.to_string(),
+        };
+        let text = format!("{mode:?}");
+        assert!(!text.contains(MARKER), "UdpMode leaked: {text}");
+        assert!(text.contains("***"), "mask missing: {text}");
     }
 }

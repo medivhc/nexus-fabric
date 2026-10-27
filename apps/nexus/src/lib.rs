@@ -62,6 +62,8 @@ pub mod plan_cli;
 /// `nexus provider` 命令族（N2 P0-5）：提供方侧常驻准入服务。
 pub mod provider_cli;
 pub mod provider_fetcher;
+/// 密钥脱敏（daemon + CLI 共享一份实现；spec §9）。
+pub mod redact;
 /// `nexus resource` 命令族（N2 P0-4/P0-5）：list / show / publish / revoke /
 /// export / import。
 pub mod resource_cli;

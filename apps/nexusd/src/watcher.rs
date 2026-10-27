@@ -101,8 +101,9 @@ fn watch_loop(dir: ConfigDir, mut current: LoadedConfig, tx: Sender<ReloadEvent>
                         current.meta.remove(f);
                     }
                 }
+                // 写点 2（spec §9.1）：构造点即脱敏（口令不落 stderr）。
                 let _ = tx.send(ReloadEvent::Rejected {
-                    error: format!("files {changed:?}: {e}"),
+                    error: nexus::redact::redact_secrets(&format!("files {changed:?}: {e}")),
                 });
                 continue;
             }

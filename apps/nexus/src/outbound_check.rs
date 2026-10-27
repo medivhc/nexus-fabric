@@ -42,7 +42,7 @@ impl CheckError {
         Self {
             code,
             field: field.into(),
-            detail: sanitize(&detail.into()),
+            detail: crate::redact::sanitize(&detail.into()),
         }
     }
 
@@ -57,100 +57,6 @@ impl CheckError {
 /// 形态（`password=…` / `password:…`）分词后键与前导 `'` 粘连；标点必须在这里
 /// 统一剥掉。bare 分支与 inline 分支共用本函数——两分支曾各自去标点，导致引号
 /// 邻接形态只有一边命中（fix-r1 review F1；R2-F8 把同一口径同步到 CLI）。
-fn normalize_key(raw: &str) -> String {
-    raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .to_ascii_lowercase()
-}
-
-/// 密钥 token 是否已经带掩码值（`password:***` / `'password=***'`）。
-///
-/// 与 daemon 侧 `apps/nexusd/src/redact.rs` 同口径（PR2R1-08）：掩码值原样保留，
-/// 避免二次脱敏产生 `password:*** ***`。
-fn value_is_mask(token: &str) -> bool {
-    token
-        .split_once(':')
-        .or_else(|| token.split_once('='))
-        .map(|(_, value)| value.trim_matches(|ch| ch == '\'' || ch == '"') == "***")
-        .unwrap_or(false)
-}
-
-/// 值尾部的引号（解析器回显 `'…'` 与 Debug `"` 叠加时保留闭合引号）。
-fn trailing_quotes(value: &str) -> String {
-    value
-        .chars()
-        .rev()
-        .take_while(|ch| matches!(ch, '\'' | '"'))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
-}
-
-/// 脱敏：`password` / `uuid` / `obfs_key` / `obfs_password` 后面的值替换为 `***`。
-///
-/// 配置解析错误可能带原始行（review r1 B3）；spec §2.9 冻结 detail 不含
-/// 密码/uuid/obfs_key。这里按空白分词，兼容 `key: value` 与 `key=value`。
-/// 与 daemon 侧同一口径（PR2R1-08）：已掩码值不重复追加 `***`，新掩码保留值
-/// 尾部引号（否则解析器回显的 `'password=…'` 会留下不闭合引号）。
-fn redact_secrets(text: &str) -> String {
-    const SECRET_KEYS: [&str; 4] = ["password", "uuid", "obfs_key", "obfs_password"];
-    let mut out: Vec<String> = Vec::new();
-    for token in text.split_whitespace() {
-        let bare = normalize_key(token);
-        if SECRET_KEYS.contains(&bare.as_str()) {
-            out.push(token.to_string());
-            if !value_is_mask(token) {
-                out.push("***".to_string());
-            }
-            // 值的边界未知（可能带引号/多词）：保留 key，其余全部截断。
-            break;
-        }
-        let inline = token
-            .split_once(':')
-            .or_else(|| token.split_once('='))
-            .filter(|(key, _)| SECRET_KEYS.contains(&normalize_key(key).as_str()));
-        match inline {
-            Some((key, _)) => {
-                if value_is_mask(token) {
-                    out.push(token.to_string());
-                } else {
-                    let value = token
-                        .split_once(':')
-                        .or_else(|| token.split_once('='))
-                        .map(|(_, value)| value)
-                        .unwrap_or("");
-                    out.push(format!("{key}:***{}", trailing_quotes(value)));
-                }
-                break;
-            }
-            None => out.push(token.to_string()),
-        }
-    }
-    out.join(" ")
-}
-
-/// 截断 128B、去控制字符、脱敏（spec §2.9/§6.5 `DETAIL_MAX_BYTES`）。
-fn sanitize(text: &str) -> String {
-    const DETAIL_MAX_BYTES: usize = 128;
-    let cleaned: String = redact_secrets(text)
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if cleaned.len() <= DETAIL_MAX_BYTES {
-        return cleaned;
-    }
-    let mut cut = cleaned;
-    let mut end = DETAIL_MAX_BYTES;
-    while end > 0 && !cut.is_char_boundary(end) {
-        end -= 1;
-    }
-    cut.truncate(end);
-    cut.push('…');
-    cut
-}
-
 fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.trim().is_empty())
 }
@@ -698,21 +604,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 重复 tag 在 **master 的解析器** 阶段即被拒绝（`CONFIG_INVALID`），
+    /// 因此 `DUPLICATE_OUTBOUND_TAG` 的 warning 分支在本仓库不可达。
+    ///
+    /// 口径说明（implement 偏差，已记入 implement-report）：spec §7.5 要求
+    /// 「`DUPLICATE_OUTBOUND_TAG` 只 warning、不改 exit code」；本仓
+    /// `nexus_proxy_config::parse` 对重复 tag 直接报 `outbounds[i].tag duplicate`，
+    /// 该 warning 因此**不可能被触发**，规则在「无重复可观测」的意义上仍成立。
+    /// 代码保留该分支（解析器放宽时可自动生效），测试改钉解析器层拒绝。
     #[test]
-    fn duplicate_tag_is_warning_only() {
+    fn duplicate_tag_is_rejected_by_parser() {
         let dir = temp_dir("duplicate");
         write_yaml(
             &dir,
             "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: ss-a\noutbounds:\n  - tag: ss-a\n    kind: shadowsocks\n    method: chacha20-ietf-poly1305\n    locator: 127.0.0.1:8388\n    password: secret\n  - tag: ss-a\n    kind: shadowsocks\n    method: chacha20-ietf-poly1305\n    locator: 127.0.0.1:8389\n    password: secret\n",
         );
         let outcome = check(&dir, None);
-        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.exit_code, 1, "duplicate tag is a hard config error");
         assert!(
-            outcome.json["warnings"]
+            outcome.json["errors"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|w| w["code"] == "DUPLICATE_OUTBOUND_TAG")
+                .any(|e| e["code"] == "PROXY_YAML_INVALID"),
+            "expected PROXY_YAML_INVALID error: {}",
+            outcome.json
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -881,7 +797,7 @@ mod tests {
         assert!(!eq.contains("r2f8-marker-eq"), "leaked: {eq}");
         assert!(eq.contains("***"), "mask missing: {eq}");
 
-        let colon = sanitize("at 'password:r2f8-marker-colon'");
+        let colon = crate::redact::sanitize("at 'password:r2f8-marker-colon'");
         assert!(!colon.contains("r2f8-marker-colon"), "leaked: {colon}");
         assert!(colon.contains("***"), "mask missing: {colon}");
     }
@@ -889,11 +805,11 @@ mod tests {
     /// R2-F8：其他 secret 键在引号邻接紧凑形态下同样命中，且键大小写不敏感。
     #[test]
     fn quoted_adjacent_inline_other_secret_keys_are_masked() {
-        let uuid = sanitize("got 'uuid=r2f8-marker-uuid'");
+        let uuid = crate::redact::sanitize("got 'uuid=r2f8-marker-uuid'");
         assert!(!uuid.contains("r2f8-marker-uuid"), "leaked: {uuid}");
         assert!(uuid.contains("***"), "mask missing: {uuid}");
 
-        let obfs = sanitize("at 'OBFS_PASSWORD:r2f8-marker-obfs'");
+        let obfs = crate::redact::sanitize("at 'OBFS_PASSWORD:r2f8-marker-obfs'");
         assert!(!obfs.contains("r2f8-marker-obfs"), "leaked: {obfs}");
         assert!(obfs.contains("***"), "mask missing: {obfs}");
     }
@@ -901,8 +817,9 @@ mod tests {
     /// R2-F8：引号邻接 + 多词口令仍整段截断（值边界未知）。
     #[test]
     fn quoted_adjacent_colonless_multi_word_password_is_masked() {
-        let got =
-            sanitize("expected 'key: value', got 'password \"r2f8-marker-multi alpha beta\"'");
+        let got = crate::redact::sanitize(
+            "expected 'key: value', got 'password \"r2f8-marker-multi alpha beta\"'",
+        );
         for secret in ["r2f8-marker-multi", "alpha", "beta"] {
             assert!(!got.contains(secret), "leaked {secret}: {got}");
         }
@@ -918,7 +835,7 @@ mod tests {
     #[test]
     fn non_secret_text_is_untouched_by_redaction() {
         let text = "parse proxy.yaml: unexpected indentation at 'tag: r1'";
-        assert_eq!(sanitize(text), text);
+        assert_eq!(crate::redact::sanitize(text), text);
     }
 
     #[test]
