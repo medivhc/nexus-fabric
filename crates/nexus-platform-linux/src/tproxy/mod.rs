@@ -19,5 +19,3 @@ pub(crate) const IP_TRANSPARENT: libc::c_int = 19;
 pub(crate) const IP_RECVORIGDSTADDR: libc::c_int = 20;
 /// Linux `IP_ORIGDSTADDR`（ancillary cmsg type）。
 pub(crate) const IP_ORIGDSTADDR: libc::c_int = 20;
-/// Linux `IP_PKTINFO`（uapi/linux/in.h）。
-pub(crate) const IP_PKTINFO: libc::c_int = 8;

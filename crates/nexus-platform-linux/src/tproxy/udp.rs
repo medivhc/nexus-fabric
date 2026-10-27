@@ -1,17 +1,19 @@
 //! TPROXY UDP socket（spec §9.1 / §13.2 S2）。
 //!
-//! 单 `SOCK_DGRAM` socket：`recvmsg` 解析 `IP_ORIGDSTADDR` ancillary 得到原始
-//! 目的地；回包用 `sendmsg` + `IP_PKTINFO`（`ipi_spec_dst = orig_dst`）保持
-//! 源地址。per-flow 状态由 core 的 `TransparentPipeline` 持有，这里无状态。
+//! 单个接收 `SOCK_DGRAM` socket：`recvmsg` 解析 `IP_ORIGDSTADDR` ancillary 得到
+//! 原始目的地。回包源地址必须恰为 `orig_dst`（IP 与端口，PRODUCT §11.18）：经
+//! 按 `orig_dst` 复用的 `IP_TRANSPARENT` 回包 socket（bind `orig_dst` 后
+//! `sendto`）发出，数量有界（LRU）。per-flow 状态由 core 的
+//! `TransparentPipeline` 持有。
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use nexus_platform::{ReceivedDatagram, TransparentIngressError, TransparentUdpIngress};
 
 use super::sockaddr::{find_orig_dst, from_sockaddr_in, parse_cmsgs, to_sockaddr_in};
-use super::{IP_PKTINFO, IP_RECVORIGDSTADDR, IP_TRANSPARENT};
+use super::{IP_RECVORIGDSTADDR, IP_TRANSPARENT};
 
 /// UDP socket 配置。
 #[derive(Debug, Clone)]
@@ -43,8 +45,9 @@ pub struct TproxyUdpSocket {
     fd: RawFd,
     started: bool,
     closed: bool,
-    #[allow(dead_code)]
     max_reply_sockets: usize,
+    /// 回包 socket，按 `orig_dst` 一个；末尾为最近使用（LRU 淘汰队首）。
+    reply_sockets: Vec<(SocketAddrV4, OwnedFd)>,
 }
 
 impl TproxyUdpSocket {
@@ -76,7 +79,8 @@ impl TproxyUdpSocket {
             fd,
             started: false,
             closed: false,
-            max_reply_sockets: config.max_reply_sockets,
+            max_reply_sockets: config.max_reply_sockets.max(1),
+            reply_sockets: Vec::new(),
         };
         socket.set_int_opt(IP_TRANSPARENT, 1, "IP_TRANSPARENT")?;
         socket.set_int_opt(IP_RECVORIGDSTADDR, 1, "IP_RECVORIGDSTADDR")?;
@@ -101,14 +105,39 @@ impl TproxyUdpSocket {
         Ok(socket)
     }
 
-    #[cfg(test)]
-    fn reply_socket_count(&self) -> usize {
-        0
+    /// 取（或建立）源地址为 `orig_dst` 的回包 socket，并记为最近使用。
+    fn reply_socket(&mut self, orig_dst: SocketAddrV4) -> Result<RawFd, TransparentIngressError> {
+        if let Some(pos) = self
+            .reply_sockets
+            .iter()
+            .position(|(dst, _)| *dst == orig_dst)
+        {
+            let entry = self.reply_sockets.remove(pos);
+            self.reply_sockets.push(entry);
+        } else {
+            let fd = open_reply_socket(orig_dst)?;
+            if self.reply_sockets.len() >= self.max_reply_sockets {
+                self.reply_sockets.remove(0);
+            }
+            self.reply_sockets.push((orig_dst, fd));
+        }
+        match self.reply_sockets.last() {
+            Some((_, fd)) => Ok(fd.as_raw_fd()),
+            None => Err(TransparentIngressError::Io {
+                operation: "sendto",
+                message: "reply socket missing".to_string(),
+            }),
+        }
     }
 
     #[cfg(test)]
-    fn has_reply_socket(&self, _orig_dst: SocketAddrV4) -> bool {
-        false
+    fn reply_socket_count(&self) -> usize {
+        self.reply_sockets.len()
+    }
+
+    #[cfg(test)]
+    fn has_reply_socket(&self, orig_dst: SocketAddrV4) -> bool {
+        self.reply_sockets.iter().any(|(dst, _)| *dst == orig_dst)
     }
 
     fn set_int_opt(
@@ -117,32 +146,93 @@ impl TproxyUdpSocket {
         value: libc::c_int,
         name: &'static str,
     ) -> Result<(), TransparentIngressError> {
-        // SAFETY: fd is valid; `value` outlives the call and its length matches
-        // the int option expected by setsockopt(2).
-        let rc = unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::IPPROTO_IP,
-                opt,
-                (&value as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Err(match errno {
-                libc::EPERM | libc::EACCES => TransparentIngressError::PermissionDenied {
-                    operation: "setsockopt",
-                    errno,
-                },
-                libc::ENOPROTOOPT | libc::EOPNOTSUPP => {
-                    TransparentIngressError::CapabilityUnavailable { capability: name }
-                }
-                _ => TransparentIngressError::SockOptFailed { opt: name, errno },
-            });
-        }
-        Ok(())
+        set_int_opt(self.fd, libc::IPPROTO_IP, opt, value, name)
     }
+}
+
+fn set_int_opt(
+    fd: RawFd,
+    level: libc::c_int,
+    opt: libc::c_int,
+    value: libc::c_int,
+    name: &'static str,
+) -> Result<(), TransparentIngressError> {
+    // SAFETY: fd is valid; `value` outlives the call and its length matches
+    // the int option expected by setsockopt(2).
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(match errno {
+            libc::EPERM | libc::EACCES => TransparentIngressError::PermissionDenied {
+                operation: "setsockopt",
+                errno,
+            },
+            libc::ENOPROTOOPT | libc::EOPNOTSUPP => {
+                TransparentIngressError::CapabilityUnavailable { capability: name }
+            }
+            _ => TransparentIngressError::SockOptFailed { opt: name, errno },
+        });
+    }
+    Ok(())
+}
+
+/// 建立源地址为 `orig_dst` 的回包 socket：`IP_TRANSPARENT` 允许 bind 非本机地址，
+/// `SO_REUSEADDR` 允许多个 `orig_dst` 共享端口号；本机已有 socket 独占该地址时
+/// bind 失败（`BindFailed`），调用方丢弃回包而不是改用其它源端口。
+fn open_reply_socket(orig_dst: SocketAddrV4) -> Result<OwnedFd, TransparentIngressError> {
+    // SAFETY: socket(2) has no pointer arguments.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(map_socket_errno("socket"));
+    }
+    // SAFETY: `raw` is a fresh, valid fd that nothing else owns; OwnedFd
+    // closes it exactly once on drop.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_int_opt(
+        fd.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_REUSEADDR,
+        1,
+        "SO_REUSEADDR",
+    )?;
+    set_int_opt(
+        fd.as_raw_fd(),
+        libc::IPPROTO_IP,
+        IP_TRANSPARENT,
+        1,
+        "IP_TRANSPARENT",
+    )?;
+    let addr = to_sockaddr_in(orig_dst);
+    // SAFETY: `addr` is a fully initialized sockaddr_in; fd is valid.
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(TransparentIngressError::BindFailed {
+            addr: orig_dst.to_string(),
+            errno,
+        });
+    }
+    Ok(fd)
 }
 
 impl TransparentUdpIngress for TproxyUdpSocket {
@@ -252,37 +342,25 @@ impl TransparentUdpIngress for TproxyUdpSocket {
                 message: "socket closed".to_string(),
             });
         }
-        let mut dest = to_sockaddr_in(peer);
-        let control = build_pktinfo_control(orig_dst);
-        let mut iov = libc::iovec {
-            iov_base: payload.as_ptr().cast_mut().cast(),
-            iov_len: payload.len(),
+        let fd = self.reply_socket(orig_dst)?;
+        let dest = to_sockaddr_in(peer);
+        // SAFETY: `payload` and `dest` are live for the call with the stated
+        // lengths; sendto only reads them. `fd` stays open (owned by
+        // `reply_sockets`) until this method returns.
+        let n = unsafe {
+            libc::sendto(
+                fd,
+                payload.as_ptr().cast(),
+                payload.len(),
+                0,
+                (&dest as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
         };
-        // SAFETY: msghdr is plain-old-data; all pointers are filled below.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = (&mut dest as *mut libc::sockaddr_in).cast();
-        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_ptr().cast_mut().cast();
-        msg.msg_controllen = control.len();
-        // SAFETY: all pointers reference live buffers with the stated lengths;
-        // sendmsg only reads them.
-        let n = unsafe { libc::sendmsg(self.fd, &msg, 0) };
         if n < 0 {
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error().unwrap_or(0);
-            return Err(match errno {
-                libc::EINVAL | libc::EPERM | libc::EACCES => {
-                    TransparentIngressError::SockOptFailed {
-                        opt: "IP_PKTINFO",
-                        errno,
-                    }
-                }
-                _ => TransparentIngressError::Io {
-                    operation: "sendmsg",
-                    message: err.to_string(),
-                },
+            return Err(TransparentIngressError::Io {
+                operation: "sendto",
+                message: io::Error::last_os_error().to_string(),
             });
         }
         Ok(usize::try_from(n).unwrap_or(0))
@@ -293,6 +371,7 @@ impl TransparentUdpIngress for TproxyUdpSocket {
             return Ok(());
         }
         self.closed = true;
+        self.reply_sockets.clear();
         // SAFETY: fd is owned and closed exactly once (guarded by `closed`).
         let rc = unsafe { libc::close(self.fd) };
         if rc != 0 {
@@ -313,39 +392,6 @@ impl Drop for TproxyUdpSocket {
             unsafe { libc::close(self.fd) };
         }
     }
-}
-
-/// 构造 `IP_PKTINFO` 控制消息（`ipi_spec_dst = orig_dst.ip()`、ifindex=0）。
-///
-/// 纯函数便于单测校验布局，不需要真实发送。
-pub(crate) fn build_pktinfo_control(orig_dst: SocketAddrV4) -> Vec<u8> {
-    let header = std::mem::size_of::<usize>() + 2 * std::mem::size_of::<libc::c_int>();
-    let data_len = std::mem::size_of::<libc::in_pktinfo>();
-    let len = header + data_len;
-    let align = std::mem::size_of::<usize>();
-    let padded = (len + align - 1) & !(align - 1);
-    let mut out = vec![0u8; padded];
-    out[0..std::mem::size_of::<usize>()].copy_from_slice(&len.to_ne_bytes());
-    out[std::mem::size_of::<usize>()..std::mem::size_of::<usize>() + 4]
-        .copy_from_slice(&libc::IPPROTO_IP.to_ne_bytes());
-    out[std::mem::size_of::<usize>() + 4..header].copy_from_slice(&IP_PKTINFO.to_ne_bytes());
-    let info = libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr {
-            s_addr: u32::from_ne_bytes(orig_dst.ip().octets()),
-        },
-        ipi_addr: libc::in_addr { s_addr: 0 },
-    };
-    // SAFETY: `info` is a plain-old-data struct; copying its bytes into the
-    // control buffer is valid and does not read padding-dependent fields.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            (&info as *const libc::in_pktinfo).cast::<u8>(),
-            std::mem::size_of::<libc::in_pktinfo>(),
-        )
-    };
-    out[header..len].copy_from_slice(bytes);
-    out
 }
 
 fn map_socket_errno(operation: &'static str) -> TransparentIngressError {
@@ -407,20 +453,6 @@ mod tests {
             err,
             TransparentIngressError::UnsupportedFamily { .. }
         ));
-    }
-
-    #[test]
-    fn tproxy_udp_pktinfo_control_sets_spec_dst() {
-        let dst = SocketAddrV4::new(Ipv4Addr::new(10, 200, 2, 2), 53);
-        let control = build_pktinfo_control(dst);
-        let messages = parse_cmsgs(&control).unwrap();
-        assert_eq!(messages.len(), 1);
-        let msg = &messages[0];
-        assert_eq!(msg.level, libc::IPPROTO_IP);
-        assert_eq!(msg.ty, IP_PKTINFO);
-        // in_pktinfo: ipi_ifindex (4 bytes) then ipi_spec_dst (4 bytes).
-        assert_eq!(&msg.data[0..4], &0i32.to_ne_bytes());
-        assert_eq!(&msg.data[4..8], &dst.ip().octets());
     }
 
     #[test]
