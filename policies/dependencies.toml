@@ -765,16 +765,6 @@ feature_scope = "workspace crate，无 feature 开关；只使用 SIP004 TCP 面
 license = "Apache-2.0 OR MIT（workspace 统一 license，allowlisted）"
 security = "no known advisories；依赖 RustCrypto（chacha20poly1305/hkdf/sha1/sha2/md5）与 ring（SystemRandom），均为树中既有版本；RustSec 由 harness dependency-governance gate 检查"
 portability = "crate 为 workspace outbound 层（portable=false），无平台专有 API；nexusd 本就不是 portable core"
-consumer = "apps/nexusd"
-crate = "nexus-outbound-shadowsocks"
-version = "0.1.0"
-default_features = false
-features = []
-architecture_layer = "composition root (nexusd proxy-fwd): 步骤 4 把 SS TCP 生产路径从 daemon 内嵌 ss_std 切到 outbound crate 的 SIP004 会话（`SsStream`/`encode_request`/`SsTarget`/`SsMethod`/`Role`）。不新增架构边：consumer 是 composition root，crate 属 outbound 层（`policies/architecture.toml` 已声明 `nexus-connectivity`/`nexus-plugin` 边），Core Planner 不感知。"
-feature_scope = "workspace crate，无 feature 开关；只使用 SIP004 TCP 面（SsStream/encode_request/SsTarget/SsMethod/Role）。离线自洽 `ShadowsocksAdapter` 与 `write_record`/`read_record` 不在 nexusd 调用面内。"
-license = "Apache-2.0 OR MIT（workspace 统一 license，allowlisted）"
-security = "no known advisories；依赖 RustCrypto（chacha20poly1305/hkdf/sha1/sha2/md5）与 ring（SystemRandom），均为树中既有版本；RustSec 由 harness dependency-governance gate 检查"
-portability = "crate 为 workspace outbound 层（portable=false），无平台专有 API；nexusd 本就不是 portable core"
 supply_chain = "workspace path 依赖，无版本漂移；其第三方依赖已在 Cargo.lock 且各自有 [[dependency_reviews.direct]] 记录（chacha20poly1305/hkdf/sha1/sha2/md5/ring）；不引入新包、无 lock churn"
 os_transitive_deps = "none（ring 的 cc 构建已在树中并被既有评审接受）"
 approved = true

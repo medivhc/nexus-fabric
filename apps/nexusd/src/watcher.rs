@@ -167,17 +167,25 @@ mod tests {
         let yaml_v1 = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         let yaml_v2 = "schema_version: 1\nrules:\n  - tag: r2\n    kind: domain\n    match: x.com\n    action:\n      - kind: select_outbound\n        tag: d\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         write(&d, config::PROXY_YAML, yaml_v1);
+        write(&d, config::DNS_TOML, "servers = [\"1.1.1.1\"]\n");
         let dir = ConfigDir::new(&d).unwrap();
         let current = config::load(&dir).unwrap();
         let (tx, rx) = channel();
         let _h = spawn(dir.clone(), current, tx);
 
-        // 有效变更 → Applied
+        // Hot 路径仍存在：已有 dns.toml 的**内容**变更 → Applied
+        write(&d, config::DNS_TOML, "servers = [\"8.8.8.8\"]\n");
+        let ev = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("expected Applied event for dns.toml");
+        assert!(matches!(ev, ReloadEvent::Applied { .. }), "got {ev:?}");
+
+        // proxy.yaml 内容变更 → NeedsRestart（Q-7=B：engine 只在启动构造）
         write(&d, config::PROXY_YAML, yaml_v2);
         let ev = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("expected Applied event");
-        assert!(matches!(ev, ReloadEvent::Applied { .. }), "got {ev:?}");
+            .expect("expected NeedsRestart event");
+        assert!(matches!(ev, ReloadEvent::NeedsRestart { .. }), "got {ev:?}");
 
         // 无效变更 → Rejected（TOML 语法错误）
         write(&d, config::NETWORK_TOML, "[[[broken");
