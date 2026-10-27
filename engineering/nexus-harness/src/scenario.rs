@@ -1002,28 +1002,50 @@ fn toml_value_to_json(v: &toml::Value) -> Value {
 
 /// Load all scenario files under scenarios/<subdir>/.
 pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
+    let (scenarios, errors) = load_with_errors(scenarios_dir, subdirs);
+    for error in errors {
+        eprintln!("[scenario] 跳过 {error}");
+    }
+    scenarios
+}
+
+// Discovery-only callers retain their valid subset and diagnostics. Gate callers
+// must inspect errors before interpreting an empty or partially loaded pack.
+fn load_with_errors(scenarios_dir: &Path, subdirs: &[&str]) -> (Vec<Scenario>, Vec<String>) {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     for sub in subdirs {
         let dir = scenarios_dir.join(sub);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Optional scenario groups need not have a directory at all.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errors.push(format!("read directory {}: {e}", dir.display()));
+                continue;
+            }
         };
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-            .collect();
+        let mut files = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|x| x == "toml") {
+                        files.push(path);
+                    }
+                }
+                Err(e) => errors.push(format!("read directory entry {}: {e}", dir.display())),
+            }
+        }
         files.sort();
         for f in files {
             match load_file(&f, sub) {
                 Ok(s) => out.push(s),
-                // 契约校验失败的场景不静默丢弃：记录日志后跳过，
-                // 由 verify --full 的 product-scenarios gate 汇总为 FAIL。
-                Err(e) => eprintln!("[scenario] 跳过 {}: {e}", f.display()),
+                Err(e) => errors.push(format!("{}: {e}", f.display())),
             }
         }
     }
-    out
+    (out, errors)
 }
 
 /// 单个 expect 失败的结构化信息（供失败签名使用）。
@@ -1726,11 +1748,19 @@ pub fn run_gate(
 ) -> (Vec<ScenarioResult>, Gate) {
     use std::time::Instant;
     let started = Instant::now();
-    let scenarios = load_all(&config.scenarios_dir, subdirs);
+    let (scenarios, errors) = load_with_errors(&config.scenarios_dir, subdirs);
+    if !errors.is_empty() {
+        let mut gate = Gate::fail(
+            gate_name,
+            &format!("scenario loading failed:\n{}", errors.join("\n")),
+        );
+        gate.duration_ms = started.elapsed().as_millis() as u64;
+        return (Vec::new(), gate);
+    }
     if scenarios.is_empty() {
         return (
             Vec::new(),
-            Gate::ok(gate_name, "no scenario files declared"),
+            Gate::unknown(gate_name, "no scenario files declared"),
         );
     }
     let jobs = parallel_jobs();

@@ -142,10 +142,12 @@ status: current
 
 ## E. harness 自身的 fail-open（与本特性无关，但会被它坑到）
 
-- **E1 语法错误的场景文件会"无声消失"**：`scenario.rs` 的 `load_all` 对解析失败的文件静默跳过，
-  也没有"声明条数 == 加载条数"的校验 ⇒ 一条写坏的场景从 pack 里消失而门禁仍全绿。
-  我自己两次被它的症状（`failed_step="lookup"` / `unknown scenario id`）误导成"id 写错了"。
-  硬要求：**区分 `lookup`（测试根本没跑）与 `expect`（被测性质为假）**。修它属 harness 域，需独立周期。
+- **E1 场景加载错误的门禁传播已修复（2026-10-27）**：此前 `load_all` 只打印错误并返回合法子集，
+  `run_gate` 因而可能把写坏的场景遗漏为整组 PASS。现在门禁保留并汇总文件读取、TOML、版本、
+  必填字段和目录读取错误，在执行场景前返回带路径的 FAIL；真正无场景时依 MODULE 返回 UNKNOWN。
+  `scenario list` / `scenario run` 的目录查询兼容入口仍返回合法子集并打印诊断，未知 ID 的
+  `failed_step="lookup"` 与实际断言失败的 `expect` 继续区分；没有扩展其结构化加载错误接口。
+  回归与边界见 `scenario_load_tests.rs` 和知识条目 `2026-10-27-harness-scenario-load-errors.md`。
 - **E2 输出里没有"跑的是哪个构建"**：`scenario run` / `status` 只报 `source_revision` 与
   `working_tree_digest`（描述仓库），不报被执行二进制的路径与 mtime ⇒ "新代码的结论"与
   "旧构建的结论"在案卷里长得一模一样（D2 的机器缺口）。
