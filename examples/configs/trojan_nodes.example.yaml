@@ -3,7 +3,15 @@
 # 用法参考：把这两个节点并入你自己的 Nexus 配置的 `outbounds:` 段，再在 rules/groups
 # 里引用 tag。**密码一律占位 CHANGE_ME，请勿把真实凭据提交进仓库。**
 #
-# server 域名/端口/ALPN/udp/skip-cert-verify 为真实公开值；password 必须替换。
+# server 域名/端口/ALPN 为真实公开值；password 必须替换。
+#
+# TLS 声明：trojan 出站必须显式声明 TLS，判据是**字段出现**——`alpn` 非空，或
+# `skip_cert_verify` 字段出现（写 `false` 也算声明）。缺省（两个字段都不写）会被
+# 判为明文 Trojan，nexusd 启动失败（PRODUCT §11.9.4）。`tls: true` 对 trojan 无效
+# （该字段只有 VLESS 语义）。
+# 下面只写 `alpn`：缺省走系统根证书校验。只有当服务端证书不在系统信任链内（自签 /
+# 企业内网 CA）时才显式写 `skip_cert_verify: true`。
+# Trojan 的 UDP 不可用（TLS Trojan 的 UDP 恒为 Unsupported，永久丢包）。
 
 schema_version: 1
 
@@ -22,18 +30,14 @@ outbounds:
     locator: ty-3.tr202613.com:443
     password: CHANGE_ME            # TODO: 替换为真实 trojan 密码，勿入库
     alpn: [h2, http/1.1]
-    skip_cert_verify: true
     header_format: singbox          # sing-box 系服务器要求 0x01 命令字节
-    udp: true
 
   - tag: 日本-OS-3
     kind: trojan
     locator: os-3.tr202613.com:443
     password: CHANGE_ME            # TODO: 替换为真实 trojan 密码，勿入库
     alpn: [h2, http/1.1]
-    skip_cert_verify: true
     header_format: singbox
-    udp: true
 
 groups:
   - tag: trojan-auto

@@ -103,8 +103,9 @@ fn run() -> serde_json::Value {
         "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: {}\n",
         socks_addr
     );
-    let proxy_engine =
-        nexusd::proxy_fwd::ProxyEngine::new(&proxy_yaml).expect("proxy engine from stub socks5");
+    let proxy_engine = nexusd::proxy_fwd::ProxyEngine::new(Some(&proxy_yaml))
+        .expect("proxy engine from stub socks5")
+        .expect("engine constructed");
     dp.set_proxy_engine(proxy_engine);
     // P3：`Dataplane::new` 初始规则为空（fail-closed），须显式注入与
     // ProxyEngine 同源的规则引擎，否则 198.18.1.1 会被判 Drop。
@@ -115,7 +116,7 @@ fn run() -> serde_json::Value {
     // 3. 处理所有包。
     let mut processed = 0;
     for _ in 0..10 {
-        match dp.process_one() {
+        match dp.tick(now_ticks()) {
             Ok(true) => processed += 1,
             Ok(false) => break,
             Err(e) => {
@@ -251,4 +252,12 @@ fn build_dns_query(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, qname: &str, txi
     pkt[20..20 + udp.len()].copy_from_slice(&udp);
     pkt[20 + udp.len()..].copy_from_slice(&dns);
     pkt
+}
+
+/// 单调毫秒时间源（example 内允许直接用 std）。
+fn now_ticks() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

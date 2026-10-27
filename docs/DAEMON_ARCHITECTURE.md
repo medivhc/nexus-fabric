@@ -170,7 +170,7 @@ nexus proxy run|host|relay ...        # 数据面组合根
 6. watcher::spawn() 启动配置监听线程
    ↓
 7. 主事件循环：
-   - 接收 ReloadEvent::Applied → 日志 "config hot-reloaded: [...]"
+   - 接收 ReloadEvent::Applied → 日志 "config applied: [...]"（仅 Hot 文件；proxy.yaml 走 NeedsRestart + stale）
    - 接收 ReloadEvent::NeedsRestart → warning 日志
    - 接收 ReloadEvent::Rejected → error 日志，沿用旧配置
    ↓

@@ -418,19 +418,26 @@ pub fn status() -> Result<Value, NexusError> {
     let conn = connectivity_status()?;
     let plan = plan_explain(None)?;
     let caps = platform_capabilities()?;
+    let (outbound, outbound_error) = crate::outbound_manifest::runtime_outbound_json();
+    let mut summary = json!({
+        "dns": {
+            "cache_entries": dns["cache_entries"],
+            "resolver_calls": dns["resolver_calls"],
+        },
+        "connectivity_links": conn["links"].as_array().map(|a| a.len()).unwrap_or(0),
+        "plan_selected_provider": plan["plan"]["provider"],
+        "typed_plan_extension": plan["plan"]["typed_extension"],
+        "capabilities": caps["capabilities"],
+        // 五载体（§7.7 载体 5）：与 LocalAPI /dataplane/stats 的 `outbound` 同一序列化。
+        "outbound": outbound,
+    });
+    if let Some(error) = outbound_error {
+        summary["outbound_error"] = error;
+    }
     Ok(json!({
         "verdict": "PASS",
         "command": "status",
-        "summary": {
-            "dns": {
-                "cache_entries": dns["cache_entries"],
-                "resolver_calls": dns["resolver_calls"],
-            },
-            "connectivity_links": conn["links"].as_array().map(|a| a.len()).unwrap_or(0),
-            "plan_selected_provider": plan["plan"]["provider"],
-            "typed_plan_extension": plan["plan"]["typed_extension"],
-            "capabilities": caps["capabilities"],
-        },
+        "summary": summary,
     }))
 }
 

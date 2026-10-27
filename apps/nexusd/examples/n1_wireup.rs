@@ -154,8 +154,9 @@ fn run() -> serde_json::Value {
         "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: {}\n",
         socks_addr
     );
-    let proxy_engine =
-        nexusd::proxy_fwd::ProxyEngine::new(&proxy_yaml).expect("proxy engine from stub socks5");
+    let proxy_engine = nexusd::proxy_fwd::ProxyEngine::new(Some(&proxy_yaml))
+        .expect("proxy engine from stub socks5")
+        .expect("engine constructed");
     dp.set_proxy_engine(proxy_engine);
     // P3：`Dataplane::new` 初始规则为空（fail-closed），须显式注入与
     // ProxyEngine 同源的规则引擎，否则 198.18.1.1 会被判 Drop。
@@ -166,7 +167,7 @@ fn run() -> serde_json::Value {
     // 4. 处理所有包。
     let mut processed = 0;
     for _ in 0..10 {
-        match dp.process_one() {
+        match dp.tick(now_ticks()) {
             Ok(true) => processed += 1,
             Ok(false) => break,
             Err(e) => {
@@ -293,3 +294,11 @@ fn handle_socks5_udp_assoc(mut s: TcpStream) {
 // 抑制未使用导入警告（N1PeerId 在 trait 签名中间接使用）。
 #[allow(dead_code)]
 fn _use_types(_: N1PeerId, _: IpAddr) {}
+
+/// 单调毫秒时间源（example 内允许直接用 std）。
+fn now_ticks() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}

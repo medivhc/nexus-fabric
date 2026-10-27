@@ -7,17 +7,17 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use nexus_projection::egress::FlowKey;
 use nexus_projection::transparent::{ProxyEgressEvent, ProxyFlowEgress, TransparentFrontendError};
 
-use crate::proxy_fwd::ProxyDialConfig;
+use crate::proxy_fwd::{OutboundRegistry, OutboundSlot};
 
 const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum RelayCmd {
     Data(Vec<u8>),
@@ -32,48 +32,74 @@ enum RelayEvent {
 
 /// 生产代理出口适配器。
 pub struct StreamProxyEgress {
-    outbounds: HashMap<String, ProxyDialConfig>,
+    registry: Arc<OutboundRegistry>,
     tcp: HashMap<FlowKey, Sender<RelayCmd>>,
     events_tx: Sender<RelayEvent>,
     events_rx: Receiver<RelayEvent>,
     udp: HashMap<String, crate::proxy_fwd::udp_relay::UdpForwarder>,
     udp_tags: HashMap<FlowKey, String>,
     udp_peers: HashMap<FlowKey, (SocketAddrV4, SocketAddrV4)>,
+    /// §12.3 `event=outbound_unavailable` 的限频状态（per `(tag, cause)`）。
+    ///
+    /// 与 TUN 侧同一语义：首次立即发射、其后 10 s 一行、`suppressed=<n>` 带出。
+    unavailable_log: crate::log_throttle::KeyedLogThrottle,
 }
 
 impl StreamProxyEgress {
-    /// 从 `proxy.yaml` 构造；没有可拨号出站时返回 `None`。
+    /// 从共享注册表构造（Q-5=B：TUN 与 TPROXY 同一批 dialer 实例）。
+    ///
+    /// registry 无任何 dialer 时返回 `None`（等价旧 `outbounds.is_empty()`）。
     #[must_use]
-    pub fn from_yaml(proxy_yaml: &str) -> Option<Self> {
-        let config = nexus_proxy_config::parse(proxy_yaml).ok()?;
-        let mut outbounds = HashMap::new();
-        for outbound in &config.outbounds {
-            if let Some(dial) = crate::proxy_fwd::dial_config_from_outbound(outbound) {
-                outbounds.insert(outbound.tag.clone(), dial);
-            }
-        }
-        if outbounds.is_empty() {
+    pub fn from_registry(registry: Arc<OutboundRegistry>) -> Option<Self> {
+        if !registry.has_any_dialer() {
             return None;
         }
         let (events_tx, events_rx) = mpsc::channel();
         Some(Self {
-            outbounds,
+            registry,
             tcp: HashMap::new(),
             events_tx,
             events_rx,
             udp: HashMap::new(),
             udp_tags: HashMap::new(),
             udp_peers: HashMap::new(),
+            unavailable_log: crate::log_throttle::KeyedLogThrottle::new(),
         })
     }
 
-    fn spawn_tcp_relay(&mut self, key: FlowKey, config: ProxyDialConfig, target: SocketAddrV4) {
+    /// §12.3：tag 不可用时的结构化行（TPROXY 无 SYN 时刻，仍给出 cause）。
+    ///
+    /// 与 TUN 侧 `Dataplane::log_outbound_unavailable` 同一限频语义：同一
+    /// `(tag, cause)` 首次立即发射，其后每 10 s 一行，被抑制条数以
+    /// `suppressed=<n>` 带出并清零（review MAJOR-2/C4）。
+    fn log_outbound_unavailable(&mut self, tag: &str, kind: &str, cause: &str, detail: &str) {
+        let decision = self.unavailable_log.decide(
+            tag,
+            cause,
+            std::time::Instant::now(),
+            crate::log_throttle::OUTBOUND_UNAVAILABLE_LOG_INTERVAL,
+        );
+        if !decision.emit {
+            return;
+        }
+        eprintln!(
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={kind} cause={cause} detail=\"{detail}\" suppressed={}",
+            decision.suppressed
+        );
+    }
+
+    fn spawn_tcp_relay(
+        &mut self,
+        key: FlowKey,
+        dialer: Arc<dyn crate::proxy_fwd::adapter::OutboundDialer>,
+        target: SocketAddrV4,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let events_tx = self.events_tx.clone();
         std::thread::Builder::new()
             .name("nexusd-tproxy-relay".to_string())
             .spawn(move || {
-                let mut stream = match dial_proxy_stream(&config, target.into()) {
+                let mut stream = match dialer.dial_tcp(target.into()) {
                     Ok(stream) => stream,
                     Err(e) => {
                         let _ = events_tx.send(RelayEvent::Failed(key, e.to_string()));
@@ -123,12 +149,21 @@ impl ProxyFlowEgress for StreamProxyEgress {
         orig_dst: SocketAddrV4,
         outbound_tag: &str,
     ) -> Result<(), TransparentFrontendError> {
-        let config = self.outbounds.get(outbound_tag).cloned().ok_or_else(|| {
-            TransparentFrontendError::OutboundUnresolved {
-                tag: outbound_tag.to_string(),
+        let Some(dialer) = self.registry.dialer(outbound_tag).cloned() else {
+            // 不可用槽位（ProtocolNotWired / Invalid）与「tag 不存在」同行为：
+            // 前端按 on_path_failure 处置；额外打结构化行（§12.3）。
+            let unavailable = self
+                .registry
+                .unsupported(outbound_tag)
+                .map(outbound_unavailable_fields);
+            if let Some((kind, cause, detail)) = unavailable {
+                self.log_outbound_unavailable(outbound_tag, &kind, cause, &detail);
             }
-        })?;
-        self.spawn_tcp_relay(key, config, orig_dst);
+            return Err(TransparentFrontendError::OutboundUnresolved {
+                tag: outbound_tag.to_string(),
+            });
+        };
+        self.spawn_tcp_relay(key, dialer, orig_dst);
         Ok(())
     }
 
@@ -169,16 +204,21 @@ impl ProxyFlowEgress for StreamProxyEgress {
                 tag: "<unset>".to_string(),
             }
         })?;
-        let config = self
-            .outbounds
-            .get(&tag)
-            .cloned()
-            .ok_or_else(|| TransparentFrontendError::OutboundUnresolved { tag: tag.clone() })?;
+        let dialer = self.registry.dialer(&tag).cloned().ok_or_else(|| {
+            if let Some((kind, cause, detail)) = self
+                .registry
+                .unsupported(&tag)
+                .map(outbound_unavailable_fields)
+            {
+                self.log_outbound_unavailable(&tag, &kind, cause, &detail);
+            }
+            TransparentFrontendError::OutboundUnresolved { tag: tag.clone() }
+        })?;
         let packet = synthetic_udp_packet(key, orig_dst, payload);
         let forwarder = self
             .udp
             .entry(tag.clone())
-            .or_insert_with(|| crate::proxy_fwd::udp_relay::UdpForwarder::new(config));
+            .or_insert_with(|| crate::proxy_fwd::udp_relay::UdpForwarder::new(dialer));
         if forwarder.handle_packet(&packet) {
             self.udp_peers.insert(key, (key_peer(key), orig_dst));
             Ok(())
@@ -276,84 +316,26 @@ fn synthetic_udp_packet(key: FlowKey, orig_dst: SocketAddrV4, payload: &[u8]) ->
     pkt
 }
 
-enum ProxyStream {
-    Tcp(TcpStream),
-    Tls(Box<nexus_proxy_transport::TlsStream>),
-    Ss(crate::proxy_fwd::ss_std::SsTcpClient),
-}
-
-impl ProxyStream {
-    fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            Self::Tcp(stream) => stream.set_read_timeout(dur),
-            Self::Tls(stream) => stream.get_mut().set_read_timeout(dur),
-            Self::Ss(_) => Ok(()),
-        }
-    }
-}
-
-impl Read for ProxyStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Tcp(stream) => stream.read(buf),
-            Self::Tls(stream) => stream.read(buf),
-            Self::Ss(stream) => stream
-                .read(buf)
-                .map_err(|e| std::io::Error::other(e.to_string())),
-        }
-    }
-}
-
-impl Write for ProxyStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Tcp(stream) => stream.write(buf),
-            Self::Tls(stream) => stream.write(buf),
-            Self::Ss(stream) => stream
-                .write_all(buf)
-                .map(|()| buf.len())
-                .map_err(|e| std::io::Error::other(e.to_string())),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn dial_proxy_stream(config: &ProxyDialConfig, target: SocketAddr) -> std::io::Result<ProxyStream> {
-    match config {
-        ProxyDialConfig::Socks5 { server } => {
-            let cfg = nexus_proxy_transport::Socks5ProxyConfig::new(*server, None);
-            nexus_proxy_transport::socks5_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Trojan { server, password } => {
-            let cfg = nexus_proxy_transport::TrojanProxyConfig::new(*server, password.clone());
-            nexus_proxy_transport::trojan_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::TrojanTls {
-            server,
-            password,
-            sni,
-            skip_verify,
-        } => {
-            let mut cfg =
-                nexus_proxy_transport::TrojanTlsConfig::new(*server, password.clone(), sni.clone());
-            cfg.skip_cert_verify = *skip_verify;
-            nexus_proxy_transport::trojan_tls_connect(&cfg, target)
-                .map(|s| ProxyStream::Tls(Box::new(s)))
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Shadowsocks {
-            server, password, ..
-        } => {
-            crate::proxy_fwd::ss_std::SsTcpClient::connect(*server, password, target, DIAL_TIMEOUT)
-                .map(ProxyStream::Ss)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
+/// §12.3 结构化行的字段：`(kind, cause, detail)`。
+///
+/// 与 `StreamProxyEgress::log_outbound_unavailable` 拆开是为了先取出 owned 字段，
+/// 再以 `&mut self` 更新限频状态（避免与 `registry` 的不可变借用重叠）。
+fn outbound_unavailable_fields(slot: &OutboundSlot) -> (String, &'static str, String) {
+    match slot {
+        OutboundSlot::ProtocolNotWired { kind } => (
+            kind.as_str().to_string(),
+            "PROTOCOL_NOT_WIRED",
+            String::new(),
+        ),
+        OutboundSlot::Invalid { kind, cause } => (
+            kind.as_str().to_string(),
+            cause.name(),
+            nexus::redact::sanitize(cause.detail()),
+        ),
+        OutboundSlot::Dialer(dialer) => (
+            dialer.kind().as_str().to_string(),
+            "UNKNOWN_OUTBOUND",
+            String::new(),
+        ),
     }
 }

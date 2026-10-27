@@ -203,6 +203,14 @@ fn enabled_no_provider() -> (String, bool, u64, u64, u64) {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+    // D2 后 RST 在 SYN 当场发出，建立失败可能晚于 RST 到达观测点；
+    // 三条冻结期望（rst / session_establish_failed / direct_attempts）不变，
+    // 因此继续有界泵送直到失败计数可见（不改变断言值，只改变采样时机）。
+    let fail_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while dp.flow_establish_failures() == 0 && std::time::Instant::now() < fail_deadline {
+        dp.process_one().expect("pump establish");
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let failures = dp.flow_establish_failures();
     let direct_attempts = dp.stats().direct_tcp_dial_ok;
     let state_after = dp.flow_sessions_state().state.to_string();

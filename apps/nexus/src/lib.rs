@@ -51,12 +51,19 @@ pub mod node_cli;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
+/// `nexus config check`：出站配置面只读校验（spec §7.7 载体 2）。
+pub mod outbound_check;
+/// 出站互操作标注：`verdicts.json` 嵌入解析 + 五载体共享的 label/warning 派生，
+/// `is_wired` / `select_index` 唯一定义（spec §3.6.1 / N9）。
+pub mod outbound_manifest;
 pub mod pair_cli;
 /// N2 P0-3：`nexus plan` 只读预览 + `plan explain` 双模式（进程内，无 I/O）。
 pub mod plan_cli;
 /// `nexus provider` 命令族（N2 P0-5）：提供方侧常驻准入服务。
 pub mod provider_cli;
 pub mod provider_fetcher;
+/// 密钥脱敏（daemon + CLI 共享一份实现；spec §9）。
+pub mod redact;
 /// `nexus resource` 命令族（N2 P0-4/P0-5）：list / show / publish / revoke /
 /// export / import。
 pub mod resource_cli;
