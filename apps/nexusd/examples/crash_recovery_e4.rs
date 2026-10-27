@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nexus_connectivity::{LinkKind, LinkMarker, LinkMarkerStore};
 use nexus_domain::{LifecyclePhase, SessionId, TerminalOutcome};
-use nexus_session::{SessionRecord, SessionRecordStore};
+use nexus_session::{
+    LinkMarker, LinkMarkerKind, LinkMarkerStore, SessionRecord, SessionRecordStore,
+};
 use nexusd::recovery::{self, FileLinkMarkerStore, FileSessionRecordStore};
 
 fn now_unix() -> u64 {
@@ -51,7 +52,7 @@ fn victim(state_dir: &Path) -> ! {
     let mut links = FileLinkMarkerStore::new(state_dir);
     if let Err(e) = links.save(&LinkMarker::established(
         "direct/peer-crash",
-        LinkKind::Direct,
+        LinkMarkerKind::Direct,
         "10.99.99.99:4242",
         now_unix(),
     )) {

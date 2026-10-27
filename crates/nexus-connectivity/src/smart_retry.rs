@@ -1,6 +1,6 @@
 //! 智能重试（指数退避 + 错误分类 + 熔断器，内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的智能重试骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的智能重试骨架：
 //! - **退避**：`RetryExecutor::compute_backoff(attempt)` 按
 //!   `initial_delay_ms * backoff_factor^(attempt-1)` 计算下次重试延迟（attempt 从 1 开始）；
 //! - **错误分类**：`RetryableClass` 由调用方对错误做分类——`Retryable`（可重试）/

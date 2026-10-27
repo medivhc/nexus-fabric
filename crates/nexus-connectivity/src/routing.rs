@@ -1,7 +1,7 @@
 #![allow(deprecated)] // §12.57 退役模块：内部实现允许自引用
 //! 多跳动态路由（Distance Vector，P1.1 PRODUCT §12.6）。
 //!
-//! 本模块是 delivery 层共享底座的路由骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的路由骨架：
 //! - **距离矢量（Bellman-Ford 简化版）**：节点只知道"到目的地经谁、代价多少"，
 //!   通过邻居间周期性交换路由通告（`RoutingAdvertisement`）逐步收敛；
 //! - **水平分割（Split Horizon）**：从邻居 X 学到的路由，不再通告回 X，

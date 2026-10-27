@@ -1,6 +1,6 @@
 //! 分片传输（大报文分片 + 重组 + 超时清理，内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的分片传输骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的分片传输骨架：
 //! - **分片**：`Fragmenter::fragment(data, packet_id)` 把 `data` 按
 //!   `max_fragment_size` 切成有序 `Fragment { packet_id, index, total, payload }`；
 //!   空数据返回单个空载荷分片（total=1），保持"一个报文至少一片"语义；

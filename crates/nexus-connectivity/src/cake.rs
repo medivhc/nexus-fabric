@@ -1,6 +1,6 @@
 //! CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 令牌桶整形，内存确定性）。
 //!
-//! 本模块是 delivery 层共享底座的用户态包调度器（MVP）：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的用户态包调度器（MVP）：
 //! - **流识别**：`FiveTuple`（5 元组）→ `FlowId`（同进程内确定性哈希，不持久化）；
 //! - **优先级**：`Priority::{High, Medium, Low}`，类间严格优先级（High 排空前不看
 //!   Medium/Low），类内 DRR；新流按端口/协议规则定级（ICMP 恒 High，命中

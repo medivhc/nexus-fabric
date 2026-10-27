@@ -9,7 +9,7 @@ description = "Production wiring for NAT punch-through: PunchChannel/PunchSocket
 [dependencies]
 nexus-fabric = { path = "../nexus-fabric" }
 nexus-nat-traversal = { path = "../nexus-nat-traversal" }
-nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-domain = { path = "../nexus-domain" }
 
 [dev-dependencies]
 nexus-turn = { path = "../nexus-turn" }

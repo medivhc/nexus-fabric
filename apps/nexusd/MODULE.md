@@ -42,6 +42,9 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：②`OutboundAdapter`（待 P2）/ ③CAKE（待 P3，新增 `nexus-qos` 后下沉），
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants
 

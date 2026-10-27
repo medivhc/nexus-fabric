@@ -9,6 +9,9 @@
 /// N3 Task/Snapshot/Artifact DTOs, separate from stable Core Plan.
 pub mod task;
 
+/// 跨栈 NAT 词汇（`NatType` / `StunMapping`）：v9 CLI 运行时与 N1 运行时共用。
+pub mod nat;
+
 use core::fmt;
 
 // ---------- Identity / Resource ----------

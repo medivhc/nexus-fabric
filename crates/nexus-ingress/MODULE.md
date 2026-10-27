@@ -30,6 +30,8 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 

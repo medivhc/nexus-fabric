@@ -1,6 +1,6 @@
 //! 配置热加载（内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的配置热加载骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的配置热加载骨架：
 //! - **配置**：`HotReloadConfig` 持有轮询间隔 / 是否在应用前校验；
 //! - **结果**：`ReloadResult` 二态（Success 携带已应用 revision / Failed 携带原因）；
 //! - **管理器**：`HotReloadManager` 记录当前已生效 revision，按提议决定是否应用；

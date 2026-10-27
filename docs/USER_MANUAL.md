@@ -321,6 +321,8 @@ cargo build --workspace
 
   * SDK：`nexus_connectivity::nat::{NatEvent, NatType, StunMapping}`（canonical codec：`nexus_turn::stun`；`StunClient`/`HolePuncher` 已随 #1 退役）
 
+  > 该 SDK 面属 v9 CLI 运行时（frozen）；新栈请用 `nexus_domain::nat`。
+
 * **代码级校验**：`nexus-harness run nat-hole-punching` → PASS（2026-10-18：RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析确定性自检）；单元测试 `cargo test -p nexusd nat_stun` 12/12。真实 STUN 服务器集成测试待完善。
 
 #### 4.1.9 Proxy 节点测速（tcp /http204，§11.10）

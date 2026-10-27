@@ -736,25 +736,18 @@ ServicePlanExtension
 
 ### Delivery Infrastructure
 
-Connectivity 与 Transport 是共享底座：
+Delivery Infrastructure 是分层词（Ingress → Application/Session → Delivery → Platform），
+不指代单一 crate。系统内有两套实现，划界见 `ARCHITECTURE.md` §6 与
+`docs/adr/0001-dual-stack-boundary.md`：
 
+- **N1 投递面**（唯一演进面）：`nexus-fabric` / `nexus-path` / `nexus-nat-*` /
+  `nexus-projection` / `nexus-network` / `nexus-dns` / `nexus-turn`，由 `apps/nexusd` 装配。
+- **v9 CLI 运行时**（frozen）：`nexus-connectivity`，只服务 `apps/nexus` 旧命令面；
+  只接受带 Red Evidence 的缺陷 / 安全 / 崩溃一致性修复。
 
-
-```
-Network
-
-Service
-
-Workspace
-
-Compute
-```
-
-都通过 Delivery Infrastructure 使用远端资源。
+Network / Service / Workspace / Compute 都通过 Delivery Infrastructure 使用远端资源。
 
 禁止让 Delivery 反向依赖：
-
-
 
 ```
 Workspace
@@ -763,6 +756,10 @@ Compute
 
 Service business logic
 ```
+
+N1 运行时 crate 不得直接依赖 `nexus-connectivity`；跨栈共享词汇在 `nexus-domain` /
+`nexus-proxy-config` / `nexus-session` / `nexus-qos`（机器判据见
+`policies/architecture.toml` 的 `[dual_stack]`，P5 落地）。
 
 
 
@@ -2121,6 +2118,10 @@ owner 列给出推荐的身份值（见 29.2），未分配 Agent 的 crate 先�
 | 组装层（`agent-c`） | `apps/nexus/`、`apps/nexusd/`、`apps/nexus-platform-host/` | CLI/daemon/平台宿主：改动最易冲突，先同步再改 |
 | 工具链 | `engineering/`、`.githooks/`、`.agents/` | harness/hooks/skills（低冲突） |
 | 共享 | `scenarios/`、`policies/`、`*.MODULE.md`、`PRODUCT.md` | 契约文件：冻结先行，改动走 requirement-change + contract marker（§7） |
+
+> `nexus-connectivity` 为 frozen（2026-10-26 划界，见 `ARCHITECTURE.md` §6 与
+> `docs/adr/0001-dual-stack-boundary.md`）；改动须 owner（`agent-b`）会签 + 独立 Review
+> （AGENTS §19.1）；本表不构成放行依据。
 
 ### 29.2 Evidence 命名空间（NEXUS_AGENT）
 

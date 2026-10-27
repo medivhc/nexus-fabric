@@ -24,7 +24,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::*;
 
 struct SystemClock(Instant);

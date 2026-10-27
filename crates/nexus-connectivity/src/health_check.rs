@@ -1,6 +1,6 @@
 //! 节点健康检查（内存骨架，注入逻辑时钟）。
 //!
-//! 本模块是 delivery 层共享底座的节点健康状态机骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的节点健康状态机骨架：
 //! - **配置**：`HealthConfig` 持有探测间隔 / 超时 / 连续失败阈值；
 //! - **状态**：`HealthState` 三态（Healthy / Degraded / Unhealthy）；
 //! - **检查器**：`HealthChecker` 按 `node_id` 维护连续失败计数，记录每次探测的逻辑时间；

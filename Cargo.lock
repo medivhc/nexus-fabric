@@ -1328,14 +1328,14 @@ dependencies = [
 name = "nexus-nat-traversal"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-domain",
 ]
 
 [[package]]
 name = "nexus-nat-wireup"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-domain",
  "nexus-fabric",
  "nexus-nat-quality",
  "nexus-nat-traversal",

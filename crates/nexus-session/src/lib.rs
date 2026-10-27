@@ -18,6 +18,13 @@ use nexus_domain::{
     TerminalOutcome,
 };
 
+/// 运行时会话记录与链路 durable marker（与 `SessionRecord` 同址）。
+pub mod link_marker;
+
+pub use link_marker::{
+    LinkMarker, LinkMarkerKind, LinkMarkerStore, LinkReconcileReport, reconcile_link_markers,
+};
+
 // ---------- 事件（Worker 只发事件，Owner 消费） ----------
 
 /// Worker 上报的结构化事件（ARCHITECTURE §7：Worker 只能发送事件）。

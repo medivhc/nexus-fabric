@@ -136,3 +136,9 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
   握手签名校验）、`rcgen 0.13`（测试用自签证书）、`sha2 0.10`
   （`pin-sha256` 计算）、`blake2 0.10`（Salamander `BLAKE2b-256`）、
   `bytes 1`（quinn-proto sans-IO buffer 类型）。
+
+## Forbidden Dependencies
+
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。

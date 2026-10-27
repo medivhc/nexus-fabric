@@ -988,7 +988,7 @@ mod tests {
     use crate::config::TurnSection;
     use crate::nat_switch::{NatSwitching, gather_host_candidates};
     use crate::nat_turn::TurnHandle;
-    use nexus_connectivity::nat::NatType;
+    use nexus_domain::nat::NatType;
     use nexus_nat_traversal::LocalCandidates;
     use nexus_nat_wireup::SystemPunchClock;
     use nexus_turn::client::{TurnClient, TurnCredentials};
