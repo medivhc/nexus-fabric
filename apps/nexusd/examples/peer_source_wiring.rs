@@ -60,13 +60,15 @@ impl RelayAddressBook for FakeBook {
     }
 }
 
+type SinkList = Vec<Weak<dyn RelayConnSink>>;
+
 /// Fake relay: records trigger calls, returns `Ok(addr)` immediately and keeps
 /// the established map current (so `established_relay_addr` is truthful).
 #[derive(Default)]
 struct FakeRelay {
     calls: Mutex<Vec<(nexus_fabric::PeerId, SocketAddr)>>,
     established: Mutex<HashMap<[u8; 32], SocketAddr>>,
-    sinks: Mutex<HashMap<[u8; 32], Vec<Weak<dyn RelayConnSink>>>>,
+    sinks: Mutex<HashMap<[u8; 32], SinkList>>,
 }
 
 impl RelayTrigger for FakeRelay {
