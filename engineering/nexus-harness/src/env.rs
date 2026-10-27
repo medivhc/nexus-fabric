@@ -1002,7 +1002,8 @@ pub(crate) mod tests {
         assert_eq!(repo.contract_hash(), "contract-unknown");
     }
 
-    #[cfg(unix)]
+    // Linux only: macOS (APFS) rejects non-UTF-8 file names outright.
+    #[cfg(target_os = "linux")]
     #[test]
     fn contract_hash_reads_non_utf8_file_names() {
         use std::os::unix::ffi::OsStrExt;

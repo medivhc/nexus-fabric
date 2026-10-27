@@ -248,8 +248,8 @@ MVP 优先 Cargo metadata + 显式 mapping，不构造脆弱的全程序猜测�
   复现方法（2026-10-27 起，见 `engineering/nexus-harness/MODULE.md` Invariants 中的
   `contract_hash` 条）：输入集为 `harness.toml [protection].root_contract_paths` 下的全部
   git 可见文件与全仓 `**/MODULE.md`（`git ls-files -z -co --exclude-standard`），按路径
-  字节序排序；每个文件拼 `<path>\0<字节长度>\0<内容>`（工作树缺失的已跟踪文件内容记为
-  `<missing>`），整体喂给 `git hash-object --stdin`。此前的值（只覆盖
+  字节序排序；每个文件拼 `<path>\0<字节长度>\0<内容>`（工作树缺失的已跟踪文件记为
+  `<path>\0-\0`），整体喂给 `git hash-object --stdin`。此前的值（只覆盖
   `scenarios/*/*.toml`，如 `8ba9fea` = `cea5547a…`、`d4138b7` = `f13e96c6…`）与新口径不可比。
   覆盖面扩大到 `*.md` 契约后，CRLF 工作树字节的问题影响更多文件，下面的待办仍未关闭。
 - `scenario.rs` 用 `Command::new(program)` 直接执行命令首词，`echo` 在 Windows 上是
