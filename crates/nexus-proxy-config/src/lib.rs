@@ -17,6 +17,9 @@
 
 use std::collections::BTreeSet;
 
+/// TPROXY 透明入站默认监听地址（spec §11.1 冻结端口 7895）。
+pub const TPROXY_DEFAULT_LISTEN: &str = "0.0.0.0:7895";
+
 // ---------------------------------------------------------------------------
 // 结构化配置错误（不以日志文本代替错误类型，MODULE.md Outputs）
 // ---------------------------------------------------------------------------
@@ -73,15 +76,308 @@ pub struct ProxyConfig {
     pub rule_providers: Vec<RuleProviderConfig>,
 }
 
+/// 入站协议类型（显式代理与透明入站）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKind {
+    /// SOCKS5 显式代理入口。
+    Socks5,
+    /// SOCKS5/HTTP 混合显式代理入口。
+    Mixed,
+    /// TUN 透明入站（系统级接管）。
+    Tun,
+    /// TPROXY 透明入站（Linux 捕获前端）。
+    Tproxy,
+}
+
+impl InboundKind {
+    /// 解析 YAML 的 `kind` 取值；未知值结构化报错。
+    ///
+    /// # Errors
+    ///
+    /// 返回 `CONFIG_INVALID [kind]`，调用方负责补全 `inbounds[i]` 字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "socks5" => Ok(Self::Socks5),
+            "mixed" => Ok(Self::Mixed),
+            "tun" => Ok(Self::Tun),
+            "tproxy" => Ok(Self::Tproxy),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown inbound kind '{other}' (supports socks5/mixed/tun/tproxy)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签（与配置取值一致）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Socks5 => "socks5",
+            Self::Mixed => "mixed",
+            Self::Tun => "tun",
+            Self::Tproxy => "tproxy",
+        }
+    }
+}
+
 /// 入站监听配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundConfig {
     /// 入站标识。
     pub tag: String,
-    /// 入站协议（P0 仅 `"socks5"`）。
-    pub kind: String,
-    /// 监听地址（host:port）。
+    /// 入站协议。
+    pub kind: InboundKind,
+    /// 监听地址（host:port；tun 不使用，tproxy 缺省 `0.0.0.0:7895`）。
     pub listen: String,
+    /// `kind: tun` 的子配置；非 tun 入站为 `None`。
+    pub tun: Option<TunInboundConfig>,
+    /// `kind: tproxy` 的子配置；非 tproxy 入站为 `None`。
+    pub tproxy: Option<TproxyInboundConfig>,
+}
+
+/// 流会话开关模式（Q2 定案默认 `auto`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowSessionsMode {
+    /// 有 provider 源时启用，无源禁用。
+    Auto,
+    /// 强制启用。
+    Enabled,
+    /// 强制禁用。
+    Disabled,
+}
+
+impl FlowSessionsMode {
+    /// 解析配置取值（`auto` / `enabled` / `disabled`）。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown flow sessions mode '{other}' (supports auto/enabled/disabled)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// `kind: tun` 入站子配置（spec §10.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunInboundConfig {
+    /// TUN 设备名（默认 `nexus`）。
+    pub name: String,
+    /// MTU（默认 1500，范围 `[1280, 9000]`）。
+    pub mtu: u16,
+    /// 设备地址（默认 `10.99.0.1/24`，IPv4 CIDR）。
+    pub address: String,
+    /// 是否接管默认路由（默认 `false`，必须显式 opt-in）。
+    pub default_route: bool,
+    /// 是否自动排除代理服务器路由（默认 `true`）。
+    pub exclude_server_routes: bool,
+    /// fake-IP（本 run 必须 `false`）。
+    pub fake_ip: bool,
+    /// IPv6（本 run 必须 `false`）。
+    pub ipv6: bool,
+    /// 流会话模式（默认 `auto`）。
+    pub sessions: FlowSessionsMode,
+    /// YAML 是否显式给出 `sessions`（用于 §10.7 与 `[flow_sessions].enabled` 的冲突判定）。
+    pub sessions_explicit: bool,
+}
+
+impl Default for TunInboundConfig {
+    fn default() -> Self {
+        Self {
+            name: "nexus".to_string(),
+            mtu: 1500,
+            address: "10.99.0.1/24".to_string(),
+            default_route: false,
+            exclude_server_routes: true,
+            fake_ip: false,
+            ipv6: false,
+            sessions: FlowSessionsMode::Auto,
+            sessions_explicit: false,
+        }
+    }
+}
+
+/// TPROXY 捕获 backend。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBackendConfig {
+    /// iptables（默认）。
+    Iptables,
+    /// nftables。
+    Nftables,
+    /// external：只校验不写规则。
+    External,
+}
+
+impl CaptureBackendConfig {
+    /// 解析配置取值。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "iptables" => Ok(Self::Iptables),
+            "nftables" => Ok(Self::Nftables),
+            "external" => Ok(Self::External),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown capture backend '{other}' (supports iptables/nftables/external)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Iptables => "iptables",
+            Self::Nftables => "nftables",
+            Self::External => "external",
+        }
+    }
+}
+
+/// 捕获失败策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFailureMode {
+    /// 阻断（默认）：安装 DROP 规则；backend 不可用时 `enforcement=impossible`。
+    Block,
+    /// 显式 bypass：不写规则。
+    Bypass,
+}
+
+impl CaptureFailureMode {
+    /// 解析配置取值。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "block" => Ok(Self::Block),
+            "bypass" => Ok(Self::Bypass),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown capture failure mode '{other}' (supports block/bypass)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+/// 路径失败策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathFailureMode {
+    /// 阻断（默认）：TCP RST、UDP 丢弃，不静默直连。
+    Block,
+    /// 按策略组剩余候选重试（有上限）。
+    Fallback,
+}
+
+impl PathFailureMode {
+    /// 解析配置取值。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "block" => Ok(Self::Block),
+            "fallback" => Ok(Self::Fallback),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown path failure mode '{other}' (supports block/fallback)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// `kind: tproxy` 入站子配置（spec §10.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TproxyInboundConfig {
+    /// TCP 监听端口（默认取 `listen` 端口）。
+    pub tcp_port: u16,
+    /// UDP 监听端口（默认取 `listen` 端口）。
+    pub udp_port: u16,
+    /// 捕获 backend（默认 iptables）。
+    pub backend: CaptureBackendConfig,
+    /// 专用链名（默认 `NEXUS_TPROXY`）。
+    pub chain: String,
+    /// fwmark（默认 `0x1f3`）。
+    pub mark: u32,
+    /// 策略路由表（默认 100）。
+    pub route_table: u32,
+    /// 拦截目的 CIDR（默认 `["0.0.0.0/0"]`）。
+    pub intercept_dst_cidrs: Vec<String>,
+    /// 排除目的 CIDR（默认空；mesh/TUN/代理服务器自动追加）。
+    pub exclude_dst_cidrs: Vec<String>,
+    /// 捕获失败策略（默认 block）。
+    pub on_capture_failure: CaptureFailureMode,
+    /// 路径失败策略（默认 block）。
+    pub on_path_failure: PathFailureMode,
+    /// TCP 并发连接上限（默认 4096）。
+    pub max_tcp_conns: usize,
+    /// UDP 流表容量（默认 8192）。
+    pub udp_table_capacity: usize,
+    /// UDP 流空闲老化秒数（默认 60）。
+    pub udp_idle_secs: u64,
+    /// IPv6（本 run 必须 `false`）。
+    pub ipv6: bool,
+}
+
+impl Default for TproxyInboundConfig {
+    fn default() -> Self {
+        Self {
+            tcp_port: 7895,
+            udp_port: 7895,
+            backend: CaptureBackendConfig::Iptables,
+            chain: "NEXUS_TPROXY".to_string(),
+            mark: 0x1f3,
+            route_table: 100,
+            intercept_dst_cidrs: vec!["0.0.0.0/0".to_string()],
+            exclude_dst_cidrs: Vec::new(),
+            on_capture_failure: CaptureFailureMode::Block,
+            on_path_failure: PathFailureMode::Block,
+            max_tcp_conns: 4096,
+            udp_table_capacity: 8192,
+            udp_idle_secs: 60,
+            ipv6: false,
+        }
+    }
 }
 
 /// 规则类型（P0 冻结为四类；2026-10-01 新增端口/进程三类）。
@@ -712,6 +1008,336 @@ fn refield(mut e: ConfigError, field: &str) -> ConfigError {
     e
 }
 
+/// 宽松数值字段：存在时必须能解析为 `u64`，不静默回退默认值。
+fn req_opt_u64(node: &Node, key: &str, base: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(raw) = node.get(key) else {
+        return Ok(None);
+    };
+    let text = raw
+        .as_str()
+        .ok_or_else(|| ConfigError::new(format!("{base}.{key}"), "expected an integer scalar"))?;
+    let value = text.trim().parse::<u64>().map_err(|_| {
+        ConfigError::new(
+            format!("{base}.{key}"),
+            format!("expected an integer, got '{text}'"),
+        )
+    })?;
+    Ok(Some(value))
+}
+
+/// 校验 IPv4 CIDR（`a.b.c.d/prefix`，prefix ∈ `[0, 32]`）。
+fn validate_ipv4_cidr(value: &str) -> Result<(), String> {
+    let (addr, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| format!("must be IPv4 CIDR (a.b.c.d/prefix), got '{value}'"))?;
+    addr.parse::<std::net::Ipv4Addr>()
+        .map_err(|_| format!("invalid IPv4 address '{addr}'"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("invalid CIDR prefix '{prefix}'"))?;
+    if prefix > 32 {
+        return Err(format!("CIDR prefix out of range: {prefix}"));
+    }
+    Ok(())
+}
+
+/// 校验 TUN 设备名（Linux `IFNAMSIZ` 上限 15 字节）。
+fn validate_tun_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if name.len() > 15 {
+        return Err(format!("must be at most 15 bytes, got {}", name.len()));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(format!("contains invalid character in '{name}'"));
+    }
+    Ok(())
+}
+
+fn parse_tun_inbound(node: &Node, base: &str) -> Result<TunInboundConfig, ConfigError> {
+    let mut cfg = TunInboundConfig::default();
+    if let Some(name) = opt_str(node, "name") {
+        validate_tun_name(&name)
+            .map_err(|reason| ConfigError::new(format!("{base}.name"), reason))?;
+        cfg.name = name;
+    }
+    if let Some(mtu) = req_opt_u64(node, "mtu", base)? {
+        let mtu = u16::try_from(mtu).map_err(|_| {
+            ConfigError::new(
+                format!("{base}.mtu"),
+                format!("must be in [1280, 9000], got {mtu}"),
+            )
+        })?;
+        if !(1280..=9000).contains(&mtu) {
+            return Err(ConfigError::new(
+                format!("{base}.mtu"),
+                format!("must be in [1280, 9000], got {mtu}"),
+            ));
+        }
+        cfg.mtu = mtu;
+    }
+    if let Some(address) = opt_str(node, "address") {
+        validate_ipv4_cidr(&address)
+            .map_err(|reason| ConfigError::new(format!("{base}.address"), reason))?;
+        cfg.address = address;
+    }
+    if let Some(value) = opt_bool(node, "default_route") {
+        cfg.default_route = value;
+    }
+    if let Some(value) = opt_bool(node, "exclude_server_routes") {
+        cfg.exclude_server_routes = value;
+    }
+    if opt_bool(node, "fake_ip") == Some(true) {
+        return Err(ConfigError::new(
+            format!("{base}.fake_ip"),
+            "fake-IP is not supported in this release; must be false",
+        ));
+    }
+    if opt_bool(node, "ipv6") == Some(true) {
+        return Err(ConfigError::new(
+            format!("{base}.ipv6"),
+            "IPv6 is not supported in this release; must be false",
+        ));
+    }
+    if let Some(mode) = opt_str(node, "sessions") {
+        cfg.sessions = FlowSessionsMode::parse(&mode)
+            .map_err(|e| ConfigError::new(format!("{base}.sessions"), e.reason))?;
+        cfg.sessions_explicit = true;
+    }
+    Ok(cfg)
+}
+
+/// 数值字段（支持十进制与 `0x` 十六进制）。
+fn req_opt_int(node: &Node, key: &str, base: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(raw) = node.get(key) else {
+        return Ok(None);
+    };
+    let text = raw
+        .as_str()
+        .ok_or_else(|| ConfigError::new(format!("{base}.{key}"), "expected an integer scalar"))?;
+    let trimmed = text.trim();
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<u64>()
+    };
+    parsed.map(Some).map_err(|_| {
+        ConfigError::new(
+            format!("{base}.{key}"),
+            format!("expected an integer, got '{text}'"),
+        )
+    })
+}
+
+/// 校验出站/策略组 tag 的字符约束（spec §9.7.1）。
+fn validate_tag_text(tag: &str) -> Result<(), String> {
+    if tag.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if tag.trim() != tag {
+        return Err(format!(
+            "must not have leading/trailing whitespace in '{tag}'"
+        ));
+    }
+    if tag.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "must not contain whitespace or control characters in '{tag}'"
+        ));
+    }
+    if tag.len() > 64 {
+        return Err(format!("must be at most 64 bytes, got {}", tag.len()));
+    }
+    Ok(())
+}
+
+/// 出站/策略组 tag 的完整性与唯一性校验（spec §8.7 / §9.7.1）。
+fn validate_tags(outbounds: &[OutboundConfig], groups: &[GroupConfig]) -> Result<(), ConfigError> {
+    use std::collections::BTreeMap;
+
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, outbound) in outbounds.iter().enumerate() {
+        validate_tag_text(&outbound.tag)
+            .map_err(|reason| ConfigError::new(format!("outbounds[{i}].tag"), reason))?;
+        if outbound.tag.eq_ignore_ascii_case("direct") && outbound.kind != OutboundKind::Direct {
+            return Err(ConfigError::new(
+                format!("outbounds[{i}].tag"),
+                format!("reserved tag '{}'", outbound.tag),
+            ));
+        }
+        if seen.insert(outbound.tag.as_str(), i).is_some() {
+            return Err(ConfigError::new(
+                format!("outbounds[{i}].tag"),
+                format!("duplicate tag '{}'", outbound.tag),
+            ));
+        }
+    }
+    for (i, group) in groups.iter().enumerate() {
+        validate_tag_text(&group.tag)
+            .map_err(|reason| ConfigError::new(format!("groups[{i}].tag"), reason))?;
+        if group.tag.eq_ignore_ascii_case("direct") {
+            return Err(ConfigError::new(
+                format!("groups[{i}].tag"),
+                format!("reserved tag '{}'", group.tag),
+            ));
+        }
+        if seen.insert(group.tag.as_str(), i).is_some() {
+            return Err(ConfigError::new(
+                format!("groups[{i}].tag"),
+                format!("duplicate tag '{}'", group.tag),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_chain_name(chain: &str) -> Result<(), String> {
+    if chain.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if chain.len() > 28 {
+        return Err(format!("must be at most 28 bytes, got {}", chain.len()));
+    }
+    if chain.chars().any(char::is_whitespace) {
+        return Err(format!("must not contain whitespace in '{chain}'"));
+    }
+    Ok(())
+}
+
+fn validate_cidr_list(values: &[String], field: &str) -> Result<(), ConfigError> {
+    for cidr in values {
+        validate_ipv4_cidr(cidr).map_err(|reason| {
+            ConfigError::new(field, format!("invalid CIDR '{cidr}': {reason}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn parse_tproxy_inbound(
+    node: &Node,
+    base: &str,
+    listen: &str,
+) -> Result<TproxyInboundConfig, ConfigError> {
+    let listen_addr: std::net::SocketAddrV4 = listen.parse().map_err(|_| {
+        ConfigError::new(
+            format!("{base}.listen"),
+            format!("must be an IPv4 ip:port, got '{listen}'"),
+        )
+    })?;
+    let mut cfg = TproxyInboundConfig {
+        tcp_port: listen_addr.port(),
+        udp_port: listen_addr.port(),
+        ..TproxyInboundConfig::default()
+    };
+
+    for (key, is_tcp) in [("tcp_port", true), ("udp_port", false)] {
+        if let Some(value) = req_opt_int(node, key, base)? {
+            if value == 0 || value > u64::from(u16::MAX) {
+                return Err(ConfigError::new(
+                    format!("{base}.{key}"),
+                    format!("must be in [1, 65535], got {value}"),
+                ));
+            }
+            let port = u16::try_from(value).expect("range checked");
+            if is_tcp {
+                cfg.tcp_port = port;
+            } else {
+                cfg.udp_port = port;
+            }
+        }
+    }
+
+    if let Some(backend) = opt_str(node, "backend") {
+        cfg.backend = CaptureBackendConfig::parse(&backend)
+            .map_err(|e| ConfigError::new(format!("{base}.backend"), e.reason))?;
+    }
+    if let Some(chain) = opt_str(node, "chain") {
+        validate_chain_name(&chain)
+            .map_err(|reason| ConfigError::new(format!("{base}.chain"), reason))?;
+        cfg.chain = chain;
+    }
+    if let Some(mark) = req_opt_int(node, "mark", base)? {
+        if mark == 0 || mark > u64::from(u32::MAX) {
+            return Err(ConfigError::new(
+                format!("{base}.mark"),
+                format!("must be in [1, 4294967295], got {mark}"),
+            ));
+        }
+        cfg.mark = u32::try_from(mark).expect("range checked");
+    }
+    if let Some(table) = req_opt_int(node, "route_table", base)? {
+        if table == 0 || table > u64::from(u32::MAX) {
+            return Err(ConfigError::new(
+                format!("{base}.route_table"),
+                format!("must be in [1, 4294967295], got {table}"),
+            ));
+        }
+        cfg.route_table = u32::try_from(table).expect("range checked");
+    }
+    if let Some(list) = opt_str_seq(node, "intercept_dst_cidrs") {
+        validate_cidr_list(&list, &format!("{base}.intercept_dst_cidrs"))?;
+        cfg.intercept_dst_cidrs = list;
+    }
+    if let Some(list) = opt_str_seq(node, "exclude_dst_cidrs") {
+        validate_cidr_list(&list, &format!("{base}.exclude_dst_cidrs"))?;
+        cfg.exclude_dst_cidrs = list;
+    }
+    if cfg.intercept_dst_cidrs.len() + cfg.exclude_dst_cidrs.len() > 256 {
+        return Err(ConfigError::new(
+            format!("{base}.exclude_dst_cidrs"),
+            "total CIDR entries must not exceed 256",
+        ));
+    }
+    if let Some(mode) = opt_str(node, "on_capture_failure") {
+        cfg.on_capture_failure = CaptureFailureMode::parse(&mode)
+            .map_err(|e| ConfigError::new(format!("{base}.on_capture_failure"), e.reason))?;
+    }
+    if let Some(mode) = opt_str(node, "on_path_failure") {
+        cfg.on_path_failure = PathFailureMode::parse(&mode)
+            .map_err(|e| ConfigError::new(format!("{base}.on_path_failure"), e.reason))?;
+    }
+    if let Some(value) = req_opt_int(node, "max_tcp_conns", base)? {
+        if value == 0 {
+            return Err(ConfigError::new(
+                format!("{base}.max_tcp_conns"),
+                "must be >= 1",
+            ));
+        }
+        cfg.max_tcp_conns = usize::try_from(value).expect("fits usize on supported targets");
+    }
+    if let Some(value) = req_opt_int(node, "udp_table_capacity", base)? {
+        if value == 0 {
+            return Err(ConfigError::new(
+                format!("{base}.udp_table_capacity"),
+                "must be >= 1",
+            ));
+        }
+        cfg.udp_table_capacity = usize::try_from(value).expect("fits usize on supported targets");
+    }
+    if let Some(value) = req_opt_int(node, "udp_idle_secs", base)? {
+        if value == 0 {
+            return Err(ConfigError::new(
+                format!("{base}.udp_idle_secs"),
+                "must be >= 1",
+            ));
+        }
+        cfg.udp_idle_secs = value;
+    }
+    if opt_bool(node, "ipv6") == Some(true) {
+        return Err(ConfigError::new(
+            format!("{base}.ipv6"),
+            "IPv6 is not supported in this release; must be false",
+        ));
+    }
+    Ok(cfg)
+}
+
 // ---------------------------------------------------------------------------
 // 公开解析入口
 // ---------------------------------------------------------------------------
@@ -755,7 +1381,14 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     if let Some(seq) = root.get("outbounds").and_then(Node::as_seq) {
         for (i, item) in seq.iter().enumerate() {
             let field = format!("outbounds[{i}]");
-            let tag = req_str(item, "tag", &field)?.to_string();
+            let tag = req_str(item, "tag", &field)
+                .map_err(|mut e| {
+                    if e.field == field {
+                        e.field = format!("{field}.tag");
+                    }
+                    e
+                })?
+                .to_string();
             let kind_s = req_str(item, "kind", &field)?;
             let kind =
                 OutboundKind::parse(kind_s).map_err(|e| refield(e, &format!("{field}.kind")))?;
@@ -944,7 +1577,14 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     if let Some(seq) = root.get("groups").and_then(Node::as_seq) {
         for (i, item) in seq.iter().enumerate() {
             let field = format!("groups[{i}]");
-            let tag = req_str(item, "tag", &field)?.to_string();
+            let tag = req_str(item, "tag", &field)
+                .map_err(|mut e| {
+                    if e.field == field {
+                        e.field = format!("{field}.tag");
+                    }
+                    e
+                })?
+                .to_string();
             let kind_s = req_str(item, "kind", &field)?;
             let kind =
                 GroupKind::parse(kind_s).map_err(|e| refield(e, &format!("{field}.kind")))?;
@@ -974,22 +1614,67 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         }
     }
 
+    validate_tags(&outbounds, &groups)?;
+
     // ---- inbounds ----
     let mut inbounds = Vec::new();
     if let Some(seq) = root.get("inbounds").and_then(Node::as_seq) {
         for (i, item) in seq.iter().enumerate() {
             let field = format!("inbounds[{i}]");
             let tag = req_str(item, "tag", &field)?.to_string();
-            let kind = req_str(item, "kind", &field)?.to_string();
-            if kind != "socks5" && kind != "mixed" {
-                return Err(ConfigError::new(
-                    format!("{field}.kind"),
-                    format!("supports 'socks5' or 'mixed', got '{kind}'"),
-                ));
-            }
-            let listen = req_str(item, "listen", &field)?.to_string();
-            inbounds.push(InboundConfig { tag, kind, listen });
+            let kind_s = req_str(item, "kind", &field)?;
+            let kind = InboundKind::parse(kind_s).map_err(|mut e| {
+                e.field = format!("{field}.kind");
+                e
+            })?;
+            let listen = match kind {
+                InboundKind::Socks5 | InboundKind::Mixed => {
+                    req_str(item, "listen", &field)?.to_string()
+                }
+                InboundKind::Tun => opt_str(item, "listen").unwrap_or_default(),
+                InboundKind::Tproxy => opt_str(item, "listen")
+                    .unwrap_or_else(|| crate::TPROXY_DEFAULT_LISTEN.to_string()),
+            };
+            let tun = if kind == InboundKind::Tun {
+                Some(parse_tun_inbound(item, &field)?)
+            } else {
+                None
+            };
+            let tproxy = if kind == InboundKind::Tproxy {
+                Some(parse_tproxy_inbound(item, &field, &listen)?)
+            } else {
+                None
+            };
+            inbounds.push(InboundConfig {
+                tag,
+                kind,
+                listen,
+                tun,
+                tproxy,
+            });
         }
+    }
+    if inbounds
+        .iter()
+        .filter(|i| i.kind == InboundKind::Tun)
+        .count()
+        > 1
+    {
+        return Err(ConfigError::new(
+            "inbounds",
+            "only one tun inbound is supported",
+        ));
+    }
+    if inbounds
+        .iter()
+        .filter(|i| i.kind == InboundKind::Tproxy)
+        .count()
+        > 1
+    {
+        return Err(ConfigError::new(
+            "inbounds",
+            "only one tproxy inbound is supported",
+        ));
     }
 
     // ---- rules ----
@@ -2356,5 +3041,422 @@ mod warn5_obfs_validation_tests {
         assert!(parse(&hy2_yaml("none")).is_ok());
         // 空串同样表示无混淆（Obfs::parse: "" | "none" => None）。
         assert!(parse(&hy2_yaml("")).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod inbound_kind_tests {
+    use super::*;
+
+    #[test]
+    fn inbound_kind_as_str_roundtrip() {
+        for (raw, kind) in [
+            ("socks5", InboundKind::Socks5),
+            ("mixed", InboundKind::Mixed),
+            ("tun", InboundKind::Tun),
+            ("tproxy", InboundKind::Tproxy),
+        ] {
+            assert_eq!(InboundKind::parse(raw).unwrap(), kind);
+            assert_eq!(kind.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn unknown_inbound_kind_is_structured() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: in\n    kind: wireguard\n    listen: 127.0.0.1:1080\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).expect_err("unknown kind must fail");
+        assert_eq!(err.field, "inbounds[0].kind");
+        assert!(err.reason.contains("wireguard"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn explicit_inbound_kinds_parse() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: a\n    kind: socks5\n    listen: 127.0.0.1:1080\n  - tag: b\n    kind: mixed\n    listen: 127.0.0.1:1081\n  - tag: c\n    kind: tun\n  - tag: e\n    kind: tproxy\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let cfg = parse(yaml).expect("valid config");
+        assert_eq!(cfg.inbounds[0].kind, InboundKind::Socks5);
+        assert_eq!(cfg.inbounds[1].kind, InboundKind::Mixed);
+        assert_eq!(cfg.inbounds[2].kind, InboundKind::Tun);
+        assert_eq!(cfg.inbounds[3].kind, InboundKind::Tproxy);
+        assert_eq!(cfg.inbounds[2].listen, "");
+        assert_eq!(cfg.inbounds[3].listen, TPROXY_DEFAULT_LISTEN);
+    }
+}
+
+#[cfg(test)]
+mod tun_inbound_tests {
+    use super::*;
+
+    fn yaml_with_tun(extra: &str) -> String {
+        format!(
+            "schema_version: 1\ninbounds:\n  - tag: tun-in\n    kind: tun\n{extra}rules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n"
+        )
+    }
+
+    #[test]
+    fn tun_inbound_defaults_match_spec() {
+        let cfg = parse(&yaml_with_tun("")).expect("valid tun inbound");
+        let tun = cfg.inbounds[0].tun.as_ref().expect("tun sub config");
+        assert_eq!(tun.name, "nexus");
+        assert_eq!(tun.mtu, 1500);
+        assert_eq!(tun.address, "10.99.0.1/24");
+        assert!(!tun.default_route);
+        assert!(tun.exclude_server_routes);
+        assert!(!tun.fake_ip);
+        assert!(!tun.ipv6);
+        assert_eq!(tun.sessions, FlowSessionsMode::Auto);
+    }
+
+    #[test]
+    fn tun_inbound_overrides_parse() {
+        let extra = "    name: nexus-test\n    mtu: 9000\n    address: 10.42.0.1/16\n    default_route: true\n    exclude_server_routes: false\n    sessions: enabled\n";
+        let cfg = parse(&yaml_with_tun(extra)).expect("valid tun inbound");
+        let tun = cfg.inbounds[0].tun.as_ref().unwrap();
+        assert_eq!(tun.name, "nexus-test");
+        assert_eq!(tun.mtu, 9000);
+        assert_eq!(tun.address, "10.42.0.1/16");
+        assert!(tun.default_route);
+        assert!(!tun.exclude_server_routes);
+        assert_eq!(tun.sessions, FlowSessionsMode::Enabled);
+    }
+
+    #[test]
+    fn tun_inbound_rejects_bad_mtu_range() {
+        for mtu in ["1279", "9001"] {
+            let err = parse(&yaml_with_tun(&format!("    mtu: {mtu}\n"))).unwrap_err();
+            assert_eq!(err.field, "inbounds[0].mtu", "{err:?}");
+            assert!(err.reason.contains("1280"), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn tun_inbound_rejects_bad_address() {
+        let err = parse(&yaml_with_tun("    address: 10.99.0.1/33\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].address");
+        let err = parse(&yaml_with_tun("    address: not-a-cidr\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].address");
+    }
+
+    #[test]
+    fn tun_inbound_rejects_bad_name() {
+        let err = parse(&yaml_with_tun("    name: bad name\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].name");
+        let err = parse(&yaml_with_tun(&format!("    name: {}\n", "a".repeat(16)))).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].name");
+    }
+
+    #[test]
+    fn tun_inbound_rejects_fake_ip_and_ipv6() {
+        let err = parse(&yaml_with_tun("    fake_ip: true\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].fake_ip");
+        let err = parse(&yaml_with_tun("    ipv6: true\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+    }
+
+    #[test]
+    fn tun_inbound_rejects_unknown_sessions_mode() {
+        let err = parse(&yaml_with_tun("    sessions: sometimes\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].sessions");
+    }
+
+    #[test]
+    fn only_one_tun_inbound_is_supported() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: a\n    kind: tun\n  - tag: b\n    kind: tun\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tun"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tproxy_inbound_tests {
+    use super::*;
+
+    fn yaml_with_tproxy(extra: &str) -> String {
+        format!(
+            "schema_version: 1\ninbounds:\n  - tag: tp\n    kind: tproxy\n{extra}rules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n"
+        )
+    }
+
+    #[test]
+    fn tproxy_inbound_defaults_match_spec() {
+        let cfg = parse(&yaml_with_tproxy("")).expect("valid tproxy inbound");
+        let tp = cfg.inbounds[0].tproxy.as_ref().expect("tproxy sub config");
+        assert_eq!(cfg.inbounds[0].listen, "0.0.0.0:7895");
+        assert_eq!(tp.tcp_port, 7895);
+        assert_eq!(tp.udp_port, 7895);
+        assert_eq!(tp.backend, CaptureBackendConfig::Iptables);
+        assert_eq!(tp.chain, "NEXUS_TPROXY");
+        assert_eq!(tp.mark, 0x1f3);
+        assert_eq!(tp.route_table, 100);
+        assert_eq!(tp.intercept_dst_cidrs, vec!["0.0.0.0/0".to_string()]);
+        assert!(tp.exclude_dst_cidrs.is_empty());
+        assert_eq!(tp.on_capture_failure, CaptureFailureMode::Block);
+        assert_eq!(tp.on_path_failure, PathFailureMode::Block);
+        assert_eq!(tp.max_tcp_conns, 4096);
+        assert_eq!(tp.udp_table_capacity, 8192);
+        assert_eq!(tp.udp_idle_secs, 60);
+        assert!(!tp.ipv6);
+    }
+
+    #[test]
+    fn tproxy_ports_default_to_listen_port() {
+        let cfg = parse(&yaml_with_tproxy("    listen: 127.0.0.1:7896\n")).unwrap();
+        let tp = cfg.inbounds[0].tproxy.as_ref().unwrap();
+        assert_eq!(tp.tcp_port, 7896);
+        assert_eq!(tp.udp_port, 7896);
+    }
+
+    #[test]
+    fn tproxy_inbound_overrides_parse() {
+        let extra = "    tcp_port: 9001\n    udp_port: 9002\n    backend: nftables\n    chain: MYCHAIN\n    mark: 0x2a\n    route_table: 200\n    intercept_dst_cidrs: [10.0.0.0/8]\n    exclude_dst_cidrs: [10.1.0.0/16, 192.168.0.0/16]\n    on_capture_failure: bypass\n    on_path_failure: fallback\n    max_tcp_conns: 10\n    udp_table_capacity: 20\n    udp_idle_secs: 30\n";
+        let cfg = parse(&yaml_with_tproxy(extra)).unwrap();
+        let tp = cfg.inbounds[0].tproxy.as_ref().unwrap();
+        assert_eq!(tp.tcp_port, 9001);
+        assert_eq!(tp.udp_port, 9002);
+        assert_eq!(tp.backend, CaptureBackendConfig::Nftables);
+        assert_eq!(tp.chain, "MYCHAIN");
+        assert_eq!(tp.mark, 0x2a);
+        assert_eq!(tp.route_table, 200);
+        assert_eq!(tp.intercept_dst_cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(tp.exclude_dst_cidrs.len(), 2);
+        assert_eq!(tp.on_capture_failure, CaptureFailureMode::Bypass);
+        assert_eq!(tp.on_path_failure, PathFailureMode::Fallback);
+        assert_eq!(tp.max_tcp_conns, 10);
+        assert_eq!(tp.udp_table_capacity, 20);
+        assert_eq!(tp.udp_idle_secs, 30);
+    }
+
+    #[test]
+    fn tproxy_ipv6_true_is_exact_field_error() {
+        let err = parse(&yaml_with_tproxy("    ipv6: true\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+        assert!(err.reason.contains("IPv6"), "{err:?}");
+    }
+
+    #[test]
+    fn tproxy_rejects_zero_ports_and_limits() {
+        for (field, value) in [
+            ("tcp_port", "0"),
+            ("udp_port", "0"),
+            ("mark", "0"),
+            ("route_table", "0"),
+            ("max_tcp_conns", "0"),
+            ("udp_table_capacity", "0"),
+            ("udp_idle_secs", "0"),
+        ] {
+            let err = parse(&yaml_with_tproxy(&format!("    {field}: {value}\n"))).unwrap_err();
+            assert_eq!(err.field, format!("inbounds[0].{field}"), "{field}");
+        }
+    }
+
+    #[test]
+    fn tproxy_rejects_bad_chain_and_cidr_and_backend() {
+        let err = parse(&yaml_with_tproxy("    chain: NEXUS TPROXY\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].chain");
+        let err = parse(&yaml_with_tproxy(
+            "    intercept_dst_cidrs: [999.0.0.0/8]\n",
+        ))
+        .unwrap_err();
+        assert_eq!(err.field, "inbounds[0].intercept_dst_cidrs");
+        let err = parse(&yaml_with_tproxy("    backend: pf\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].backend");
+    }
+
+    #[test]
+    fn tproxy_rejects_too_many_excludes() {
+        let items = (0..257)
+            .map(|i| format!("10.{}.0.0/16", i % 250))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = parse(&yaml_with_tproxy(&format!(
+            "    exclude_dst_cidrs: [{items}]\n"
+        )))
+        .unwrap_err();
+        assert_eq!(err.field, "inbounds[0].exclude_dst_cidrs");
+        assert!(err.reason.contains("256"), "{err:?}");
+    }
+
+    #[test]
+    fn tproxy_rejects_unknown_failure_modes() {
+        let err = parse(&yaml_with_tproxy("    on_capture_failure: drop\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].on_capture_failure");
+        let err = parse(&yaml_with_tproxy("    on_path_failure: direct\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].on_path_failure");
+    }
+
+    #[test]
+    fn only_one_tproxy_inbound_is_supported() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: a\n    kind: tproxy\n  - tag: b\n    kind: tproxy\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tproxy"), "{err:?}");
+    }
+}
+#[cfg(test)]
+mod tag_validation_tests {
+    use super::*;
+
+    fn yaml_with(outbounds: &str, groups: &str) -> String {
+        format!(
+            "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n{outbounds}{groups}"
+        )
+    }
+
+    fn direct_outbound(tag: &str) -> String {
+        format!("  - tag: \"{tag}\"\n    kind: direct\n")
+    }
+
+    fn proxy_outbound(tag: &str) -> String {
+        format!("  - tag: \"{tag}\"\n    kind: socks5\n    locator: 127.0.0.1:1080\n")
+    }
+
+    #[test]
+    fn duplicate_outbound_tags_are_rejected() {
+        let yaml = yaml_with(
+            &format!("{}{}", proxy_outbound("p1"), proxy_outbound("p1")),
+            "",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[1].tag");
+        assert!(err.reason.contains("duplicate tag 'p1'"), "{err:?}");
+    }
+
+    #[test]
+    fn outbound_and_group_tags_must_be_unique() {
+        let yaml = yaml_with(
+            &proxy_outbound("p1"),
+            "groups:\n  - tag: p1\n    kind: selector\n    candidates: [p1]\n",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "groups[0].tag");
+        assert!(err.reason.contains("duplicate tag 'p1'"), "{err:?}");
+    }
+
+    #[test]
+    fn reserved_direct_tag_only_allowed_for_direct_outbound() {
+        let yaml = yaml_with(&proxy_outbound("DIRECT"), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("reserved tag"), "{err:?}");
+
+        let yaml = yaml_with(
+            &proxy_outbound("p1"),
+            "groups:\n  - tag: Direct\n    kind: selector\n    candidates: [p1]\n",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "groups[0].tag");
+        assert!(err.reason.contains("reserved tag"), "{err:?}");
+
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: direct\noutbounds:\n  - tag: direct\n    kind: direct\n";
+        assert!(parse(yaml).is_ok());
+    }
+
+    #[test]
+    fn invalid_tag_text_is_rejected() {
+        let yaml = yaml_with(&proxy_outbound(""), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+
+        let yaml = yaml_with(&direct_outbound(" lead"), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("leading/trailing"), "{err:?}");
+
+        let yaml = yaml_with(&direct_outbound("a b"), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("whitespace"), "{err:?}");
+
+        let long = "x".repeat(65);
+        let yaml = yaml_with(&direct_outbound(&long), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("64"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod config_error_matrix_tests {
+    use super::*;
+
+    fn base(extra_inbounds: &str) -> String {
+        format!(
+            "schema_version: 1\ninbounds:\n{extra_inbounds}rules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n"
+        )
+    }
+
+    #[test]
+    fn config_error_matrix_no_outbounds() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds");
+    }
+
+    #[test]
+    fn config_error_matrix_all_direct_is_legal() {
+        let cfg = parse(&base("")).expect("all-direct outbounds are legal");
+        assert_eq!(cfg.outbounds.len(), 1);
+        assert_eq!(cfg.outbounds[0].kind, OutboundKind::Direct);
+    }
+
+    #[test]
+    fn config_error_matrix_unknown_inbound_kind() {
+        let yaml = base("  - tag: in\n    kind: wireguard\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].kind");
+    }
+
+    #[test]
+    fn config_error_matrix_two_tun() {
+        let yaml = base("  - tag: a\n    kind: tun\n  - tag: b\n    kind: tun\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tun"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_two_tproxy() {
+        let yaml = base("  - tag: a\n    kind: tproxy\n  - tag: b\n    kind: tproxy\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tproxy"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_ipv6_true_tun() {
+        let yaml = base("  - tag: a\n    kind: tun\n    ipv6: true\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+    }
+
+    #[test]
+    fn config_error_matrix_ipv6_true_tproxy() {
+        let yaml = base("  - tag: a\n    kind: tproxy\n    ipv6: true\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+    }
+
+    #[test]
+    fn config_error_matrix_duplicate_tag() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[1].tag");
+        assert!(err.reason.contains("duplicate"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_reserved_tag() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: DIRECT\n    kind: socks5\n    locator: 127.0.0.1:1080\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("reserved"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_invalid_tag_text() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: \"a b\"\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("whitespace"), "{err:?}");
     }
 }

@@ -1,0 +1,78 @@
+schema_version = 1
+id = "product.tun-production-chain"
+title = "TUN 生产链：规则分流 + Proxy/Direct 真转发（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example tun_production_chain --json）：MockTun 注入流量，真实驱动
+# Direct UDP 往返、Direct TCP 真拨号/回程、Proxy TCP 经本地 SOCKS5 真中继、
+# ICMP 丢弃计数，并做 Proxy dial 失败注入；matched_rule/selected_outbound 来自
+# DomainRuleEngine.explain 的实际结果。
+
+[when]
+command = "cargo run --quiet -p nexusd --example tun_production_chain -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "matched_rule"
+equals = "proxy-target"
+
+[[expect]]
+field = "selected_outbound"
+equals = "p1"
+
+[[expect]]
+field = "egress_hint"
+equals = "p1"
+
+[[expect]]
+field = "dataplane_cached_outbound"
+equals = "p1"
+
+[[expect]]
+field = "direct_tcp_dial_ok"
+equals = 1
+
+[[expect]]
+field = "direct_tcp_sha_match"
+equals = true
+
+[[expect]]
+field = "proxy_tcp_streams"
+equals = 1
+
+[[expect]]
+field = "proxy_forwarded"
+equals = 1
+
+[[expect]]
+field = "proxy_sent_sha256"
+non_empty = true
+
+[[expect]]
+field = "proxy_recv_sha256"
+non_empty = true
+
+[[expect]]
+field = "proxy_sha_match"
+equals = true
+
+[[expect]]
+field = "direct_dropped_unsupported"
+equals = 1
+
+[[expect]]
+field = "upstream_failed"
+equals = 1
+
+[[expect]]
+field = "direct_udp_sent"
+equals = 2
+
+[[expect]]
+field = "direct_replies"
+equals = 2

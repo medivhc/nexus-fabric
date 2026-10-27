@@ -303,6 +303,8 @@ pub enum FlowOrigin {
     Http,
     /// 进程内 Native API 直接提交。
     NativeApi,
+    /// 已 accept 的透明 socket（TPROXY / TUN 前端；平台实现在 nexus-platform-*）。
+    TransparentSocket,
 }
 
 /// 中立流量上下文。
@@ -320,6 +322,8 @@ pub struct FlowContext {
     pub destination: String,
     /// 使用画像，供 Policy 展开为 Intent。
     pub profile: String,
+    /// 规则命中的出站 tag 提示（非身份/资源语义，只影响快照候选；spec §7.4）。
+    pub egress_hint: Option<String>,
 }
 
 // ---------- Plan / PlanExtension ----------
@@ -1066,6 +1070,21 @@ pub struct RouteRequest<'a> {
     pub packet: &'a [u8],
     /// 域名（P0 为 None；P1 由 DNS 劫持提供）。
     pub domain: Option<&'a str>,
+    /// 源端口（TCP/UDP 头；不可用时为 `None`）。
+    pub src_port: Option<u16>,
+    /// 目的端口（TCP/UDP 头；不可用时为 `None`）。
+    pub dst_port: Option<u16>,
+    /// 进程名（不可用时为 `None`；本 run 不采集）。
+    pub process_name: Option<&'a str>,
+}
+
+/// 规则命中说明（可观测性；`matched_rule` 为稳定文本，`rule_kind` 为规则类别）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleExplanation {
+    /// 命中的规则原文（如 `DOMAIN-SUFFIX,example.com`）。
+    pub matched_rule: String,
+    /// 规则类别（如 `DOMAIN-SUFFIX` / `IP-CIDR`）。
+    pub rule_kind: String,
 }
 
 /// 规则引擎 trait：输入路由请求，输出统一路由决策。
@@ -1074,11 +1093,39 @@ pub struct RouteRequest<'a> {
 /// （域名/geoip/进程），trait 签名不变。
 pub trait RuleEngine: Send + Sync {
     fn decide(&self, req: &RouteRequest) -> RouteTarget;
+
+    /// 返回决策与命中规则说明；默认实现不提供说明（`None`），
+    /// 不改变 `decide` 语义。
+    fn explain(&self, req: &RouteRequest) -> (RouteTarget, Option<RuleExplanation>) {
+        (self.decide(req), None)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_engine_explain_defaults_to_none() {
+        struct OnlyDecide;
+        impl RuleEngine for OnlyDecide {
+            fn decide(&self, _req: &RouteRequest) -> RouteTarget {
+                RouteTarget::Drop
+            }
+        }
+        let pkt = [0u8; 20];
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
+        };
+        assert_eq!(OnlyDecide.decide(&req), RouteTarget::Drop);
+        let (target, explanation) = OnlyDecide.explain(&req);
+        assert_eq!(target, RouteTarget::Drop);
+        assert!(explanation.is_none());
+    }
 
     fn sample_plan() -> Plan {
         Plan {
@@ -1274,6 +1321,7 @@ mod tests {
             resource: ResourceId("internet-access".into()),
             destination: "https://example.invalid/".into(),
             profile: "Balanced".into(),
+            egress_hint: None,
         };
         assert_eq!(flow.origin, FlowOrigin::Socks5);
         // 中立上下文不携带 Path/Provider 决策字段。

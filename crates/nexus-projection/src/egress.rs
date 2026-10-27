@@ -9,7 +9,7 @@
 //!   rewritten, only the mapping is recorded; E4 validates the mapping logic
 //!   with a mock.
 
-use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
+use nexus_domain::{RouteRequest, RouteTarget, RuleEngine, RuleExplanation};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io;
@@ -83,6 +83,10 @@ impl DomainMatch {
 /// 3b-3: domain rules (`Exact`/`Suffix`/`Keyword`). When `req.domain` is
 /// `Some`, domain rules are consulted first (exact > suffix > keyword,
 /// S16); a domain miss falls back to the IP rules.
+///
+/// **默认实现边界（spec §6 D2.3）**：仅当没有 `proxy.yaml` 时使用；存在
+/// `proxy.yaml` 时组合根必须注入 `nexus_proxy::DomainRuleEngine`。全仓
+/// `nexus_domain::RuleEngine` 实现只允许这两个（S16 E1 门禁）。
 pub struct SimpleRuleEngine {
     rules: Vec<Rule>,
     domain_rules: Vec<DomainRule>,
@@ -144,6 +148,11 @@ impl SimpleRuleEngine {
 
     /// Match domain rules only (S16 ordering). Returns `None` on miss.
     fn match_domain(&self, domain: &str) -> Option<RouteTarget> {
+        self.match_domain_explained(domain).map(|(t, _)| t)
+    }
+
+    /// Match domain rules and return the matched rule description.
+    fn match_domain_explained(&self, domain: &str) -> Option<(RouteTarget, RuleExplanation)> {
         let domain = normalize_domain(domain);
         if domain.is_empty() {
             return None;
@@ -151,7 +160,20 @@ impl SimpleRuleEngine {
         for rank in 0..=2u8 {
             for r in &self.domain_rules {
                 if r.matcher.rank() == rank && r.matcher.matches(&domain) {
-                    return Some(r.target.clone());
+                    let (kind, text) = match &r.matcher {
+                        DomainMatch::Exact(d) => ("DOMAIN", format!("DOMAIN,{d}")),
+                        DomainMatch::Suffix(d) => ("DOMAIN-SUFFIX", format!("DOMAIN-SUFFIX,{d}")),
+                        DomainMatch::Keyword(d) => {
+                            ("DOMAIN-KEYWORD", format!("DOMAIN-KEYWORD,{d}"))
+                        }
+                    };
+                    return Some((
+                        r.target.clone(),
+                        RuleExplanation {
+                            matched_rule: text,
+                            rule_kind: kind.to_string(),
+                        },
+                    ));
                 }
             }
         }
@@ -178,6 +200,30 @@ impl RuleEngine for SimpleRuleEngine {
             }
         }
         RouteTarget::Drop
+    }
+
+    fn explain(&self, req: &RouteRequest) -> (RouteTarget, Option<RuleExplanation>) {
+        if let Some(domain) = req.domain {
+            if let Some((target, explanation)) = self.match_domain_explained(domain) {
+                return (target, Some(explanation));
+            }
+        }
+        let dst = match parse_ipv4_dst(req.packet) {
+            Some(d) => d,
+            None => return (RouteTarget::Drop, None),
+        };
+        for r in &self.rules {
+            if r.cidr.contains(dst) {
+                return (
+                    r.target.clone(),
+                    Some(RuleExplanation {
+                        matched_rule: format!("IP-CIDR,{}", r.cidr),
+                        rule_kind: "IP-CIDR".to_string(),
+                    }),
+                );
+            }
+        }
+        (RouteTarget::Drop, None)
     }
 }
 
@@ -740,6 +786,27 @@ mod tests {
     }
 
     #[test]
+    fn simple_rule_engine_explain_returns_matched_rule() {
+        let e = SimpleRuleEngine::new(vec![Rule {
+            cidr: "1.2.3.0/24".parse().unwrap(),
+            target: RouteTarget::Drop,
+        }]);
+        let pkt = udp_packet([10, 0, 0, 1], [1, 2, 3, 4], 1234, 53);
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: None,
+            src_port: Some(1234),
+            dst_port: Some(53),
+            process_name: None,
+        };
+        let (target, explanation) = e.explain(&req);
+        assert_eq!(target, RouteTarget::Drop);
+        let explanation = explanation.expect("simple engine explains matches");
+        assert_eq!(explanation.rule_kind, "IP-CIDR");
+        assert!(explanation.matched_rule.contains("1.2.3.0/24"));
+    }
+
+    #[test]
     fn simple_rule_engine_first_match_wins() {
         let e = SimpleRuleEngine::new(vec![
             Rule {
@@ -759,14 +826,20 @@ mod tests {
         assert_eq!(
             e.decide(&RouteRequest {
                 packet: &p1,
-                domain: None
+                domain: None,
+                src_port: None,
+                dst_port: None,
+                process_name: None,
             }),
             RouteTarget::Drop
         );
         assert_eq!(
             e.decide(&RouteRequest {
                 packet: &p2,
-                domain: None
+                domain: None,
+                src_port: None,
+                dst_port: None,
+                process_name: None,
             }),
             RouteTarget::Egress {
                 peer: "self".to_string()
@@ -934,6 +1007,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("www.blocked.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -945,6 +1021,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("blocked.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -956,6 +1035,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("notblocked.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(e.decide(&req), RouteTarget::Drop);
     }
@@ -968,6 +1050,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("www.allowed.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -979,6 +1064,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -1009,6 +1097,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("www.ads.example.com"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -1020,6 +1111,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("cdn.ads.example.com"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -1031,6 +1125,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("ads-tracker.other.net"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(e.decide(&req), RouteTarget::Drop);
     }
@@ -1049,6 +1146,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("WWW.BLOCKED.EXAMPLE"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),

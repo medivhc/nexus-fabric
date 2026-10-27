@@ -391,6 +391,7 @@ pub struct ScenarioEvidence<'a> {
     pub message: &'a str,
     pub failure_signature: &'a Value,
     pub duration_ms: u64,
+    pub output: Option<&'a Value>,
 }
 
 /// 写单场景运行证据：`.evidence/scenario-<id>/summary.json`。
@@ -407,7 +408,7 @@ pub fn write_scenario_evidence(
     let dir = config.evidence_dir.join(&id);
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
 
-    let summary = json!({
+    let mut summary = json!({
         "schema_version": 1,
         "command": "scenario run",
         "scenario": ev.scenario_id,
@@ -418,6 +419,9 @@ pub fn write_scenario_evidence(
         "duration_ms": ev.duration_ms,
         "bindings": bindings.to_json(),
     });
+    if let Some(output) = ev.output {
+        summary["output"] = output.clone();
+    }
     write_json(&dir.join("summary.json"), &summary)?;
     write_json(
         &dir.join("metadata.json"),

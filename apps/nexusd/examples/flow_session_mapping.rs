@@ -8,8 +8,32 @@ use std::time::Duration;
 
 use nexus_flow_session::{FlowKey, IpProto};
 use nexus_projection::MockTun;
-use nexusd::dataplane::{Dataplane, DataplaneConfig};
+use nexusd::dataplane::{Dataplane, DataplaneConfig, ProductionChainDeps};
 use serde_json::json;
+
+/// 生产装配的 provider 源（同 `nexusd` main：`proxy.yaml` 出站 → Registry）。
+///
+/// Mesh 流不带 `egress_hint`：候选集不窄化，由 Policy + Core Planner 决定
+/// （PRODUCT §tun-ingress-session-chain）。
+const YAML_ONE_PROVIDER: &str = r#"schema_version: 1
+rules:
+  - tag: proxy-all
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: p1
+groups: []
+outbounds:
+  - tag: p1
+    kind: socks5
+    locator: 127.0.0.1:1
+"#;
+
+/// 注入生产 ChainDeps（必须在 `enable_flow_sessions*` 之前调用）。
+fn inject_production_chain(dp: &mut Dataplane) {
+    let deps = ProductionChainDeps::from_config(None, Some(YAML_ONE_PROVIDER)).expect("deps");
+    dp.set_production_chain_deps(deps);
+}
 
 fn main() {
     let output = run();
@@ -167,10 +191,12 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: true,
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp = Dataplane::new(Box::new(SharedTun(tun_clone)), config).expect("new");
     // 注入 mock N1 → establish 成功（会话可进 Active）。
     dp.set_n1_sender(std::sync::Arc::new(MockN1Sender));
+    inject_production_chain(&mut dp);
     dp.enable_flow_sessions();
 
     let tk = tcp_key();
@@ -296,8 +322,10 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: false,
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp3 = Dataplane::new(Box::new(SharedTun3(tun3_clone)), config3).expect("new3");
+    inject_production_chain(&mut dp3);
     dp3.enable_flow_sessions_with_establisher(Box::new(BlockingEstablisher));
     let udp_pkt = build_udp(uk.src_ip, uk.dst_ip, uk.src_port, uk.dst_port, b"udp-data");
     tun3.lock().unwrap().inject(udp_pkt.clone());
@@ -336,8 +364,10 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: false, // 无上游
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp2 = Dataplane::new(Box::new(SharedTun2(tun2_clone)), config2).expect("new2");
+    inject_production_chain(&mut dp2);
     dp2.enable_flow_sessions();
     tun2.lock().unwrap().inject(syn.clone());
     let _ = dp2.process_one();
@@ -362,7 +392,8 @@ fn run() -> serde_json::Value {
     // ---- 10/11. 空闲超时 → Draining → 0 ----
     dp.set_flow_idle_timeout(Duration::from_millis(1));
     std::thread::sleep(Duration::from_millis(5));
-    let drained = dp.flow_sweep_idle();
+    // S31：扫描点由 driver 传单调毫秒。
+    let drained = dp.flow_sweep_idle(dp.epoch_millis());
     let idle_timeout_drains = drained >= 1;
     // TearDown 信号在 flow_pump 中处理 → 再跑几轮 process_one 触发。
     for _ in 0..5 {

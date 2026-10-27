@@ -52,6 +52,17 @@ impl Cidr {
     }
 }
 
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            std::net::Ipv4Addr::from(self.network),
+            self.prefix
+        )
+    }
+}
+
 /// Parse `"10.0.0.0/8"` style CIDR notation.
 impl FromStr for Cidr {
     type Err = String;
@@ -114,6 +125,25 @@ fn parse_ipv4_addr(packet: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+/// 从 IPv4 TCP/UDP 头解析 `(src_port, dst_port)`；非 TCP/UDP 或截断时为 `(None, None)`。
+pub(crate) fn parse_packet_ports(packet: &[u8]) -> (Option<u16>, Option<u16>) {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return (None, None);
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if ihl < 20 || packet.len() < ihl + 4 {
+        return (None, None);
+    }
+    match packet[9] {
+        6 | 17 => {
+            let src = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+            let dst = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+            (Some(src), Some(dst))
+        }
+        _ => (None, None),
+    }
+}
+
 /// Unified routing decision point (lives in the projection layer, §6.4).
 ///
 /// Implementors classify a packet to a [`RouteTarget`]. The provided
@@ -129,9 +159,13 @@ pub trait Router: Send + Sync {
     /// Classify a raw IP packet. DNS-sniffing routers override this to
     /// fill `RouteRequest.domain` (and learn response mappings) first.
     fn route_packet(&self, packet: &[u8]) -> RouteTarget {
+        let (src_port, dst_port) = parse_packet_ports(packet);
         self.route(&RouteRequest {
             packet,
             domain: None,
+            src_port,
+            dst_port,
+            process_name: None,
         })
     }
 }
@@ -222,9 +256,13 @@ impl Router for UnifiedRouter {
                 }
             }
         }
+        let (src_port, dst_port) = parse_packet_ports(packet);
         let req = RouteRequest {
             packet,
             domain: domain.as_deref(),
+            src_port,
+            dst_port,
+            process_name: None,
         };
         self.route(&req)
     }
@@ -282,6 +320,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             r.route(&req),
@@ -298,6 +339,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         let a = r.route(&req);
         let b = r.route(&req);
@@ -319,12 +363,18 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(r.route(&req), RouteTarget::Drop);
         // Truncated.
         let req = RouteRequest {
             packet: &[0x45, 0x00],
             domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(r.route(&req), RouteTarget::Drop);
     }
@@ -502,5 +552,29 @@ mod tests {
         let q = dns_query_msg("www.blocked.example");
         let pkt = udp_payload_packet(40000, 53, &q);
         assert_eq!(IpOnly.route_packet(&pkt), RouteTarget::Drop);
+    }
+
+    #[test]
+    fn route_packet_fills_explicit_ports() {
+        type Ports = (Option<u16>, Option<u16>);
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Option<Ports>>>);
+        impl Router for Recorder {
+            fn route(&self, req: &RouteRequest) -> RouteTarget {
+                *self.0.lock().unwrap() = Some((req.src_port, req.dst_port));
+                RouteTarget::Drop
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let r = Recorder(seen.clone());
+        let pkt = udp_payload_packet(40000, 53, &[]);
+        assert_eq!(r.route_packet(&pkt), RouteTarget::Drop);
+        assert_eq!(*seen.lock().unwrap(), Some((Some(40000), Some(53))));
+
+        // Non-TCP/UDP protocol: ports stay None.
+        let mut icmp = [0u8; 20];
+        icmp[0] = 0x45;
+        icmp[9] = 1;
+        assert_eq!(r.route_packet(&icmp), RouteTarget::Drop);
+        assert_eq!(*seen.lock().unwrap(), Some((None, None)));
     }
 }

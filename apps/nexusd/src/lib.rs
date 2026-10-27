@@ -15,6 +15,7 @@ pub mod proxy_fwd;
 pub mod recovery;
 /// nexusd Workspace sync 传输适配（C2；fabric QUIC bi-stream）。
 pub mod sync_transport;
+pub mod tproxy_egress;
 /// nexusd Workspace 生产接线（C1；仅 Linux：FUSE 挂载）。
 #[cfg(target_os = "linux")]
 pub mod workspace;

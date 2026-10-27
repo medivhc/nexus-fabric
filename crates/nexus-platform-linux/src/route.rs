@@ -54,6 +54,10 @@ pub struct ApplyReport {
     pub dry_run: bool,
     /// 计划执行的操作描述（干跑时为计划，非干跑时为实际执行）。
     pub actions: Vec<String>,
+    /// 新加的排除路由数。
+    pub excludes_added: u32,
+    /// 是否新加默认路由。
+    pub default_route_added: bool,
 }
 
 /// 拍快照（只读 netlink，不修改状态）。

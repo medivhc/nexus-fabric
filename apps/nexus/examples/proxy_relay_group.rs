@@ -37,6 +37,7 @@ fn flow() -> FlowContext {
         resource: nexus_domain::ResourceId("internet".into()),
         destination: "example.in:443".into(),
         profile: String::new(),
+        egress_hint: None,
     }
 }
 

@@ -7,8 +7,20 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use nexus_domain::RouteTarget;
 use nexus_path::{CandidatePath, PathConfig, PathKind, PathManager, PathStats};
 use nexus_projection::classifier::{Classification, PacketClassifier};
+use nexus_projection::egress::{Rule, SimpleRuleEngine};
+
+/// 无代理配置默认规则：全部流量交给名为 `proxy` 的出站。
+fn default_rules() -> SimpleRuleEngine {
+    SimpleRuleEngine::new(vec![Rule {
+        cidr: "0.0.0.0/0".parse().unwrap(),
+        target: RouteTarget::Egress {
+            peer: "proxy".to_string(),
+        },
+    }])
+}
 
 fn v4_packet(dst: [u8; 4]) -> Vec<u8> {
     let mut pkt = vec![0u8; 20];
@@ -22,9 +34,9 @@ fn v4_packet(dst: [u8; 4]) -> Vec<u8> {
 fn cls_name(c: &Classification) -> &'static str {
     match c {
         Classification::Mesh { .. } => "Mesh",
-        Classification::Proxy => "Proxy",
+        Classification::Proxy { .. } => "Proxy",
         Classification::Direct => "Direct",
-        Classification::Drop => "Drop",
+        Classification::Drop { .. } => "Drop",
     }
 }
 
@@ -75,28 +87,31 @@ fn main() {
         },
     );
 
+    let rules = default_rules();
     let clf = PacketClassifier::new(
         vec!["10.0.0.0/8".parse().unwrap()],
         vec!["192.168.0.0/16".parse().unwrap()],
+        &rules,
+        false,
         &manager,
         &candidates,
         50.0, // degrade_threshold
     );
 
     // --- S29: 三路分类 ---
-    let mesh = clf.classify(&v4_packet([10, 1, 2, 3]));
+    let mesh = clf.classify(&v4_packet([10, 1, 2, 3]), None);
     let mesh_name = cls_name(&mesh);
     check(mesh_name == "Mesh");
 
-    let fake = clf.classify(&v4_packet([198, 18, 0, 5]));
+    let fake = clf.classify(&v4_packet([198, 18, 0, 5]), None);
     let fake_name = cls_name(&fake);
     check(fake_name == "Proxy");
 
-    let bypass = clf.classify(&v4_packet([192, 168, 1, 1]));
+    let bypass = clf.classify(&v4_packet([192, 168, 1, 1]), None);
     let bypass_name = cls_name(&bypass);
     check(bypass_name == "Direct");
 
-    let inet = clf.classify(&v4_packet([8, 8, 8, 8]));
+    let inet = clf.classify(&v4_packet([8, 8, 8, 8]), None);
     let inet_name = cls_name(&inet);
     check(inet_name == "Proxy");
 
@@ -119,8 +134,16 @@ fn main() {
 
     // 全 unknown 回落。
     let m2 = PathManager::new(PathConfig::default());
-    let clf2 = PacketClassifier::new(vec!["10.0.0.0/8".parse().unwrap()], vec![], &m2, &[], 50.0);
-    let fallback = clf2.classify(&v4_packet([10, 9, 9, 9]));
+    let clf2 = PacketClassifier::new(
+        vec!["10.0.0.0/8".parse().unwrap()],
+        vec![],
+        &rules,
+        false,
+        &m2,
+        &[],
+        50.0,
+    );
+    let fallback = clf2.classify(&v4_packet([10, 9, 9, 9]), None);
     let unknown_fallback = matches!(
         fallback,
         Classification::Mesh {
@@ -144,7 +167,7 @@ fn main() {
     check(proxy_dst == "198.18.0.5");
 
     // --- Drop ---
-    let drop = clf.classify(&[]);
+    let drop = clf.classify(&[], None);
     let drop_name = cls_name(&drop);
     check(drop_name == "Drop");
 

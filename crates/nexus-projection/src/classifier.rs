@@ -1,6 +1,6 @@
 //! 统一包分类器（S29/S30/S31）。
 //!
-//! 单个 TUN 的唯一包分类入口（文档 §6/§11.2 数据面位置）：
+//! TUN 前端分类器（TPROXY 前端使用 TransparentPipeline，不经过本类型）：
 //!
 //! - S29：分类顺序 mesh CIDR → fake-IP → bypass → 规则引擎；
 //! - S30：mesh 命中时用 `boost::select_best` 做 EWMA 选路（只读）；
@@ -10,16 +10,37 @@
 
 use std::net::Ipv4Addr;
 
-use nexus_domain::{FlowContext, FlowOrigin, ResourceId};
+use nexus_domain::{
+    FlowContext, FlowOrigin, ResourceId, RouteRequest, RouteTarget, RuleEngine, RuleExplanation,
+};
 use nexus_path::{CandidatePath, PathManager};
 
 use crate::boost::select_best;
-use crate::routing::{Cidr, parse_ipv4_dst};
+use crate::routing::{Cidr, parse_ipv4_dst, parse_packet_ports};
 
 /// Fake-IP 池 CIDR（nexus-dns S-unified）：`198.18.0.0/15`。
 fn fake_ip_cidr() -> Cidr {
     // 198.18.0.0 = 0xC6120000, /15
     Cidr::new(0xC612_0000, 15).expect("hardcoded fake-ip CIDR is valid")
+}
+
+/// 丢弃原因（spec §9.6；调用方按原因计数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// 非 IPv4 包。
+    NotIpv4,
+    /// IPv4 头截断。
+    Truncated,
+    /// 分片包（需重组，前端不支持）。
+    Fragmented,
+    /// 非 TCP/UDP 协议。
+    UnsupportedProtocol,
+    /// 规则引擎判定 Drop（REJECT）。
+    RuleRejected,
+    /// 规则引擎运行期错误。
+    RuleError,
+    /// 规则引擎产出 MeshPeer，但本前端不支持 mesh。
+    MeshUnsupported,
 }
 
 /// 分类结果（S29）。
@@ -32,15 +53,21 @@ pub enum Classification {
         path: Option<std::net::SocketAddr>,
         degraded: bool,
     },
-    /// 代理：送 proxy 规则引擎。
-    Proxy,
-    /// 直连：bypass/白名单。
+    /// 代理：送 proxy 规则引擎，携带规则选定的出站 tag。
+    Proxy {
+        /// 规则选定的出站 tag。
+        outbound: String,
+    },
+    /// 直连：bypass/白名单或规则 DIRECT。
     Direct,
-    /// 丢弃：非 IPv4/截断包等（S12 可见性由调用方负责）。
-    Drop,
+    /// 丢弃：规则 REJECT / 不支持的类型（调用方计数）。
+    Drop {
+        /// 丢弃原因。
+        reason: DropReason,
+    },
 }
 
-/// 统一包分类器：单个 TUN 的唯一分类入口。
+/// 统一包分类器：TUN 前端的分类器（TPROXY 走 TransparentPipeline 的决策路径）。
 ///
 /// - `manager` / `candidates` 仅用于 S30 的只读 EWMA 选路；
 ///   不持有写权限（single writer 仍在 `nexus-path`）。
@@ -50,6 +77,8 @@ pub struct PacketClassifier<'a> {
     manager: &'a PathManager,
     candidates: &'a [CandidatePath],
     degrade_threshold: f64,
+    rules: &'a dyn RuleEngine,
+    fake_ip_enabled: bool,
 }
 
 impl<'a> PacketClassifier<'a> {
@@ -62,6 +91,8 @@ impl<'a> PacketClassifier<'a> {
     pub fn new(
         mesh_cidrs: Vec<Cidr>,
         bypass_cidrs: Vec<Cidr>,
+        rules: &'a dyn RuleEngine,
+        fake_ip_enabled: bool,
         manager: &'a PathManager,
         candidates: &'a [CandidatePath],
         degrade_threshold: f64,
@@ -72,33 +103,92 @@ impl<'a> PacketClassifier<'a> {
             manager,
             candidates,
             degrade_threshold,
+            rules,
+            fake_ip_enabled,
         }
     }
 
-    /// 分类一个 IP 包（S29）。
+    /// 分类一个 IP 包（S29 / spec §9.6）。
     ///
-    /// 顺序：mesh CIDR → fake-IP → bypass → 规则引擎（此处回落 `Proxy`，
-    /// 完整规则引擎由调用方在外层接入；见 S29-4）。
-    /// 非 IPv4 或截断包 → `Drop`。
-    pub fn classify(&self, packet: &[u8]) -> Classification {
+    /// 顺序：mesh CIDR → fake-IP（启用时）→ bypass → 注入的规则引擎。
+    /// 非 IPv4 → `Drop { NotIpv4 }`；IPv4 头截断 → `Drop { Truncated }`。
+    pub fn classify(&self, packet: &[u8], domain: Option<&str>) -> Classification {
+        self.classify_explained(packet, domain).0
+    }
+
+    /// 与 [`Self::classify`] 完全相同的决策，额外透出规则命中说明。
+    ///
+    /// 调用方（TUN 前端事件发射点，spec §11.2 `matched_rule=`）需要决策出处；
+    /// mesh/bypass 快路径不经规则引擎 → `None`。规则引擎每次决策只调用一次
+    /// （`explain` 一次返回目标与说明，不额外再跑 `decide`）。
+    pub fn classify_explained(
+        &self,
+        packet: &[u8],
+        domain: Option<&str>,
+    ) -> (Classification, Option<RuleExplanation>) {
+        if packet.is_empty() || packet[0] >> 4 != 4 {
+            return (
+                Classification::Drop {
+                    reason: DropReason::NotIpv4,
+                },
+                None,
+            );
+        }
         let dst = match parse_ipv4_dst(packet) {
             Some(d) => d,
-            None => return Classification::Drop,
+            None => {
+                return (
+                    Classification::Drop {
+                        reason: DropReason::Truncated,
+                    },
+                    None,
+                );
+            }
         };
         // 1. mesh fast path（S10）：规则引擎不介入。
         if self.mesh_cidrs.iter().any(|c| c.contains(dst)) {
-            return self.classify_mesh();
+            return (self.classify_mesh(), None);
         }
-        // 2. fake-IP → proxy。
-        if fake_ip_cidr().contains(dst) {
-            return Classification::Proxy;
+        // 2. fake-IP：本 run 不启用；启用时仍需经规则引擎（不吞域名规则）。
+        if self.fake_ip_enabled && fake_ip_cidr().contains(dst) {
+            return self.classify_rules(packet, domain);
         }
         // 3. bypass/白名单 → 直连。
         if self.bypass_cidrs.iter().any(|c| c.contains(dst)) {
-            return Classification::Direct;
+            return (Classification::Direct, None);
         }
-        // 4. 其余 → 规则引擎（本 MVP 回落 Proxy；完整引擎由调用方接入）。
-        Classification::Proxy
+        // 4. 其余 → 注入的规则引擎（TUN 与 TPROXY 共用同一实现）。
+        self.classify_rules(packet, domain)
+    }
+
+    /// 委派规则引擎并把 `RouteTarget` 映射为分类结果（spec §9.6）。
+    ///
+    /// 返回规则命中说明（无命中时规则引擎给 `None`），供事件发射点透传。
+    fn classify_rules(
+        &self,
+        packet: &[u8],
+        domain: Option<&str>,
+    ) -> (Classification, Option<RuleExplanation>) {
+        let (src_port, dst_port) = parse_packet_ports(packet);
+        let req = RouteRequest {
+            packet,
+            domain,
+            src_port,
+            dst_port,
+            process_name: None,
+        };
+        let (target, explanation) = self.rules.explain(&req);
+        let classification = match target {
+            RouteTarget::Egress { peer } if peer == "self" => Classification::Direct,
+            RouteTarget::Egress { peer } => Classification::Proxy { outbound: peer },
+            RouteTarget::Drop => Classification::Drop {
+                reason: DropReason::RuleRejected,
+            },
+            RouteTarget::MeshPeer { .. } => Classification::Drop {
+                reason: DropReason::MeshUnsupported,
+            },
+        };
+        (classification, explanation)
     }
 
     /// mesh 命中的 EWMA 选路（S30）。
@@ -143,17 +233,20 @@ impl<'a> PacketClassifier<'a> {
         let destination = domain
             .map(|d| d.to_string())
             .unwrap_or_else(|| dst_ip.to_string());
-        let resource = match classification {
-            Classification::Mesh { .. } => ResourceId("mesh".to_string()),
-            Classification::Proxy => ResourceId("proxy".to_string()),
-            Classification::Direct => ResourceId("direct".to_string()),
-            Classification::Drop => return None,
+        let (resource, egress_hint) = match classification {
+            Classification::Mesh { .. } => (ResourceId("mesh".to_string()), None),
+            Classification::Proxy { outbound } => {
+                (ResourceId("proxy".to_string()), Some(outbound.clone()))
+            }
+            Classification::Direct => (ResourceId("direct".to_string()), None),
+            Classification::Drop { .. } => return None,
         };
         Some(FlowContext {
             origin: FlowOrigin::VirtualPacketInterface,
             resource,
             destination,
             profile: profile.to_string(),
+            egress_hint,
         })
     }
 }
@@ -172,6 +265,19 @@ mod tests {
         pkt
     }
 
+    fn test_rules() -> &'static crate::egress::SimpleRuleEngine {
+        static RULES: std::sync::OnceLock<crate::egress::SimpleRuleEngine> =
+            std::sync::OnceLock::new();
+        RULES.get_or_init(|| {
+            crate::egress::SimpleRuleEngine::new(vec![crate::egress::Rule {
+                cidr: "0.0.0.0/0".parse().unwrap(),
+                target: RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                },
+            }])
+        })
+    }
+
     fn classifier<'a>(
         manager: &'a PathManager,
         candidates: &'a [CandidatePath],
@@ -179,6 +285,8 @@ mod tests {
         PacketClassifier::new(
             vec!["10.0.0.0/8".parse().unwrap()],
             vec!["192.168.0.0/16".parse().unwrap()],
+            test_rules(),
+            false,
             manager,
             candidates,
             50.0,
@@ -191,7 +299,7 @@ mod tests {
         let c = classifier(&m, &[]);
         // 全 unknown → Mesh { path: None }，不阻塞。
         assert_eq!(
-            c.classify(&v4_packet([10, 1, 2, 3])),
+            c.classify(&v4_packet([10, 1, 2, 3]), None),
             Classification::Mesh {
                 path: None,
                 degraded: false
@@ -203,19 +311,26 @@ mod tests {
     fn s29_fake_ip_to_proxy() {
         let m = PathManager::new(Default::default());
         let c = classifier(&m, &[]);
+        // fake_ip_enabled=false：198.18/15 不特殊处理，按规则走 Proxy。
         assert_eq!(
-            c.classify(&v4_packet([198, 18, 0, 5])),
-            Classification::Proxy
+            c.classify(&v4_packet([198, 18, 0, 5]), None),
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
         );
         // 198.19.x.x 也在 /15 内。
         assert_eq!(
-            c.classify(&v4_packet([198, 19, 1, 1])),
-            Classification::Proxy
+            c.classify(&v4_packet([198, 19, 1, 1]), None),
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
         );
-        // 198.16 不在 /15 内 → 回落 Proxy（规则引擎）。
+        // 198.16 不在 /15 内 → 规则引擎。
         assert_eq!(
-            c.classify(&v4_packet([198, 16, 0, 1])),
-            Classification::Proxy
+            c.classify(&v4_packet([198, 16, 0, 1]), None),
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
         );
     }
 
@@ -224,17 +339,98 @@ mod tests {
         let m = PathManager::new(Default::default());
         let c = classifier(&m, &[]);
         assert_eq!(
-            c.classify(&v4_packet([192, 168, 1, 1])),
+            c.classify(&v4_packet([192, 168, 1, 1]), None),
             Classification::Direct
         );
+    }
+
+    /// P6-c：`classify_explained` 与 `classify` 同一决策，额外透出规则说明；
+    /// mesh/bypass 快路径不经规则引擎 → `None`。
+    #[test]
+    fn s29_classify_explained_surfaces_rule_provenance() {
+        let m = PathManager::new(Default::default());
+        let c = classifier(&m, &[]);
+
+        let proxy_pkt = v4_packet([1, 2, 3, 4]);
+        let (classification, explanation) = c.classify_explained(&proxy_pkt, None);
+        assert_eq!(classification, c.classify(&proxy_pkt, None));
+        assert_eq!(
+            classification,
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
+        );
+        let explanation = explanation.expect("rule hit carries an explanation");
+        assert_eq!(explanation.matched_rule, "IP-CIDR,0.0.0.0/0");
+
+        let (mesh, explanation) = c.classify_explained(&v4_packet([10, 1, 2, 3]), None);
+        assert!(matches!(mesh, Classification::Mesh { .. }));
+        assert!(
+            explanation.is_none(),
+            "mesh fast path skips the rule engine"
+        );
+
+        let (direct, explanation) = c.classify_explained(&v4_packet([192, 168, 1, 1]), None);
+        assert_eq!(direct, Classification::Direct);
+        assert!(
+            explanation.is_none(),
+            "bypass fast path skips the rule engine"
+        );
+    }
+
+    /// P6-c：取说明不额外再跑一遍规则引擎（每次决策一次引擎调用）。
+    #[test]
+    fn s29_classify_explained_calls_rule_engine_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl RuleEngine for Counting {
+            fn decide(&self, _req: &RouteRequest<'_>) -> RouteTarget {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rules = Counting(Arc::clone(&calls));
+        let m = PathManager::new(Default::default());
+        let c = PacketClassifier::new(vec![], vec![], &rules, false, &m, &[], 0.0);
+        let (classification, explanation) = c.classify_explained(&v4_packet([1, 2, 3, 4]), None);
+        assert_eq!(
+            classification,
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one engine call per decision"
+        );
+        // 默认 `explain` 不提供说明，不得因此再跑一次 `decide`。
+        assert!(explanation.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn s29_non_ipv4_drop() {
         let m = PathManager::new(Default::default());
         let c = classifier(&m, &[]);
-        assert_eq!(c.classify(&[]), Classification::Drop);
-        assert_eq!(c.classify(&[0x60, 0, 0, 0]), Classification::Drop); // IPv6
+        assert_eq!(
+            c.classify(&[], None),
+            Classification::Drop {
+                reason: DropReason::NotIpv4
+            }
+        );
+        assert_eq!(
+            c.classify(&[0x60, 0, 0, 0], None),
+            Classification::Drop {
+                reason: DropReason::NotIpv4
+            }
+        ); // IPv6
     }
 
     #[test]
@@ -242,7 +438,7 @@ mod tests {
         let m = PathManager::new(Default::default());
         let c = classifier(&m, &[]);
         let pkt = v4_packet([10, 9, 9, 9]);
-        assert_eq!(c.classify(&pkt), c.classify(&pkt));
+        assert_eq!(c.classify(&pkt, None), c.classify(&pkt, None));
     }
 
     #[test]
@@ -250,7 +446,7 @@ mod tests {
         let m = PathManager::new(Default::default());
         let c = classifier(&m, &[]);
         let pkt = v4_packet([10, 1, 2, 3]);
-        let cl = c.classify(&pkt);
+        let cl = c.classify(&pkt, None);
         let ctx = c.to_flow_context(&cl, &pkt, None, "default").unwrap();
         assert_eq!(ctx.origin, FlowOrigin::VirtualPacketInterface);
         assert_eq!(ctx.destination, "10.1.2.3");
@@ -259,7 +455,7 @@ mod tests {
 
         // domain 透传。
         let pkt2 = v4_packet([198, 18, 0, 5]);
-        let cl2 = c.classify(&pkt2);
+        let cl2 = c.classify(&pkt2, None);
         let ctx2 = c
             .to_flow_context(&cl2, &pkt2, Some("example.com"), "p")
             .unwrap();
@@ -267,7 +463,14 @@ mod tests {
         assert_eq!(ctx2.resource, ResourceId("proxy".to_string()));
 
         // Drop 不生成。
-        let ctx3 = c.to_flow_context(&Classification::Drop, &[], None, "p");
+        let ctx3 = c.to_flow_context(
+            &Classification::Drop {
+                reason: DropReason::RuleRejected,
+            },
+            &[],
+            None,
+            "p",
+        );
         assert!(ctx3.is_none());
     }
 
@@ -292,7 +495,7 @@ mod tests {
         // 无样本时全 unknown → Mesh { path: None }，不阻塞。
         let c = classifier(&m, &candidates);
         assert_eq!(
-            c.classify(&v4_packet([10, 1, 2, 3])),
+            c.classify(&v4_packet([10, 1, 2, 3]), None),
             Classification::Mesh {
                 path: None,
                 degraded: false
@@ -320,7 +523,7 @@ mod tests {
         // EWMA 选出 c0。
         let c = classifier(&m, &candidates);
         assert_eq!(
-            c.classify(&v4_packet([10, 1, 2, 3])),
+            c.classify(&v4_packet([10, 1, 2, 3]), None),
             Classification::Mesh {
                 path: Some(c0.remote_addr),
                 degraded: false,
@@ -357,16 +560,96 @@ mod tests {
         let c = PacketClassifier::new(
             vec!["10.0.0.0/8".parse().unwrap()],
             vec![],
+            test_rules(),
+            false,
             &m,
             &candidates,
             1e9, // 极高阈值，任何真实分数都低于它
         );
-        match c.classify(&v4_packet([10, 1, 2, 3])) {
+        match c.classify(&v4_packet([10, 1, 2, 3]), None) {
             Classification::Mesh {
                 path: Some(p),
                 degraded: true,
             } => assert_eq!(p, c0.remote_addr),
             other => panic!("expected degraded Mesh, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn s17_rule_engine_direct_proxy_reject() {
+        use crate::egress::{Rule, SimpleRuleEngine};
+        let m = PathManager::new(Default::default());
+        let rules = SimpleRuleEngine::new(vec![
+            Rule {
+                cidr: "1.2.3.0/24".parse().unwrap(),
+                target: RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                },
+            },
+            Rule {
+                cidr: "4.4.4.0/24".parse().unwrap(),
+                target: RouteTarget::Egress {
+                    peer: "self".to_string(),
+                },
+            },
+            Rule {
+                cidr: "6.6.6.0/24".parse().unwrap(),
+                target: RouteTarget::Drop,
+            },
+        ]);
+        let c = PacketClassifier::new(vec![], vec![], &rules, false, &m, &[], 0.0);
+        assert_eq!(
+            c.classify(&v4_packet([1, 2, 3, 4]), None),
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
+        );
+        assert_eq!(
+            c.classify(&v4_packet([4, 4, 4, 4]), None),
+            Classification::Direct
+        );
+        assert_eq!(
+            c.classify(&v4_packet([6, 6, 6, 6]), None),
+            Classification::Drop {
+                reason: DropReason::RuleRejected
+            }
+        );
+    }
+
+    #[test]
+    fn s17_mesh_peer_target_is_unsupported_drop() {
+        struct MeshEngine;
+        impl RuleEngine for MeshEngine {
+            fn decide(&self, _req: &RouteRequest<'_>) -> RouteTarget {
+                RouteTarget::MeshPeer {
+                    peer: "10.0.0.9".to_string(),
+                }
+            }
+        }
+        let m = PathManager::new(Default::default());
+        let c = PacketClassifier::new(vec![], vec![], &MeshEngine, false, &m, &[], 0.0);
+        assert_eq!(
+            c.classify(&v4_packet([8, 8, 8, 8]), None),
+            Classification::Drop {
+                reason: DropReason::MeshUnsupported
+            }
+        );
+    }
+
+    #[test]
+    fn s17_fake_ip_disabled_does_not_swallow_pool() {
+        use crate::egress::{Rule, SimpleRuleEngine};
+        let m = PathManager::new(Default::default());
+        let rules = SimpleRuleEngine::new(vec![Rule {
+            cidr: "198.18.0.0/15".parse().unwrap(),
+            target: RouteTarget::Drop,
+        }]);
+        let c = PacketClassifier::new(vec![], vec![], &rules, false, &m, &[], 0.0);
+        assert_eq!(
+            c.classify(&v4_packet([198, 18, 0, 5]), None),
+            Classification::Drop {
+                reason: DropReason::RuleRejected
+            }
+        );
     }
 }

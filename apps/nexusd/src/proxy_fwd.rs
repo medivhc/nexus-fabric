@@ -10,13 +10,14 @@
 //! 不直接持有/写 TUN。
 
 pub mod ss_std;
-mod tcp_relay;
-mod udp_relay;
+pub(crate) mod tcp_relay;
+pub(crate) mod udp_relay;
 
 pub use udp_relay::build_udp_reply;
 
 use std::net::{IpAddr, SocketAddr};
 
+use nexus_projection::tcp::TcpTerminator;
 use nexus_proxy_config::{OutboundConfig, OutboundKind};
 
 /// 代理 dial 配置（P3 选路结果）。
@@ -45,14 +46,21 @@ pub enum ProxyDialConfig {
 /// Proxy 转发统计（P4 可观测；dataplane 合并到 DataplaneStats）。
 #[derive(Debug, Default, Clone)]
 pub struct ProxyFwdStats {
+    /// 进入终结器的 Proxy TCP 流数（SYN 事件，AC-G1-TUN-02）。
+    pub tcp_streams: u64,
     pub tcp_dials_ok: u64,
     pub tcp_dials_failed: u64,
+    /// 拨号窗口期内已从 TUN 接收、但最终未写入上游的字节数（P7）：
+    /// 拨号失败、RST 先到、缓冲超限、流已终止后迟到的 Data 都计入。
+    pub tcp_dial_buffer_dropped_bytes: u64,
+    /// 拨号窗口期缓冲超限而被 RST 的流数（P7）。
+    pub tcp_dial_buffer_overflow_resets: u64,
     pub udp_sent: u64,
     pub udp_send_failed: u64,
 }
 
 /// 从 `OutboundConfig` 解析 dial 配置；不支持的 kind 返回 None（P3 跳过）。
-fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
+pub(crate) fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
     let locator = o.locator.as_deref().filter(|s| !s.is_empty())?;
     let server: SocketAddr = locator.parse().ok()?;
     match o.kind {
@@ -105,81 +113,255 @@ pub fn select_outbound(proxy_yaml: &str) -> Option<ProxyDialConfig> {
     config.outbounds.iter().find_map(dial_config_from_outbound)
 }
 
+/// ProxyEngine 结构化错误（spec §8.9 / §9.10）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyEngineError {
+    /// 规则选出的 tag 不在引擎出站表。
+    UnknownOutbound { tag: String },
+    /// 出站 kind 无对应拨号器。
+    UnsupportedOutboundKind { tag: String, kind: String },
+    /// 代理服务器拒绝/超时。
+    DialFailed { tag: String, reason: String },
+    /// 非 TCP/UDP 包。
+    UnsupportedProtocol { ip_proto: u8 },
+}
+
+impl std::fmt::Display for ProxyEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownOutbound { tag } => write!(f, "PROXY_UNKNOWN_OUTBOUND: {tag}"),
+            Self::UnsupportedOutboundKind { tag, kind } => {
+                write!(f, "PROXY_UNSUPPORTED_OUTBOUND: {tag} ({kind})")
+            }
+            Self::DialFailed { tag, reason } => {
+                write!(f, "PROXY_DIAL_FAILED: {tag}: {reason}")
+            }
+            Self::UnsupportedProtocol { ip_proto } => {
+                write!(f, "PROXY_UNSUPPORTED_PROTOCOL: {ip_proto}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProxyEngineError {}
+
+/// 异步流事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyStreamEvent {
+    /// 本地 SYN 已进入终结器。
+    Syn { stream_id: u32 },
+    /// 代理拨号成功。
+    Established { stream_id: u32 },
+    /// 关闭。
+    Closed { stream_id: u32, reset: bool },
+    /// 失败。
+    Failed { stream_id: u32, reason: String },
+}
+
+/// `handle_packet` 结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyHandleResult {
+    /// 待写回 TUN 的包。
+    pub tun_packets: Vec<Vec<u8>>,
+    /// 是否真实转发（UDP 发送成功）。
+    pub forwarded: bool,
+    /// 本次使用的出站 tag。
+    pub outbound_tag: String,
+    /// 同步产生的流事件。
+    pub stream_events: Vec<ProxyStreamEvent>,
+}
+
+/// `poll()` 结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyPollResult {
+    /// 待写回 TUN 的包。
+    pub tun_packets: Vec<Vec<u8>>,
+    /// 异步流事件。
+    pub stream_events: Vec<ProxyStreamEvent>,
+}
+
 /// Proxy 转发引擎（dataplane 拥有）。
+///
+/// TCP 共享单个 `TcpTerminator`（§9.10.1 的两个实例之一），按规则 tag 选拨号器；
+/// UDP 每个 tag 一个转发器（不新增终结器）。
 pub struct ProxyEngine {
+    /// TCP 共享终结器（AC-G3b-03：实例只允许两个——ProxyEngine 与 Dataplane）。
+    terminator: TcpTerminator,
     tcp: tcp_relay::TcpForwarder,
-    udp: udp_relay::UdpForwarder,
+    udp: std::collections::HashMap<String, udp_relay::UdpForwarder>,
+    outbounds: std::collections::HashMap<String, ProxyDialConfig>,
+    unsupported: std::collections::HashMap<String, String>,
 }
 
 impl ProxyEngine {
-    /// 从 proxy.yaml 构造；无可用出站返回 None（调用方走计数降级）。
-    pub fn new(proxy_yaml: &str) -> Option<Self> {
-        let dial_config = select_outbound(proxy_yaml)?;
-        Some(Self {
-            tcp: tcp_relay::TcpForwarder::new(dial_config.clone()),
-            udp: udp_relay::UdpForwarder::new(dial_config),
+    /// 从 `proxy.yaml` 构造；无可拨号出站或配置非法 → Err。
+    ///
+    /// # Errors
+    ///
+    /// 配置解析失败 → `UnsupportedOutboundKind`；无代理出站 → `UnknownOutbound`。
+    pub fn new(proxy_yaml: &str) -> Result<Self, ProxyEngineError> {
+        let config = nexus_proxy_config::parse(proxy_yaml).map_err(|e| {
+            ProxyEngineError::UnsupportedOutboundKind {
+                tag: "<config>".to_string(),
+                kind: e.to_string(),
+            }
+        })?;
+        let mut outbounds = std::collections::HashMap::new();
+        let mut unsupported = std::collections::HashMap::new();
+        for outbound in &config.outbounds {
+            match dial_config_from_outbound(outbound) {
+                Some(cfg) => {
+                    outbounds.insert(outbound.tag.clone(), cfg);
+                }
+                None => {
+                    unsupported.insert(outbound.tag.clone(), outbound.kind.as_str().to_string());
+                }
+            }
+        }
+        if outbounds.is_empty() {
+            return Err(ProxyEngineError::UnknownOutbound {
+                tag: "<no-proxy-outbound>".to_string(),
+            });
+        }
+        Ok(Self {
+            terminator: TcpTerminator::new(),
+            tcp: tcp_relay::TcpForwarder::new(outbounds.clone()),
+            udp: std::collections::HashMap::new(),
+            outbounds,
+            unsupported,
         })
     }
 
-    /// 处理一个 proxy 分类的包；返回 (待写回 TUN 的包, 是否真实转发)。
+    /// 处理一个 proxy 分类的包（按规则 tag 选路）。
     ///
-    /// - TCP → TcpForwarder；UDP → UdpForwarder；其他 → (vec![], false)。
-    /// - 返回的包由 dataplane 写回 TUN（D1 不变量）。
-    /// - bool 语义（P1）：UDP 返回真实发送结果；TCP 恒返回 false——
-    ///   dial 是异步的，SYN 到达时转发尚未确认，TCP 的真实计数由
-    ///   dataplane 经 `stats().tcp_dials_ok/failed` 的增量驱动。
-    pub fn handle_packet(&mut self, packet: &[u8]) -> (Vec<Vec<u8>>, bool) {
+    /// # Errors
+    ///
+    /// tag 不存在/不支持、非 TCP-UDP。
+    pub fn handle_packet(
+        &mut self,
+        packet: &[u8],
+        outbound_tag: &str,
+    ) -> Result<ProxyHandleResult, ProxyEngineError> {
         if packet.len() < 20 {
-            return (vec![], false);
+            return Err(ProxyEngineError::UnsupportedProtocol { ip_proto: 0 });
         }
-        match packet[9] {
-            6 => {
-                // TCP
-                let tun_pkts = self.tcp.handle_packet(packet);
-                // P1：dial 是异步的（worker 线程），SYN 到达时转发尚未确认，
-                // 此时返回 false；真实计数由 dataplane 经
-                // engine.stats().tcp_dials_ok/failed 的增量驱动。
-                (tun_pkts, false)
-            }
-            17 => {
-                // UDP（DNS 已在 D3 短路，这里的 UDP 是业务流量）。
-                let ok = self.udp.handle_packet(packet);
-                (vec![], ok)
-            }
-            _ => (vec![], false),
+        let proto = packet[9];
+        if proto != 6 && proto != 17 {
+            return Err(ProxyEngineError::UnsupportedProtocol { ip_proto: proto });
         }
+        if let Some(kind) = self.unsupported.get(outbound_tag) {
+            return Err(ProxyEngineError::UnsupportedOutboundKind {
+                tag: outbound_tag.to_string(),
+                kind: kind.clone(),
+            });
+        }
+        let Some(config) = self.outbounds.get(outbound_tag).cloned() else {
+            return Err(ProxyEngineError::UnknownOutbound {
+                tag: outbound_tag.to_string(),
+            });
+        };
+        if proto == 6 {
+            let tun_packets = self
+                .tcp
+                .handle_packet(&mut self.terminator, packet, outbound_tag);
+            let stream_events = self
+                .tcp
+                .take_failures()
+                .into_iter()
+                .map(|f| ProxyStreamEvent::Failed {
+                    stream_id: f.stream_id,
+                    reason: f.reason,
+                })
+                .collect();
+            return Ok(ProxyHandleResult {
+                tun_packets,
+                forwarded: false,
+                outbound_tag: outbound_tag.to_string(),
+                stream_events,
+            });
+        }
+        let forwarder = self
+            .udp
+            .entry(outbound_tag.to_string())
+            .or_insert_with(|| udp_relay::UdpForwarder::new(config));
+        let forwarded = forwarder.handle_packet(packet);
+        Ok(ProxyHandleResult {
+            tun_packets: Vec::new(),
+            forwarded,
+            outbound_tag: outbound_tag.to_string(),
+            stream_events: Vec::new(),
+        })
     }
 
-    /// 定期驱动（dataplane 每轮调用）；返回待写回 TUN 的包。
-    pub fn poll(&mut self) -> Vec<Vec<u8>> {
-        let mut out = self.tcp.poll();
-        // UDP 回包 → 重构 IP 包。
-        for inbound in self.udp.drain_inbound() {
-            if let Some(local) = self.udp.lookup_local(&inbound.remote) {
-                if let Some(pkt) = build_udp_reply(local, inbound.remote, &inbound.payload) {
-                    out.push(pkt);
+    /// 定期驱动（dataplane 每轮调用）；返回待写回 TUN 的包与流事件。
+    pub fn poll(&mut self) -> ProxyPollResult {
+        let tun_packets = self.tcp.poll(&mut self.terminator);
+        let stream_events = self
+            .tcp
+            .take_failures()
+            .into_iter()
+            .map(|f| ProxyStreamEvent::Failed {
+                stream_id: f.stream_id,
+                reason: f.reason,
+            })
+            .collect();
+        let mut out = ProxyPollResult {
+            tun_packets,
+            stream_events,
+        };
+        for forwarder in self.udp.values_mut() {
+            for inbound in forwarder.drain_inbound() {
+                if let Some(local) = forwarder.lookup_local(&inbound.remote) {
+                    if let Some(pkt) = build_udp_reply(local, inbound.remote, &inbound.payload) {
+                        out.tun_packets.push(pkt);
+                    }
                 }
             }
         }
         out
     }
 
+    /// 写回 TUN 前的 fixup（P6-a 归属：Proxy 流归本引擎的终结器）。
+    ///
+    /// Proxy TCP 连接的 orig_dst 只登记在 `ProxyEngine.terminator`（§9.10.1
+    /// 两个终结器之一），dataplane 自己的连接表查不到它们；因此这条路径的
+    /// `fixup_tun_packet` 必须在这里执行，不能借道
+    /// `Dataplane::write_tun_packets`。非 TCP 包（UDP 回包由
+    /// `build_udp_reply` 合成，源地址已是原始目的）原样透传。
+    ///
+    /// 返回 (fixup 后的可写包, 丢弃数)；TCP 包查不到连接 → 丢弃计数
+    /// （与 `Dataplane::write_tun_packets` 同语义）。
+    pub fn fixup_tun_packets(&self, pkts: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, u64) {
+        let mut ready = Vec::with_capacity(pkts.len());
+        let mut dropped = 0u64;
+        for pkt in pkts {
+            let is_tcp = pkt.len() >= 20 && pkt[9] == 6;
+            if !is_tcp {
+                ready.push(pkt);
+                continue;
+            }
+            match self.terminator.fixup_tun_packet(&pkt) {
+                Some(fixed) => ready.push(fixed),
+                None => dropped += 1,
+            }
+        }
+        (ready, dropped)
+    }
+
     /// 合并统计。
     pub fn stats(&self) -> ProxyFwdStats {
-        let t = self.tcp.stats();
-        let u = self.udp.stats();
-        ProxyFwdStats {
-            tcp_dials_ok: t.tcp_dials_ok,
-            tcp_dials_failed: t.tcp_dials_failed,
-            udp_sent: u.udp_sent,
-            udp_send_failed: u.udp_send_failed,
+        let mut stats = self.tcp.stats();
+        for forwarder in self.udp.values() {
+            let u = forwarder.stats();
+            stats.udp_sent += u.udp_sent;
+            stats.udp_send_failed += u.udp_send_failed;
         }
+        stats
     }
 
     /// 是否有可用 dial 配置（P3 可观测）。
-    #[allow(dead_code)]
     pub fn has_dial_config(&self) -> bool {
-        true
+        !self.outbounds.is_empty()
     }
 }
 
@@ -192,6 +374,7 @@ fn is_usable_target(_ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn yaml_with(kind: &str, locator: &str, extra: &str) -> String {
         format!(
@@ -248,9 +431,281 @@ mod tests {
         assert!(matches!(cfg, ProxyDialConfig::Socks5 { .. }));
     }
 
+    fn craft_syn(dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[20..22].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = 0x02;
+        pkt
+    }
+
     #[test]
-    fn engine_none_when_no_usable() {
+    fn engine_unknown_outbound_tag() {
+        let yaml = yaml_with("socks5", "127.0.0.1:1080", "");
+        let mut engine = ProxyEngine::new(&yaml).expect("engine");
+        let err = engine
+            .handle_packet(&craft_syn([127, 0, 0, 1], 18080), "missing")
+            .expect_err("unknown tag");
+        assert_eq!(
+            err,
+            ProxyEngineError::UnknownOutbound {
+                tag: "missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn engine_unsupported_outbound_kind() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: s\noutbounds:\n  - tag: s\n    kind: socks5\n    locator: 127.0.0.1:1080\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n";
+        let mut engine = ProxyEngine::new(yaml).expect("engine");
+        let err = engine
+            .handle_packet(&craft_syn([127, 0, 0, 1], 18080), "v")
+            .expect_err("unsupported kind");
+        assert!(matches!(
+            err,
+            ProxyEngineError::UnsupportedOutboundKind { .. }
+        ));
+    }
+
+    #[test]
+    fn engine_dial_failure_emits_stream_event() {
+        let yaml = yaml_with("socks5", "127.0.0.1:1", "");
+        let mut engine = ProxyEngine::new(&yaml).expect("engine");
+        let syn = craft_syn([127, 0, 0, 1], 18080);
+        let syn_ack = engine.handle_packet(&syn, "test").expect("syn").tun_packets;
+        assert_eq!(syn_ack.len(), 1, "SYN-ACK expected");
+        let srv_seq = u32::from_be_bytes([
+            syn_ack[0][24],
+            syn_ack[0][25],
+            syn_ack[0][26],
+            syn_ack[0][27],
+        ]);
+        let mut ack = craft_syn([127, 0, 0, 1], 18080);
+        ack[24..28].copy_from_slice(&1u32.to_be_bytes());
+        ack[28..32].copy_from_slice(&(srv_seq + 1).to_be_bytes());
+        ack[33] = 0x10;
+        let _ = engine.handle_packet(&ack, "test");
+        let mut failed = None;
+        for _ in 0..15_000 {
+            for event in engine.poll().stream_events {
+                if let ProxyStreamEvent::Failed { reason, .. } = event {
+                    failed = Some(reason);
+                }
+            }
+            if failed.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(failed.is_some(), "dial failure must surface as StreamEvent");
+        assert!(engine.stats().tcp_dials_failed >= 1);
+    }
+
+    #[test]
+    fn engine_error_when_no_usable() {
         let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
-        assert!(ProxyEngine::new(yaml).is_none());
+        assert!(matches!(
+            ProxyEngine::new(yaml),
+            Err(ProxyEngineError::UnknownOutbound { .. })
+        ));
+    }
+
+    // --- P7: dial 窗口期缓冲的真实链路测试 -------------------------------
+
+    fn ip_checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        sum += ((src[0] as u32) << 8) | src[1] as u32;
+        sum += ((src[2] as u32) << 8) | src[3] as u32;
+        sum += ((dst[0] as u32) << 8) | dst[1] as u32;
+        sum += ((dst[2] as u32) << 8) | dst[3] as u32;
+        sum += 6;
+        sum += tcp_seg.len() as u32;
+        let mut i = 0;
+        while i + 1 < tcp_seg.len() {
+            sum += u16::from_be_bytes([tcp_seg[i], tcp_seg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < tcp_seg.len() {
+            sum += (tcp_seg[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn craft_tcp(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + payload.len()];
+        pkt[0] = 0x45;
+        let tot = (40 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&tot.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let c = ip_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        let t = &mut pkt[20..40];
+        t[0..2].copy_from_slice(&src_port.to_be_bytes());
+        t[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[8..12].copy_from_slice(&ack.to_be_bytes());
+        t[12] = 0x50;
+        t[13] = flags;
+        t[14..16].copy_from_slice(&8192u16.to_be_bytes());
+        pkt[40..].copy_from_slice(payload);
+        let tc = tcp_checksum(src_ip, dst_ip, &pkt[20..]);
+        pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    fn parse_tcp_seq_ack(pkt: &[u8]) -> Option<(u32, u32, u8)> {
+        if pkt.len() < 40 || pkt[9] != 6 {
+            return None;
+        }
+        let seq = u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]);
+        let ack = u32::from_be_bytes([pkt[28], pkt[29], pkt[30], pkt[31]]);
+        Some((seq, ack, pkt[33]))
+    }
+
+    /// 假 SOCKS5 出口：完成握手与 CONNECT 读取后在 `release` 处暂停，
+    /// 放行后才回 SUCCESS，从而精确制造拨号窗口期；随后读回中继写入的
+    /// 请求字节并通过 channel 交给测试。
+    fn delayed_socks5(
+        release: Arc<std::sync::Barrier>,
+        expected_len: usize,
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind socks5");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept dial");
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .expect("timeout");
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).expect("greeting");
+            s.write_all(&[0x05, 0x00]).expect("method reply");
+            let mut connect = [0u8; 10];
+            s.read_exact(&mut connect).expect("connect req");
+            // 拨号窗口期：客户端请求字节先到 engine，再由测试放行。
+            release.wait();
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .expect("connect reply");
+            let mut got = Vec::new();
+            let mut buf = [0u8; 1024];
+            while got.len() < expected_len {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = tx.send(got);
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn engine_dial_window_buffers_request_until_dial_completes() {
+        use std::sync::Barrier;
+
+        let release = Arc::new(Barrier::new(2));
+        let payload: &[u8] = b"GET / HTTP/1.1
+Host: upstream\r
+\r\n";
+        let (proxy_addr, rx) = delayed_socks5(Arc::clone(&release), payload.len());
+        let yaml = yaml_with("socks5", &proxy_addr.to_string(), "");
+        let mut engine = ProxyEngine::new(&yaml).expect("engine");
+
+        let (src_ip, dst_ip) = ([10, 0, 0, 2], [127, 0, 0, 1]);
+        let (src_port, dst_port) = (41111u16, proxy_addr.port());
+        let mut seq = 1000u32;
+        let syn = craft_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x02, &[]);
+        let syn_ack = engine.handle_packet(&syn, "test").expect("syn").tun_packets;
+        let (srv_seq, _, flags) = parse_tcp_seq_ack(&syn_ack[0]).expect("syn-ack");
+        assert_eq!(flags & 0x12, 0x12);
+        seq += 1;
+        let ack = craft_tcp(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        engine.handle_packet(&ack, "test").expect("ack");
+
+        // 握手刚完成、SOCKS5 尚未回 SUCCESS：请求字节落进拨号窗口期。
+        let data = craft_tcp(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            srv_seq + 1,
+            0x18,
+            payload,
+        );
+        engine.handle_packet(&data, "test").expect("data");
+        assert_eq!(
+            engine.stats().tcp_dial_buffer_dropped_bytes,
+            0,
+            "buffered, not dropped, while dial is in flight"
+        );
+        assert_eq!(engine.stats().tcp_dials_ok, 0, "dial still in flight");
+
+        release.wait();
+        let mut got = None;
+        for _ in 0..5000 {
+            let _ = engine.poll();
+            if let Ok(bytes) = rx.try_recv() {
+                got = Some(bytes);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(payload),
+            "request bytes reach the SOCKS5 upstream in full, in order"
+        );
+        assert_eq!(engine.stats().tcp_dials_ok, 1);
+        assert_eq!(engine.stats().tcp_dial_buffer_dropped_bytes, 0);
     }
 }

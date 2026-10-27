@@ -30,7 +30,7 @@ TUN (默认路由 0.0.0.0/0)
 [分类器]
   ├─ Mesh (10.200.0.0/24) → smoltcp 终结 TCP → N1 QUIC → 对端
   ├─ Proxy (规则命中) → smoltcp 终结 TCP → Trojan/SS → 代理服务器
-  ├─ Direct (bypass) → 写回 TUN → OS 直接发出
+  ├─ Direct (bypass) → 本地真 socket 直连（TCP connect / UDP send），不是写回 TUN
   └─ DNS (UDP 53) → UnifiedDns → 写回 TUN
 ```
 

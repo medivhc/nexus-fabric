@@ -98,6 +98,7 @@ mod tests {
             resource: ResourceId("internet-access".into()),
             destination: "93.184.216.34:443".into(),
             profile: "Balanced".into(),
+            egress_hint: None,
         }
     }
 

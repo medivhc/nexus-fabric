@@ -29,6 +29,7 @@ fn classify(origin: FlowOrigin, destination: &str, profile: &str) -> FlowContext
         resource: ResourceId(INTERNET_ACCESS_RESOURCE.into()),
         destination: destination.to_string(),
         profile: profile.to_string(),
+        egress_hint: None,
     }
 }
 
@@ -54,6 +55,12 @@ pub fn from_virtual_packet_interface(destination: &str, profile: &str) -> FlowCo
 #[must_use]
 pub fn from_native_api(destination: &str, profile: &str) -> FlowContext {
     classify(FlowOrigin::NativeApi, destination, profile)
+}
+
+/// 已 accept 的透明 socket（TPROXY / TUN 前端）产生的流。
+#[must_use]
+pub fn from_transparent_socket(destination: &str, profile: &str) -> FlowContext {
+    classify(FlowOrigin::TransparentSocket, destination, profile)
 }
 
 // ---------- SOCKS5 有状态握手状态机（RFC 1928 + RFC 1929，sing-box 吸收） ----------

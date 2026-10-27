@@ -326,9 +326,9 @@ fn main() {
     // 构造 ProxyEngine（SOCKS5）。
     let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: 127.0.0.1:11080\n";
     let mut engine = match ProxyEngine::new(yaml) {
-        Some(e) => e,
-        None => {
-            println!("{{\"verdict\":\"FAIL\",\"error\":\"ProxyEngine::new returned None\"}}");
+        Ok(e) => e,
+        Err(e) => {
+            println!("{{\"verdict\":\"FAIL\",\"error\":\"ProxyEngine::new failed: {e}\"}}");
             std::process::exit(1);
         }
     };
@@ -372,7 +372,10 @@ fn test_tcp(engine: &mut ProxyEngine) -> bool {
 
     // 1. SYN
     let syn = craft_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x02, &[]);
-    let (tun_pkts, _) = engine.handle_packet(&syn);
+    let tun_pkts = engine
+        .handle_packet(&syn, "proxy")
+        .map(|r| r.tun_packets)
+        .unwrap_or_default();
     if tun_pkts.is_empty() {
         eprintln!("TCP: no SYN-ACK");
         return false;
@@ -401,7 +404,7 @@ fn test_tcp(engine: &mut ProxyEngine) -> bool {
         0x10,
         &[],
     );
-    let _ = engine.handle_packet(&ack);
+    let _ = engine.handle_packet(&ack, "proxy");
     // 驱动 engine（dial 在后台线程）。
     std::thread::sleep(Duration::from_millis(1500));
     let _ = engine.poll();
@@ -418,11 +421,11 @@ fn test_tcp(engine: &mut ProxyEngine) -> bool {
         0x18,
         data,
     );
-    let _ = engine.handle_packet(&data_pkt);
+    let _ = engine.handle_packet(&data_pkt, "proxy");
 
     // 4. 等待 echo 回包（轮询 poll）。
     for _ in 0..50 {
-        let pkts = engine.poll();
+        let pkts = engine.poll().tun_packets;
         for pkt in pkts {
             // 检查是否包含 echo 数据。
             if pkt.len() > 40 && pkt[9] == 6 {
@@ -445,13 +448,17 @@ fn test_udp(engine: &mut ProxyEngine) -> bool {
     let dst_ip = [127, 0, 0, 1];
     let payload = b"hello proxy udp";
     let pkt = craft_udp(src_ip, dst_ip, 40001, 18081, payload);
-    if !engine.handle_packet(&pkt).1 {
+    if !engine
+        .handle_packet(&pkt, "proxy")
+        .map(|r| r.forwarded)
+        .unwrap_or(false)
+    {
         eprintln!("UDP: handle_packet failed");
         return false;
     }
     // 等待回包。
     for _ in 0..50 {
-        let pkts = engine.poll();
+        let pkts = engine.poll().tun_packets;
         for p in pkts {
             if p.len() >= 28 && p[9] == 17 {
                 // 解析 UDP 载荷。

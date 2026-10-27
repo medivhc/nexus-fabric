@@ -2,7 +2,9 @@
 
 ## Responsibility
 
-实现 Linux 平台 Capability Adapter，包括 TUN、透明拦截、Mount/Filesystem、Service/Privilege 等宿主桥接。
+实现 Linux 平台 Capability Adapter，包括 TUN、Linux TPROXY capture adapter（`tproxy`：`IP_TRANSPARENT` TCP listener / `IP_RECVORIGDSTADDR` UDP socket / iptables+nftables+external 捕获规则）、Mount/Filesystem、Service/Privilege 等宿主桥接。
+
+`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` / `IP_PKTINFO` 不得出现在该目录之外。
 
 ## Non-Responsibilities
 

@@ -1,0 +1,89 @@
+schema_version = 1
+id = "product.tun-flow-sessions-auto"
+title = "流会话 auto 三态：首包链计数 / 无 provider / 显式禁用（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example tun_flow_sessions_auto --json）：真实注入 UDP/TCP 包。
+# provider 分支跑首包链（同流不重复规划、新流递增），hint 缺失 -> Drop，
+# enabled 且无上游 -> 建连失败 RST（不直连）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example tun_flow_sessions_auto -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "flow_sessions.state"
+equals = "enabled"
+
+[[expect]]
+field = "flow_sessions.reason"
+absent = true
+
+[[expect]]
+field = "flow_sessions.providers"
+equals = 1
+
+[[expect]]
+field = "flow_sessions.planner_calls"
+equals = 2
+
+[[expect]]
+field = "planner_calls_first"
+equals = 1
+
+[[expect]]
+field = "planner_calls_same_flow"
+equals = 1
+
+[[expect]]
+field = "planner_calls_other_flow"
+equals = 2
+
+[[expect]]
+field = "hint_log"
+equals = "egress_hint=p1 outbound=p1"
+
+[[expect]]
+field = "enabled_no_provider.state"
+equals = "enabled/enabled"
+
+[[expect]]
+field = "enabled_no_provider.rst"
+equals = true
+
+[[expect]]
+field = "enabled_no_provider.direct_attempts"
+equals = 0
+
+[[expect]]
+field = "enabled_no_provider.session_establish_failed"
+equals = 1
+
+[[expect]]
+field = "hint_missing.outbound_unresolved"
+equals = 1
+
+[[expect]]
+field = "hint_missing.dropped"
+equals = 1
+
+[[expect]]
+field = "auto_no_provider.state"
+equals = "disabled"
+
+[[expect]]
+field = "auto_no_provider.reason"
+equals = "no_providers"
+
+[[expect]]
+field = "auto_no_provider.providers"
+equals = 0
+
+[[expect]]
+field = "disabled.state"
+equals = "disabled"

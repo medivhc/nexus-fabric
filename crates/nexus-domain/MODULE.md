@@ -8,6 +8,11 @@
 
 不执行 I/O，不依赖平台 API，不做发现、网络建连、存储、调度或协议解析。
 
+`FlowContext.egress_hint` 的语义边界：它是“建议出口 tag”的**非身份、非资源**提示，
+只用于缩小 Provider 候选快照（`build_snapshot` 单候选过滤）；它不改变 Resource/
+Provider 身份，不构成 Plan，也不表示出口已建立。`None` 表示无提示（防御性空候选由
+组合根处理），不得把 hint 当作已解析的 Provider。
+
 ## Inputs
 
 - 仅接受公开类型、DTO、trait、事件或稳定协议对象。

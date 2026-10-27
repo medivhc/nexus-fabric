@@ -1317,6 +1317,8 @@ pub struct ScenarioRunReport {
     pub timed_out: bool,
     /// 人类可读明细（与旧 ScenarioResult.detail 同格式）。
     pub detail: String,
+    /// 命令成功解析后的 JSON 输出（证据可追溯；失败为 None）。
+    pub output: Option<Value>,
 }
 
 /// 取文本最后至多 n 行。
@@ -1366,6 +1368,7 @@ fn unknown_report(failed_step: &str, assertion: String, detail: String) -> Scena
         key_log_lines: Vec::new(),
         duration_ms: 0,
         timed_out: false,
+        output: None,
         detail,
     }
 }
@@ -1419,6 +1422,7 @@ fn run_single_inner(
                     key_log_lines: tail_lines(&reason, 10),
                     duration_ms: 0,
                     timed_out: false,
+                    output: None,
                     detail: reason,
                 };
             }
@@ -1435,6 +1439,7 @@ fn run_single_inner(
                     assertion: assertion.clone(),
                     duration_ms: 0,
                     timed_out: false,
+                    output: None,
                     detail: format!("fixture target not declared: {assertion}"),
                 };
             }
@@ -1471,6 +1476,7 @@ fn run_single_inner(
                 key_log_lines: tail_lines(&err_tail, 10),
                 duration_ms: 0,
                 timed_out: true,
+                output: None,
                 detail: format!(
                     "fixture command timed out after {}s: {fixture}",
                     scenario_timeout.as_secs()
@@ -1485,6 +1491,7 @@ fn run_single_inner(
                 key_log_lines: tail_lines(&err_tail, 10),
                 duration_ms: 0,
                 timed_out: false,
+                output: None,
                 detail: format!("fixture failed: {fixture} (stderr: {err_tail})"),
             };
         }
@@ -1516,6 +1523,7 @@ fn run_single_inner(
                 assertion,
                 duration_ms: 0,
                 timed_out: false,
+                output: None,
                 detail: format!("target not declared: {package}:{kind}:{target}"),
             };
         }
@@ -1527,6 +1535,7 @@ fn run_single_inner(
                 key_log_lines: tail_lines(&reason, 10),
                 duration_ms: 0,
                 timed_out: false,
+                output: None,
                 detail: reason,
             };
         }
@@ -1552,6 +1561,7 @@ fn run_single_inner(
             key_log_lines: tail_lines(&format!("{stdout}\n{stderr_tail}"), 10),
             duration_ms: 0,
             timed_out: true,
+            output: None,
             detail: format!(
                 "scenario command timed out after {}s",
                 scenario_timeout.as_secs()
@@ -1564,6 +1574,7 @@ fn run_single_inner(
             key_log_lines: tail_lines(&stderr_tail, 10),
             duration_ms: 0,
             timed_out: false,
+            output: None,
             detail: format!("cannot run scenario command: {stderr_tail}"),
         },
         RunOutcome::Exited(_) => match serde_json::from_str::<Value>(&stdout) {
@@ -1575,6 +1586,7 @@ fn run_single_inner(
                     key_log_lines: Vec::new(),
                     duration_ms: 0,
                     timed_out: false,
+                    output: Some(json),
                     detail: format!("command ran, all {} expectations held", s.expects.len()),
                 },
                 Err(f) => ScenarioRunReport {
@@ -1584,6 +1596,7 @@ fn run_single_inner(
                     key_log_lines: tail_lines(&stdout, 10),
                     duration_ms: 0,
                     timed_out: false,
+                    output: None,
                     detail: format!("expect {}.{} failed (actual: {})", s.id, f.path, f.actual),
                 },
             },
@@ -1607,6 +1620,7 @@ fn run_single_inner(
                         key_log_lines: tail_lines(&stdout, 10),
                         duration_ms: 0,
                         timed_out: false,
+                        output: None,
                         detail: format!("output not JSON ({e}): {}", stdout.trim()),
                     }
                 }
@@ -1686,6 +1700,7 @@ fn run_parallel(
                     key_log_lines: Vec::new(),
                     duration_ms: 0,
                     timed_out: false,
+                    output: None,
                     detail: format!(
                         "scenario worker produced no report for '{}' (worker panic?)",
                         scenarios[i].id
@@ -2764,7 +2779,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_returns_none_current_dir_for_all_268() {
+    fn resolve_returns_none_current_dir_for_all_275() {
         let repo = Repo::discover().expect("repo must be discoverable");
         let config = Config::load(&repo).expect("config must load");
         let scenarios = load_all(
@@ -2815,12 +2830,12 @@ mod tests {
                 ),
             }
         }
-        assert_eq!(parseable, 268, "268 cargo-run [when].command");
+        assert_eq!(parseable, 275, "275 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 246, "all declared targets resolve to Direct");
+        assert_eq!(direct, 253, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -2859,10 +2874,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            190,
-            "186 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            197,
+            "193 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 186);
+        assert_eq!(examples.len(), 193);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(

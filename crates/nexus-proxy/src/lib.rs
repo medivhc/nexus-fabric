@@ -26,13 +26,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod domain_engine;
 pub mod geoip_nex;
 pub mod geosite_nex;
-pub mod tun;
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexus_connectivity::{LinkActivator, LinkCandidate, LinkKind, LinkProbe, LinkSelection};
 use nexus_domain::{FlowContext, FlowOrigin};
@@ -329,6 +329,7 @@ pub fn origin_tag(origin: FlowOrigin) -> &'static str {
         FlowOrigin::Http => "http",
         FlowOrigin::VirtualPacketInterface => "virtual-packet-interface",
         FlowOrigin::NativeApi => "native-api",
+        FlowOrigin::TransparentSocket => "transparent-socket",
     }
 }
 
@@ -901,13 +902,13 @@ struct OutboundRecord {
 }
 
 /// 策略组注册表项。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct GroupRecord {
     kind: GroupKind,
     candidates: Vec<String>,
     selected: String,
     /// load_balance round-robin 游标（进程内确定性状态；Cell 保持 route(&self) 不可变签名）。
-    cursor: Cell<usize>,
+    cursor: AtomicUsize,
 }
 
 /// 一次分流决策的可观察结果（MODULE.md Outputs / PRODUCT.md §11.1）。
@@ -982,7 +983,7 @@ impl ProxyService {
                         kind: g.kind,
                         candidates: g.candidates.clone(),
                         selected,
-                        cursor: Cell::new(0),
+                        cursor: AtomicUsize::new(0),
                     },
                 )
             })
@@ -1023,8 +1024,7 @@ impl ProxyService {
                         }
                         GroupKind::LoadBalance => {
                             let n = group.candidates.len();
-                            let idx = group.cursor.get() % n;
-                            group.cursor.set((group.cursor.get() + 1) % n);
+                            let idx = group.cursor.fetch_add(1, Ordering::Relaxed) % n;
                             group.candidates[idx].clone()
                         }
                         GroupKind::Relay => {
@@ -1261,12 +1261,22 @@ groups:
         assert_eq!(d.group_type.as_deref(), Some("selector"));
     }
 
+    #[test]
+    fn origin_tag_covers_transparent_socket() {
+        assert_eq!(
+            origin_tag(FlowOrigin::TransparentSocket),
+            "transparent-socket"
+        );
+        assert_eq!(origin_tag(FlowOrigin::Socks5), "socks5");
+    }
+
     fn nexus_domain_flow(dest: &str) -> FlowContext {
         FlowContext {
             origin: FlowOrigin::Socks5,
             resource: nexus_domain::ResourceId("internet-access".into()),
             destination: dest.to_string(),
             profile: String::new(),
+            egress_hint: None,
         }
     }
 

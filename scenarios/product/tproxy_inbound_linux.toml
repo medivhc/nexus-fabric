@@ -1,0 +1,58 @@
+schema_version = 1
+id = "product.tproxy-inbound-linux"
+title = "TPROXY Linux 前端：TCP/UDP 原始目的地、单 socket、回包源地址逻辑（E4，进程内）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example tproxy_inbound_e4 --json，进程内闭环，不依赖特权）：
+# - TCP：内存双工 accepted stream -> DirectEgress 真 socket -> 本地回显 -> 写回；
+# - UDP：单 socket DirectEgress -> 本地回显 -> UdpReply；
+# - orig_dst 缺失（local == peer）必须报错且不写回；不得回退 listener。
+
+[when]
+command = "cargo run --quiet -p nexusd --example tproxy_inbound_e4 -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "tcp_accepted"
+equals = 1
+
+[[expect]]
+field = "udp_datagrams"
+equals = 1
+
+[[expect]]
+field = "orig_dst_missing"
+equals = 0
+
+[[expect]]
+field = "udp_reply_failed"
+equals = 0
+
+[[expect]]
+field = "matched_rule"
+equals = "IP-CIDR,127.0.0.1/32"
+
+[[expect]]
+field = "selected_outbound"
+equals = "self"
+
+[[expect]]
+field = "egress_hint"
+absent = true
+
+[[expect]]
+field = "tproxy.state"
+equals = "active"
+
+[[expect]]
+field = "tproxy.privilege"
+one_of = ["root", "cap_net_admin", "insufficient"]
+
+[[expect]]
+field = "tproxy.enforcement"
+one_of = ["none", "active", "block", "impossible"]

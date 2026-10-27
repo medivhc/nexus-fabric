@@ -1,0 +1,97 @@
+schema_version = 1
+id = "product.provider-derivation"
+title = "Provider 派生：字段级映射 + 四类错误变体（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example provider_derivation --json）：outbounds=direct(d), ss(p1), trojan(p2)。
+# 字段 id/resource/placement/locator/capabilities/present 直接取自 ProviderRecord；
+# duplicate/reserved/invalid/missing_locator 四类错误各真实命中一次。
+
+[when]
+command = "cargo run --quiet -p nexusd --example provider_derivation -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "provider_count"
+equals = 2
+
+[[expect]]
+field = "providers.0.id"
+equals = "p1"
+
+[[expect]]
+field = "providers.0.resource"
+equals = "internet-access"
+
+[[expect]]
+field = "providers.0.placement"
+equals = "shadowsocks"
+
+[[expect]]
+field = "providers.0.locator"
+equals = "203.0.113.10:8388"
+
+[[expect]]
+field = "providers.0.capabilities"
+equals = ["internet-access"]
+
+[[expect]]
+field = "providers.0.present"
+equals = true
+
+[[expect]]
+field = "providers.1.id"
+equals = "p2"
+
+[[expect]]
+field = "providers.1.resource"
+equals = "internet-access"
+
+[[expect]]
+field = "providers.1.placement"
+equals = "trojan"
+
+[[expect]]
+field = "providers.1.locator"
+equals = "203.0.113.11:443"
+
+[[expect]]
+field = "providers.1.capabilities"
+equals = ["internet-access"]
+
+[[expect]]
+field = "providers.1.present"
+equals = true
+
+[[expect]]
+field = "tags"
+equals = ["p1", "p2"]
+
+[[expect]]
+field = "placements"
+equals = ["shadowsocks", "trojan"]
+
+[[expect]]
+field = "direct_in_registry"
+equals = false
+
+[[expect]]
+field = "errors.duplicate"
+equals = "DuplicateTag"
+
+[[expect]]
+field = "errors.reserved"
+equals = "ReservedTag"
+
+[[expect]]
+field = "errors.invalid"
+equals = "InvalidTag"
+
+[[expect]]
+field = "errors.missing_locator"
+equals = "MissingLocator"

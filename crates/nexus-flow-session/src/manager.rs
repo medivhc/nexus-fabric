@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nexus_domain::{FlowContext, FlowOrigin, LifecyclePhase, ResourceId, SessionId};
 use nexus_planner::Planned;
@@ -82,6 +82,10 @@ pub struct SessionManager {
     next_id: u64,
     /// 首包链总运行次数（E4 `no_planner_in_hot_path` 证明：快路径不得增加此计数）。
     pub planner_calls: u64,
+    /// 后台建连失败累计数（E4 `session_establish_failed` 证明）。
+    pub establish_failures: u64,
+    /// 最近一次建连失败原因（`pump` 与计数同点记录，供状态面发布）。
+    last_failure_reason: Option<String>,
 }
 
 impl SessionManager {
@@ -107,12 +111,35 @@ impl SessionManager {
             signals: VecDeque::new(),
             next_id: 0,
             planner_calls: 0,
+            establish_failures: 0,
+            last_failure_reason: None,
         }
     }
 
     #[must_use]
     pub fn flow_count(&self) -> usize {
         self.table.len()
+    }
+
+    /// 后台建连失败累计数。
+    #[must_use]
+    pub fn establish_failures(&self) -> u64 {
+        self.establish_failures
+    }
+
+    /// 取走最近一次建连失败原因（dataplane 每轮 `pump` 后发布）。
+    #[must_use]
+    pub fn take_failure_reason(&mut self) -> Option<String> {
+        self.last_failure_reason.take()
+    }
+
+    /// 某流首包链规划出的 Provider（plan.provider_id）。
+    #[must_use]
+    pub fn planned_provider(&self, key: &FlowKey) -> Option<&str> {
+        let session_id = &self.table.get(key)?.session_id;
+        self.plans
+            .get(session_id)
+            .map(|planned| planned.plan.provider_id.0.as_str())
     }
 
     #[must_use]
@@ -135,10 +162,24 @@ impl SessionManager {
         packet: &[u8],
         is_syn: bool,
         deps: &ChainDeps,
+        now: Instant,
+    ) -> FlowDecision {
+        self.on_packet_with_hint(key, packet, is_syn, deps, now, None)
+    }
+
+    /// 同 [`Self::on_packet`]，额外带上规则引擎选出的出站 tag（Q3 `egress_hint`）。
+    pub fn on_packet_with_hint(
+        &mut self,
+        key: FlowKey,
+        packet: &[u8],
+        is_syn: bool,
+        deps: &ChainDeps,
+        now: Instant,
+        egress_hint: Option<&str>,
     ) -> FlowDecision {
         // 快路径：已建流。
         if let Some(entry) = self.table.get_mut(&key) {
-            entry.last_seen = std::time::Instant::now();
+            entry.last_seen = now;
             match entry.phase {
                 FlowPhase::Active => {
                     // 已建流：不再调 Planner（hot path 纯洁性由 planner_calls 计数证明）。
@@ -190,6 +231,7 @@ impl SessionManager {
                 key.dst_ip[0], key.dst_ip[1], key.dst_ip[2], key.dst_ip[3], key.dst_port
             ),
             profile: "Balanced".into(),
+            egress_hint: egress_hint.map(str::to_string),
         };
         let outcome = match run_first_packet_chain(&flow, deps) {
             Ok(o) => o,
@@ -217,7 +259,7 @@ impl SessionManager {
             .insert(session_id.clone(), outcome.policy_trace);
 
         // 流表项（幂等：重传 SYN 走上面的快路径，不会重复建）。
-        let entry = self.table.insert(key, session_id.clone());
+        let entry = self.table.insert(key, session_id.clone(), now);
         self.session_to_key.insert(session_id.clone(), key);
         debug_assert_eq!(entry.chain_runs, 1);
 
@@ -266,7 +308,8 @@ impl SessionManager {
                     }
                 }
                 EstablishEvent::Failed { session_id, reason } => {
-                    let _ = reason;
+                    self.establish_failures += 1;
+                    self.last_failure_reason = Some(reason);
                     if let Some(key) = self.key_of_session(&session_id) {
                         if let Some(entry) = self.table.get_mut(&key) {
                             entry.phase = FlowPhase::Draining;
@@ -299,8 +342,8 @@ impl SessionManager {
 
     /// 空闲扫描：超时流进 Draining，对应 Session 也进 Draining。
     /// 返回进入 Draining 的 session 数量。
-    pub fn sweep_idle(&mut self) -> usize {
-        let drained = self.table.sweep_idle(self.config.idle_timeout);
+    pub fn sweep_idle(&mut self, now: Instant) -> usize {
+        let drained = self.table.sweep_idle(self.config.idle_timeout, now);
         for sid in &drained {
             if let Some(owner) = self.sessions.get_mut(sid) {
                 let _ = owner.transition_phase(LifecyclePhase::Draining);
@@ -529,17 +572,18 @@ mod tests {
 
     #[test]
     fn syn_creates_session_exactly_once() {
+        let t0 = Instant::now();
         let mut mgr = SessionManager::new(SessionManagerConfig::default(), Box::new(OkEstablisher));
         let deps = test_deps();
         let pkt = tcp_syn_packet();
-        let d1 = mgr.on_packet(tcp_key(), &pkt, true, &deps);
+        let d1 = mgr.on_packet(tcp_key(), &pkt, true, &deps, t0);
         let sid = match d1 {
             FlowDecision::NewSession { session_id } => session_id,
             other => panic!("expected NewSession, got {other:?}"),
         };
         assert_eq!(mgr.planner_calls, 1);
         // 重传 SYN：走快路径（Allocating），不重复建会话、不重复调链。
-        let d2 = mgr.on_packet(tcp_key(), &pkt, true, &deps);
+        let d2 = mgr.on_packet(tcp_key(), &pkt, true, &deps, t0);
         assert!(
             matches!(&d2, FlowDecision::Forward { session_id } if session_id == &sid),
             "{d2:?}"
@@ -550,19 +594,21 @@ mod tests {
 
     #[test]
     fn tcp_non_syn_without_flow_is_dropped() {
+        let t0 = Instant::now();
         let mut mgr = SessionManager::new(SessionManagerConfig::default(), Box::new(OkEstablisher));
         let deps = test_deps();
-        let d = mgr.on_packet(tcp_key(), &tcp_syn_packet(), false, &deps);
+        let d = mgr.on_packet(tcp_key(), &tcp_syn_packet(), false, &deps, t0);
         assert!(matches!(d, FlowDecision::Drop { .. }), "{d:?}");
         assert_eq!(mgr.session_count(), 0);
     }
 
     #[test]
     fn establish_success_activates_flow() {
+        let t0 = Instant::now();
         let mut mgr = SessionManager::new(SessionManagerConfig::default(), Box::new(OkEstablisher));
         let deps = test_deps();
         let pkt = tcp_syn_packet();
-        let sid = match mgr.on_packet(tcp_key(), &pkt, true, &deps) {
+        let sid = match mgr.on_packet(tcp_key(), &pkt, true, &deps, t0) {
             FlowDecision::NewSession { session_id } => session_id,
             other => panic!("{other:?}"),
         };
@@ -572,7 +618,7 @@ mod tests {
         assert_eq!(mgr.get_phase(&tcp_key()), Some(FlowPhase::Active));
         // Active 后后续包走快路径，planner_calls 不变。
         let calls = mgr.planner_calls;
-        let d = mgr.on_packet(tcp_key(), &pkt, false, &deps);
+        let d = mgr.on_packet(tcp_key(), &pkt, false, &deps, t0);
         assert!(
             matches!(&d, FlowDecision::Forward { session_id } if session_id == &sid),
             "{d:?}"
@@ -582,11 +628,12 @@ mod tests {
 
     #[test]
     fn establish_failure_drains_and_signals_reset() {
+        let t0 = Instant::now();
         let mut mgr =
             SessionManager::new(SessionManagerConfig::default(), Box::new(FailEstablisher));
         let deps = test_deps();
         let pkt = tcp_syn_packet();
-        mgr.on_packet(tcp_key(), &pkt, true, &deps);
+        mgr.on_packet(tcp_key(), &pkt, true, &deps, t0);
         // 等待失败事件回填（不提前 drain 信号）。
         for _ in 0..200 {
             mgr.pump();
@@ -608,11 +655,12 @@ mod tests {
 
     #[test]
     fn udp_first_packet_buffered_and_bounded() {
+        let t0 = Instant::now();
         let mut mgr = SessionManager::new(SessionManagerConfig::default(), Box::new(OkEstablisher));
         let deps = test_deps();
         let pkt = vec![0u8; 32];
         // 首包 → Buffered（会话创建）。
-        let d = mgr.on_packet(udp_key(), &pkt, false, &deps);
+        let d = mgr.on_packet(udp_key(), &pkt, false, &deps, t0);
         let sid = match d {
             FlowDecision::Buffered { session_id } => session_id,
             other => panic!("{other:?}"),
@@ -621,7 +669,7 @@ mod tests {
         // 继续塞包直到超 bound。
         let mut got_drop = false;
         for _ in 0..40 {
-            match mgr.on_packet(udp_key(), &pkt, false, &deps) {
+            match mgr.on_packet(udp_key(), &pkt, false, &deps, t0) {
                 FlowDecision::Buffered { .. } => {}
                 FlowDecision::Drop { .. } => {
                     got_drop = true;
@@ -644,9 +692,11 @@ mod tests {
         };
         let mut mgr = SessionManager::new(config, Box::new(OkEstablisher));
         let deps = test_deps();
-        mgr.on_packet(tcp_key(), &tcp_syn_packet(), true, &deps);
-        std::thread::sleep(Duration::from_millis(5));
-        let n = mgr.sweep_idle();
+        let t0 = Instant::now();
+        mgr.on_packet(tcp_key(), &tcp_syn_packet(), true, &deps, t0);
+        // 虚拟时间：只随传入的 now 老化，不依赖墙钟。
+        assert_eq!(mgr.sweep_idle(t0), 0);
+        let n = mgr.sweep_idle(t0 + Duration::from_millis(5));
         assert_eq!(n, 1);
         assert_eq!(mgr.get_phase(&tcp_key()), Some(FlowPhase::Draining));
         // TearDown 信号发出。
@@ -668,12 +718,12 @@ mod tests {
     #[test]
     #[ignore]
     fn perf_baseline_fast_path_and_chain() {
-        use std::time::Instant;
         let mut mgr = SessionManager::new(SessionManagerConfig::default(), Box::new(OkEstablisher));
         let deps = test_deps();
         let pkt = tcp_syn_packet();
+        let t0 = Instant::now();
         // 预热：建流并等 Active。
-        mgr.on_packet(tcp_key(), &pkt, true, &deps);
+        mgr.on_packet(tcp_key(), &pkt, true, &deps, t0);
         for _ in 0..200 {
             mgr.pump();
             if mgr.get_phase(&tcp_key()) == Some(FlowPhase::Active) {
@@ -687,7 +737,7 @@ mod tests {
         let mut times = Vec::with_capacity(N);
         for _ in 0..N {
             let t = Instant::now();
-            let d = mgr.on_packet(tcp_key(), &pkt, false, &deps);
+            let d = mgr.on_packet(tcp_key(), &pkt, false, &deps, t0);
             times.push(t.elapsed());
             assert!(matches!(d, FlowDecision::Forward { .. }));
         }
@@ -702,6 +752,7 @@ mod tests {
             resource: ResourceId("internet-access".into()),
             destination: "93.184.216.34:443".into(),
             profile: "Balanced".into(),
+            egress_hint: None,
         };
         let mut chain_times = Vec::with_capacity(1000);
         for _ in 0..1000 {

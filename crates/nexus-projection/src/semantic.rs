@@ -359,7 +359,7 @@ fn split_host_port(dest: &str) -> Option<(&str, u16)> {
 /// its S10 fast path for IP literals; the `domain` field carries the
 /// hostname for S16 domain rules (None for IP literals).
 pub(crate) fn route_destination(router: &Arc<dyn Router>, host: &str, port: u16) -> RouteTarget {
-    let _ = port; // port is not part of the routing decision (S9/S16).
+    let _ = port; // packet-level route_destination 不把端口写入规则命中（由调用方提供）。
     let mut pkt = [0u8; 20];
     pkt[0] = 0x45; // IPv4, IHL=5
     pkt[9] = 6; // TCP (protocol value is informational here)
@@ -376,6 +376,9 @@ pub(crate) fn route_destination(router: &Arc<dyn Router>, host: &str, port: u16)
     router.route(&RouteRequest {
         packet: &pkt,
         domain,
+        src_port: None,
+        dst_port: Some(port),
+        process_name: None,
     })
 }
 

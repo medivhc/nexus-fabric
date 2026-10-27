@@ -362,11 +362,11 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
 以下为 P1+ 展望，本期契约不承诺、不冻结为 expectation：
 
 - 真实加密代理协议栈（Vmess / Trojan / Hysteria2；Shadowsocks AEAD 见 §11.6）；
-- TUN 透明代理 / Virtual Packet Interface 全局拦截：已转 §11.18 落地（portable
-  IP 包解析 + 规则路由 + NAT 决策 E4 离线闭环；真实 wintun adapter 开卡与收发为 E5）。
-  窄 wintun C ABI 绑定（手写 LoadLibraryW、无第三方 FFI、纯符号解析单测）与
-  WintunVpiAdapter 复用 §12.29；真实双向字节中继回写、路由表改写、IPv6、DNS 劫持
-  仍为 §11.18 冻结边界（下批）；
+- TUN / TPROXY 透明入站：已按 §11.18 落地（TUN 生产链 + Linux TPROXY 前端；
+  E4 离线闭环 + E5 netns 验收已执行（S1–S10：除 S2 外均通过；S2 的 UDP 回包源端口项
+  因冻结 spec §9.1/§9.4 冲突裁决挂起，修复走 follow-up run tproxy-udp-reply-origdst）。
+  Windows/macOS TPROXY、IPv6 透明代理、DoH/DoT
+  仍为后续项（见 §11.18 末条）；
 - Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；
 - LoadBalance / Relay 链式策略组（多跳）；
 - DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
@@ -940,63 +940,75 @@ SubscriptionSourceConfig（url / interval_secs / user_agent / headers / tls 选�
   HTTP 订阅源（可变内容 + 可制造失败）：首次拉取 2 节点 -> 热生效节点数 +2；
   拉取失败 -> 节点数保持不变（回退）；再次拉取 3 节点（含 1 未知协议行）-> 节点数 +3、
   rejected=1；断言 `HotReloadManager` revision 在成功时推进、失败时不推进。
-### 11.18 TUN 透明代理入站（TUN transparent proxy inbound，2026-09-24） {#11-tun-transparent-inbound}
+### 11.18 TUN / TPROXY 透明入站（TUN & TPROXY transparent inbound，2026-09-24） {#11-tun-transparent-inbound}
 
-把 §11 代理内核的入站从「仅 SOCKS5 显式代理」扩展为「可被 TUN 虚拟网卡透明接管全局
-流量」，对齐 Clash TUN 模式语义。与 §12.29（虚拟子网 mesh 隧道线的 PacketTunnel）是
-**两条独立数据面**：§12.29 把 VPI 包封装后发给对端节点组网；本节把 VPI 包解出来按
-§11 规则表路由到出站（代理上网）。二者复用同一个 `nexus-platform::VirtualPacketInterface`
-trait 与 `nexus-platform-windows::WintunVpiAdapter`，但上层编排互不调用。
+把 §11 代理内核的入站从「仅 SOCKS5 显式代理」扩展为「可被 TUN 虚拟网卡或 Linux
+TPROXY 透明接管全局流量」。与 §12.29（虚拟子网 mesh 隧道线的 PacketTunnel）是
+**两条独立数据面**：§12.29 把 VPI 包封装后发给对端节点组网；本节把流量解出来按
+§11 规则表路由到出站（代理上网）。
 
-数据面链路（portable core 部分，离线可确定性闭环）：
+数据面链路（TUN，portable core 部分，离线可确定性闭环）：
 
 ```text
-wintun 虚拟网卡（nexus-platform-windows::WintunVpiAdapter，§12.29 窄 C ABI 已落地）
-  -> VirtualPacketInterface::receive 读原始 IP 包
-  -> nexus-ingress::ip_packet 纯函数解析 IPv4 头 + TCP(6)/UDP(17) 传输头 -> TunPacket
-       { proto, src_ip:src_port, dst_ip:dst_port }
-  -> FlowContext(origin=VirtualPacketInterface, destination="dst_ip:dst_port")
-       （复用 ingress::from_virtual_packet_interface，中立零 I/O）
-  -> nexus-proxy::ProxyService::route（§11.1 纯决策，零改动）
-  -> nexus-proxy::TunNatRouter 按 5 元组缓存分流决策
-       （首包决策并建映射；同流后续包命中缓存，不再重跑规则表）
-  -> selected_outbound_tag（可观察；出站 adapter 承接见 §11.4/§11.16）
+TUN 设备（Linux nexus-platform-linux / Windows wintun）
+  -> Dataplane 读取 IPv4 包（IPv4-only；IPv6 不进入本路径）
+  -> nexus-projection::PacketClassifier（注入统一 nexus_domain::RuleEngine）
+  -> FlowDecisionCache（TUN/TPROXY 共用 5 元组决策缓存；首包 miss 才跑规则）
+  -> Direct：Dataplane 的 TcpTerminator + DirectTcpRelay / RealUdpEgress 真 socket 转发
+     Proxy ：ProxyEngine 按规则 tag 拨号并双向中继（真实 TCP；UDP 协议中继）
+     Mesh  ：N1 发送器（既有路径）
+  -> 流会话（[flow_sessions] / inbounds[kind=tun].sessions；auto/enabled/disabled）
 ```
 
-- **平台边界（ARCHITECTURE §10/§11）**：wintun 是 Windows 平台能力，只存在于
-  `nexus-platform-windows`；portable core（`nexus-ingress` / `nexus-proxy`）只消费注入的
-  `nexus-platform::VirtualPacketInterface` trait，不直接调 wintun API。`nexus-ingress` 的
-  IP 包解析是纯字节解码（零 I/O、`#![forbid(unsafe_code)]`），不触碰任何平台句柄。
-- **解析语义**：仅处理 IPv4 且传输协议为 TCP(6) 或 UDP(17) 的包。版本非 4、IHL 非法、
-  长度截断、协议为 ICMP(1)/其他、IPv6 的包一律解析为 `None` 并计入 `dropped` 计数
-  （结构化丢弃，不 panic、不写 per-packet 日志）。端口从传输头前 4 字节提取。
-- **NAT/连接跟踪**：`TunNatRouter` 以 `(proto, src_ip, src_port, dst_ip, dst_port)` 为键
-  缓存 `RoutingDecision`。首包 miss → 走 `ProxyService::route` 并建映射；后续同键包
-  hit → 直接复用缓存决策（可观察 `cache_hit=true`，`mappings` 计数不增）。这是 TUN
-  per-packet 数据面相对 SOCKS5 per-stream 的独立变化维度，故独立成模块（Deletion Test：
-  删除它则每个 IP 包都重跑线性规则表，破坏「同流一次决策」的独立约束）。
-- **可观察性**（counter/histogram，禁止 per-packet 日志）：`packets_in` / `bytes_in` /
-  `dropped`（无法解析或非 TCP/UDP）/ `mappings`（活跃 5 元组映射数）/ `cache_hits`。
-  每条新流首次决策输出 `matched_rule` / `selected_outbound_tag` / `flow_origin`
-  （flow_origin=`virtual-packet-interface`）。
-- **失败语义**：wintun adapter 创建失败（缺 `wintun.dll` / 无管理员权限 / 驱动未安装）
-  → 结构化 `{ verdict:"TUN_ERROR", error:"..." }`（exit 0，不静默回退为 SOCKS5 监听）。
-  包解析失败计入 `dropped`，不中断读循环。
-- **CLI**：`nexusd proxy --tun [--tun-name <n>] [--config <path>]` 在既有 SOCKS5 监听之外
-  追加 TUN 入站；无 `--tun` 时既有 `nexusd proxy --addr` 行为零变化。`--tun` 装配走真实
-  `WintunVpiAdapter::create`（E5，需管理员 + 随附 `wintun.dll` 于 nexusd.exe 同目录）。
-- **E4 场景**：`scenarios/product/proxy_tun_inbound.toml`——组合根注入 `MemoryVpi`
-  （离线确定性替身）：注入一条 IPv4/TCP SYN（dst=10.1.2.3:443，命中 ip_cidr 规则）+
-  一条 IPv4/UDP（dst=8.8.8.8:53，落入 MATCH）+ 同 TCP 5 元组第二个包（应 cache_hit）+
-  一个截断/ICMP 坏包（计入 dropped）。断言解析、FlowContext origin、命中规则、选定出站、
-  NAT 映射数与 cache_hit、计数器。不依赖真实驱动。
-- **E5 真机观察**：`cargo run -p nexus --example tun_proxy -- --real [--tun-name <n>]`
-  （管理员）→ 真实 `WintunVpiAdapter::create` 成功，输出 `backend`/`mtu`/`driver_version`/
-  `capabilities` 与一次非阻塞 `receive`（0 = 无包）。创建失败 → `verdict=TUN_ERROR`。
-- **冻结边界（本期不做，下批）**：真实双向 TCP/UDP 字节中继回写 TUN（userspace TCP/IP
-  栈 / tun2socks 式连接跟踪与报文改写）、路由表增删（route include/exclude）、IPv6 解析、
-  DNS 劫持接入 §11.5 DNS 模块、MTU/MSS 钳制。本期 E4 冻结的是「解析 → 分类 → 规则路由
-  → NAT 决策」portable 闭环；真实报文拨号与回写为下批。
+TPROXY 数据面链路（仅 Linux）：
+
+```text
+Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100）
+  -> nexus-platform-linux::tproxy 的 IP_TRANSPARENT TCP listener /
+     IP_RECVORIGDSTADDR UDP socket（unsafe 只在此子模块，逐条 SAFETY）
+  -> 有界 channel（1024）-> Dataplane owner 线程
+  -> TransparentPipeline（nexus-projection::transparent，core 不读时钟/不做系统调用）
+  -> Direct：DirectEgress；Proxy：ProxyFlowEgress（真实代理字节流 / UDP 中继）
+  -> UDP 回包经 sendmsg + IP_PKTINFO 以 orig_dst 为源地址发出
+```
+
+- **规则与决策（G2/G3）**：`apps/nexusd` 直接构造 `nexus_proxy::DomainRuleEngine`
+  并注入 `Dataplane`；TUN 与 TPROXY 使用同一 `RuleEngine` 与同一 `FlowDecisionCache`。
+  `SimpleRuleEngine` 只在没有 `proxy.yaml` 时作为默认（bypass 规则）。同一目的地/
+  规则在两条前端上的 `RouteTarget` 与 `selected_outbound` 必须一致。
+- **Direct / Proxy 真转发（G3b/G6）**：Direct TCP 走真实 `connect` 并双向中继，Direct
+  UDP 走 `RealUdpEgress`；Proxy TCP 按规则 tag 拨号并中继，失败发 RST 且计数
+  `upstream_failed`。ICMP/分片/非 TCP-UDP 计 `direct_dropped_unsupported`，不伪装成功。
+- **会话层（G4）**：`auto` 在 `proxy.yaml` 派生 Provider 非空时启用，否则
+  `disabled/no_providers`；`enabled=true` 且无 provider 源时 Proxy 流显式 RST（不静默直连）。
+- **平台边界（ARCHITECTURE §10/§11）**：`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` /
+  `IP_PKTINFO` 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core
+  （`nexus-projection` / `nexus-domain` / `nexus-proxy`）不直接调用平台 API、不取系统时间。
+- **IPv4-only / fake-IP**：本 run 仅 IPv4；`ipv6: true` 在 `tun`/`tproxy` 配置中直接
+  `CONFIG_INVALID`。fake-IP 未启用（`fake_ip: true` 为配置错误），198.18/15 按普通 IP 走规则。
+- **失败语义（不静默漏流量）**：捕获失败 → `tproxy.state=degraded` + `reason`
+  （`permission_denied` / `bind_failed` / `sockopt_failed` / `rule_apply_failed` /
+  `tool_missing` …）+ `enforcement`（`block` / `impossible` / `none`）；`on_capture_failure`
+  默认 `block`，backend 不可用时 `enforcement=impossible`，不得声称已阻断。`orig_dst`
+  缺失/非法 → 关闭/丢弃 + 计数，绝不回退 listener 地址。`on_path_failure=block` 时代理
+  失效不静默直连。
+- **可观察性**：`/localapi/v0/dataplane/stats` 暴露 `takeover_mode`、`ingress_ip_family`、
+  `dataplane.flow_sessions.{state,reason,providers,planner_calls}`、
+  `dataplane.os_assemble.*` 与 `tproxy.{state,reason,enforcement,backend,privilege,
+  chain,mark,route_table,listen,ip_family,ipv6_enabled,counters,last_failure_reason}`。
+  Hot path 只计数，不写 per-packet 日志。
+- **CLI `--tun` 的真实语义**：`nexus proxy --tun` 是 Windows 一次性设备打开 smoke
+  （创建 wintun 适配器、读一帧、释放），**不是数据面**；`nexus subnet up --tun` 是
+  虚拟子网 mesh 隧道（§12.29），与代理透明入站无关。daemon 数据面由 `nexusd <config-dir>`
+  按 `proxy.yaml` 的 `inbounds[kind=tun|tproxy]` 装配。
+- **E4 场景**：`product.proxy-tun-inbound`（迁移到 `FlowDecisionCache` + 统一规则）、
+  `product.tun-production-chain`、`product.tun-os-assemble`、`product.tun-flow-sessions-auto`、
+  `product.provider-derivation`、`product.tproxy-inbound-linux`、
+  `product.transparent-rule-consistency`、`product.tproxy-capture-failure`。
+- **E5 真机范围**：Linux netns S1–S10（TPROXY TCP/UDP/DNS 源地址、TUN 对照、失败阻断、
+  捕获失败、清理、nftables、权限/external、无 provider）。Windows/macOS TPROXY 不在本 run 范围。
+- **仍不做（后续项）**：IPv6 透明代理、Windows/macOS TPROXY、DoH/DoT、mesh 流量经 TPROXY
+  重建 L3 包（mesh/virtual CIDR、TUN 网段、代理服务器地址自动排除，走 TUN/显式路径）。
 
 ### 11.19 HTTP/混合代理入站（HTTP & mixed proxy inbound，2026-09-25） {#11-http-mixed-inbound}
 

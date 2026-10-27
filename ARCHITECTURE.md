@@ -258,6 +258,12 @@ SOCKS5 Ingress（nexus-ingress Socks5Handshake）
   Composition Root / `nexus-platform-*` 注入。
 - `nexus-proxy` 不反向依赖 `nexus-network` / `nexus-service` / `nexus-workspace`
   / `nexus-compute`；代理内核产品线与远程资源访问闭环共享底座但不互相调用业务逻辑。
+- `FlowContext.egress_hint` 是规则给出的出口 tag **提示**，只影响 Provider 候选快照
+  的单候选过滤；它不是 Resource/Provider 身份、不是 Locator、不是 Plan/Session。
+  `None` 表示无提示，未解析的 hint 必须显式 Drop/报错，不得静默改走其它出口。
+- TUN / TPROXY 透明入站（PRODUCT §11.18）把已解析流量交给 `nexusd::Dataplane` 的
+  统一 `RuleEngine` 与 `FlowDecisionCache`；Linux TPROXY 的 sockopt/ancillary 只在
+  `nexus-platform-linux::tproxy`，portable core 不取时间、不做系统调用。
 
 ## 12. N3 Task / Snapshot / Artifact（契约阶段）
 

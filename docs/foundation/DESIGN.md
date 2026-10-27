@@ -300,6 +300,10 @@ SOCKS5 / HTTP 代理作为**显式语义入口**（§11 已有）：
 
 ### 6.4 统一路由：Clash TUN 与 EasyTier TUN 的融合（用户决策，2026-09-30）
 
+> **[工程依据，非产品事实]** 本节的迁移方向已由 tproxy-completion run 落地
+> （`Dataplane` + 统一 `RuleEngine` + `FlowDecisionCache` + Linux TPROXY 前端）。
+> 产品行为以 `PRODUCT.md` §11.18 与 `scenarios/` 为准；本节只解释设计依据。
+
 **核心洞察**：Clash TUN（透明代理入口，按规则选互联网出口）和 EasyTier TUN
 （虚拟网卡，mesh 内转发）都在回答同一个问题——"这个包交给谁"。不需要两个
 TUN 设备，一个 TUN + 统一决策链即可。

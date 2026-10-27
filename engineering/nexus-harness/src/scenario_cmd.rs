@@ -117,6 +117,7 @@ fn run_one(name: &str) -> Outcome {
         message: &message,
         failure_signature: &failure_signature,
         duration_ms: rep.duration_ms,
+        output: rep.output.as_ref(),
     };
     match evidence::write_scenario_evidence(&repo, &config, &ev, &bindings) {
         Ok(id) => (
@@ -165,6 +166,7 @@ fn blocked_unknown(
         message: &message,
         failure_signature: &failure_signature,
         duration_ms: 0,
+        output: None,
     };
     let evidence_id = evidence::write_scenario_evidence(repo, config, &ev, &bindings).ok();
     (

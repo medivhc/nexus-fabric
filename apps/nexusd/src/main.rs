@@ -352,26 +352,82 @@ fn main() -> ExitCode {
     }
 }
 
-/// 数据面线程主循环：创建 TUN → 处理包 → 出错时退出线程（daemon 继续服务 LocalAPI）。
+/// 跨线程规则引擎句柄（组合根构建，数据面线程注入）。
+type ErasedRuleEngine = Box<dyn nexus_domain::RuleEngine>;
+
+/// 由已解析的 `proxy.yaml` 构建数据面规则引擎（组合根唯一构建点）。
+///
+/// - `Some(config)` → `DomainRuleEngine`，失败返回 `Err`（调用方 fail-fast，
+///   不得回落到 `default_simple_engine`）；
+/// - `None` → `Ok(None)`，由装配层显式选择无配置默认引擎并留痕。
+fn build_dataplane_rule_engine(
+    proxy_config: Option<&nexus_proxy_config::ProxyConfig>,
+) -> Result<Option<ErasedRuleEngine>, String> {
+    match proxy_config {
+        Some(config) => nexus_proxy::domain_engine::DomainRuleEngine::from_config(config)
+            .map(|engine| Some(Box::new(engine) as ErasedRuleEngine))
+            .map_err(|e| format!("rule engine from proxy.yaml: {e}")),
+        None => Ok(None),
+    }
+}
+
+/// 构造数据面并注入规则引擎（生产唯一装配点）。
+///
+/// 有配置 → 注入 `DomainRuleEngine`；无配置 → 显式启用并记录默认引擎。
+/// 有配置但引擎缺失/注入失败不在本函数内静默兜底（`None` 仅来自无配置路径）。
+fn assemble_dataplane(
+    tun: Box<dyn nexus_projection::TunDevice>,
+    config: nexusd::dataplane::DataplaneConfig,
+    rule_engine: Option<ErasedRuleEngine>,
+) -> Result<nexusd::dataplane::Dataplane, String> {
+    let mut dp = nexusd::dataplane::Dataplane::new(tun, config)?;
+    match rule_engine {
+        Some(engine) => {
+            dp.set_rule_engine(engine);
+            eprintln!(
+                "[nexusd.dataplane] level=info event=rule_engine state=wired source=proxy.yaml"
+            );
+        }
+        None => {
+            dp.set_default_simple_engine()
+                .map_err(|e| format!("default rule engine: {e}"))?;
+            eprintln!(
+                "[nexusd.dataplane] level=warn event=rule_engine state=default source=none reason=no_proxy_yaml"
+            );
+        }
+    }
+    Ok(dp)
+}
+
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
 /// 为 None 时保持 D2 计数降级。
 /// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
 /// 否则 D2 计数降级。
+/// S24：`rule_engine` 由组合根从同一份 `proxy.yaml` 构建并注入，分类走配置规则。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
+#[allow(clippy::too_many_arguments)]
 fn run_dataplane(
     config: nexusd::dataplane::DataplaneConfig,
     shutdown: Arc<AtomicBool>,
     n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>>,
     tun_name: &str,
     tun_mtu: u32,
+    rule_engine: Option<ErasedRuleEngine>,
     proxy_yaml: Option<String>,
+    network_toml: Option<String>,
+    flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
+    tun_default_route: bool,
+    tun_excludes: Vec<([u8; 4], u8)>,
+    tproxy_config: Option<nexus_proxy_config::TproxyInboundConfig>,
+    tproxy_listen: String,
 ) {
     use nexus_projection::TunDevice;
-    // D1：创建单个 TUN（Linux）。设备名与 MTU 来自 [tun] 配置（T1）。
-    let tun_pattern = format!("{tun_name}%d");
-    let tun: Box<dyn nexus_projection::TunDevice> =
+    // D1：TUN 模式创建单个 TUN；纯 TPROXY 模式使用 InertTun（不伪造数据面）。
+    let create_tun = tun_enabled();
+    let tun: Box<dyn nexus_projection::TunDevice> = if create_tun {
+        let tun_pattern = format!("{tun_name}%d");
         match nexus_projection::tun_rs_device::TunRsDevice::create(&tun_pattern, tun_mtu) {
             Ok(dev) => {
                 eprintln!("[nexusd] dataplane: TUN {} created", dev.name());
@@ -383,9 +439,13 @@ fn run_dataplane(
                 );
                 return;
             }
-        };
+        }
+    } else {
+        eprintln!("[nexusd] dataplane: TUN disabled; using InertTun (tproxy-only mode)");
+        Box::new(nexusd::dataplane::InertTun)
+    };
 
-    let mut dp = match nexusd::dataplane::Dataplane::new(tun, config) {
+    let mut dp = match assemble_dataplane(tun, config, rule_engine) {
         Ok(dp) => dp,
         Err(e) => {
             eprintln!("[nexusd] dataplane: init failed ({e}); dataplane disabled");
@@ -396,36 +456,176 @@ fn run_dataplane(
     // B1：发布 stats 句柄供 LocalAPI 读取。
     nexusd::dataplane::publish_stats_handle(dp.stats_handle());
 
+    // S28：TUN 数据面启动时装配 OS 路由；失败 → os_assemble=failed 降级。
+    #[cfg(target_os = "linux")]
+    let mut os_assemble = if !create_tun {
+        None
+    } else {
+        use nexus_platform_linux::assemble::{
+            ExcludeEgress, OsAssemble, OsAssembleConfig, capture_egress_for,
+        };
+        // P5-b：exclude CIDR 必须沿用**接管前**该目的地址的真实出口，不得
+        // `dev <TUN>`。在此刻（TUN 已建、路由尚未接管）逐项捕获 oif+gateway
+        // 并显式传入；捕获不到的项交给 OsAssemble 从接管前快照再解析，
+        // 仍解析不到则以显式错误降级（不静默回退 TUN）。
+        let exclude_egress: Vec<(([u8; 4], u8), ExcludeEgress)> = tun_excludes
+            .iter()
+            .filter_map(|dst| match capture_egress_for(*dst) {
+                Ok(Some(egress)) => {
+                    eprintln!(
+                        "[nexusd.os] level=info event=os_assemble_exclude_egress dst={dst:?} oif={} gateway={:?}",
+                        egress.oif, egress.gateway
+                    );
+                    Some((*dst, egress))
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[nexusd.os] level=warn event=os_assemble_exclude_egress dst={dst:?} reason=no_pre_takeover_route"
+                    );
+                    None
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[nexusd.os] level=warn event=os_assemble_exclude_egress dst={dst:?} reason={e}"
+                    );
+                    None
+                }
+            })
+            .collect();
+        let config = OsAssembleConfig {
+            ifname: dp.tun_name().to_string(),
+            tun_ip: [10, 99, 0, 1],
+            prefixlen: 24,
+            subnet: ([10, 99, 0, 0], 24),
+            default_route: tun_default_route,
+            dry_run: false,
+            log_path: None,
+            exclude_dst_cidrs: tun_excludes,
+            exclude_egress,
+        };
+        match OsAssemble::new(config) {
+            Ok(mut assemble) => match assemble.apply() {
+                Ok(report) => {
+                    nexusd::dataplane::publish_os_assemble(nexusd::dataplane::OsAssembleStatus {
+                        state: "applied",
+                        ifname: dp.tun_name().to_string(),
+                        default_route: report.default_route_added,
+                        excludes: report.excludes_added,
+                    });
+                    eprintln!(
+                        "[nexusd.os] level=info event=os_assemble state=applied ifname={} addrs={} routes={} default_route={} excludes={}",
+                        dp.tun_name(),
+                        report.addrs_added,
+                        report.routes_added,
+                        report.default_route_added,
+                        report.excludes_added,
+                    );
+                    Some(assemble)
+                }
+                Err(e) => {
+                    nexusd::dataplane::publish_os_assemble(nexusd::dataplane::OsAssembleStatus {
+                        state: "failed",
+                        ifname: dp.tun_name().to_string(),
+                        default_route: tun_default_route,
+                        excludes: 0,
+                    });
+                    eprintln!(
+                        "[nexusd.os] level=error event=os_assemble state=failed ifname={} reason={e}",
+                        dp.tun_name()
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[nexusd.os] level=error event=os_assemble state=failed ifname={} reason={e}",
+                    dp.tun_name()
+                );
+                None
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut os_assemble: Option<()> = None;
+
     // R1：注入 N1 发送器（有则真发，无则 D2 计数降级）。
     if let Some(sender) = n1_sender {
         dp.set_n1_sender(sender);
         eprintln!("[nexusd] dataplane: N1 sender wired (n1_bridge_ready=true)");
     }
 
+    // S25：生产 ChainDeps + 流会话三态（spec §7.6 第 3 步）。
+    match nexusd::dataplane::ProductionChainDeps::from_config(
+        network_toml.as_deref(),
+        proxy_yaml.as_deref(),
+    ) {
+        Ok(deps) => {
+            let providers = deps.provider_count();
+            dp.set_production_chain_deps(deps);
+            let enabled = dp.enable_flow_sessions_for_config(flow_sessions_mode, providers);
+            let status = dp.flow_sessions_state();
+            nexusd::dataplane::publish_flow_sessions(status);
+            eprintln!(
+                "[nexusd.session] level=info event=flow_sessions state={} reason={} providers={} auto={}",
+                status.state,
+                status.reason.unwrap_or("-"),
+                status.providers,
+                matches!(
+                    flow_sessions_mode,
+                    nexus_proxy_config::FlowSessionsMode::Auto
+                ),
+            );
+            if enabled {
+                eprintln!("[nexusd.session] level=info event=providers_derived count={providers}");
+            }
+        }
+        Err(e) => {
+            eprintln!("[nexusd] ERROR: flow session wiring failed: {e}");
+        }
+    }
+
     // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
     if let Some(yaml) = proxy_yaml.as_deref() {
         match nexusd::proxy_fwd::ProxyEngine::new(yaml) {
-            Some(engine) => {
+            Ok(engine) => {
                 dp.set_proxy_engine(engine);
                 eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
             }
-            None => {
+            Err(e) => {
                 eprintln!(
-                    "[nexusd] dataplane: proxy.yaml has no usable outbound; proxy packets counted"
+                    "[nexusd] dataplane: ProxyEngine unavailable ({e}); proxy packets counted"
                 );
             }
         }
     }
 
+    #[cfg(target_os = "linux")]
+    let mut tproxy_frontend = match tproxy_config {
+        Some(config) => setup_tproxy_frontend(
+            &config,
+            &tproxy_listen,
+            proxy_yaml.as_deref(),
+            &mut dp,
+            Arc::clone(&shutdown),
+        ),
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut tproxy_frontend: Option<()> = None;
+
     eprintln!("[nexusd] dataplane: running");
+    let _ = &mut os_assemble;
+    let loop_start = std::time::Instant::now();
+    let mut last_tproxy_publish = std::time::Instant::now();
     loop {
         // R4：关闭信号 → 退出循环（TUN 随 Dataplane drop 关闭）。
         if shutdown.load(Ordering::Relaxed) {
             eprintln!("[nexusd] dataplane: shutdown signal, exiting");
             break;
         }
-        match dp.process_one() {
-            Ok(true) => continue,
+        let now_millis = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match dp.tick(now_millis) {
+            Ok(true) => {}
             Ok(false) => {
                 // 无包：短暂休眠避免忙轮询。
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -435,7 +635,396 @@ fn run_dataplane(
                 break;
             }
         }
+        if last_tproxy_publish.elapsed() >= std::time::Duration::from_secs(1) {
+            nexusd::dataplane::publish_flow_sessions(dp.flow_sessions_state());
+            nexusd::dataplane::publish_tproxy_counters(
+                dp.tproxy_counters(),
+                dp.tproxy_last_failure().map(str::to_string),
+            );
+            last_tproxy_publish = std::time::Instant::now();
+        }
     }
+    // §13.4 清理顺序：停收包 → 透明前端 → 捕获规则 → OS 装配。
+    dp.shutdown_transparent();
+    #[cfg(target_os = "linux")]
+    if let Some(mut frontend) = tproxy_frontend.take() {
+        frontend.shutdown();
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tproxy_frontend.take();
+    #[cfg(target_os = "linux")]
+    if let Some(mut assemble) = os_assemble.take() {
+        match assemble.cleanup() {
+            Ok(report) => eprintln!(
+                "[nexusd.os] level=info event=os_assemble state=cleaned addrs={} routes={} excludes={}",
+                report.addrs_removed, report.routes_removed, report.excludes_removed
+            ),
+            Err(e) => eprintln!(
+                "[nexusd.os] level=error event=os_assemble state=cleanup_failed reason={e}"
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = os_assemble.take();
+}
+
+/// TPROXY 前端运行期句柄（S42：listener 线程 + 捕获规则所有权）。
+#[cfg(target_os = "linux")]
+struct TproxyFrontend {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    rules: Box<dyn nexus_platform::TransparentCaptureRules>,
+}
+
+#[cfg(target_os = "linux")]
+impl TproxyFrontend {
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        match self.rules.cleanup() {
+            Ok(report) => eprintln!(
+                "[nexusd.tproxy] level=info event=rules_cleaned chain={} rules={} ip_rules={} routes={}",
+                nexusd::dataplane::tproxy_status_snapshot().chain,
+                report.rules_removed,
+                report.ip_rules_removed,
+                report.routes_removed,
+            ),
+            Err(e) => {
+                let mut status = nexusd::dataplane::tproxy_status_snapshot();
+                status.state = "cleanup_failed";
+                status.reason = Some("cleanup_failed");
+                nexusd::dataplane::publish_tproxy_status(status);
+                eprintln!(
+                    "[nexusd.tproxy] level=error event=rules_failed step=cleanup reason=cleanup_failed stderr=\"{e}\""
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_capture_backend(
+    backend: nexus_proxy_config::CaptureBackendConfig,
+) -> nexus_platform::CaptureBackend {
+    match backend {
+        nexus_proxy_config::CaptureBackendConfig::Iptables => {
+            nexus_platform::CaptureBackend::Iptables
+        }
+        nexus_proxy_config::CaptureBackendConfig::Nftables => {
+            nexus_platform::CaptureBackend::Nftables
+        }
+        nexus_proxy_config::CaptureBackendConfig::External => {
+            nexus_platform::CaptureBackend::External
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ingress_reason(error: &nexus_platform::TransparentIngressError) -> &'static str {
+    use nexus_platform::TransparentIngressError as E;
+    match error {
+        E::CapabilityUnavailable { .. } => "capability_unavailable",
+        E::PermissionDenied { .. } => "permission_denied",
+        E::BindFailed { .. } => "bind_failed",
+        E::SockOptFailed { .. } => "sockopt_failed",
+        E::OrigDstMissing { .. } => "orig_dst_missing",
+        E::OrigDstInvalid { .. } => "orig_dst_invalid",
+        E::AncillaryParseFailed { .. } => "ancillary_parse_failed",
+        E::UnsupportedFamily { .. } => "unsupported_family",
+        E::Io { .. } => "listener_io_failed",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rule_reason(error: &nexus_platform::CaptureRuleError) -> &'static str {
+    use nexus_platform::CaptureRuleError as E;
+    match error {
+        E::PermissionDenied { .. } => "rule_permission_denied",
+        E::ToolMissing { .. } => "tool_missing",
+        E::CommandFailed { .. } => "rule_apply_failed",
+        E::CleanupFailed { .. } => "cleanup_failed",
+        E::UnsupportedBackend { .. } => "rule_apply_failed",
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn setup_tproxy_frontend(
+    config: &nexus_proxy_config::TproxyInboundConfig,
+    listen: &str,
+    proxy_yaml: Option<&str>,
+    dp: &mut nexusd::dataplane::Dataplane,
+    shutdown: Arc<AtomicBool>,
+) -> Option<TproxyFrontend> {
+    use nexus_platform::CaptureRuleSpec;
+    use nexus_platform::{TransparentTcpIngress, TransparentUdpIngress};
+    use nexus_platform_linux::tproxy::rules::capture_rules_for;
+    use nexus_platform_linux::tproxy::{
+        TproxyTcpConfig, TproxyTcpListener, TproxyUdpConfig, TproxyUdpSocket,
+    };
+    use nexus_projection::transparent::direct::{DirectEgress, DirectEgressConfig};
+    use nexus_projection::transparent::runtime::TransparentPipeline;
+    use nexus_projection::transparent::{
+        PathFailurePolicy, ProxyFlowEgress, TransparentConfig, TransparentDeps, TransparentOutput,
+    };
+
+    let privilege = nexusd::dataplane::detect_privilege();
+    let backend = map_capture_backend(config.backend);
+    let mut spec = CaptureRuleSpec::new(backend);
+    spec.chain = config.chain.clone();
+    spec.tcp_port = config.tcp_port;
+    spec.udp_port = config.udp_port;
+    spec.mark = config.mark;
+    spec.mark_mask = config.mark;
+    spec.route_table = config.route_table;
+    spec.intercept_dst_cidrs = config.intercept_dst_cidrs.clone();
+    spec.exclude_dst_cidrs = config.exclude_dst_cidrs.clone();
+    if let Some(yaml) = proxy_yaml {
+        if let Ok(parsed) = nexus_proxy_config::parse(yaml) {
+            for outbound in &parsed.outbounds {
+                if let Some(locator) = outbound.locator.as_deref() {
+                    let host = locator.rsplit_once(':').map_or(locator, |(host, _)| host);
+                    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                        let cidr = format!("{ip}/32");
+                        if !spec.exclude_dst_cidrs.contains(&cidr) {
+                            spec.exclude_dst_cidrs.push(cidr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let listen_addr = listen
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .and_then(|addr| match addr {
+            std::net::SocketAddr::V4(v4) => Some(v4),
+            std::net::SocketAddr::V6(_) => None,
+        })
+        .unwrap_or_else(|| {
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, config.tcp_port)
+        });
+    let tcp_config = TproxyTcpConfig {
+        listen: std::net::SocketAddrV4::new(*listen_addr.ip(), config.tcp_port),
+        ..TproxyTcpConfig::default()
+    };
+    let udp_config = TproxyUdpConfig {
+        listen: std::net::SocketAddrV4::new(*listen_addr.ip(), config.udp_port),
+        ..TproxyUdpConfig::default()
+    };
+    let mut rules = capture_rules_for(backend);
+
+    let mut tcp = match TproxyTcpListener::bind(&tcp_config) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let reason = ingress_reason(&error);
+            let mut status = nexusd::dataplane::capture_failure_status(
+                reason,
+                privilege,
+                config.on_capture_failure,
+                true,
+            );
+            status.backend = backend.as_str();
+            status.chain = config.chain.clone();
+            status.mark = format!("0x{:x}", config.mark);
+            status.route_table = config.route_table;
+            status.listen = listen.to_string();
+            if config.on_capture_failure == nexus_proxy_config::CaptureFailureMode::Block {
+                status.enforcement = match rules.enforce_block(&spec) {
+                    Ok(_) => "block",
+                    Err(_) => "impossible",
+                };
+            }
+            nexusd::dataplane::publish_tproxy_status(status);
+            eprintln!(
+                "[nexusd.tproxy] level=error event=capture_failed reason={reason} addr={} errno=0 msg=\"{error}\"",
+                listen_addr
+            );
+            return None;
+        }
+    };
+    let mut udp = match TproxyUdpSocket::bind(&udp_config) {
+        Ok(socket) => socket,
+        Err(error) => {
+            let reason = ingress_reason(&error);
+            let mut status = nexusd::dataplane::capture_failure_status(
+                reason,
+                privilege,
+                config.on_capture_failure,
+                true,
+            );
+            status.backend = backend.as_str();
+            status.chain = config.chain.clone();
+            status.mark = format!("0x{:x}", config.mark);
+            status.route_table = config.route_table;
+            status.listen = listen.to_string();
+            if config.on_capture_failure == nexus_proxy_config::CaptureFailureMode::Block {
+                status.enforcement = match rules.enforce_block(&spec) {
+                    Ok(_) => "block",
+                    Err(_) => "impossible",
+                };
+            }
+            nexusd::dataplane::publish_tproxy_status(status);
+            eprintln!(
+                "[nexusd.tproxy] level=error event=capture_failed reason={reason} addr={} errno=0 msg=\"{error}\"",
+                listen_addr
+            );
+            return None;
+        }
+    };
+    let _ = tcp.start();
+    let _ = udp.start();
+
+    let mut status = nexusd::dataplane::TproxyStatus {
+        state: "active",
+        reason: None,
+        enforcement: "active",
+        backend: backend.as_str(),
+        privilege,
+        chain: config.chain.clone(),
+        mark: format!("0x{:x}", config.mark),
+        route_table: config.route_table,
+        listen: listen.to_string(),
+        ip_family: "ipv4",
+        ipv6_enabled: false,
+        counters: nexusd::dataplane::TproxyCounters::default(),
+        last_failure_reason: None,
+    };
+    match rules.apply(&spec) {
+        Ok(report) => eprintln!(
+            "[nexusd.tproxy] level=info event=rules_applied backend={} chain={} rules={} ip_rules={} routes={} idempotent=true",
+            backend.as_str(),
+            config.chain,
+            report.rules_added,
+            report.ip_rules_added,
+            report.routes_added,
+        ),
+        Err(error) => {
+            let reason = rule_reason(&error);
+            status.state = "degraded";
+            status.reason = Some(reason);
+            status.enforcement = match config.on_capture_failure {
+                nexus_proxy_config::CaptureFailureMode::Bypass => "none",
+                nexus_proxy_config::CaptureFailureMode::Block => match rules.enforce_block(&spec) {
+                    Ok(_) => "block",
+                    Err(_) => "impossible",
+                },
+            };
+            eprintln!(
+                "[nexusd.tproxy] level=error event=rules_failed step=apply reason={reason} stderr=\"{error}\""
+            );
+        }
+    }
+
+    let Ok(direct) = DirectEgress::new(DirectEgressConfig::default()) else {
+        eprintln!(
+            "[nexusd.tproxy] level=error event=capture_failed reason=sockopt_failed addr={listen_addr} errno=0 msg=\"direct egress init failed\""
+        );
+        return None;
+    };
+    let proxy_egress: Option<Box<dyn ProxyFlowEgress>> = proxy_yaml
+        .and_then(nexusd::tproxy_egress::StreamProxyEgress::from_yaml)
+        .map(|egress| Box::new(egress) as Box<dyn ProxyFlowEgress>);
+    let transparent_config = TransparentConfig {
+        udp_table_capacity: config.udp_table_capacity,
+        max_tcp_conns: config.max_tcp_conns,
+        udp_idle: std::time::Duration::from_secs(config.udp_idle_secs),
+        on_path_failure: match config.on_path_failure {
+            nexus_proxy_config::PathFailureMode::Block => PathFailurePolicy::Block,
+            nexus_proxy_config::PathFailureMode::Fallback => PathFailurePolicy::Fallback,
+        },
+        ..TransparentConfig::default()
+    };
+    let pipeline = TransparentPipeline::new(TransparentDeps {
+        proxy_egress,
+        direct,
+        config: transparent_config,
+    });
+    let (tx, rx) = nexusd::dataplane::inbound_channel();
+    let failure_tx = tx.clone();
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    dp.set_transparent_pipeline(pipeline, reply_tx);
+    dp.set_transparent_rx(rx, failure_tx);
+    let counters = dp.tproxy_counters_handle();
+    nexusd::dataplane::publish_tproxy_status(status.clone());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("nexusd-tproxy".to_string())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            while !thread_stop.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
+                let now_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                match tcp.accept(now_millis) {
+                    Ok(Some(accepted)) => {
+                        if tx
+                            .try_send(nexusd::dataplane::TransparentInbound::Tcp(accepted))
+                            .is_err()
+                        {
+                            nexusd::dataplane::record_inbound_queue_full(&counters);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if tx
+                            .try_send(nexusd::dataplane::TransparentInbound::CaptureFailed(error))
+                            .is_err()
+                        {
+                            nexusd::dataplane::record_inbound_queue_full(&counters);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+                match udp.recv(now_millis) {
+                    Ok(Some(datagram)) => {
+                        if tx
+                            .try_send(nexusd::dataplane::TransparentInbound::Udp(datagram))
+                            .is_err()
+                        {
+                            nexusd::dataplane::record_inbound_queue_full(&counters);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if tx
+                            .try_send(nexusd::dataplane::TransparentInbound::CaptureFailed(error))
+                            .is_err()
+                        {
+                            nexusd::dataplane::record_inbound_queue_full(&counters);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+                while let Ok(output) = reply_rx.try_recv() {
+                    if let TransparentOutput::UdpReply {
+                        orig_dst,
+                        peer,
+                        payload,
+                    } = output
+                    {
+                        if udp.send_from(orig_dst, peer, &payload).is_err() {
+                            if let Ok(mut guard) = counters.lock() {
+                                guard.udp_reply_failed += 1;
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = tcp.shutdown();
+            let _ = udp.shutdown();
+        })
+        .ok()?;
+
+    Some(TproxyFrontend {
+        stop,
+        handle: Some(handle),
+        rules,
+    })
 }
 
 /// NAT switching daemon runtime（AC5）。
@@ -940,6 +1529,29 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
     // T4：发布 tun_enabled 状态供 LocalAPI 查询。
     publish_tun_enabled(loaded.daemon.tun.enabled);
+    let takeover_mode = loaded
+        .proxy_yaml
+        .as_deref()
+        .and_then(|yaml| nexus_proxy_config::parse(yaml).ok())
+        .map(|config| {
+            let has_system_inbound = config.inbounds.iter().any(|inbound| {
+                matches!(
+                    inbound.kind,
+                    nexus_proxy_config::InboundKind::Tun | nexus_proxy_config::InboundKind::Tproxy
+                )
+            });
+            if has_system_inbound || loaded.daemon.tun.enabled {
+                "system-level"
+            } else {
+                "resource-level"
+            }
+        })
+        .unwrap_or(if loaded.daemon.tun.enabled {
+            "system-level"
+        } else {
+            "resource-level"
+        });
+    nexusd::dataplane::publish_runtime_basics(takeover_mode, "ipv4");
 
     // 2. 组装 DataplaneConfig（R2/R3；dns.toml 解析失败 → exit 1）。
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
@@ -979,7 +1591,66 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let tun_name = loaded.daemon.tun.name.clone();
     let tun_mtu = loaded.daemon.tun.mtu;
     let proxy_yaml = loaded.proxy_yaml.clone();
-    let dataplane_handle = if tun_enabled() {
+    let network_toml = loaded.network_toml.clone();
+    let flow_sessions_mode = loaded
+        .daemon
+        .flow_sessions
+        .enabled
+        .unwrap_or(nexus_proxy_config::FlowSessionsMode::Auto);
+    let tun_default_route = loaded.daemon.tun.default_route;
+    let parsed_proxy = loaded
+        .proxy_yaml
+        .as_deref()
+        .and_then(|yaml| nexus_proxy_config::parse(yaml).ok());
+    let tproxy_inbound = parsed_proxy.as_ref().and_then(|config| {
+        config
+            .inbounds
+            .iter()
+            .find(|inbound| inbound.kind == nexus_proxy_config::InboundKind::Tproxy)
+            .map(|inbound| (inbound.listen.clone(), inbound.tproxy.clone()))
+    });
+    let has_tproxy = tproxy_inbound.is_some();
+    // S28：exclude_server_routes=true 时从 proxy outbounds locator 收集 IP → /32。
+    let tun_excludes: Vec<([u8; 4], u8)> = if loaded.daemon.tun.exclude_server_routes {
+        loaded
+            .proxy_yaml
+            .as_deref()
+            .and_then(|yaml| nexus_proxy_config::parse(yaml).ok())
+            .map(|config| {
+                config
+                    .outbounds
+                    .iter()
+                    .filter_map(|outbound| outbound.locator.as_deref())
+                    .filter_map(|locator| {
+                        let host = locator.rsplit_once(':').map(|(h, _)| h).unwrap_or(locator);
+                        host.parse::<std::net::Ipv4Addr>().ok()
+                    })
+                    .map(|ip| (ip.octets(), 32))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // S24：数据面规则引擎来自同一份 proxy.yaml；构造失败 → 启动失败（fail-fast，
+    // 不得静默回落到把全部流量送往 `proxy` 的默认引擎）。
+    // 此接线由 dataplane_rule_engine_assembly_tests 装配回归测试钉住；
+    // 删改接线（如改传 None）时必须同步更新该测试。
+    let rule_engine = if tun_enabled() || has_tproxy {
+        match build_dataplane_rule_engine(parsed_proxy.as_ref()) {
+            Ok(engine) => engine,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    json!({"verdict":"FAIL","error":{"code":"CONFIG","message":e}})
+                );
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+    let dataplane_handle = if tun_enabled() || has_tproxy {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
             std::thread::Builder::new()
@@ -991,7 +1662,19 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         n1_sender,
                         &tun_name,
                         tun_mtu,
+                        rule_engine,
                         proxy_yaml,
+                        network_toml,
+                        flow_sessions_mode,
+                        tun_default_route,
+                        tun_excludes,
+                        tproxy_inbound
+                            .as_ref()
+                            .and_then(|(_, tproxy)| tproxy.clone()),
+                        tproxy_inbound
+                            .as_ref()
+                            .map(|(listen, _)| listen.clone())
+                            .unwrap_or_else(|| "0.0.0.0:7895".to_string()),
                     );
                 })
                 .expect("spawn dataplane thread"),
@@ -1832,23 +2515,16 @@ fn handle_localapi_request(
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/dataplane/stats" => {
-            // B1：统一数据面统计（D6 可观测）。
-            // T4：包含 tun_enabled 状态（no-tun 模式可观测）。
+            // B1 / S30：统一数据面统计（D6 可观测，spec §9.16）。
             let s = nexusd::dataplane::dataplane_stats_snapshot();
-            Ok(json!({
-                "verdict": "PASS",
-                "tun_enabled": tun_enabled(),
-                "dataplane": {
-                    "mesh_forwarded": s.mesh_forwarded,
-                    "proxy_forwarded": s.proxy_forwarded,
-                    "direct_forwarded": s.direct_forwarded,
-                    "dropped": s.dropped,
-                    "dns_answered": s.dns_answered,
-                    "qos_dropped": s.qos_dropped,
-                    "mesh_dropped_no_n1": s.mesh_dropped_no_n1,
-                    "proxy_dropped_no_proxy": s.proxy_dropped_no_proxy,
-                }
-            }))
+            let status = nexusd::dataplane::runtime_status_snapshot();
+            let tproxy = nexusd::dataplane::tproxy_status_json();
+            Ok(nexusd::dataplane::dataplane_stats_json(
+                tun_enabled(),
+                &status,
+                &s,
+                tproxy,
+            ))
         }
         "/localapi/v0/dns/status" => nexus::observability::dns_status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
@@ -2069,5 +2745,101 @@ mod p1_15_localapi_hardening_tests {
             "must be a real bound, got {:?}",
             LOCALAPI_IO_TIMEOUT
         );
+    }
+}
+
+/// 装配级回归（P3）：规则引擎必须由生产装配路径注入数据面。
+///
+/// 本缺陷的形态是“单测全绿、生产从未接线”：因此这里跨过 `run_dataplane` 使用的
+/// 两个装配步骤（`build_dataplane_rule_engine` → `assemble_dataplane`），
+/// 直接对装配出的 `Dataplane` 断言分类结果。
+#[cfg(test)]
+mod dataplane_rule_engine_assembly_tests {
+    use super::{assemble_dataplane, build_dataplane_rule_engine};
+    use nexus_projection::{MockTun, TunDevice};
+    use nexusd::dataplane::DataplaneConfig;
+    use std::sync::{Arc, Mutex};
+
+    const DIRECT_MATCH_YAML: &str = "\
+schema_version: 1
+inbounds:
+  - tag: tp-in
+    kind: tproxy
+    listen: 0.0.0.0:7895
+    backend: iptables
+rules:
+  - tag: rule-match
+    kind: match
+    match: \"\"
+    action:
+      - kind: select_outbound
+        tag: direct
+outbounds:
+  - tag: direct
+    kind: direct
+    locator: \"\"
+";
+
+    struct SharedTun(Arc<Mutex<MockTun>>);
+
+    impl TunDevice for SharedTun {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().read(buf)
+        }
+        fn write(&mut self, packet: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(packet)
+        }
+        fn name(&self) -> &str {
+            "test0"
+        }
+    }
+
+    fn craft_udp(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
+        pkt
+    }
+
+    fn assemble(proxy_yaml: Option<&str>) -> (nexusd::dataplane::Dataplane, Vec<u8>) {
+        let proxy = proxy_yaml.map(|yaml| nexus_proxy_config::parse(yaml).expect("proxy.yaml"));
+        let engine = build_dataplane_rule_engine(proxy.as_ref()).expect("rule engine");
+        let mock = Arc::new(Mutex::new(MockTun::new("test0")));
+        let mut dp = assemble_dataplane(
+            Box::new(SharedTun(Arc::clone(&mock))),
+            DataplaneConfig::default(),
+            engine,
+        )
+        .expect("assemble dataplane");
+        let pkt = craft_udp([10, 200, 1, 2], [203, 0, 113, 7], 32_890, 8080);
+        mock.lock().unwrap().inject(pkt.clone());
+        assert!(dp.process_one().expect("process_one"));
+        (dp, pkt)
+    }
+
+    #[test]
+    fn config_rule_engine_directs_flow_in_assembled_dataplane() {
+        // S1 的 proxy.yaml：MATCH -> direct。旧缺陷下分类走默认引擎 → Proxy("proxy")。
+        let (mut dp, pkt) = assemble(Some(DIRECT_MATCH_YAML));
+        let outbound = dp.cached_outbound(&pkt).expect("decision cached");
+        assert_eq!(
+            outbound, "self",
+            "config MATCH->direct must classify as direct, not Proxy(proxy)"
+        );
+    }
+
+    #[test]
+    fn no_config_uses_explicit_default_engine() {
+        // 无 proxy.yaml 是显式保留的唯一默认路径（装配层记录 warn 日志）。
+        let (mut dp, pkt) = assemble(None);
+        let outbound = dp.cached_outbound(&pkt).expect("decision cached");
+        assert_eq!(outbound, "proxy");
     }
 }

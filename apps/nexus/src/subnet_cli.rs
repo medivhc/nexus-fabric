@@ -1896,10 +1896,12 @@ address = "udp://other:11010"
                 .env("NEXUS_C5_CHILD", "1")
                 .output()
                 .unwrap();
+            // libtest may prefix the key with `test <name> ... ` when the
+            // child runs single-threaded; match the marker anywhere on a line.
             String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .find_map(|l| l.strip_prefix("CHILD_PUBKEY="))
-                .map(str::to_string)
+                .find_map(|l| l.split("CHILD_PUBKEY=").nth(1))
+                .map(|s| s.trim().to_string())
                 .expect("child must print CHILD_PUBKEY")
         };
         let first = dump();

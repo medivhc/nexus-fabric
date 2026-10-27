@@ -1182,6 +1182,7 @@ dependencies = [
  "nexus-platform-windows",
  "nexus-plugin",
  "nexus-policy",
+ "nexus-projection",
  "nexus-proxy",
  "nexus-proxy-config",
  "nexus-proxy-transport",
@@ -1480,9 +1481,11 @@ name = "nexus-platform-linux"
 version = "0.1.0"
 dependencies = [
  "fuser",
+ "libc",
  "nexus-platform",
  "nexus-storage",
  "nexus-workspace",
+ "socket2",
 ]
 
 [[package]]
@@ -1678,6 +1681,7 @@ dependencies = [
  "nexus-platform-windows",
  "nexus-policy",
  "nexus-projection",
+ "nexus-proxy",
  "nexus-proxy-config",
  "nexus-proxy-transport",
  "nexus-registry",

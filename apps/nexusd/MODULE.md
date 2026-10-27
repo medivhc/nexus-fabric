@@ -47,6 +47,11 @@
 
 - 该 app 只承担前端或 Composition Root 角色。
 - 不得让 production crate 反向依赖 app。
+- S49 文档一致性 grep 明确排除 `docs/recovery/`：该目录是 SHA-256 manifest
+  固定的取证归档（`docs/recovery/2026-10-20/canonical-export-manifest.json`），
+  历史快照包含旧符号是预期事实；改写快照会破坏 manifest 校验。门禁实现在
+  `scripts/doc-consistency-check.sh`，只扫描 `PRODUCT.md`、`docs/`、`crates/`、
+  `scenarios/` 中的活文档。
 
 ## Side Effects
 

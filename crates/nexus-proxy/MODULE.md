@@ -132,13 +132,9 @@
   - relay 组由 `GroupKind::Relay` 配置承载，跳序列表经 `RoutingDecision.relay_hops` 暴露。
   - `ProxyService`：编排 service，持有 RuleEngine + Group 注册表 + Outbound 注册表，
     对每个入站 FlowContext 执行 route -> group resolve -> outbound activate。
-  - `TunNatRouter`（§11.18，portable 纯决策 + 进程内 5 元组缓存，零网络 I/O）：
-    `TunNatRouter::new(ProxyService)` 构造；`route_packet(&mut self, &TunPacket) ->
-    Result<TunRouteOutcome, ProxyError>`——首包 miss 走 `ProxyService::route` 建映射，
-    同 `(proto, src_ip, src_port, dst_ip, dst_port)` 后续包 hit 复用缓存决策（`cache_hit`）；
-    `stats() -> TunStats { packets, bytes, dropped, mappings, cache_hits }`。
-    它是 TUN per-packet 数据面相对 SOCKS5 per-stream 的独立决策频率维度，不产生第二套
-    系统级 Plan。
+  - 5 元组决策缓存已迁移到 `nexus-projection::transparent::decision::FlowDecisionCache`
+    （TUN/TPROXY 共用，spec §9.13）；`nexus-proxy` 不再提供 per-packet NAT 路由类型。
+    缓存只复用 `RouteTarget` 决策，不产生第二套系统级 Plan。
 
 ## Verification
 
