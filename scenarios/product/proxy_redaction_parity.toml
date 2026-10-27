@@ -1,0 +1,80 @@
+schema_version = 1
+id = "product.proxy-redaction-parity"
+title = "A6：口令脱敏装配级 parity（真实畸形 proxy.yaml 启动 + CLI check，marker 0 命中）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+# 可执行 E4（example proxy_redaction_parity --json）：marker 串
+# `NXPARITYMARKER7F3C9A1D` 同时作为 (a) 明文 Trojan 的 `password` 值、
+# (b) 解析失败行原文（`password <marker>`，缺冒号 → 解析器回显该行）。
+# 两个载体：
+# - 启动侧：真实 `nexusd <config-dir>` 子进程，捕获**全部** stdout + stderr；
+#   预期失败确实发生（`stage=proxy_engine_init` / `stage=config_load` + exit 1）；
+# - check 侧：生产函数 `nexus::outbound_check::check`（`nexus config check` 实现体）
+#   的 JSON + stderr 警示行，预期 `static_valid=false`。
+# 断言：所有捕获面的 marker 命中数 = 0（`marker_hits_total`），且最容易漏脱敏的
+# 解析回显路径确实打了掩码（`mask_present=true`）——防止「没跑到」的假绿。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_redaction_parity -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "failures_observed"
+equals = true
+
+[[expect]]
+field = "marker_hits_total"
+equals = 0
+
+[[expect]]
+field = "startup.proxy_engine_init.stage"
+equals = "proxy_engine_init"
+
+[[expect]]
+field = "startup.proxy_engine_init.exit_code"
+equals = 1
+
+[[expect]]
+field = "startup.proxy_engine_init.marker_hits"
+equals = 0
+
+[[expect]]
+field = "startup.config_load.stage"
+equals = "config_load"
+
+[[expect]]
+field = "startup.config_load.exit_code"
+equals = 1
+
+[[expect]]
+field = "startup.config_load.marker_hits"
+equals = 0
+
+[[expect]]
+field = "startup.config_load.mask_present"
+equals = true
+
+[[expect]]
+field = "check.plaintext_trojan.static_valid"
+equals = false
+
+[[expect]]
+field = "check.plaintext_trojan.marker_hits"
+equals = 0
+
+[[expect]]
+field = "check.malformed_yaml.static_valid"
+equals = false
+
+[[expect]]
+field = "check.malformed_yaml.marker_hits"
+equals = 0
+
+[[expect]]
+field = "check.malformed_yaml.mask_present"
+equals = true
