@@ -210,6 +210,13 @@ jobs:
       - name: Install git hooks
         run: ./.githooks/install.sh
 
+      # dependency-governance gate 真跑 cargo-deny（policies/deny.toml）；
+      # 未安装时该 gate 只能报 UNKNOWN。版本固定，与本地验证一致。
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
       # 核心验证：nexus-harness verify --fast
       - name: Verify Fast
         id: verify
