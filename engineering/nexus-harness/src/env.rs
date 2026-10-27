@@ -292,15 +292,18 @@ impl Repo {
             .collect();
         let mut input = Vec::new();
         for path in paths {
-            let rel = String::from_utf8_lossy(path);
-            // A tracked file missing from the working tree still counts.
-            let content = std::fs::read(self.root.join(rel.as_ref()))
-                .unwrap_or_else(|_| b"<missing>".to_vec());
             input.extend_from_slice(path);
             input.push(0);
-            input.extend_from_slice(content.len().to_string().as_bytes());
-            input.push(0);
-            input.extend_from_slice(&content);
+            // A tracked file missing from the working tree still counts, as
+            // a `-` frame that no real content (`<len>\0<bytes>`) can equal.
+            match std::fs::read(self.root.join(path_from_git(path))) {
+                Ok(content) => {
+                    input.extend_from_slice(content.len().to_string().as_bytes());
+                    input.push(0);
+                    input.extend_from_slice(&content);
+                }
+                Err(_) => input.extend_from_slice(b"-\0"),
+            }
         }
         self.hash_stdin_bytes(&input)
     }
@@ -407,6 +410,20 @@ pub fn path_is_within_resolved(path: &Path, dir: &Path) -> bool {
     match (canonicalized(path), canonicalized(dir)) {
         (Some(p), Some(d)) => p.starts_with(&d),
         _ => false,
+    }
+}
+
+/// A `git ls-files -z` path as a filesystem path: raw bytes on Unix, so
+/// non-UTF-8 names still open; git emits UTF-8 elsewhere.
+fn path_from_git(path: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(path).as_ref())
     }
 }
 
@@ -777,6 +794,7 @@ pub(crate) mod tests {
             std::fs::write(r.resolve("apps/new/MODULE.md"), "new\n").unwrap();
         });
         let extra = "policies/extra.toml";
+        let without_extra = repo.contract_hash();
         std::fs::write(repo.resolve(extra), "e = 1\n").unwrap();
         repo.git(&["add", extra]).unwrap();
         repo.git(&["commit", "-m", "extra"]).unwrap();
@@ -785,6 +803,18 @@ pub(crate) mod tests {
             "tracked contract deleted from the worktree only",
             |r| std::fs::remove_file(r.resolve(extra)).unwrap(),
         );
+        assert_ne!(
+            repo.contract_hash(),
+            without_extra,
+            "a tracked contract missing from the worktree is not the same as never having it"
+        );
+        // Nor is it the same as a file whose content looks like a marker.
+        let missing = repo.contract_hash();
+        std::fs::write(repo.resolve(extra), "-").unwrap();
+        assert_ne!(repo.contract_hash(), missing);
+        std::fs::write(repo.resolve(extra), "<missing>").unwrap();
+        assert_ne!(repo.contract_hash(), missing);
+        std::fs::remove_file(repo.resolve(extra)).unwrap();
         assert_contract_moves(&repo, "deleted tracked contract", |r| {
             std::fs::remove_file(r.resolve("ARCHITECTURE.md")).unwrap()
         });
@@ -961,5 +991,26 @@ pub(crate) mod tests {
         );
         assert_eq!(repo.contract_hash(), "contract-unknown");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_hash_is_sentinel_when_listing_fails() {
+        // hash-object still works here; only the listing fails.
+        let repo = contract_fixture("contract-corrupt-index");
+        std::fs::write(repo.resolve(".git/index"), b"not an index").unwrap();
+        assert!(repo.git(&["ls-files"]).is_err(), "index must be unreadable");
+        assert_eq!(repo.contract_hash(), "contract-unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contract_hash_reads_non_utf8_file_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let repo = contract_fixture("contract-raw-name");
+        let name = std::ffi::OsStr::from_bytes(b"policies/caf\xe9.toml");
+        std::fs::write(repo.root.join(name), "v1\n").unwrap();
+        assert_contract_moves(&repo, "content of a non-UTF-8 file name", |r| {
+            std::fs::write(r.root.join(name), "v2\n").unwrap()
+        });
     }
 }
