@@ -19,6 +19,13 @@ const TAG_HELLO: u8 = 1;
 const TAG_WELCOME: u8 = 2;
 const TAG_LSA_ADVERT: u8 = 3;
 
+/// 能力位：可作中继（`capabilities` 位图，与 `Lsa::capabilities` 注释一致）。
+pub const CAP_RELAY: u32 = 0x01;
+/// 能力位：可作出口节点（本 run 不置位）。
+pub const CAP_EXIT_NODE: u32 = 0x02;
+/// 能力位：承载 TUN 虚拟网段。
+pub const CAP_TUN: u32 = 0x04;
+
 /// 链路度量（§12.44；本期发现只用占位，选路 feature 用 latency/bandwidth）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkMetrics {
@@ -384,6 +391,12 @@ impl Lsdb {
         self.nodes.len()
     }
 
+    /// 枚举 LSDB 中的全部节点 id（只读、不 evict；顺序不保证）。
+    #[must_use]
+    pub fn peer_ids(&self) -> Vec<PeerId> {
+        self.nodes.keys().map(|k| PeerId(k.clone())).collect()
+    }
+
     /// 是否为空。
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -478,6 +491,10 @@ impl super::Discovery for LsaDiscovery<'_> {
             .and_then(Self::parse_locator)
             .into_iter()
             .collect()
+    }
+
+    fn peers(&self) -> Vec<super::PeerId> {
+        self.lsdb.peer_ids()
     }
 }
 
