@@ -5,7 +5,10 @@
 //! 1. 真实 `nexusd` 子进程：两个 wired，第二个 trojan 未声明 TLS →
 //!    启动 warn `engine=unsupported cause=PLAINTEXT_TROJAN_UNSUPPORTED`，daemon 存活；
 //! 2. 装配级（MockTun + 真实 Dataplane）：规则选中坏 tag → 恰好一个 RST、无 SYN-ACK、
-//!    不回退 direct（`direct_forwarded == 0`）；
+//!    不回退 direct（`direct_forwarded == 0`）；SUG-5：运行期结构化事件行
+//!    `event=outbound_unavailable` 的内容（cause/kind/tag/`suppressed`）必须被断言。
+//!    该行由 `eprintln!` 发到进程 stderr，进程内无法捕获 → 本 example 以隐藏参数
+//!    `--runtime-invalid-child` 重执行自身，父进程读子进程 stderr 提取该行；
 //! 3. Q-2 降级组：只有 direct 的配置 → daemon 存活且不输出启动失败 JSON，
 //!    in-process 无 engine 的 Proxy SYN 仍回 RST（D2）。
 
@@ -52,6 +55,12 @@ outbounds:
 ";
 
 fn main() {
+    // SUG-5：运行期用例的隐藏子进程模式（stderr 可被父进程捕获）。
+    if std::env::args().any(|arg| arg == "--runtime-invalid-child") {
+        let output = runtime_invalid_case();
+        println!("{}", serde_json::to_string(&output).expect("json"));
+        return;
+    }
     let output = run();
     println!("{}", serde_json::to_string(&output).expect("json"));
     if output["verdict"] != "PASS" {
@@ -67,7 +76,7 @@ fn run() -> Value {
         Ok(bin) => startup_warn_case(&bin, &base.join("two-wired"), TWO_WIRED_YAML),
         Err(error) => json!({"present": false, "error": error}),
     };
-    let runtime = runtime_invalid_case();
+    let runtime = runtime_invalid_subprocess();
     let degraded = match nexusd_binary() {
         Ok(bin) => degrade_case(&bin, &base.join("direct-only"), DIRECT_ONLY_YAML),
         Err(error) => json!({"alive_without_engine": false, "error": error}),
@@ -77,6 +86,10 @@ fn run() -> Value {
         && runtime["rst_count"] == 1
         && runtime["no_synack"] == true
         && runtime["direct_forwarded"] == 0
+        && runtime["event_line_present"] == true
+        && runtime["event_cause"] == "PLAINTEXT_TROJAN_UNSUPPORTED"
+        && runtime["event_kind"] == "trojan"
+        && runtime["event_tag"] == "bad"
         && degraded["alive_without_engine"] == true
         && degraded["no_startup_failure_json"] == true
         && degraded["proxy_rst_on_no_engine"] == true
@@ -138,6 +151,101 @@ fn startup_warn_case(bin: &std::path::Path, dir: &std::path::Path, yaml: &str) -
     let _ = child.wait();
     let _ = reader.join();
     json!({"present": seen, "daemon_alive": alive})
+}
+
+/// 2. 运行期（父进程侧）：重执行自身 `--runtime-invalid-child`，捕获 stderr 中的
+///    `event=outbound_unavailable` 结构化行并解析字段。
+fn runtime_invalid_subprocess() -> Value {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return json!({"error": format!("current_exe: {error}")}),
+    };
+    let mut child = match Command::new(exe)
+        .arg("--runtime-invalid-child")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return json!({"error": format!("spawn child: {error}")}),
+    };
+    let stderr_pipe = child.stderr.take().expect("child stderr");
+    let sink = Arc::new(Mutex::new(String::new()));
+    let sink_handle = Arc::clone(&sink);
+    let reader = std::thread::spawn(move || {
+        let mut reader = stderr_pipe;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut guard) = sink_handle.lock() {
+                        guard.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                }
+            }
+        }
+    });
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let _ = child.wait();
+    let _ = reader.join();
+    let stderr = sink.lock().map(|g| g.clone()).unwrap_or_default();
+
+    let child_json: Value = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .unwrap_or(Value::Null);
+    let event = parse_unavailable_event(&stderr, "bad");
+    json!({
+        "rst_count": child_json["rst_count"],
+        "no_synack": child_json["no_synack"],
+        "direct_forwarded": child_json["direct_forwarded"],
+        "proxy_dropped_no_proxy": child_json["proxy_dropped_no_proxy"],
+        "event_line_present": event["present"],
+        "event_cause": event["cause"],
+        "event_kind": event["kind"],
+        "event_tag": event["tag"],
+        "event_suppressed": event["suppressed"],
+    })
+}
+
+/// 从 stderr 提取 `event=outbound_unavailable` 行（首个匹配 tag 的行）的字段。
+fn parse_unavailable_event(stderr: &str, expected_tag: &str) -> Value {
+    for line in stderr.lines() {
+        if !line.contains("event=outbound_unavailable") {
+            continue;
+        }
+        let mut cause = Value::Null;
+        let mut kind = Value::Null;
+        let mut tag = Value::Null;
+        let mut suppressed = Value::Null;
+        for token in line.split_whitespace() {
+            if let Some(value) = token.strip_prefix("cause=") {
+                cause = json!(value);
+            } else if let Some(value) = token.strip_prefix("kind=") {
+                kind = json!(value);
+            } else if let Some(value) = token.strip_prefix("tag=") {
+                tag = json!(value);
+            } else if let Some(value) = token.strip_prefix("suppressed=") {
+                suppressed = value.parse::<u64>().map_or(Value::Null, |n| json!(n));
+            }
+        }
+        if tag.as_str() != Some(expected_tag) {
+            continue;
+        }
+        return json!({
+            "present": true,
+            "cause": cause,
+            "kind": kind,
+            "tag": tag,
+            "suppressed": suppressed,
+        });
+    }
+    json!({"present": false})
 }
 
 /// 2. 运行期：规则选中坏 tag → 单 RST、无 SYN-ACK、不回退 direct。

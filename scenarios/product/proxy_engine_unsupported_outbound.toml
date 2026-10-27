@@ -14,6 +14,10 @@ requirement = "apps/nexusd/MODULE.md#统一数据面装配"
 #    不输出 `stage=proxy_engine_init` 失败 JSON（`no_startup_failure_json`）、
 #    `ProxyEngine unavailable (NO_USABLE_OUTBOUND)` warn，且无 engine 的 Proxy
 #    SYN 仍按 D2 回 RST（`proxy_rst_on_no_engine`）。
+# 4) SUG-5：运行期结构化行 `event=outbound_unavailable` 本身必须被断言——
+#    行存在、`cause=PLAINTEXT_TROJAN_UNSUPPORTED`、`kind=trojan`、`tag=bad`
+#    （坏出站的 tag）。事件行由隐藏子进程模式捕获 stderr；限频保证首次立即
+#    发射，故首行断言不依赖时序。
 
 [when]
 command = "cargo run --quiet -p nexusd --example proxy_engine_unsupported_outbound -- --json"
@@ -33,6 +37,22 @@ equals = true
 [[expect]]
 field = "runtime_invalid.direct_forwarded"
 equals = 0
+
+[[expect]]
+field = "runtime_invalid.event_line_present"
+equals = true
+
+[[expect]]
+field = "runtime_invalid.event_cause"
+equals = "PLAINTEXT_TROJAN_UNSUPPORTED"
+
+[[expect]]
+field = "runtime_invalid.event_kind"
+equals = "trojan"
+
+[[expect]]
+field = "runtime_invalid.event_tag"
+equals = "bad"
 
 [[expect]]
 field = "degraded.alive_without_engine"
