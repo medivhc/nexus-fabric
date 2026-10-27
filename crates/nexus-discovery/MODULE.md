@@ -164,7 +164,7 @@
   `mdns_cached_peers`（`mdns = None` 时全部惰性返回 None/空/0，不 panic）。
 - `pub fn metrics(&self) -> DiscoveryMetricsSnapshot`。
 
-**`DiscoveryHub` 不实现 `Discovery` trait**（不存在 `impl Discovery for DiscoveryHub`）：
+**`DiscoveryHub` 不实现 `Discovery` trait**（`impl Discovery for …` 指向 hub 的代码无命中）：
 trait 的 `resolve`/`peers` 没有 `now` 参数，hub 的全部新鲜度语义必须由调用方显式注入时间才可判定；
 N1 侧只经 `apps/nexus/src/network.rs` 的 `N1Discovery` 适配器桥接（`hub.resolve(peer, Instant::now())`）。
 `FreshLsaView` 是 hub 内部的一次性适配器（私有），不是公开 trait 实现。
