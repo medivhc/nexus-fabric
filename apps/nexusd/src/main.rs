@@ -264,6 +264,7 @@ use nexus_network::n1::{N1PeerId, config::N1Config};
 
 use nexusd::assembly;
 use nexusd::config::{self, ConfigDir, LoadedConfig, TurnSection};
+use nexusd::discovery_runtime;
 
 /// Verify managed bindings before any startup operation can create durable state.
 fn validate_task_provider_startup(config_root: &std::path::Path) -> Result<bool, ExitCode> {
@@ -1564,14 +1565,34 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
     };
 
-    // 3. R1：装配 N1 网桥（失败 → 降级，dataplane 照常跑）。
-    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> = match loaded
-        .network_toml
-        .as_deref()
-    {
+    // 3. R1：装配 N1 网桥 + 单一 discovery hub（失败 → 降级，dataplane 照常跑）。
+    //
+    // 本段是进程内**唯一**的 N1/hub 装配点（spec §4.10.2）：hub、sessions、
+    // static_peers 与权威 N1Config 都由 `N1Assembly` 提供，NAT/发现段不再二次解析。
+    let discovery_section = loaded.daemon.discovery.clone();
+    let advertise_ip = discovery_section
+        .advertise_ip
+        .or_else(discovery_runtime::select_advertise_ipv4);
+    let discovery_params = nexus::network::DiscoveryParams {
+        mdns: match (discovery_section.mdns, advertise_ip) {
+            (true, Some(ip)) => Some(nexus::network::MdnsParams {
+                // CR-BLOCKED-1: SRV carries the discovery/gossip endpoint.
+                service_port: discovery_section.gossip_port,
+                announce_ip: ip,
+            }),
+            _ => None,
+        },
+        lsa_stale_after: Duration::from_secs(discovery_section.lsa_stale_sec),
+    };
+    let n1_assembly: Option<assembly::N1Assembly> = match loaded.network_toml.as_deref() {
         Some(text) => {
-            match assembly::assemble_n1(text, loaded.daemon.proxy.as_ref(), Arc::clone(&shutdown)) {
-                Ok(bridge) => Some(bridge),
+            match assembly::assemble_n1_with_discovery(
+                text,
+                loaded.daemon.proxy.as_ref(),
+                Arc::clone(&shutdown),
+                discovery_params,
+            ) {
+                Ok(assembly) => Some(assembly),
                 Err(e) => {
                     eprintln!(
                         "[nexusd] ERROR: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
@@ -1582,9 +1603,74 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
         None => None,
     };
+    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> =
+        n1_assembly.as_ref().map(|a| Arc::clone(&a.bridge));
     let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> = n1_bridge
         .clone()
         .map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
+
+    // 3b. 发现 pump：即使没有 `[network.turn]` 也启动（发现/状态面独立，
+    // 启动顺序冻结：装配 → DiscoveryRuntime::start → NatSwitchRuntime::start）。
+    let discovery_handle = match n1_assembly.as_ref() {
+        Some(assembly) if discovery_section.enabled => {
+            let static_gossip_addrs: Vec<std::net::SocketAddr> = assembly
+                .config
+                .peers
+                .iter()
+                .flat_map(|p| {
+                    p.addrs.iter().map(|addr| {
+                        std::net::SocketAddr::new(addr.ip(), discovery_section.gossip_port)
+                    })
+                })
+                .collect();
+            // CAP_RELAY is advertised when the daemon is configured to relay;
+            // the authoritative identity check stays fail-closed at NAT start.
+            let mut capabilities = nexus_discovery::lsa::CAP_TUN;
+            if loaded.daemon.punch.enabled
+                && loaded.daemon.punch.relay_provider_enabled
+                && loaded.daemon.identity.seed_file.is_some()
+            {
+                capabilities |= nexus_discovery::lsa::CAP_RELAY;
+            }
+            let incarnation = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                .max(1);
+            let self_lsa = discovery_runtime::SelfLsaConfig {
+                node_id: nexus_discovery::PeerId(assembly.config.peer_id.to_hex()),
+                vip: assembly.config.vpi.address.to_string(),
+                capabilities,
+                incarnation,
+            };
+            let cfg = discovery_runtime::DiscoveryRuntimeConfig {
+                gossip_bind: std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    discovery_section.gossip_port,
+                ),
+                advertise_ip,
+                lsa_enabled: discovery_section.lsa,
+                mdns_enabled: discovery_section.mdns && advertise_ip.is_some(),
+                lsa_hello_interval: Duration::from_secs(30),
+                lsa_self_refresh: Duration::from_secs(discovery_section.lsa_refresh_sec),
+                mdns_announce_interval: Duration::from_secs(60),
+                static_gossip_addrs,
+            };
+            Some(discovery_runtime::DiscoveryRuntime::start(
+                Arc::clone(&assembly.discovery),
+                cfg,
+                self_lsa,
+                Arc::clone(&shutdown),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(handle) = &discovery_handle {
+        nexusd::nat_status::publish_discovery_status(handle.status());
+    }
+    if let Some(assembly) = n1_assembly.as_ref() {
+        nexusd::nat_status::publish_discovery_hub(Arc::clone(&assembly.discovery));
+    }
 
     // 4. 统一数据面线程（D1：单个 TUN 由 nexusd 持有；TUN 创建失败则线程内降级）。
     //    T2：[tun].enabled=false 时跳过 TUN/数据面（no-tun 模式）。
