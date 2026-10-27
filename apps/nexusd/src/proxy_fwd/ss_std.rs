@@ -1,15 +1,16 @@
-//! 标准 Shadowsocks AEAD（chacha20-ietf-poly1305）TCP/UDP。
+//! 标准 Shadowsocks AEAD（chacha20-ietf-poly1305）**UDP**。
 //!
-//! 与 `nexus-outbound-shadowsocks` 的自定义握手（`ss-proxy-ok` ack）不同，
-//! 这里实现标准 ss 协议，可与真实 ss 服务器互通（P1/P2）：
-//! - TCP：`salt || AEAD(addr) || [AEAD(len) || AEAD(payload)]*`
+//! TCP 已切到 `nexus-outbound-shadowsocks`（SIP004 `SsStream`/`encode_request`）：
+//! 本模块只保留 UDP 一侧（`TODO(deletion-gate: fixes-6)`：SsUdp 删除门归 fixes-6）。
+//!
 //! - UDP：每包独立 `salt || AEAD(addr || payload)`
 //!
-//! 密钥派生：HKDF-SHA1（标准 ss 规定 SHA1），info=`"ss-subkey"`。
-//! Nonce：12 字节，TCP 从 0 递增；UDP 每包随机 salt 派生独立 key，nonce 从 0 开始。
+//! 密钥派生：HKDF-SHA1（标准 ss 规定 SHA1），info=`"ss-subkey"`（`derive_subkey`
+//! 保留供向量测试复现）。
+//! Nonce：12 字节；UDP 每包随机 salt 派生独立 key，nonce 从 0 开始。
 
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::io::{self, Read};
+use std::net::{IpAddr, SocketAddr};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -22,8 +23,6 @@ const SALT_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 /// Nonce 长度（12B）。
 const NONCE_LEN: usize = 12;
-/// TCP 数据块最大明文（16KB，标准 ss 建议）。
-const MAX_CHUNK: usize = 0x3FFF;
 
 /// 标准 ss 错误。
 #[derive(Debug)]
@@ -135,128 +134,6 @@ fn open(key: &[u8; 32], nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, SsStdE
         .map_err(|_| SsStdError::DecryptFailed)
 }
 
-/// 标准 ss TCP 客户端连接。
-///
-/// Wire: `salt || AEAD(addr) || [AEAD(len:u16 BE) || AEAD(chunk)]*`
-/// Nonce 从 0 开始每块递增（addr 占 nonce 0，len/payload 依次递增）。
-pub struct SsTcpClient {
-    stream: TcpStream,
-    tx_key: [u8; 32],
-    rx_key: [u8; 32],
-    tx_nonce: u64,
-    rx_nonce: u64,
-    /// 读缓冲（解密后的明文）。
-    read_buf: Vec<u8>,
-}
-
-impl SsTcpClient {
-    /// 连接并完成握手（发送 salt + 加密的目标地址）。
-    pub fn connect(
-        server: SocketAddr,
-        password: &str,
-        target: SocketAddr,
-        timeout: std::time::Duration,
-    ) -> Result<Self, SsStdError> {
-        let mut stream = TcpStream::connect_timeout(&server, timeout)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-
-        let salt = gen_salt()?;
-        let tx_key = derive_subkey(password.as_bytes(), &salt);
-
-        // 发送 salt + AEAD(addr)（nonce 0）。
-        let addr_enc = encode_addr(target);
-        let sealed_addr = seal(&tx_key, 0, &addr_enc);
-        stream.write_all(&salt)?;
-        stream.write_all(&sealed_addr)?;
-        stream.flush()?;
-
-        // 读取 server 的 salt + AEAD(addr) 回应？标准 ss TCP 服务器不回地址，
-        // 直接开始数据。读取 server salt（32B）用于派生 rx key。
-        let mut srv_salt = [0u8; SALT_LEN];
-        stream.read_exact(&mut srv_salt)?;
-        let rx_key = derive_subkey(password.as_bytes(), &srv_salt);
-
-        // 清除超时（调用方按需设置）。
-        stream.set_read_timeout(None)?;
-        stream.set_write_timeout(None)?;
-
-        Ok(Self {
-            stream,
-            tx_key,
-            rx_key,
-            tx_nonce: 1, // nonce 0 已用于 addr
-            rx_nonce: 0,
-            read_buf: Vec::new(),
-        })
-    }
-
-    /// 写入一块明文（自动分块 ≤ MAX_CHUNK）。
-    pub fn write_all(&mut self, mut data: &[u8]) -> Result<(), SsStdError> {
-        while !data.is_empty() {
-            let n = data.len().min(MAX_CHUNK);
-            let chunk = &data[..n];
-            // 先写加密的长度（2B BE）。
-            let len_bytes = (n as u16).to_be_bytes();
-            let sealed_len = seal(&self.tx_key, self.tx_nonce, &len_bytes);
-            self.tx_nonce += 1;
-            self.stream.write_all(&sealed_len)?;
-            // 再写加密的载荷。
-            let sealed = seal(&self.tx_key, self.tx_nonce, chunk);
-            self.tx_nonce += 1;
-            self.stream.write_all(&sealed)?;
-            data = &data[n..];
-        }
-        self.stream.flush()?;
-        Ok(())
-    }
-
-    /// 读取解密后的明文（阻塞；返回 0 表示对端关闭）。
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SsStdError> {
-        // 先消费缓冲。
-        if !self.read_buf.is_empty() {
-            let n = buf.len().min(self.read_buf.len());
-            buf[..n].copy_from_slice(&self.read_buf[..n]);
-            self.read_buf.drain(..n);
-            return Ok(n);
-        }
-        // 读一个完整的 chunk：[AEAD(len)] [AEAD(payload)]。
-        let mut sealed_len = vec![0u8; 2 + TAG_LEN];
-        match self.stream.read_exact(&mut sealed_len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
-            Err(e) => return Err(SsStdError::Io(e)),
-        }
-        let len_bytes = open(&self.rx_key, self.rx_nonce, &sealed_len)?;
-        self.rx_nonce += 1;
-        if len_bytes.len() != 2 {
-            return Err(SsStdError::DecryptFailed);
-        }
-        let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
-        if len > MAX_CHUNK {
-            return Err(SsStdError::TooLarge);
-        }
-        let mut sealed = vec![0u8; len + TAG_LEN];
-        self.stream.read_exact(&mut sealed)?;
-        let plain = open(&self.rx_key, self.rx_nonce, &sealed)?;
-        self.rx_nonce += 1;
-
-        let n = buf.len().min(plain.len());
-        buf[..n].copy_from_slice(&plain[..n]);
-        if plain.len() > n {
-            self.read_buf.extend_from_slice(&plain[n..]);
-        }
-        Ok(n)
-    }
-
-    /// 消费为原始 TcpStream（已握手；调用方负责后续 AEAD 分块）。
-    /// 本期未用；保留供将来零拷贝优化。
-    #[allow(dead_code)]
-    pub fn into_inner(self) -> TcpStream {
-        self.stream
-    }
-}
-
 /// 标准 ss UDP：单包加解密（每包独立 salt）。
 pub struct SsUdp;
 
@@ -315,6 +192,20 @@ mod tests {
         let (dec, n) = decode_addr(&enc).unwrap();
         assert_eq!(dec, addr);
         assert_eq!(n, enc.len());
+    }
+
+    /// FU-1 证据可复现：HKDF-SHA1(SHA1) + info="ss-subkey" 的已知答案向量。
+    ///
+    /// `#[ignore]`：`cargo test -p nexusd ss_std:: -- --ignored` 手动跑（R14）。
+    #[test]
+    #[ignore]
+    fn ss_subkey_known_answer_vector() {
+        let key = derive_subkey(b"password", &[1u8; 32]);
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5054b44ff2adee45905b64b0a4bff0e450cbcdb5255ec7420461de8706774761"
+        );
     }
 
     #[test]
