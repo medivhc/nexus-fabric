@@ -91,6 +91,8 @@ pub struct DaemonConfig {
     pub punch: PunchSection,
     /// `[network.identity]` 小节：fabric ed25519 身份种子文件（BLOCKED-1 (a)）。
     pub identity: IdentitySection,
+    /// `[network.discovery]` 小节：peer 发现（LSA/mDNS pump 与订阅 feed）。
+    pub discovery: DiscoverySection,
 }
 
 /// `[network.identity]`：daemon 的 fabric ed25519 seed 来源。
@@ -157,6 +159,91 @@ pub struct FlowSessionsSection {
     pub idle_timeout_secs: Option<u64>,
     /// UDP 会话缓冲报文数（默认 64；0 非法）。
     pub udp_buffer_datagrams: Option<usize>,
+}
+
+/// `daemon.toml` 的 `[network.discovery]` 小节（peer 发现与订阅）。
+///
+/// 全部可选；缺失时与默认值一致。语义（spec §4.11.1）：
+/// - `enabled=false` 或 `feed=false` → `peer_source.state="disabled:config"`；
+/// - `mdns=false` / `lsa=false` 只停对应 pump；
+/// - 任一字段变化 → `NeedsRestart`（与 `[network.turn]` 同口径）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverySection {
+    /// 总开关（默认 true）。
+    pub enabled: bool,
+    /// mDNS pump 开关（默认 true）。
+    pub mdns: bool,
+    /// LSA gossip pump 开关（默认 true）。
+    pub lsa: bool,
+    /// 订阅/触发 feed 开关（默认 true）。
+    pub feed: bool,
+    /// LSA gossip 端口（默认 19010；不得等于 mDNS 的 5353）。
+    pub gossip_port: u16,
+    /// mDNS 通告 IPv4（`None` = 自动选择）。
+    pub advertise_ip: Option<std::net::Ipv4Addr>,
+    /// 自身 LSA 刷新间隔秒（默认 30）。
+    pub lsa_refresh_sec: u64,
+    /// LSA 新鲜度窗口秒（默认 90）。
+    pub lsa_stale_sec: u64,
+    /// relay 地址簿轮询间隔毫秒（默认 5000）。
+    pub book_poll_ms: u64,
+    /// 连续触发失败上限（默认 3）。
+    pub trigger_max_failures: u32,
+}
+
+impl Default for DiscoverySection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mdns: true,
+            lsa: true,
+            feed: true,
+            gossip_port: 19010,
+            advertise_ip: None,
+            lsa_refresh_sec: 30,
+            lsa_stale_sec: 90,
+            book_poll_ms: 5000,
+            trigger_max_failures: 3,
+        }
+    }
+}
+
+impl DiscoverySection {
+    /// 校验取值范围（越界 → `Err` → 启动失败 CONFIG）。
+    fn validate(&self) -> Result<(), String> {
+        if self.gossip_port == 0 || self.gossip_port == 5353 {
+            return Err(format!(
+                "[network.discovery].gossip_port must be 1..=65535 and != 5353 (mDNS), got {}",
+                self.gossip_port
+            ));
+        }
+        if !(5..=300).contains(&self.lsa_refresh_sec) {
+            return Err(format!(
+                "[network.discovery].lsa_refresh_sec must be 5..=300, got {}",
+                self.lsa_refresh_sec
+            ));
+        }
+        let stale_min = std::cmp::max(60, self.lsa_refresh_sec.saturating_mul(2));
+        if !(stale_min..=3600).contains(&self.lsa_stale_sec) {
+            return Err(format!(
+                "[network.discovery].lsa_stale_sec must be {stale_min}..=3600                  (>= 2x lsa_refresh_sec), got {}",
+                self.lsa_stale_sec
+            ));
+        }
+        if !(1000..=60000).contains(&self.book_poll_ms) {
+            return Err(format!(
+                "[network.discovery].book_poll_ms must be 1000..=60000, got {}",
+                self.book_poll_ms
+            ));
+        }
+        if !(1..=10).contains(&self.trigger_max_failures) {
+            return Err(format!(
+                "[network.discovery].trigger_max_failures must be 1..=10, got {}",
+                self.trigger_max_failures
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `daemon.toml` 的 `[network.turn]` 小节（NAT switching daemon activation，AC2）。
@@ -378,6 +465,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
             proxy: None,
             punch: PunchSection::default(),
             identity: IdentitySection::default(),
+            discovery: DiscoverySection::default(),
         },
         ..Default::default()
     };
@@ -455,6 +543,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         proxy: None,
         punch: PunchSection::default(),
         identity: IdentitySection::default(),
+        discovery: DiscoverySection::default(),
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -505,6 +594,10 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         };
         cfg.identity = IdentitySection { seed_file };
     }
+    // [network.discovery] 小节（可选；缺失 = 默认值）
+    if let Some(t) = v.get("network").and_then(|n| n.get("discovery")) {
+        cfg.discovery = parse_discovery_section(t)?;
+    }
     // [network.punch] 小节（可选；缺失 = 默认值）
     if let Some(t) = v.get("network").and_then(|n| n.get("punch")) {
         cfg.punch = parse_punch_section(t)?;
@@ -513,6 +606,78 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
             .map_err(|e| format!("{DAEMON_TOML}: [network.punch] {e}"))?;
     }
     Ok(cfg)
+}
+
+/// 解析 `daemon.toml` 的 `[network.discovery]` 小节。
+///
+/// 键全部可选（缺失 = `DiscoverySection::default()` 的值）；`advertise_ip`
+/// 为空字符串表示自动选择，非空必须是 IPv4 字面量。
+fn parse_discovery_section(t: &toml::Value) -> Result<DiscoverySection, String> {
+    let mut out = DiscoverySection::default();
+    let get_bool = |k: &str, dst: &mut bool| -> Result<(), String> {
+        if let Some(x) = t.get(k) {
+            *dst = x.as_bool().ok_or_else(|| {
+                format!("{DAEMON_TOML}: [network.discovery].{k} must be a boolean")
+            })?;
+        }
+        Ok(())
+    };
+    get_bool("enabled", &mut out.enabled)?;
+    get_bool("mdns", &mut out.mdns)?;
+    get_bool("lsa", &mut out.lsa)?;
+    get_bool("feed", &mut out.feed)?;
+
+    let get_u64 = |k: &str, dst: &mut u64| -> Result<(), String> {
+        if let Some(x) = t.get(k) {
+            *dst = x
+                .as_integer()
+                .and_then(|i| u64::try_from(i).ok())
+                .ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [network.discovery].{k} must be a positive integer")
+                })?;
+        }
+        Ok(())
+    };
+    get_u64("lsa_refresh_sec", &mut out.lsa_refresh_sec)?;
+    get_u64("lsa_stale_sec", &mut out.lsa_stale_sec)?;
+    get_u64("book_poll_ms", &mut out.book_poll_ms)?;
+
+    if let Some(x) = t.get("gossip_port") {
+        let n = x
+            .as_integer()
+            .and_then(|i| u16::try_from(i).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{DAEMON_TOML}: [network.discovery].gossip_port must be an integer 1..=65535"
+                )
+            })?;
+        out.gossip_port = n;
+    }
+    if let Some(x) = t.get("trigger_max_failures") {
+        let n = x
+            .as_integer()
+            .and_then(|i| u32::try_from(i).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{DAEMON_TOML}: [network.discovery].trigger_max_failures must be an integer 1..=10"
+                )
+            })?;
+        out.trigger_max_failures = n;
+    }
+    if let Some(x) = t.get("advertise_ip") {
+        let s = x.as_str().ok_or_else(|| {
+            format!("{DAEMON_TOML}: [network.discovery].advertise_ip must be a string")
+        })?;
+        if !s.is_empty() {
+            out.advertise_ip = Some(s.parse::<std::net::Ipv4Addr>().map_err(|_| {
+                format!(
+                    "{DAEMON_TOML}: [network.discovery].advertise_ip must be an IPv4 literal, got '{s}'"
+                )
+            })?);
+        }
+    }
+    out.validate().map_err(|e| format!("{DAEMON_TOML}: {e}"))?;
+    Ok(out)
 }
 
 /// 解析 `daemon.toml` 的 `[network.turn]` 小节（AC2）。
