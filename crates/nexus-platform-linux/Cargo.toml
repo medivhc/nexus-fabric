@@ -14,7 +14,7 @@ nexus-platform = { path = "../nexus-platform" }
 # Linux-only adapter (v9 §22 D4=A); other platforms get their own adapters.
 fuser = "0.18"
 # TPROXY capture: socket2 for sockaddr/inspection, libc for IP_TRANSPARENT /
-# IP_RECVORIGDSTADDR / IP_PKTINFO setsockopt + ancillary cmsg (spec §9.1).
+# IP_RECVORIGDSTADDR setsockopt + ancillary cmsg, transparent reply sockets (spec §9.1).
 # Both are Linux-only adapter dependencies; portable core never sees them.
 socket2 = { version = "0.6", default-features = false }
 libc = "0.2"

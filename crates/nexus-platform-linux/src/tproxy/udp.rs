@@ -184,9 +184,11 @@ fn set_int_opt(
     Ok(())
 }
 
-/// 建立源地址为 `orig_dst` 的回包 socket：`IP_TRANSPARENT` 允许 bind 非本机地址，
-/// `SO_REUSEADDR` 允许多个 `orig_dst` 共享端口号；本机已有 socket 独占该地址时
-/// bind 失败（`BindFailed`），调用方丢弃回包而不是改用其它源端口。
+/// 建立源地址为 `orig_dst` 的回包 socket：`IP_TRANSPARENT` 允许 bind 非本机地址
+/// （不同 `orig_dst` IP 共用同一端口号本就不冲突）；`SO_REUSEADDR` 让它与同样设置
+/// 了 `SO_REUSEADDR` 的本机通配 socket（如 dnsmasq 的 `0.0.0.0:53`）共存。本机已有
+/// socket 独占该地址端口时 bind 失败（`BindFailed`），调用方丢弃回包而不是改用其它
+/// 源端口（已知限制：此时发往该端口的透明 UDP 流收不到回包）。
 fn open_reply_socket(orig_dst: SocketAddrV4) -> Result<OwnedFd, TransparentIngressError> {
     // SAFETY: socket(2) has no pointer arguments.
     let raw = unsafe {
@@ -338,7 +340,7 @@ impl TransparentUdpIngress for TproxyUdpSocket {
     ) -> Result<usize, TransparentIngressError> {
         if self.closed {
             return Err(TransparentIngressError::Io {
-                operation: "sendmsg",
+                operation: "sendto",
                 message: "socket closed".to_string(),
             });
         }

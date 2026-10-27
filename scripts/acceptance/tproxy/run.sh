@@ -165,7 +165,7 @@ step_s1() {
     ss_local="$(awk '$1=="ESTAB" && $4=="'"${UPSTREAM_ADDR}"':8080" {print $4; exit}' "$ev/ss.txt")"
     assert_eq ss_accepted_local "$ss_local" "${UPSTREAM_ADDR}:8080"
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.tcp_accepted' 1
     local tcp missing upstream state ipv6
     tcp="$(stats_value "$ev/status.json" '.tproxy.counters.tcp_accepted')"
     missing="$(stats_value "$ev/status.json" '.tproxy.counters.orig_dst_missing')"
@@ -247,7 +247,7 @@ step_s2() {
         STEP_FAILED=1
     fi
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.udp_datagrams' 2
     local datagrams reply_failed missing state ipv6
     datagrams="$(stats_value "$ev/status.json" '.tproxy.counters.udp_datagrams')"
     reply_failed="$(stats_value "$ev/status.json" '.tproxy.counters.udp_reply_failed')"
@@ -509,7 +509,7 @@ step_s5() {
         record "PASS no_direct_bypass no router-originated packet to ${SITE_ADDR}"
     fi
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.upstream_failed' 1
     local upstream last_reason
     upstream="$(stats_value "$ev/status.json" '.tproxy.counters.upstream_failed')"
     last_reason="$(stats_value "$ev/status.json" '.tproxy.last_failure_reason')"
@@ -708,7 +708,7 @@ step_s8() {
     dig_out="$(client_dig example.nexus 2>&1)"
     assert_contains dig_answer "$dig_out" "${SITE_ADDR}"
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.tcp_accepted' 1 '.tproxy.counters.udp_datagrams' 1
     local backend tcp datagrams
     backend="$(stats_value "$ev/status.json" '.tproxy.backend')"
     tcp="$(stats_value "$ev/status.json" '.tproxy.counters.tcp_accepted')"

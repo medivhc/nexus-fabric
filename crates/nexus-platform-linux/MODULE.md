@@ -4,7 +4,7 @@
 
 实现 Linux 平台 Capability Adapter，包括 TUN、Linux TPROXY capture adapter（`tproxy`：`IP_TRANSPARENT` TCP listener / `IP_RECVORIGDSTADDR` UDP socket / iptables+nftables+external 捕获规则）、Mount/Filesystem、Service/Privilege 等宿主桥接。
 
-`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` / `IP_PKTINFO` 不得出现在该目录之外。
+`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` 不得出现在该目录之外。TPROXY UDP 回包 socket 绑定在 `orig_dst` 上，因此捕获规则不得加入 `socket`/DIVERT 类按已存在 socket 投递的规则：那会把客户端后续数据报投给只发不收的回包 socket，绕开监听 socket。
 
 ## Non-Responsibilities
 

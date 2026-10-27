@@ -449,6 +449,31 @@ stats_json() {
     fi
 }
 
+# nexusd publishes tproxy counters at most once per second (apps/nexusd
+# main.rs), so one read right after traffic can still see the previous
+# snapshot. Poll `out` until every `<jq expr> <minimum>` pair holds or ~3 s
+# pass; the last poll stays in `out` for the assertions that follow, which
+# keep their thresholds.
+stats_wait() {
+    local out="$1" i j ok actual
+    shift
+    local args=("$@")
+    for i in $(seq 1 12); do
+        stats_json "${out}" >/dev/null 2>&1 || true
+        ok=1
+        for ((j = 0; j < ${#args[@]}; j += 2)); do
+            actual="$(stats_value "${out}" "${args[j]}")"
+            if ! [ "${actual:-0}" -ge "${args[j + 1]}" ] 2>/dev/null; then
+                ok=0
+                break
+            fi
+        done
+        [ "${ok}" = 1 ] && return 0
+        sleep 0.25
+    done
+    return 0
+}
+
 stats_value() {
     local path="$1" expr="$2"
     jq -r "${expr} | select(. != null)" "${path}" 2>/dev/null || true

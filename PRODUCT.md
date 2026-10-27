@@ -990,7 +990,7 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   失败（如该地址端口已被本机其它 socket 独占）时丢弃该回包并计 `udp_reply_failed`，
   **不得**以监听端口或其它源端口冒充发出。
 - **平台边界（ARCHITECTURE §10/§11）**：`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` /
-  `IP_PKTINFO` 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core
+  透明回包 socket 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core
   （`nexus-projection` / `nexus-domain` / `nexus-proxy`）不直接调用平台 API、不取系统时间。
 - **IPv4-only / fake-IP**：本 run 仅 IPv4；`ipv6: true` 在 `tun`/`tproxy` 配置中直接
   `CONFIG_INVALID`。fake-IP 未启用（`fake_ip: true` 为配置错误），198.18/15 按普通 IP 走规则。
