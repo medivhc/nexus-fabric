@@ -504,6 +504,8 @@ impl PeerSourceFeed {
         stop: Arc<AtomicBool>,
     ) -> Self {
         let (trigger_tx, trigger_rx) = mpsc::channel();
+        // Poll immediately on the first tick: the provider already published
+        // our address before the loop starts.
         let last_book_poll = Instant::now()
             .checked_sub(cfg.book_poll_interval)
             .unwrap_or_else(Instant::now);
@@ -1095,5 +1097,830 @@ impl PeerSourceFeed {
         snap.book_reloads_total = self.counters.book_reloads_total;
         snap.book_errors_total = self.counters.book_errors_total;
         self.status.publish(snap);
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+    use crate::nat_relay::RelayConnProvider;
+    use nexus_discovery::PeerId as DiscoveryPeerId;
+    use nexus_discovery::lsa::Lsa;
+    use nexus_network::n1::{N1Connection, N1Error, N1KeepaliveStream};
+    use std::sync::Mutex;
+
+    fn hex_id(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn peer(byte: u8) -> FabricPeerId {
+        FabricPeerId([byte; 32])
+    }
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    fn now() -> Instant {
+        Instant::now()
+    }
+
+    // ---------- fixtures ----------
+
+    #[derive(Default)]
+    struct FakeBook {
+        entries: Mutex<HashMap<[u8; 32], SocketAddr>>,
+        fail: AtomicBool,
+        reloads: std::sync::atomic::AtomicU64,
+    }
+
+    impl FakeBook {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn set(&self, peer: FabricPeerId, addr: SocketAddr) {
+            self.entries.lock().unwrap().insert(peer.0, addr);
+        }
+    }
+
+    impl RelayAddressBook for FakeBook {
+        fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr> {
+            self.entries.lock().unwrap().get(peer).copied()
+        }
+
+        fn reload(&self) -> std::io::Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("fake book reload failure"));
+            }
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn publish(&self, peer: [u8; 32], addr: SocketAddr) -> std::io::Result<()> {
+            self.entries.lock().unwrap().insert(peer, addr);
+            Ok(())
+        }
+    }
+
+    type SinkList = Vec<std::sync::Weak<dyn crate::nat_relay::RelayConnSink>>;
+    type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+    /// Fake relay that implements both faces the feed/runtime need.
+    #[derive(Default)]
+    struct FakeRelay {
+        calls: Mutex<Vec<(FabricPeerId, SocketAddr)>>,
+        established: Mutex<HashMap<[u8; 32], SocketAddr>>,
+        sinks: Mutex<HashMap<[u8; 32], SinkList>>,
+        fail: Mutex<Option<String>>,
+        gate: Mutex<Option<Gate>>,
+    }
+
+    impl FakeRelay {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn calls(&self) -> Vec<(FabricPeerId, SocketAddr)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn set_fail(&self, msg: Option<&str>) {
+            *self.fail.lock().unwrap() = msg.map(str::to_string);
+        }
+
+        fn block(&self) -> Gate {
+            let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            *self.gate.lock().unwrap() = Some(Arc::clone(&gate));
+            gate
+        }
+    }
+
+    impl RelayTrigger for FakeRelay {
+        fn established_relay_addr(&self, peer: &FabricPeerId) -> Option<SocketAddr> {
+            self.established.lock().unwrap().get(&peer.0).copied()
+        }
+
+        fn established_peer_ids(&self) -> Vec<FabricPeerId> {
+            let mut out: Vec<FabricPeerId> = self
+                .established
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| FabricPeerId(*k))
+                .collect();
+            out.sort_by_key(|p| p.0);
+            out
+        }
+
+        fn trigger_relay(
+            &self,
+            peer: FabricPeerId,
+            peer_relayed: SocketAddr,
+        ) -> Result<SocketAddr, RelayError> {
+            self.calls.lock().unwrap().push((peer, peer_relayed));
+            if let Some(gate) = self.gate.lock().unwrap().clone() {
+                let (lock, cv) = &*gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv
+                        .wait_timeout(released, Duration::from_millis(200))
+                        .unwrap()
+                        .0;
+                }
+            }
+            if let Some(msg) = self.fail.lock().unwrap().clone() {
+                return Err(RelayError::Turn(msg));
+            }
+            self.established
+                .lock()
+                .unwrap()
+                .insert(peer.0, peer_relayed);
+            Ok(peer_relayed)
+        }
+    }
+
+    impl crate::nat_relay::RelayConnProvider for FakeRelay {
+        fn subscribe(&self, peer: FabricPeerId, sink: Arc<dyn crate::nat_relay::RelayConnSink>) {
+            self.sinks
+                .lock()
+                .unwrap()
+                .entry(peer.0)
+                .or_default()
+                .push(Arc::downgrade(&sink));
+        }
+
+        fn unsubscribe(&self, peer: FabricPeerId, sink: &Arc<dyn crate::nat_relay::RelayConnSink>) {
+            let live = {
+                let mut g = self.sinks.lock().unwrap();
+                let target = Arc::downgrade(sink);
+                if let Some(list) = g.get_mut(&peer.0) {
+                    list.retain(|w| !std::sync::Weak::ptr_eq(w, &target));
+                }
+                let live = g.get(&peer.0).map(|l| l.len()).unwrap_or(0);
+                if live == 0 {
+                    g.remove(&peer.0);
+                }
+                live
+            };
+            if live == 0 {
+                // Simulate the provider's zero-sink teardown.
+                self.established.lock().unwrap().remove(&peer.0);
+            }
+        }
+
+        fn established_relay(&self, peer: &FabricPeerId) -> Option<crate::nat_relay::RelayConn> {
+            let _ = peer;
+            None
+        }
+
+        fn established_peers(&self) -> Vec<FabricPeerId> {
+            Vec::new()
+        }
+
+        fn subscribed_peers(&self) -> Vec<FabricPeerId> {
+            let mut out: Vec<FabricPeerId> = self
+                .sinks
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| FabricPeerId(*k))
+                .collect();
+            out.sort_by_key(|p| p.0);
+            out
+        }
+
+        fn sink_count(&self, peer: &FabricPeerId) -> usize {
+            self.sinks
+                .lock()
+                .unwrap()
+                .get(&peer.0)
+                .map(|l| l.iter().filter(|w| w.strong_count() > 0).count())
+                .unwrap_or(0)
+        }
+    }
+
+    struct MockConn(N1PeerId);
+
+    impl N1Connection for MockConn {
+        fn send_datagram(&self, _data: &[u8]) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn open_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn accept_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn rebind(&self) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn connection_id(&self) -> u64 {
+            1
+        }
+        fn peer(&self) -> N1PeerId {
+            self.0
+        }
+        fn close(&self) {}
+    }
+
+    fn sessions_with(peers: &[N1PeerId]) -> Arc<N1SessionManager> {
+        let text = format!(
+            "peer_id = \"{}\"\n[vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1200\n",
+            hex_id(0xaa)
+        );
+        let (_cfg, mgr, _hub) = nexus::network::build_session_manager_with_discovery(
+            &text,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            nexus::network::DiscoveryParams::static_only(),
+        )
+        .expect("session manager");
+        for peer in peers {
+            mgr.insert_accepted(*peer, Box::new(MockConn(*peer)));
+        }
+        mgr
+    }
+
+    struct Harness {
+        feed: PeerSourceFeed,
+        status: Arc<PeerSourceStatus>,
+        book: Arc<FakeBook>,
+        relay: Arc<FakeRelay>,
+        hub: Arc<DiscoveryHub>,
+        sw: Arc<NatSwitching>,
+        clock: Instant,
+    }
+
+    impl Harness {
+        fn new(static_peers: Vec<N1PeerId>, sessions: Arc<N1SessionManager>) -> Self {
+            let self_id = peer(0x11);
+            let hub = Arc::new(DiscoveryHub::new(
+                DiscoveryPeerId(hex_id(0x11)),
+                Vec::new(),
+                None,
+                Duration::from_secs(90),
+            ));
+            let book = FakeBook::new();
+            let relay = FakeRelay::new();
+            let sw = switch(self_id);
+            sw.attach_relay_provider(relay.clone());
+            let status = Arc::new(PeerSourceStatus::default());
+            status.set_state("running");
+            let clock = now();
+            let feed = PeerSourceFeed::new(
+                Arc::clone(&sw),
+                relay.clone(),
+                book.clone(),
+                sessions,
+                static_peers,
+                Arc::clone(&hub),
+                self_id,
+                PeerSourceConfig {
+                    book_poll_interval: Duration::from_millis(1000),
+                    ..PeerSourceConfig::default()
+                },
+                Arc::clone(&status),
+                Arc::new(AtomicBool::new(false)),
+            );
+            Self {
+                feed,
+                status,
+                book,
+                relay,
+                hub,
+                sw,
+                clock,
+            }
+        }
+
+        fn tick(&mut self) -> PeerSourceStatusSnapshot {
+            // 300ms ticks advance the 1s/2s backoff in a bounded number of steps.
+            self.clock += Duration::from_millis(300);
+            self.feed.tick(self.clock);
+            self.status.snapshot()
+        }
+
+        fn tick_at(&mut self, at: Instant) -> PeerSourceStatusSnapshot {
+            self.clock = at;
+            self.feed.tick(self.clock);
+            self.status.snapshot()
+        }
+
+        fn drain(&mut self) {
+            std::thread::sleep(Duration::from_millis(60));
+        }
+
+        fn run_until(
+            &mut self,
+            mut pred: impl FnMut(&PeerSourceStatusSnapshot) -> bool,
+            max_ticks: usize,
+        ) -> PeerSourceStatusSnapshot {
+            for _ in 0..max_ticks {
+                self.drain();
+                let snap = self.tick();
+                if pred(&snap) {
+                    return snap;
+                }
+            }
+            panic!(
+                "condition not reached within {max_ticks} ticks (state: {:?})",
+                self.status.snapshot()
+            );
+        }
+
+        fn inject_lsa(&self, byte: u8) {
+            let id = hex_id(byte);
+            self.hub.upsert_lsa(
+                Lsa {
+                    node_id: DiscoveryPeerId(id.clone()),
+                    vip: "10.99.0.1".to_string(),
+                    incarnation: 1,
+                    seq: 1,
+                    capabilities: 0,
+                    locator: Some(format!("udp://10.0.0.{}:19010", byte.max(1))),
+                    neighbors: Vec::new(),
+                },
+                self.clock,
+            );
+            self.hub.note_lsa_heard(&DiscoveryPeerId(id), self.clock);
+        }
+
+        fn finish(mut self) {
+            self.sw.shutdown();
+            self.feed.shutdown();
+        }
+    }
+
+    fn switch(my_id: FabricPeerId) -> Arc<NatSwitching> {
+        let driver =
+            nexus_fabric::Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("driver");
+        let local = nexus_nat_traversal::LocalCandidates {
+            host: crate::nat_switch::gather_host_candidates(&driver),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: nexus_connectivity::nat::NatType::Unknown,
+        };
+        NatSwitching::new(
+            driver,
+            my_id,
+            local,
+            Vec::new(),
+            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+        )
+    }
+
+    // ---------- status ----------
+
+    #[test]
+    fn status_note_book_error_is_enum() {
+        let status = PeerSourceStatus::default();
+        assert_eq!(status.snapshot().state, "disabled:no-turn");
+        status.set_state("running");
+        assert!(status.snapshot().enabled);
+        status.note_book_error(String::new());
+        assert_eq!(
+            status.snapshot().last_error.as_deref(),
+            Some("book-reload-failed")
+        );
+        // Success does not clear the last failure code (spec §4.12.1).
+        status.note_book_success();
+        let snap = status.snapshot();
+        assert_eq!(snap.last_error.as_deref(), Some("book-reload-failed"));
+        assert!(snap.book_last_success_ms > 0);
+    }
+
+    #[test]
+    fn decide_state_table_order() {
+        let base = PeerSourceStateInputs {
+            enabled: true,
+            feed: true,
+            has_nat_switch: true,
+            has_provider: true,
+            has_hub: true,
+            has_sessions: true,
+        };
+        assert_eq!(decide_state(base), "running");
+        assert_eq!(
+            decide_state(PeerSourceStateInputs {
+                enabled: false,
+                ..base
+            }),
+            "disabled:config"
+        );
+        // `enabled=false` wins over a missing turn stack (judgment order).
+        assert_eq!(
+            decide_state(PeerSourceStateInputs {
+                enabled: false,
+                has_nat_switch: false,
+                ..base
+            }),
+            "disabled:config"
+        );
+        assert_eq!(
+            decide_state(PeerSourceStateInputs {
+                has_nat_switch: false,
+                ..base
+            }),
+            "disabled:no-turn"
+        );
+        assert_eq!(
+            decide_state(PeerSourceStateInputs {
+                has_provider: false,
+                ..base
+            }),
+            "disabled:no-provider"
+        );
+        assert_eq!(
+            decide_state(PeerSourceStateInputs {
+                has_hub: false,
+                ..base
+            }),
+            "disabled:no-discovery"
+        );
+        assert_eq!(
+            decide_state(PeerSourceStateInputs {
+                has_sessions: false,
+                ..base
+            }),
+            "disabled:no-sessions"
+        );
+    }
+
+    // ---------- AC8 ----------
+
+    #[test]
+    fn rejects_non_canonical_ids() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        // Uppercase / wrong length / non-hex ids injected as mDNS/LSA ids.
+        let bad = ["AB".repeat(32), "ab".repeat(31), "zz".repeat(32)];
+        for (i, id) in bad.iter().enumerate() {
+            h.hub.upsert_lsa(
+                Lsa {
+                    node_id: DiscoveryPeerId(id.clone()),
+                    vip: "10.99.0.1".into(),
+                    incarnation: 1,
+                    seq: 1,
+                    capabilities: 0,
+                    locator: Some(format!("udp://10.0.0.{}:19010", i + 1)),
+                    neighbors: Vec::new(),
+                },
+                h.clock,
+            );
+            h.hub.note_lsa_heard(&DiscoveryPeerId(id.clone()), h.clock);
+        }
+        let snap = h.tick();
+        assert_eq!(snap.subscribed_peers, 0);
+        assert_eq!(snap.invalid_peer_id_total, 3);
+
+        // Same (source, raw) over three ticks counts once.
+        let snap = h.tick();
+        assert_eq!(snap.invalid_peer_id_total, 3);
+        let snap = h.tick();
+        assert_eq!(snap.invalid_peer_id_total, 3);
+
+        // Same raw id from a different source counts again (dedup key includes
+        // the source).
+        let raw = "zz".repeat(32);
+        h.feed.note_invalid(DiscoverySource::Mdns, &raw);
+        let snap = h.tick();
+        assert_eq!(snap.invalid_peer_id_total, 4);
+        h.finish();
+    }
+
+    #[test]
+    fn static_and_n1_ids_bypass_string_validation() {
+        let static_id = N1PeerId([0x22; 32]);
+        let n1_id = N1PeerId([0x33; 32]);
+        let mut h = Harness::new(vec![static_id], sessions_with(&[n1_id]));
+        let snap = h.tick();
+        assert_eq!(snap.subscribed_peers, 2);
+        assert_eq!(snap.sources_static, 1);
+        assert_eq!(snap.sources_n1, 1);
+        assert_eq!(snap.invalid_peer_id_total, 0);
+        h.finish();
+    }
+
+    // ---------- AC9 ----------
+
+    #[test]
+    fn static_source_subscribes_without_book() {
+        let static_id = N1PeerId([0x22; 32]);
+        let mut h = Harness::new(vec![static_id], sessions_with(&[]));
+        let snap = h.tick();
+        assert_eq!(snap.subscribed_peers, 1);
+        assert_eq!(snap.sources_static, 1);
+        // No book entry: the subscription must not fabricate a trigger.
+        assert_eq!(snap.trigger_attempts_total, 0);
+        assert!(h.relay.calls().is_empty());
+        h.finish();
+    }
+
+    #[test]
+    fn static_label_wins_over_discovery_duplicate() {
+        let static_id = N1PeerId([0x2a; 32]);
+        let mut h = Harness::new(vec![static_id], sessions_with(&[]));
+        // The same id is also visible through LSA.
+        h.inject_lsa(0x2a);
+        let snap = h.tick();
+        assert_eq!(snap.subscribed_peers, 1);
+        assert_eq!(snap.sources_static, 1);
+        assert_eq!(snap.sources_lsa, 0);
+        assert_eq!(h.relay.sink_count(&peer(0x2a)), 1);
+        h.finish();
+    }
+
+    #[test]
+    fn peer_stays_until_all_sources_drop() {
+        // Discovery disappears but static remains -> still subscribed.
+        let static_id = N1PeerId([0x2b; 32]);
+        let mut h = Harness::new(vec![static_id], sessions_with(&[]));
+        h.inject_lsa(0x2b);
+        assert_eq!(h.tick().subscribed_peers, 1);
+        // Age the LSA out (90s window) but keep the static entry.
+        let stale = h.clock + Duration::from_secs(120);
+        let snap = h.tick_at(stale);
+        assert_eq!(snap.subscribed_peers, 1);
+        assert_eq!(snap.sources_static, 1);
+        assert_eq!(snap.sources_lsa, 0);
+
+        // All sources gone -> unsubscribe (guard drop -> zero sinks).
+        let mut h2 = Harness::new(Vec::new(), sessions_with(&[]));
+        h2.inject_lsa(0x2c);
+        assert_eq!(h2.tick().subscribed_peers, 1);
+        assert_eq!(h2.relay.sink_count(&peer(0x2c)), 1);
+        let stale = h2.clock + Duration::from_secs(120);
+        let snap = h2.tick_at(stale);
+        assert_eq!(snap.subscribed_peers, 0);
+        assert_eq!(h2.relay.sink_count(&peer(0x2c)), 0);
+
+        // N1 alone is a sufficient source.
+        let n1_id = N1PeerId([0x2d; 32]);
+        let mut h3 = Harness::new(Vec::new(), sessions_with(&[n1_id]));
+        let snap = h3.tick();
+        assert_eq!(snap.subscribed_peers, 1);
+        assert_eq!(snap.sources_n1, 1);
+        h.finish();
+        h2.finish();
+        h3.finish();
+    }
+
+    #[test]
+    fn static_removal_requires_restart() {
+        // (a) feed A with P static and also discoverable through LSA.
+        let p = N1PeerId([0x2e; 32]);
+        let mut a = Harness::new(vec![p], sessions_with(&[]));
+        a.inject_lsa(0x2e);
+        let snap = a.tick();
+        assert_eq!(snap.subscribed_peers, 1);
+        assert_eq!(snap.sources_static, 1);
+        assert_eq!(snap.sources_lsa, 0, "static label absorbs the duplicate");
+        assert_eq!(a.relay.sink_count(&peer(0x2e)), 1);
+
+        // (b) shutdown is the daemon-restart path: guards drop, sinks go to 0.
+        a.feed.shutdown();
+        assert_eq!(a.relay.sink_count(&peer(0x2e)), 0);
+        assert!(a.relay.established_peer_ids().is_empty());
+        a.sw.shutdown();
+
+        // (c) new config without the static entry, same hub still discovers P.
+        let hub = Arc::clone(&a.hub);
+        let book = FakeBook::new();
+        let relay = FakeRelay::new();
+        let sw = switch(peer(0x11));
+        sw.attach_relay_provider(relay.clone());
+        let status = Arc::new(PeerSourceStatus::default());
+        let status_ro = Arc::clone(&status);
+        let mut b = PeerSourceFeed::new(
+            Arc::clone(&sw),
+            relay.clone(),
+            book,
+            sessions_with(&[]),
+            Vec::new(),
+            hub,
+            peer(0x11),
+            PeerSourceConfig::default(),
+            status,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let t0 = now();
+        b.tick(t0);
+        let snap = status_ro.snapshot();
+        assert_eq!(snap.subscribed_peers, 1);
+        assert_eq!(snap.sources_lsa, 1);
+        assert_eq!(relay.sink_count(&peer(0x2e)), 1);
+        sw.shutdown();
+    }
+
+    // ---------- AC10 ----------
+
+    #[test]
+    fn trigger_once_per_address() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x31);
+        h.book.set(peer(0x31), addr(5001));
+        assert_eq!(h.tick().trigger_attempts_total, 1);
+        h.drain();
+        for _ in 0..10 {
+            h.tick();
+        }
+        assert_eq!(h.status.snapshot().trigger_ok_total, 1);
+        assert_eq!(h.relay.calls().len(), 1, "same address must not retrigger");
+        h.finish();
+    }
+
+    #[test]
+    fn retrigger_on_address_change() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x32);
+        h.book.set(peer(0x32), addr(5002));
+        h.tick();
+        h.drain();
+        h.tick();
+        assert_eq!(h.relay.calls().len(), 1);
+        h.book.set(peer(0x32), addr(6002));
+        h.tick();
+        h.drain();
+        h.tick();
+        let calls = h.relay.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1, addr(6002));
+        assert_eq!(h.status.snapshot().trigger_ok_total, 2);
+        h.finish();
+    }
+
+    #[test]
+    fn park_and_rearm_on_book_change() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x33);
+        h.book.set(peer(0x33), addr(5003));
+        h.relay.set_fail(Some("boom"));
+        // Three failures with the frozen 1s/2s backoff -> Parked{MaxFailures}.
+        h.run_until(|s| s.trigger_fail_total == 1, 20);
+        h.run_until(|s| s.trigger_fail_total == 2, 20);
+        let snap = h.run_until(|s| s.trigger_parked_peers == 1, 20);
+        assert_eq!(snap.trigger_fail_total, 3);
+        assert_eq!(h.relay.calls().len(), 3);
+        // Parked and unchanged: no new attempts.
+        for _ in 0..3 {
+            h.tick();
+        }
+        assert_eq!(h.relay.calls().len(), 3);
+
+        // Book address change re-arms and triggers again.
+        h.book.set(peer(0x33), addr(6003));
+        h.run_until(|s| s.trigger_attempts_total == 4, 20);
+        h.drain();
+        assert_eq!(h.relay.calls().len(), 4);
+        h.finish();
+    }
+
+    #[test]
+    fn trigger_failure_backoff_and_park() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x34);
+        h.book.set(peer(0x34), addr(5004));
+        h.relay.set_fail(Some("boom"));
+        h.tick();
+        h.drain();
+        // Backoff: an immediate retrigger is not attempted.
+        let snap = h.tick_at(h.clock + Duration::from_millis(100));
+        assert_eq!(snap.trigger_attempts_total, 1);
+        // Keep ticking without changing the address: 3 attempts then parked.
+        let snap = h.run_until(|s| s.trigger_parked_peers == 1, 30);
+        assert_eq!(snap.trigger_fail_total, 3);
+        assert_eq!(h.relay.calls().len(), 3);
+        for _ in 0..5 {
+            h.tick();
+        }
+        assert_eq!(h.relay.calls().len(), 3, "parked peers do not retry");
+        h.finish();
+    }
+
+    #[test]
+    fn trigger_inflight_timeout_parks() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x35);
+        h.book.set(peer(0x35), addr(5005));
+        let gate = h.relay.block();
+        let t0 = h.clock;
+        h.tick();
+        assert_eq!(h.status.snapshot().trigger_inflight_peers, 1);
+        // Past the 30s in-flight deadline: one failure, no duplicate spawn.
+        let snap = h.tick_at(t0 + Duration::from_secs(31));
+        assert_eq!(snap.trigger_fail_total, 1);
+        assert_eq!(snap.trigger_inflight_peers, 0);
+        h.drain();
+        assert_eq!(h.relay.calls().len(), 1);
+        // Release the blocked thread so the test does not leak a waiter.
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        h.finish();
+    }
+
+    // ---------- AC15 ----------
+
+    #[test]
+    fn capacity_arbitration_deterministic() {
+        // Same tick: the smaller hex wins, the other parks once.
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x0b); // H
+        h.inject_lsa(0x0a); // L
+        h.book.set(peer(0x0a), addr(5010));
+        h.book.set(peer(0x0b), addr(5011));
+        let snap = h.tick();
+        assert_eq!(snap.trigger_attempts_total, 1);
+        assert_eq!(snap.trigger_capacity_parked_total, 1);
+        assert_eq!(snap.trigger_parked_peers, 1);
+        h.drain();
+        let calls = h.relay.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, peer(0x0a), "hex-smaller peer wins the tie");
+        h.tick();
+        assert_eq!(h.status.snapshot().trigger_ok_total, 1);
+        // The loser stays parked without re-counting.
+        for _ in 0..5 {
+            h.tick();
+        }
+        assert_eq!(h.status.snapshot().trigger_capacity_parked_total, 1);
+        assert_eq!(h.relay.calls().len(), 1);
+
+        // Slot release: L ages out of discovery -> unsubscribed -> the fake
+        // provider clears its established entry -> H re-arms and triggers.
+        // H is re-announced so only L expires.
+        let stale = h.clock + Duration::from_secs(120);
+        h.clock = stale;
+        h.inject_lsa(0x0b);
+        let snap = h.tick_at(stale);
+        assert_eq!(snap.trigger_attempts_total, 2);
+        assert_eq!(snap.trigger_capacity_parked_total, 1);
+        h.drain();
+        let calls = h.relay.calls();
+        assert_eq!(calls.last().unwrap().0, peer(0x0b));
+        h.finish();
+
+        // Different tick: the earlier subscription wins regardless of hex.
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.inject_lsa(0x0b); // H subscribes first
+        h.book.set(peer(0x0a), addr(5020));
+        h.book.set(peer(0x0b), addr(5021));
+        h.tick();
+        h.inject_lsa(0x0a); // L subscribes later
+        h.tick();
+        let calls = h.relay.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, peer(0x0b), "earlier subscription tick wins");
+        h.finish();
+    }
+
+    // ---------- AC7 ----------
+
+    #[test]
+    fn degrade_no_provider() {
+        // A stack without an attached provider refuses subscriptions.
+        let h = Harness::new(Vec::new(), sessions_with(&[]));
+        let no_provider = switch(peer(0x11));
+        let status = Arc::new(PeerSourceStatus::default());
+        let mut feed = PeerSourceFeed::new(
+            Arc::clone(&no_provider),
+            h.relay.clone(),
+            h.book.clone(),
+            sessions_with(&[]),
+            Vec::new(),
+            Arc::clone(&h.hub),
+            peer(0x11),
+            PeerSourceConfig::default(),
+            Arc::clone(&status),
+            Arc::new(AtomicBool::new(false)),
+        );
+        h.inject_lsa(0x41);
+        let t0 = now();
+        feed.tick(t0);
+        feed.tick(t0 + Duration::from_millis(20));
+        let snap = status.snapshot();
+        assert_eq!(snap.subscribed_peers, 0);
+        assert_eq!(snap.subscribe_refused_total, 2);
+        no_provider.shutdown();
+        h.finish();
+    }
+
+    #[test]
+    fn degrade_book_reload() {
+        let mut h = Harness::new(Vec::new(), sessions_with(&[]));
+        h.book.fail.store(true, Ordering::SeqCst);
+        let snap = h.tick();
+        assert_eq!(snap.book_errors_total, 1);
+        assert_eq!(snap.last_error.as_deref(), Some("book-reload-failed"));
+        h.book.fail.store(false, Ordering::SeqCst);
+        let snap = h.tick_at(h.clock + Duration::from_millis(1100));
+        assert_eq!(snap.book_reloads_total, 1);
+        // Success keeps the previous failure code.
+        assert_eq!(snap.last_error.as_deref(), Some("book-reload-failed"));
+        h.finish();
     }
 }
