@@ -660,11 +660,82 @@ hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP | ADDR | PORT(BE) | CRL
 
 真实节点样例（密码一律占位 `CHANGE_ME`，严禁真实凭据入库）：
 `examples/configs/trojan_nodes.example.yaml`（日本-TY-3 / 日本-OS-3 两节点，
-server 域名/端口/ALPN/udp/skip-cert-verify 可用真实公开值，密码占位）。
+server 域名/端口/ALPN 可用真实公开值，密码占位；样例只写 `alpn`，缺省走系统根证书校验）。
 
 E4 场景：`scenarios/product/proxy_trojan_node_config.toml`——喂含两个 trojan 节点（Singbox +
 skip-verify + alpn）的 YAML，断言解析出 2 个 `OutboundConfig`、`kind=trojan`、`alpn=[h2,http/1.1]`、
 `skip_cert_verify=true`、`header_format=singbox`；再喂一个缺 `password` 的 trojan 节点 → `CONFIG_INVALID`。
+
+#### 11.9.4 明文 Trojan 出站退出与 TLS 迁移（2026-10-28） {#11-trojan-plaintext-exit}
+
+> 能力退出（不是新增开关）。本节记录**已发生**的用户可见行为变化、迁移方式与不可迁移的净损失。
+
+**退出范围**
+
+- `nexusd` 的两条前端（TUN 与 TPROXY，共享同一 `OutboundRegistry`）**都不再支持明文 Trojan 出站**：
+  首个 wired 出站是明文 Trojan → 启动硬失败（`stage=proxy_engine_init` + `exit 1`）；
+  非首个 wired 的明文 Trojan → 启动 warn（`engine=unsupported cause=PLAINTEXT_TROJAN_UNSUPPORTED`），
+  规则选中该 tag 时 TCP 流当场 RST，不直连、不回退其他出站。
+- **没有配置开关可以回退**：不存在重新启用明文 Trojan 的字段。服务端只支持明文 Trojan 时，
+  用户唯一出路是换服务端或换协议。
+- `nexus proxy`（`apps/nexus` 的 SOCKS5/HTTP 数据面）**不受影响**：该路径的 Trojan 数据面本来恒 TLS；
+  本次退出实际只影响 `nexusd` 用户。
+
+**TLS 声明判据 = 字段出现（不看值）**
+
+trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
+
+- `alpn` 非空（如 `alpn: [h2, http/1.1]`），**或**
+- `skip_cert_verify` 字段出现——**写 `false` 也算声明**，且此时走系统根证书校验（推荐形态）。
+
+`tls: true` 对 Trojan **无效**（该字段只有 VLESS 语义，trojan 分支从不读取它，解析器接受该键
+但不产生 TLS 声明）。
+
+**迁移两步（任选其一）**
+
+```yaml
+# 1) 声明 ALPN（缺省走系统根证书校验）
+- tag: node
+  kind: trojan
+  locator: example.com:443
+  password: CHANGE_ME
+  alpn: [h2, http/1.1]
+
+# 2) 或显式声明 skip_cert_verify（false = 系统根校验；true = 仅当服务端证书不受信任）
+- tag: node
+  kind: trojan
+  locator: example.com:443
+  password: CHANGE_ME
+  skip_cert_verify: false
+```
+
+**边界行为漂移（与退出前的旧实现相比，须显式记账）**
+
+- `skip_cert_verify: false`：旧实现按「值」判定 → 视为**明文**；现在按「字段出现」判定 →
+  视为 **TLS 声明**（走系统根证书校验）。对只支持明文的服务端会在运行期握手失败，而不是启动失败。
+- `alpn: []`：旧实现视为 **TLS**（`alpn.is_some()`）；现在视为**无声明**——该出站被选中时按
+  明文 Trojan 处理，启动硬失败。
+
+**UDP 不恢复（净损失）**
+
+- 迁移到 TLS **只恢复 TCP**。TLS Trojan 的 `udp_capability()` 恒为
+  `Unsupported{TlsVariantNotSupported}`：运行期 UDP 包全部丢弃（永久丢包），不直连、不伪造回包，
+  只计数 + 限频 `event=udp_unsupported`。退出前可用的是**明文** Trojan 的 UDP，因此
+  **Trojan 的 UDP 能力整体归零且不可通过配置迁移恢复**。
+- **TLS Trojan 仍为 `BROKEN` / `NOT_USABLE`**（`docs/protocols/interop/verdicts.json`）：迁移只让
+  TCP 能被建连，不改变产品可用性判定；`TROJAN_FALLBACK_FAIL_OPEN` 安全警示未消除。
+
+**启动失败与静态检查（排障入口）**
+
+- 启动失败按阶段输出**单行 JSON 到 stderr + exit 1**，三个阶段字面量：
+  `config_load`（配置读取/解析）、`rule_engine_init`（规则/组构建）、`proxy_engine_init`
+  （首个 wired 出站非法）。明文 Trojan 属 `proxy_engine_init`：
+  `variant=SELECTED_OUTBOUND_INVALID`、`cause=PLAINTEXT_TROJAN_UNSUPPORTED`，并带 `hint`
+  （只建议真实信号 `alpn` / `skip_cert_verify`；`tls: true` 对 Trojan 无效）。
+- `nexus config check --dir <dir>` 对同一配置给结构化 `errors[]`
+  （`PLAINTEXT_TROJAN_UNSUPPORTED`，`field=skip_cert_verify`）与 `static_valid=false`（exit 1）。
+  注意：该检查是**文件侧静态校验**，与 daemon 的「首个 wired fail-closed / 非首个 wired 降级」
+  分层不是同一口径（契约层收口另议）。
 
 ### 11.10 节点测速（real node speedtest，2026-09-18） {#11-speedtest}
 
