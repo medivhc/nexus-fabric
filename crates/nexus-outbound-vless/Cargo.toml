@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-proxy-config = { path = "../nexus-proxy-config" }
 
 [dev-dependencies]
 # 数据面装配集成测试（tests/dataplane_mock.rs）：mock TLS server 自签证书。

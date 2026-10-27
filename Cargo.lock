@@ -1417,7 +1417,7 @@ dependencies = [
 name = "nexus-outbound-vless"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-proxy-config",
  "rcgen 0.13.2",
  "rustls",
 ]
