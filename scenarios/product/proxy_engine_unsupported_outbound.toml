@@ -17,7 +17,7 @@ requirement = "apps/nexusd/MODULE.md#统一数据面装配"
 # 4) SUG-5：运行期结构化行 `event=outbound_unavailable` 本身必须被断言——
 #    行存在、`cause=PLAINTEXT_TROJAN_UNSUPPORTED`、`kind=trojan`、`tag=bad`
 #    （坏出站的 tag）。事件行由隐藏子进程模式捕获 stderr；限频保证首次立即
-#    发射，故首行断言不依赖时序。
+#    发射，故首行断言不依赖时序；`event_suppressed == 0` 钉住该首条未被限频吞。
 
 [when]
 command = "cargo run --quiet -p nexusd --example proxy_engine_unsupported_outbound -- --json"
@@ -53,6 +53,10 @@ equals = "trojan"
 [[expect]]
 field = "runtime_invalid.event_tag"
 equals = "bad"
+
+[[expect]]
+field = "runtime_invalid.event_suppressed"
+equals = 0
 
 [[expect]]
 field = "degraded.alive_without_engine"
