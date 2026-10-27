@@ -1693,6 +1693,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "signal-hook",
+ "socket2",
  "toml",
 ]
 
