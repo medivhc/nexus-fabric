@@ -7,6 +7,8 @@
 //! Seal or cold open, never reaching Staged.
 use super::*;
 use std::os::unix::fs::FileExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const CHUNK: usize = 65_536;
 
@@ -95,9 +97,11 @@ fn put_chunk_reads_confirmed_prefix_exactly_once() {
     );
 }
 
-/// Uploads `chunks` chunks, then tampers a confirmed byte after entry
-/// validation of the next PutChunk and before it commits.
-fn tamper_inside_put_chunk() -> (
+/// Uploads `before` of 8 chunks, then tampers a confirmed byte after entry
+/// validation of PutChunk `before` and before it commits.
+fn tamper_inside_put_chunk(
+    before: usize,
+) -> (
     Fixture,
     FileSnapshotStaging,
     TaskCallContext,
@@ -113,23 +117,30 @@ fn tamper_inside_put_chunk() -> (
     let c = f.context();
     let v = s.execute(&c, i.begin("tamper")).unwrap();
     let digest = i.files[0].sha256.clone();
-    for n in 0..4 {
+    for n in 0..before {
         s.execute(&c, put_request(&v.upload_id, &digest, &data, n))
             .unwrap();
     }
     let path = f.payload(&v.upload_id, &digest);
     let target = path.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&fired);
     s.set_tamper("chunk_scratch_ready_durable", move || {
-        flip_byte(&target, 10)
+        flip_byte(&target, 10);
+        flag.store(true, Ordering::SeqCst);
     });
     // Detection inside this request is allowed but not required (§5).
-    let _ = s.execute(&c, put_request(&v.upload_id, &digest, &data, 4));
+    let _ = s.execute(&c, put_request(&v.upload_id, &digest, &data, before));
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "tamper hook point was not reached"
+    );
     (f, s, c, i, v.upload_id, data, path)
 }
 
 #[test]
 fn tamper_after_entry_fails_closed_later() {
-    let (f, s, c, _i, id, data, _path) = tamper_inside_put_chunk();
+    let (f, s, c, _i, id, data, _path) = tamper_inside_put_chunk(4);
     assert_code(
         s.execute(
             &c,
@@ -167,7 +178,7 @@ fn tamper_after_entry_fails_closed_later() {
 
 #[test]
 fn tamper_restored_before_next_request_continues() {
-    let (_f, s, c, i, id, data, path) = tamper_inside_put_chunk();
+    let (_f, s, c, i, id, data, path) = tamper_inside_put_chunk(4);
     // Undo the damage before the next request: the committed prefix digest
     // must describe the original bytes, so the upload continues to Staged.
     flip_byte(&path, 10);
@@ -188,28 +199,58 @@ fn tamper_restored_before_next_request_continues() {
 }
 
 #[test]
+fn tamper_inside_final_put_chunk_never_seals() {
+    // Every chunk may be durable after this request; Seal must still refuse.
+    let (f, s, c, _i, id, _data, _path) = tamper_inside_put_chunk(7);
+    assert_code(
+        s.execute(
+            &c,
+            SnapshotRequest::Seal {
+                upload_id: id.clone(),
+            },
+        ),
+        TaskErrorCode::StateCorrupt,
+    );
+    assert_ne!(
+        s.test_observe(&id).unwrap().view.state,
+        UploadState::Staged,
+        "tampered upload must never reach Staged"
+    );
+    drop(s);
+    assert_code(
+        FileSnapshotStaging::open(&f.root),
+        TaskErrorCode::StateCorrupt,
+    );
+}
+
+#[test]
 fn entry_verification_precedes_any_state_change() {
     let a_payload = payload(4 * CHUNK, 1);
     let b_payload = payload(2 * CHUNK, 9);
     let a = Input::new(&[("a.bin", a_payload.as_slice())]);
     let b = Input::new(&[("b.bin", b_payload.as_slice())]);
-    let fresh = Input::new(&[("c.bin", b"fresh-upload")]);
+    let complete = Input::new(&[("c.bin", b"complete-upload")]);
+    let fresh = Input::new(&[("d.bin", b"fresh-upload")]);
     let f = Fixture::new(MAX_INTEGER, 8);
     let s = f.service();
     let c = f.context();
     let va = s.execute(&c, a.begin("entry-a")).unwrap();
     let vb = s.execute(&c, b.begin("entry-b")).unwrap();
+    let vc = s.execute(&c, complete.begin("entry-c")).unwrap();
     let (da, db) = (&a.files[0].sha256, &b.files[0].sha256);
     for n in 0..2 {
         s.execute(&c, put_request(&va.upload_id, da, &a_payload, n))
             .unwrap();
     }
+    // C is fully uploaded and ready to Seal.
+    complete.upload_all(&s, &c, &vc.upload_id);
     // Damage a confirmed byte of A between requests.
     flip_byte(&f.payload(&va.upload_id, da), 3);
     let evidence = inventory(&f.namespace());
-    let (obs_a, obs_b) = (
+    let (obs_a, obs_b, obs_c) = (
         s.test_observe(&va.upload_id).unwrap(),
         s.test_observe(&vb.upload_id).unwrap(),
+        s.test_observe(&vc.upload_id).unwrap(),
     );
     let requests = [
         (
@@ -224,6 +265,12 @@ fn entry_verification_precedes_any_state_change() {
             "Cancel",
             SnapshotRequest::Cancel {
                 upload_id: vb.upload_id.clone(),
+            },
+        ),
+        (
+            "Seal of another, complete upload",
+            SnapshotRequest::Seal {
+                upload_id: vc.upload_id.clone(),
             },
         ),
         ("Begin with a new key", fresh.begin("entry-fresh")),
@@ -244,6 +291,11 @@ fn entry_verification_precedes_any_state_change() {
             s.test_observe(&vb.upload_id).unwrap(),
             obs_b,
             "{what}: B unchanged"
+        );
+        assert_eq!(
+            s.test_observe(&vc.upload_id).unwrap(),
+            obs_c,
+            "{what}: C unchanged (not Staged)"
         );
     }
 }
