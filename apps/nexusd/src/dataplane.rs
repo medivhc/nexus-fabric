@@ -335,6 +335,11 @@ pub struct Dataplane {
     /// 回收，不再发第二个 RST。每 tick 由 `flow_pump` 消费（会话已消失的条目
     /// 直接遗忘，不会二次拦截）。
     proxy_egress_rst_pending: std::collections::HashSet<FlowKey>,
+    /// §12.3 `event=outbound_unavailable` 的限频状态（per `(tag, cause)`）。
+    ///
+    /// 该行位于每包路径（TCP 非 SYN / UDP），必须首次立即发射、其后 10 s 一行
+    /// （PRODUCT hot-path 日志契约；review MAJOR-2/C4）。
+    unavailable_log: crate::log_throttle::KeyedLogThrottle,
     /// 透明前端管道（S42：TPROXY 生产装配）。
     transparent: Option<TransparentPipeline>,
     /// owner → listener 的 UDP 回包通道（`send_from` 在 listener 线程）。
@@ -474,6 +479,7 @@ impl Dataplane {
             tproxy_counters: Arc::new(Mutex::new(TproxyCounters::default())),
             tproxy_last_failure: None,
             proxy_egress_rst_pending: std::collections::HashSet::new(),
+            unavailable_log: crate::log_throttle::KeyedLogThrottle::new(),
             transparent: None,
             transparent_udp_reply_tx: None,
         })
@@ -1513,7 +1519,7 @@ impl Dataplane {
                         if let Some(key) = key {
                             self.emit_proxy_egress_rst(&packet, &key, RstSubcase::TagUnavailable);
                         }
-                        Self::log_outbound_unavailable(&tag, "-", "UNKNOWN_OUTBOUND", "");
+                        self.log_outbound_unavailable(&tag, "-", "UNKNOWN_OUTBOUND", "");
                     }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
                         tag,
@@ -1526,7 +1532,7 @@ impl Dataplane {
                         if let Some(key) = key {
                             self.emit_proxy_egress_rst(&packet, &key, RstSubcase::TagUnavailable);
                         }
-                        Self::log_outbound_unavailable(&tag, &kind, "PROTOCOL_NOT_WIRED", "");
+                        self.log_outbound_unavailable(&tag, &kind, "PROTOCOL_NOT_WIRED", "");
                     }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::InvalidOutbound {
                         tag,
@@ -1540,7 +1546,7 @@ impl Dataplane {
                         if let Some(key) = key {
                             self.emit_proxy_egress_rst(&packet, &key, RstSubcase::TagUnavailable);
                         }
-                        Self::log_outbound_unavailable(&tag, &kind, cause.name(), cause.detail());
+                        self.log_outbound_unavailable(&tag, &kind, cause.name(), cause.detail());
                     }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedProtocol {
                         ..
@@ -2089,10 +2095,23 @@ impl Dataplane {
     }
 
     /// §12.3 运行期结构化行：`event=outbound_unavailable`（tag 不可用时）。
-    fn log_outbound_unavailable(tag: &str, kind: &str, cause: &str, detail: &str) {
+    ///
+    /// 热路径：同一 `(tag, cause)` 首次立即发射，其后每 10 s 一行，被抑制条数以
+    /// `suppressed=<n>` 带出并清零（与 `udp_unsupported` 同一限频语义）。
+    fn log_outbound_unavailable(&mut self, tag: &str, kind: &str, cause: &str, detail: &str) {
+        let decision = self.unavailable_log.decide(
+            tag,
+            cause,
+            std::time::Instant::now(),
+            crate::log_throttle::OUTBOUND_UNAVAILABLE_LOG_INTERVAL,
+        );
+        if !decision.emit {
+            return;
+        }
         let detail = nexus::redact::sanitize(detail);
         eprintln!(
-            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={kind} cause={cause} detail=\"{detail}\""
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={kind} cause={cause} detail=\"{detail}\" suppressed={}",
+            decision.suppressed
         );
     }
 

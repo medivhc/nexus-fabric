@@ -39,6 +39,10 @@ pub struct StreamProxyEgress {
     udp: HashMap<String, crate::proxy_fwd::udp_relay::UdpForwarder>,
     udp_tags: HashMap<FlowKey, String>,
     udp_peers: HashMap<FlowKey, (SocketAddrV4, SocketAddrV4)>,
+    /// §12.3 `event=outbound_unavailable` 的限频状态（per `(tag, cause)`）。
+    ///
+    /// 与 TUN 侧同一语义：首次立即发射、其后 10 s 一行、`suppressed=<n>` 带出。
+    unavailable_log: crate::log_throttle::KeyedLogThrottle,
 }
 
 impl StreamProxyEgress {
@@ -59,7 +63,29 @@ impl StreamProxyEgress {
             udp: HashMap::new(),
             udp_tags: HashMap::new(),
             udp_peers: HashMap::new(),
+            unavailable_log: crate::log_throttle::KeyedLogThrottle::new(),
         })
+    }
+
+    /// §12.3：tag 不可用时的结构化行（TPROXY 无 SYN 时刻，仍给出 cause）。
+    ///
+    /// 与 TUN 侧 `Dataplane::log_outbound_unavailable` 同一限频语义：同一
+    /// `(tag, cause)` 首次立即发射，其后每 10 s 一行，被抑制条数以
+    /// `suppressed=<n>` 带出并清零（review MAJOR-2/C4）。
+    fn log_outbound_unavailable(&mut self, tag: &str, kind: &str, cause: &str, detail: &str) {
+        let decision = self.unavailable_log.decide(
+            tag,
+            cause,
+            std::time::Instant::now(),
+            crate::log_throttle::OUTBOUND_UNAVAILABLE_LOG_INTERVAL,
+        );
+        if !decision.emit {
+            return;
+        }
+        eprintln!(
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={kind} cause={cause} detail=\"{detail}\" suppressed={}",
+            decision.suppressed
+        );
     }
 
     fn spawn_tcp_relay(
@@ -126,8 +152,12 @@ impl ProxyFlowEgress for StreamProxyEgress {
         let Some(dialer) = self.registry.dialer(outbound_tag).cloned() else {
             // 不可用槽位（ProtocolNotWired / Invalid）与「tag 不存在」同行为：
             // 前端按 on_path_failure 处置；额外打结构化行（§12.3）。
-            if let Some(slot) = self.registry.unsupported(outbound_tag) {
-                log_outbound_unavailable(outbound_tag, slot);
+            let unavailable = self
+                .registry
+                .unsupported(outbound_tag)
+                .map(outbound_unavailable_fields);
+            if let Some((kind, cause, detail)) = unavailable {
+                self.log_outbound_unavailable(outbound_tag, &kind, cause, &detail);
             }
             return Err(TransparentFrontendError::OutboundUnresolved {
                 tag: outbound_tag.to_string(),
@@ -175,8 +205,12 @@ impl ProxyFlowEgress for StreamProxyEgress {
             }
         })?;
         let dialer = self.registry.dialer(&tag).cloned().ok_or_else(|| {
-            if let Some(slot) = self.registry.unsupported(&tag) {
-                log_outbound_unavailable(&tag, slot);
+            if let Some((kind, cause, detail)) = self
+                .registry
+                .unsupported(&tag)
+                .map(outbound_unavailable_fields)
+            {
+                self.log_outbound_unavailable(&tag, &kind, cause, &detail);
             }
             TransparentFrontendError::OutboundUnresolved { tag: tag.clone() }
         })?;
@@ -282,22 +316,26 @@ fn synthetic_udp_packet(key: FlowKey, orig_dst: SocketAddrV4, payload: &[u8]) ->
     pkt
 }
 
-/// §12.3：tag 不可用时的结构化行（TPROXY 无 SYN 时刻，仍给出 cause）。
-fn log_outbound_unavailable(tag: &str, slot: &OutboundSlot) {
+/// §12.3 结构化行的字段：`(kind, cause, detail)`。
+///
+/// 与 `StreamProxyEgress::log_outbound_unavailable` 拆开是为了先取出 owned 字段，
+/// 再以 `&mut self` 更新限频状态（避免与 `registry` 的不可变借用重叠）。
+fn outbound_unavailable_fields(slot: &OutboundSlot) -> (String, &'static str, String) {
     match slot {
-        OutboundSlot::ProtocolNotWired { kind } => eprintln!(
-            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={} cause=PROTOCOL_NOT_WIRED detail=\"\"",
-            kind.as_str()
+        OutboundSlot::ProtocolNotWired { kind } => (
+            kind.as_str().to_string(),
+            "PROTOCOL_NOT_WIRED",
+            String::new(),
         ),
-        OutboundSlot::Invalid { kind, cause } => eprintln!(
-            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={} cause={} detail=\"{}\"",
-            kind.as_str(),
+        OutboundSlot::Invalid { kind, cause } => (
+            kind.as_str().to_string(),
             cause.name(),
-            nexus::redact::sanitize(cause.detail())
+            nexus::redact::sanitize(cause.detail()),
         ),
-        OutboundSlot::Dialer(dialer) => eprintln!(
-            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={} cause=UNKNOWN_OUTBOUND detail=\"\"",
-            dialer.kind().as_str()
+        OutboundSlot::Dialer(dialer) => (
+            dialer.kind().as_str().to_string(),
+            "UNKNOWN_OUTBOUND",
+            String::new(),
         ),
     }
 }
