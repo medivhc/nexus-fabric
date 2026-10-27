@@ -30,10 +30,13 @@ impl Default for Sha256Stream {
 }
 
 impl Sha256Stream {
+    /// Feeds the next bytes of the stream.
     pub fn update(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
     }
 
+    /// Consumes the state and returns SHA-256 of every byte fed so far;
+    /// clone first to keep extending the same prefix.
     #[must_use]
     pub fn finish(self) -> Sha256Digest {
         let mut raw = [0u8; 32];
