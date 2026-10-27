@@ -345,7 +345,18 @@ pub struct PeerSourceStatusSnapshot {
     pub trigger_fail_total: u64,
     pub trigger_capacity_parked_total: u64,
     pub trigger_parked_peers: usize,
+    /// Parked because the failure budget ran out (re-arms only on a book
+    /// address or source-set change).
+    pub trigger_parked_max_failures: usize,
+    /// Parked because this provider already serves another peer.
+    pub trigger_parked_capacity: usize,
     pub trigger_inflight_peers: usize,
+    /// Entries visible in the relay address book (`None` = unknown/book double).
+    pub book_entries: Option<usize>,
+    /// Subscribed peers for which the book holds no relayed address yet. This
+    /// is the observable reason a feed is silent while `trigger_attempts_total`
+    /// stays 0 (product-review r1 MAJOR-2).
+    pub subscribed_peers_without_book_addr: usize,
     pub book_reloads_total: u64,
     pub book_errors_total: u64,
     pub book_last_success_ms: u64,
@@ -1058,8 +1069,14 @@ impl PeerSourceFeed {
         let mut mdns = 0;
         let mut n1 = 0;
         let mut parked = 0;
+        let mut parked_max_failures = 0;
+        let mut parked_capacity = 0;
         let mut inflight = 0;
-        for trigger in self.triggers.values() {
+        let mut without_book_addr = 0;
+        for (peer, trigger) in &self.triggers {
+            if self.book.relay_addr(&peer.0).is_none() {
+                without_book_addr += 1;
+            }
             if trigger.sources.static_cfg {
                 stat += 1;
             }
@@ -1076,7 +1093,13 @@ impl PeerSourceFeed {
                 n1 += 1;
             }
             match trigger.state {
-                TriggerState::Parked { .. } => parked += 1,
+                TriggerState::Parked { reason, .. } => {
+                    parked += 1;
+                    match reason {
+                        ParkReason::MaxFailures => parked_max_failures += 1,
+                        ParkReason::Capacity => parked_capacity += 1,
+                    }
+                }
                 TriggerState::InFlight { .. } => inflight += 1,
                 TriggerState::Idle { .. } => {}
             }
@@ -1087,7 +1110,11 @@ impl PeerSourceFeed {
         snap.sources_mdns = mdns;
         snap.sources_n1 = n1;
         snap.trigger_parked_peers = parked;
+        snap.trigger_parked_max_failures = parked_max_failures;
+        snap.trigger_parked_capacity = parked_capacity;
         snap.trigger_inflight_peers = inflight;
+        snap.book_entries = self.book.entry_count();
+        snap.subscribed_peers_without_book_addr = without_book_addr;
         snap.invalid_peer_id_total = self.counters.invalid_peer_id_total;
         snap.subscribe_refused_total = self.counters.subscribe_refused_total;
         snap.trigger_attempts_total = self.counters.trigger_attempts_total;
@@ -1147,6 +1174,10 @@ mod feed_tests {
     impl RelayAddressBook for FakeBook {
         fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr> {
             self.entries.lock().unwrap().get(peer).copied()
+        }
+
+        fn entry_count(&self) -> Option<usize> {
+            self.entries.lock().ok().map(|g| g.len())
         }
 
         fn reload(&self) -> std::io::Result<()> {
@@ -1631,6 +1662,30 @@ mod feed_tests {
         // No book entry: the subscription must not fabricate a trigger.
         assert_eq!(snap.trigger_attempts_total, 0);
         assert!(h.relay.calls().is_empty());
+        assert_eq!(snap.book_entries, Some(0));
+        assert_eq!(
+            snap.subscribed_peers_without_book_addr, 1,
+            "the silent 'subscribed but book has no address' state must be visible"
+        );
+        h.finish();
+    }
+
+    #[test]
+    fn book_coverage_status_tracks_entries_and_missing_addresses() {
+        // Two static peers, one address in the book: the other stays counted.
+        let mut h = Harness::new(
+            vec![N1PeerId([0x22; 32]), N1PeerId([0x23; 32])],
+            sessions_with(&[]),
+        );
+        h.book.set(peer(0x22), addr(5002));
+        let snap = h.tick();
+        assert_eq!(snap.book_entries, Some(1));
+        assert_eq!(snap.subscribed_peers_without_book_addr, 1);
+        // Publishing the second address closes the gap.
+        h.book.set(peer(0x23), addr(5003));
+        let snap = h.tick();
+        assert_eq!(snap.book_entries, Some(2));
+        assert_eq!(snap.subscribed_peers_without_book_addr, 0);
         h.finish();
     }
 
@@ -1809,6 +1864,11 @@ mod feed_tests {
         // Keep ticking without changing the address: 3 attempts then parked.
         let snap = h.run_until(|s| s.trigger_parked_peers == 1, 40);
         assert_eq!(snap.trigger_fail_total, 3);
+        assert_eq!(
+            snap.trigger_parked_max_failures, 1,
+            "MaxFailures must be distinguishable from capacity parking"
+        );
+        assert_eq!(snap.trigger_parked_capacity, 0);
         h.wait_calls(3);
         assert_eq!(h.relay.calls().len(), 3);
         for _ in 0..5 {
@@ -1854,6 +1914,8 @@ mod feed_tests {
         assert_eq!(snap.trigger_attempts_total, 1);
         assert_eq!(snap.trigger_capacity_parked_total, 1);
         assert_eq!(snap.trigger_parked_peers, 1);
+        assert_eq!(snap.trigger_parked_capacity, 1);
+        assert_eq!(snap.trigger_parked_max_failures, 0);
         h.wait_calls(1);
         let calls = h.relay.calls();
         assert_eq!(calls.len(), 1);
