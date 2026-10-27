@@ -629,6 +629,7 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
 - Gate 失败必须显式 FAIL/BLOCKED/UNKNOWN，不能静默降级。
 - Local Harness 与 CI 使用同一 Gate 定义（`policies/quality.toml`）。
 - Evidence 必须绑定 revision / working-tree / config / feature / target / toolchain / platform，并写入 `.evidence/verify-<id>/`。
+- `contract_hash`（Evidence binding 与 `contract:` / `requirement-change:` marker 的取值）覆盖**全部**受保护契约，而不只是 `scenarios/`（requirement-change 2026-10-27）：输入集 = `harness.toml [protection].root_contract_paths`（文件本身；目录则为其下全部文件，递归）∪ 全仓 `**/MODULE.md`；只取 git 可见的文件（已跟踪 + 未被忽略的未跟踪，`git ls-files -co --exclude-standard`），因此 `target/` 等忽略目录不计入。按仓库相对路径排序后对**工作树字节**哈希（与 `configuration_digest` 同口径；CRLF 边界见 DEVELOPMENT.md）。任一输入文件的内容变化、新增、删除或改名都必须改变该值；输入集以外的文件（源码、README、`docs/` 等）不得影响它。`root_contract_paths` 缺失或解析失败时退回默认集 `PRODUCT.md`、`ARCHITECTURE.md`、`policies/`、`scenarios/`；git 列表失败时取哨兵 `contract-unknown`，按下面的哨兵规则不得当作确定取值。
 - `dirty_state` 是**三态**：`true`/`false` 是 git 给出的事实，`null` 表示"问不到 git"（`Repo::dirty_state() -> Option<bool>`）。git 查询失败时绝不写 `false`——那会把"无法证明"变成一条正面事实，而 verify 的 freshness 判定正好消费这个字段（独立 Review round 2 记的 fail-open 缺口）。同一失败路径下 `working_tree_digest` 取哨兵值（`tree-unknown`/`dirty-unknown`），按上一条规则不得当作确定取值。
 - verdict 语义：`PASS / FAIL / STALE / UNKNOWN / BLOCKED`；STALE 证据必须以 `"verdict":"STALE"` 形式落盘，供 `.githooks/pre-push` 检出。
 - 未实现的 gate（bench/replay/coverage 等）必须显式记录 UNKNOWN，不得以 PASS 掩盖。

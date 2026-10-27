@@ -677,4 +677,114 @@ pub(crate) mod tests {
         let repo = Repo::discover_in(&mut cmd).expect("discover must succeed under GIT_DIR");
         assert_eq!(repo.root.to_string_lossy(), expected.as_str());
     }
+
+    /// MODULE.md「contract_hash 覆盖全部受保护契约」不变量的夹具：
+    /// 一个带全部默认契约路径、一个 crate 契约与无关文件的最小仓库。
+    fn contract_fixture(tag: &str) -> Repo {
+        let repo = init_temp_repo(tag);
+        for (rel, body) in [
+            ("PRODUCT.md", "product v1\n"),
+            ("ARCHITECTURE.md", "arch v1\n"),
+            ("policies/architecture.toml", "a = 1\n"),
+            ("scenarios/product/s.toml", "id = \"s\"\n"),
+            ("crates/demo/MODULE.md", "demo v1\n"),
+            ("crates/demo/src/lib.rs", "fn f() {}\n"),
+            ("README.md", "readme\n"),
+            ("docs/notes.md", "notes\n"),
+            (".gitignore", "target/\n"),
+        ] {
+            let path = repo.resolve(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "-m", "contracts"]).unwrap();
+        repo
+    }
+
+    fn assert_contract_moves(repo: &Repo, what: &str, edit: impl FnOnce(&Repo)) {
+        let before = repo.contract_hash();
+        edit(repo);
+        let after = repo.contract_hash();
+        assert_ne!(before, after, "{what} must change contract_hash");
+        assert!(!after.ends_with("-unknown"), "{what}: sentinel {after}");
+    }
+
+    #[test]
+    fn contract_hash_covers_every_protected_contract() {
+        let repo = contract_fixture("contract-cover");
+        for rel in [
+            "PRODUCT.md",
+            "ARCHITECTURE.md",
+            "policies/architecture.toml",
+            "scenarios/product/s.toml",
+            "crates/demo/MODULE.md",
+        ] {
+            assert_contract_moves(&repo, rel, |r| {
+                std::fs::write(r.resolve(rel), format!("{rel} edited\n")).unwrap()
+            });
+        }
+    }
+
+    #[test]
+    fn contract_hash_tracks_added_removed_and_renamed_contracts() {
+        let repo = contract_fixture("contract-shape");
+        assert_contract_moves(&repo, "new crate MODULE.md", |r| {
+            std::fs::create_dir_all(r.resolve("apps/new")).unwrap();
+            std::fs::write(r.resolve("apps/new/MODULE.md"), "new\n").unwrap();
+        });
+        assert_contract_moves(&repo, "deleted tracked contract", |r| {
+            std::fs::remove_file(r.resolve("ARCHITECTURE.md")).unwrap()
+        });
+        assert_contract_moves(&repo, "renamed scenario", |r| {
+            std::fs::rename(
+                r.resolve("scenarios/product/s.toml"),
+                r.resolve("scenarios/product/t.toml"),
+            )
+            .unwrap()
+        });
+        assert_contract_moves(&repo, "non-toml file in a contract dir", |r| {
+            std::fs::write(r.resolve("policies/README.md"), "why\n").unwrap()
+        });
+    }
+
+    #[test]
+    fn contract_hash_ignores_non_contract_and_ignored_files() {
+        let repo = contract_fixture("contract-ignore");
+        let before = repo.contract_hash();
+        std::fs::write(repo.resolve("crates/demo/src/lib.rs"), "fn g() {}\n").unwrap();
+        std::fs::write(repo.resolve("README.md"), "changed\n").unwrap();
+        std::fs::write(repo.resolve("docs/notes.md"), "changed\n").unwrap();
+        std::fs::create_dir_all(repo.resolve("target/x")).unwrap();
+        std::fs::write(repo.resolve("target/x/MODULE.md"), "build output\n").unwrap();
+        assert_eq!(repo.contract_hash(), before);
+    }
+
+    #[test]
+    fn contract_hash_honors_configured_root_contract_paths() {
+        let repo = contract_fixture("contract-config");
+        std::fs::write(repo.resolve("DEV-ENV.md"), "toolchain v1\n").unwrap();
+        let unconfigured = repo.contract_hash();
+        std::fs::write(repo.resolve("DEV-ENV.md"), "toolchain v2\n").unwrap();
+        assert_eq!(
+            repo.contract_hash(),
+            unconfigured,
+            "default set excludes DEV-ENV.md"
+        );
+        std::fs::write(
+            repo.resolve("harness.toml"),
+            "[protection]\nroot_contract_paths = [\"PRODUCT.md\", \"DEV-ENV.md\"]\n",
+        )
+        .unwrap();
+        assert_contract_moves(&repo, "configured DEV-ENV.md", |r| {
+            std::fs::write(r.resolve("DEV-ENV.md"), "toolchain v3\n").unwrap()
+        });
+        let configured = repo.contract_hash();
+        std::fs::write(repo.resolve("ARCHITECTURE.md"), "arch v2\n").unwrap();
+        assert_eq!(
+            repo.contract_hash(),
+            configured,
+            "a path dropped from root_contract_paths no longer counts"
+        );
+    }
 }
