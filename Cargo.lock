@@ -1406,8 +1406,8 @@ dependencies = [
 name = "nexus-outbound-trojan"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
  "nexus-plugin",
+ "nexus-proxy-config",
  "rcgen 0.13.2",
  "rustls",
  "sha2",

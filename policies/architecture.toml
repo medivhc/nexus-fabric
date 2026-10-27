@@ -202,7 +202,7 @@ layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-trojan"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
