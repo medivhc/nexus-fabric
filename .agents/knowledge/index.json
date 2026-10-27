@@ -454,5 +454,13 @@
     "module": "apps/nexusd",
     "category": "implementation-pattern",
     "summary": "每请求入口完整校验一次已确认 prefix，同请求复核只查绑定，提交摘要由入口 Sha256Stream 续算；字节预算须列出幂等重试比较路径。"
+  },
+  {
+    "id": "gate-loaderr",
+    "file": "entries/2026-10-27-harness-scenario-load-errors.md",
+    "date": "2026-10-27",
+    "module": "engineering/nexus-harness",
+    "category": "debug",
+    "summary": "场景加载错误须进入机器Gate，防止非法文件被合法子集或空组PASS掩盖；真正空组按正式MODULE返回UNKNOWN。"
   }
 ]

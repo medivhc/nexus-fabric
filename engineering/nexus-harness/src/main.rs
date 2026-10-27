@@ -11,6 +11,9 @@ mod scenario;
 mod scenario_cmd;
 mod self_exe;
 
+#[cfg(test)]
+mod scenario_load_tests;
+
 use serde_json::{Value, json};
 use std::process::ExitCode;
 
