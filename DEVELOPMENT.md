@@ -281,7 +281,7 @@ Contract Hash）在**项目的 Linux 主机（`xc-pc-linux`）**或 `core.autocr
 `~/.cargo/config.toml`）**只可用于开发试跑，不作为结论来源**（2026-10-10 所有者指示）。
 另外一条同样重要的口径：`verify --fast` 在 `cargo-deny` 缺失时把 `dependency-governance`
 记成 UNKNOWN 因而可能"overall PASS"，这种 PASS 不代表依赖治理真跑过 —— 装上工具后同一
-分支会 FAIL。引用 PASS 时必须同时写明工具在场与否。修正哈希口径（按提交内容而非工作树字节
+分支会 FAIL。引用 PASS 时必须同时写明工具在场与否。自 2026-10-27 起 CI 的 verify-fast job 安装固定版本 cargo-deny 0.20.2 并在运行前现取 RustSec 库（`cargo deny --config policies/deny.toml fetch db`；gate 自身以 `--offline` 运行，本地需自行 fetch，否则库缺失即 FAIL、库陈旧则可能漏报）。新发布的 advisory 会让所有 PR 的 verify-fast 变红（有意 fail-closed），直到升级修复，或经所有者批准把带理由的条目写入 `policies/deny.toml` 的 `ignore`。修正哈希口径（按提交内容而非工作树字节
 归一化行尾）属于门禁契约变更，需要独立走 Contract-First 周期，不在本条目里顺带改。
 
 

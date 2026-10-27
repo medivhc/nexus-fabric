@@ -20,13 +20,15 @@ yanked = "deny"
 # Advisories evaluated and accepted must be recorded here with a reason.
 ignore = [
   # crypto-bigint 0.5.5: timing variability in operations meant to be
-  # constant-time. Only reachable through nexus-web-gateway's WebRTC stack
-  # (str0m 0.24.1 -> dimpl 0.7 -> ecdsa 0.16 -> elliptic-curve 0.13), used
-  # for DTLS ECDSA. The fix (>=0.7.6) needs elliptic-curve 0.14; the newest
-  # str0m (0.24.1) still pins dimpl ^0.7, so no compatible upgrade exists.
-  # Accepted 2026-10-27 by the repository owner; re-evaluate when str0m
-  # moves to dimpl >=0.9 (ecdsa 0.17).
-  { id = "RUSTSEC-2026-0387", reason = "WebRTC DTLS only (str0m->dimpl 0.7); no compatible fix upstream; owner-accepted 2026-10-27, revisit on str0m upgrade" },
+  # constant-time. Only reachable through nexus-web-gateway's WebRTC stack:
+  # str0m 0.24.1 -> dimpl 0.7 (ecdsa 0.16 / p256 / p384) and
+  # str0m-rust-crypto 0.6 (p256 0.13), i.e. DTLS ECDSA and ECDHE, all on
+  # elliptic-curve 0.13. The fix (>=0.7.6) needs elliptic-curve 0.14; the
+  # newest str0m (0.24.1) still pins dimpl ^0.7 and str0m-rust-crypto ^0.6,
+  # so no compatible upgrade exists. Accepted 2026-10-27 by the repository
+  # owner; re-evaluate when str0m moves to dimpl >=0.9 and a
+  # str0m-rust-crypto on p256 >=0.14.
+  { id = "RUSTSEC-2026-0387", reason = "WebRTC DTLS only (str0m -> dimpl 0.7 / str0m-rust-crypto 0.6); no compatible fix upstream; owner-accepted 2026-10-27, revisit on str0m upgrade" },
 ]
 # Warnings for ignore entries that no longer apply (keeps ignore list honest).
 unused-ignored-advisory = "warn"
