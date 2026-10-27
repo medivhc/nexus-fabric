@@ -435,8 +435,24 @@ fn default_per_self_book_is_visible_and_reports_coverage() {
                 && v["peer_source"]["book_reloads_total"].as_u64().unwrap_or(0) >= 1
         })
     };
-    let a_status = wait_subscribed(&daemon_a, "A subscribed");
-    let b_status = wait_subscribed(&daemon_b, "B subscribed");
+    wait_subscribed(&daemon_a, "A subscribed");
+    wait_subscribed(&daemon_b, "B subscribed");
+    // Mutual discovery is real in this rig: both sides exchange LSA traffic in
+    // the same run (the subscription itself is labelled `static` by the
+    // static-wins rule). Timing of the *LSDB* merge depends on the 30s Hello
+    // cycle, so assert the observable traffic rather than the merge instant.
+    let a_status = daemon_a.wait_nat(Duration::from_secs(15), "A LSA traffic", |v| {
+        v["discovery"]["lsa_adverts_recv"].as_u64().unwrap_or(0) >= 1
+    });
+    let b_status = daemon_b.wait_nat(Duration::from_secs(15), "B LSA traffic", |v| {
+        v["discovery"]["lsa_adverts_recv"].as_u64().unwrap_or(0) >= 1
+    });
+    for (name, status) in [("A", &a_status), ("B", &b_status)] {
+        assert!(
+            status["discovery"]["lsa_hellos_sent"].as_u64().unwrap_or(0) >= 1,
+            "{name}: LSA pump must be sending Hello frames"
+        );
+    }
 
     for (name, status, daemon) in [("A", &a_status, &daemon_a), ("B", &b_status, &daemon_b)] {
         assert_eq!(
