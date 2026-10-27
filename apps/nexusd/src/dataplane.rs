@@ -3583,6 +3583,84 @@ outbounds:
         assert_eq!(json["dataplane"]["flow_sessions"]["planner_calls"], 2);
     }
 
+    /// P10：Mesh 分类的 TUN 流必须进入 §10 链。
+    ///
+    /// `PRODUCT.md#tun-ingress-session-chain`：TUN 产生的**每个**新流首包触发
+    /// Policy → Core Planner → SessionOwner。Mesh 流没有 `egress_hint`，但
+    /// "无提示" 只表示不窄化候选集，不表示没有候选；规划前被 Drop 即违反契约。
+    #[test]
+    fn hintless_mesh_flow_enters_session_chain() {
+        struct MeshEstablisher;
+        impl ConnectivityEstablisher for MeshEstablisher {
+            fn establish(
+                &mut self,
+                _session_id: &SessionId,
+                _planned: &nexus_flow_session::Planned,
+            ) -> Result<String, String> {
+                Ok("mesh".to_string())
+            }
+        }
+
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: r1
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: p1
+groups: []
+outbounds:
+  - tag: p1
+    kind: socks5
+    locator: 127.0.0.1:1080
+";
+        let (mut dp, mock) = test_dataplane();
+        dp.set_production_chain_deps(
+            ProductionChainDeps::from_config(None, Some(yaml)).expect("deps"),
+        );
+        dp.enable_flow_sessions_with_establisher(Box::new(MeshEstablisher));
+
+        // UDP（Mesh CIDR 10.200.0.0/24）→ 首包建会话。
+        let udp = craft_udp([10, 0, 0, 2], [10, 200, 0, 7], 40_000, 8080, b"x");
+        mock.lock().unwrap().inject(udp.clone());
+        assert!(dp.process_one().expect("mesh udp"));
+        assert_eq!(dp.flow_planner_calls(), 1, "planner must run for Mesh");
+        let udp_key = FlowKey::parse_ipv4(&udp).expect("udp key");
+        assert!(
+            dp.flow_session_for_key(&udp_key).is_some(),
+            "Mesh flow must own a session"
+        );
+        assert_eq!(
+            dp.stats().dropped,
+            0,
+            "hint-less Mesh flow must not be dropped before planning"
+        );
+
+        // 同一 5 元组：已建流快路径，不重复规划。
+        mock.lock().unwrap().inject(udp);
+        assert!(dp.process_one().expect("same mesh udp"));
+        assert_eq!(dp.flow_planner_calls(), 1);
+
+        // TCP SYN（Mesh）→ 同样建会话，不 Drop。
+        let syn = craft_tcp(
+            [10, 0, 0, 2],
+            [10, 200, 0, 8],
+            40_001,
+            443,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn.clone());
+        assert!(dp.process_one().expect("mesh syn"));
+        assert_eq!(dp.flow_planner_calls(), 2, "planner must run for Mesh TCP");
+        let tcp_key = FlowKey::parse_ipv4(&syn).expect("tcp key");
+        assert!(dp.flow_session_for_key(&tcp_key).is_some());
+        assert_eq!(dp.stats().dropped, 0);
+    }
+
     /// S24：同 5 元组第二包命中决策缓存，规则引擎调用次数不增。
     #[test]
     fn dataplane_decision_cache_hits_skip_rule_engine() {

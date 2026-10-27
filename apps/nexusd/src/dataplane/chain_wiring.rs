@@ -248,7 +248,8 @@ impl ProductionChainDeps {
         &self.provider_tags
     }
 
-    /// 构造会话层 ChainDeps；`build_snapshot` 按 `egress_hint` 过滤候选。
+    /// 构造会话层 ChainDeps；`build_snapshot` 按 `egress_hint` 窄化候选
+    /// （`None` = 无提示，不窄化；Mesh 等流由 Policy + Planner 决定候选）。
     pub fn to_chain_deps(&self) -> ChainDeps {
         let registry = Arc::clone(&self.registry);
         let policy = self.policy.clone();
@@ -262,16 +263,14 @@ impl ProductionChainDeps {
             policy: self.policy.clone(),
             build_snapshot: Box::new(move |flow: &FlowContext| {
                 let probe = policy.evaluate(flow);
-                let candidates = match flow.egress_hint.as_deref() {
-                    Some(tag) => {
-                        let registry = registry.lock().expect("registry poisoned");
-                        let mut candidates = registry.candidates(&flow.resource);
-                        candidates.retain(|record| record.id.0 == tag);
-                        candidates
-                    }
-                    // 调用方违约（Direct/Mesh 不进入会话层）：防御性空候选。
-                    None => Vec::new(),
-                };
+                let registry = registry.lock().expect("registry poisoned");
+                let mut candidates = registry.candidates(&flow.resource);
+                if let Some(tag) = flow.egress_hint.as_deref() {
+                    // 有提示 → 单候选过滤；未解析的提示显式空候选（不回退其它出口）。
+                    candidates.retain(|record| record.id.0 == tag);
+                }
+                // 无提示 → 不窄化：候选集交给 Policy + Core Planner
+                // （PRODUCT §tun-ingress-session-chain：TUN 每个新流都入 §10 链）。
                 PlanningSnapshot::new(candidates, probe.decision.constraints)
             }),
             measure,
@@ -402,12 +401,12 @@ outbounds:
         let snapshot = (chain.build_snapshot)(&flow);
         assert!(snapshot.candidates.is_empty());
 
-        // None 是调用方违约 → 防御性空候选。
+        // 无提示（Mesh 等流）：不窄化候选集，交给 Policy + Planner。
         let flow = FlowContext {
             egress_hint: None,
             ..flow
         };
         let snapshot = (chain.build_snapshot)(&flow);
-        assert!(snapshot.candidates.is_empty());
+        assert_eq!(snapshot.candidates.len(), 2);
     }
 }
