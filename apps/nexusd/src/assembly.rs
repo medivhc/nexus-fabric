@@ -692,4 +692,40 @@ mod tests {
         let cleanup = assemble.cleanup().expect("dry-run cleanup");
         assert_eq!(cleanup.excludes_removed, 0);
     }
+    #[test]
+    fn assemble_n1_with_discovery_static_peers_ids_only() {
+        let text = network_toml_with_routes();
+        let assembly = assemble_n1_with_discovery(
+            &text,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            nexus::network::DiscoveryParams::static_only(),
+        )
+        .expect("assembly");
+        // Id-only: two configured addrs stay in `config.peers`, the id list
+        // carries no address.
+        assert_eq!(assembly.config.peers[0].addrs.len(), 1);
+        assert_eq!(assembly.static_peers.len(), 1);
+        assert_eq!(assembly.static_peers[0], assembly.config.peers[0].id);
+        // The hub the assembly exposes is the one the N1 adapter reads (the
+        // assembly holds the same Arc it passed to the session manager).
+        assert_eq!(
+            assembly.discovery.self_id().0,
+            assembly.config.peer_id.to_hex()
+        );
+        // Multiple configured addrs still yield exactly one static id.
+        let multi = text.replace(
+            "addrs = [\"127.0.0.1:19001\"]",
+            "addrs = [\"127.0.0.1:19001\", \"127.0.0.1:19002\"]",
+        );
+        let assembly = assemble_n1_with_discovery(
+            &multi,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            nexus::network::DiscoveryParams::static_only(),
+        )
+        .expect("assembly with two addrs");
+        assert_eq!(assembly.config.peers[0].addrs.len(), 2);
+        assert_eq!(assembly.static_peers.len(), 1);
+    }
 }
