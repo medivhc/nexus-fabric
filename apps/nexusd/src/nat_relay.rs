@@ -62,6 +62,24 @@ pub trait RelayConnProvider: Send + Sync {
     fn sink_count(&self, peer: &FabricPeerId) -> usize;
 }
 
+/// Minimal trigger surface the peer-source feed depends on.
+///
+/// `TurnRelayProvider` implements it in production and tests implement fakes,
+/// so the feed never needs the concrete provider type (spec §1.5 item 8).
+pub trait RelayTrigger: Send + Sync {
+    /// Relayed address currently established for `peer`, if any.
+    fn established_relay_addr(&self, peer: &FabricPeerId) -> Option<SocketAddr>;
+    /// Peers currently holding the relay slot (<= 1 in this run).
+    fn established_peer_ids(&self) -> Vec<FabricPeerId>;
+    /// Establish a relay to `peer` at `peer_relayed`; returns our relayed
+    /// address on success.
+    fn trigger_relay(
+        &self,
+        peer: FabricPeerId,
+        peer_relayed: SocketAddr,
+    ) -> Result<SocketAddr, RelayError>;
+}
+
 #[derive(Debug)]
 pub enum RelayError {
     Turn(String),
@@ -639,6 +657,25 @@ impl RelayConnProvider for TurnRelayProvider {
 
     fn sink_count(&self, peer: &FabricPeerId) -> usize {
         TurnRelayProvider::sink_count(self, peer)
+    }
+}
+
+impl RelayTrigger for TurnRelayProvider {
+    fn established_relay_addr(&self, peer: &FabricPeerId) -> Option<SocketAddr> {
+        self.established_relay(peer).map(|c| c.relayed)
+    }
+
+    fn established_peer_ids(&self) -> Vec<FabricPeerId> {
+        self.established_peers()
+    }
+
+    fn trigger_relay(
+        &self,
+        peer: FabricPeerId,
+        peer_relayed: SocketAddr,
+    ) -> Result<SocketAddr, RelayError> {
+        self.on_turn_allocated(peer, peer_relayed)
+            .map(|conn| conn.relayed)
     }
 }
 
