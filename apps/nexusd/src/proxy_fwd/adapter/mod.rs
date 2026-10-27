@@ -425,10 +425,9 @@ pub fn build_dialer(
                     OutboundConfigError::MissingPassword,
                 ))?
                 .to_string();
-            // §3.5：TLS 始终启用；skip_cert_verify / alpn 任一出现即 TLS 声明。
-            let tls_signal = outbound.skip_cert_verify.is_some()
-                || outbound.alpn.as_ref().is_some_and(|alpn| !alpn.is_empty());
-            if !tls_signal {
+            // §3.5：TLS 始终启用；`skip_cert_verify` / `alpn` 任一出现即 TLS 声明。
+            // 判据唯一定义：`nexus::outbound_manifest::trojan_tls_signal`（spec §7.7）。
+            if !::nexus::outbound_manifest::trojan_tls_signal(outbound) {
                 return Err(BuildDialerError::Config(
                     OutboundConfigError::PlaintextTrojanUnsupported,
                 ));
