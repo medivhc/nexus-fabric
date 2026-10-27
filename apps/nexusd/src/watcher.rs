@@ -38,6 +38,8 @@ pub enum ReloadEvent {
     },
     /// 需要重启 daemon（配置已校验但需重启才生效）。
     NeedsRestart {
+        /// 触发本次事件的变更文件。
+        files: Vec<String>,
         /// 原因描述。
         reason: String,
     },
@@ -118,12 +120,18 @@ fn watch_loop(dir: ConfigDir, mut current: LoadedConfig, tx: Sender<ReloadEvent>
             ChangeKind::NeedsRestart => {
                 // 不更新 current（旧配置继续生效），提示重启。
                 // 注意：若用户后续又改回，meta 对比会再次触发，这是预期的。
+                let reason = if changed.iter().any(|f| f == config::PROXY_YAML) {
+                    // Q-7=B：proxy.yaml 固定句式（§7.6.1）。
+                    "proxy.yaml changed: outbound engine requires daemon restart".to_string()
+                } else {
+                    format!(
+                        "files {changed:?} require daemon restart to take effect; \
+                         current config remains active"
+                    )
+                };
                 let _ = tx.send(ReloadEvent::NeedsRestart {
-                    reason: format!(
-                        "files {:?} require daemon restart to take effect; \
-                         current config remains active",
-                        changed
-                    ),
+                    files: changed,
+                    reason,
                 });
                 // 更新 meta 基准，避免对同一变更重复 warning。
                 // 但保留旧配置内容（current 的各字段不动，只换 meta）。

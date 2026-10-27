@@ -136,6 +136,19 @@ fn run_daemon(dir: &std::path::Path, port: u16) -> Result<Value, String> {
         ));
     }
 
+    // R2-F12（Q-3）：reload 被拒 → 原样恢复 → 标记清除（同一 daemon，真实 watcher）。
+    let broken = format!("{PROXY_YAML}    password r2f12marker multi word\n");
+    std::fs::write(dir.join("proxy.yaml"), &broken)
+        .map_err(|e| format!("write broken proxy.yaml: {e}"))?;
+    let rejected = wait_outbound(&addr, &token, |outbound| {
+        outbound["file_rejected"] == true && outbound["stale"] == true
+    })?;
+    std::fs::write(dir.join("proxy.yaml"), PROXY_YAML)
+        .map_err(|e| format!("restore proxy.yaml: {e}"))?;
+    let restored = wait_outbound(&addr, &token, |outbound| {
+        outbound["file_rejected"] == false && outbound["stale"] == false
+    })?;
+
     // 收尾：杀 daemon，读完整 stderr。
     let _ = child.kill();
     let _ = child.wait();
@@ -178,6 +191,10 @@ fn run_daemon(dir: &std::path::Path, port: u16) -> Result<Value, String> {
         "startup_log_has_partial": log_line,
         "startup_log_has_selected": selected_line,
         "startup_warn_code": "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT",
+        "rejected.file_rejected": rejected["file_rejected"],
+        "rejected.stale": rejected["stale"],
+        "restored.file_rejected": restored["file_rejected"],
+        "restored.stale": restored["stale"],
     }))
 }
 
@@ -199,6 +216,29 @@ fn read_pipe(child: &mut Child) -> Result<String, String> {
             .map_err(|e| format!("read stderr: {e}"))?;
     }
     Ok(text)
+}
+
+/// 轮询 LocalAPI `outbound` 块直到谓词成立（≤15s）。
+fn wait_outbound(
+    addr: &str,
+    token: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        if let Ok(body) = http_get(addr, "/localapi/v0/dataplane/stats", token)
+            && let Ok(stats) = serde_json::from_str::<Value>(&body)
+        {
+            let outbound = stats["outbound"].clone();
+            if predicate(&outbound) {
+                return Ok(outbound);
+            }
+            last = outbound;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(format!("timeout waiting for outbound state; last={last}"))
 }
 
 fn http_get(addr: &str, path: &str, token: &str) -> Result<String, String> {

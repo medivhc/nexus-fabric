@@ -1644,6 +1644,41 @@ fn config_load_failure_json(error: &str, dir: Option<&ConfigDir>) -> serde_json:
 /// exit 1；仅 `NoUsableOutbound` 降级为无 engine）。
 /// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
 /// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
+/// 按磁盘现状刷新 proxy.yaml 的 file 侧（Applied / NeedsRestart / Rejected 共用，Q-7=B）。
+///
+/// 只描述磁盘现状：解析失败 → `mark_file_rejected`（带脱敏原因）；成功 →
+/// `update_file_side`（R2-F12：成功即无条件清 `file_rejected`）。
+/// 返回 `stale`（无快照 → `None`）。
+fn refresh_proxy_file_side(dir: &ConfigDir, rejected_reason: Option<&str>) -> Option<bool> {
+    use nexus::outbound_manifest;
+    let text = std::fs::read_to_string(dir.file(config::PROXY_YAML)).ok();
+    let surface = outbound_manifest::startup_surface(text.as_deref());
+    let (file_tag, file_kind) = surface
+        .selected
+        .and_then(|index| surface.labels.get(index))
+        .map(|label| (Some(label.tag.clone()), Some(label.kind.clone())))
+        .unwrap_or((None, None));
+    let sha1 = config_sha1(text.as_deref());
+    match rejected_reason {
+        Some(reason) if surface.error.is_some() => outbound_manifest::mark_file_rejected(
+            file_tag,
+            file_kind,
+            &sha1,
+            &nexus::redact::redact_secrets(reason),
+        ),
+        _ => outbound_manifest::update_file_side(file_tag, file_kind, &sha1),
+    }
+}
+
+/// spec §12.1 stale 行（`some(true)` 时打印）。
+fn log_stale_line(stale: Option<bool>) {
+    if stale == Some(true)
+        && let Some(line) = nexus::outbound_manifest::stale_line()
+    {
+        eprintln!("{line}");
+    }
+}
+
 fn run_daemon(config_dir: &str) -> ExitCode {
     // Anchor relative daemon input once without resolving symlinks or removing
     // parent components: managed preflight must retain its path safety checks.
@@ -2177,10 +2212,18 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
         match ev_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(watcher::ReloadEvent::Applied { files }) => {
-                eprintln!("[nexusd] config hot-reloaded: {files:?}");
+                // §7.6.2：只对 Hot 文件宣告「已生效」；proxy.yaml 走 NeedsRestart。
+                eprintln!("[nexusd] config applied: {files:?}");
+                if files.iter().any(|f| f == config::PROXY_YAML) {
+                    log_stale_line(refresh_proxy_file_side(&dir, None));
+                }
             }
-            Ok(watcher::ReloadEvent::NeedsRestart { reason }) => {
+            Ok(watcher::ReloadEvent::NeedsRestart { files, reason }) => {
                 eprintln!("[nexusd] WARN: {reason}");
+                if files.iter().any(|f| f == config::PROXY_YAML) {
+                    // §12.1：active/file 对照 + stale=true（磁盘改了但未生效）。
+                    log_stale_line(refresh_proxy_file_side(&dir, None));
+                }
             }
             Ok(watcher::ReloadEvent::Rejected { error }) => {
                 // 写点 3：打印点再脱敏（幂等；双写点漏网防护）。
@@ -2188,6 +2231,9 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                     "[nexusd] ERROR: config reload rejected: {} (keeping old config)",
                     nexus::redact::redact_secrets(&error)
                 );
+                // R2-F12/PR2R1-02：拒绝后按磁盘现状刷新 file 侧，避免观测面继续
+                // 报「文件与 active 同步」；proxy.yaml 自身解析失败才标 file_rejected。
+                let _ = refresh_proxy_file_side(&dir, Some(&error));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3281,5 +3327,61 @@ mod redact_parity_tests {
         let text = format!("{mode:?}");
         assert!(!text.contains(MARKER), "UdpMode leaked: {text}");
         assert!(text.contains("***"), "mask missing: {text}");
+    }
+}
+
+/// S9 / A10：reload 拒绝后原样恢复，status 清标记（R2-F12）。
+#[cfg(test)]
+mod reload_restore_tests {
+    use super::{config_sha1, refresh_proxy_file_side};
+    use nexusd::config::ConfigDir;
+
+    const GOOD: &str = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: ss-a\noutbounds:\n  - tag: ss-a\n    kind: shadowsocks\n    method: chacha20-ietf-poly1305\n    locator: 127.0.0.1:8388\n    password: secret\n";
+
+    fn temp_dir(tag: &str) -> (std::path::PathBuf, ConfigDir) {
+        let path = std::env::temp_dir().join(format!(
+            "nexusd-reload-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp dir");
+        let dir = ConfigDir::new(&path).expect("config dir");
+        (path, dir)
+    }
+
+    #[test]
+    fn rejected_then_restored_clears_file_rejected() {
+        let (path, dir) = temp_dir("restore");
+        std::fs::write(dir.file(nexusd::config::PROXY_YAML), GOOD).expect("good yaml");
+        let surface = nexus::outbound_manifest::startup_surface(Some(GOOD));
+        nexus::outbound_manifest::install_surface(&surface, &config_sha1(Some(GOOD)));
+
+        // 1) 磁盘被覆盖为畸形文件 → 拒绝分支刷新 file 侧并标 rejected。
+        let broken = format!("{GOOD}    password r2f12marker multi word\n");
+        std::fs::write(dir.file(nexusd::config::PROXY_YAML), &broken).expect("broken yaml");
+        let stale = refresh_proxy_file_side(&dir, Some("parse proxy.yaml failed"));
+        assert_eq!(stale, Some(true), "rejected disk config must look stale");
+        let snapshot = nexus::outbound_manifest::runtime_snapshot().expect("snapshot");
+        assert!(snapshot.file_rejected, "rejection must be visible");
+
+        // 2) 原样改回（与 active 逐字节相同）→ Applied 分支刷新 → 标记清空。
+        std::fs::write(dir.file(nexusd::config::PROXY_YAML), GOOD).expect("restore");
+        let stale = refresh_proxy_file_side(&dir, None);
+        assert_eq!(
+            stale,
+            Some(false),
+            "restored file equals active → not stale"
+        );
+        let snapshot = nexus::outbound_manifest::runtime_snapshot().expect("snapshot");
+        assert!(
+            !snapshot.file_rejected,
+            "R2-F12: restored file clears rejection"
+        );
+        assert_eq!(
+            snapshot.file_config_sha1, snapshot.active_config_sha1,
+            "file sha must match active sha after restore"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

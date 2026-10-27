@@ -58,3 +58,19 @@ equals = true
 [[expect]]
 field = "startup_warn_code"
 equals = "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT"
+
+[[expect]]
+field = "rejected.file_rejected"
+equals = true
+
+[[expect]]
+field = "rejected.stale"
+equals = true
+
+[[expect]]
+field = "restored.file_rejected"
+equals = false
+
+[[expect]]
+field = "restored.stale"
+equals = false
