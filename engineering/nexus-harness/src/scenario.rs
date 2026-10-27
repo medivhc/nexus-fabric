@@ -2830,12 +2830,12 @@ mod tests {
                 ),
             }
         }
-        assert_eq!(parseable, 286, "286 cargo-run [when].command");
+        assert_eq!(parseable, 287, "287 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 264, "all declared targets resolve to Direct");
+        assert_eq!(direct, 265, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -2874,10 +2874,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            208,
-            "204 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            209,
+            "205 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 204);
+        assert_eq!(examples.len(), 205);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(
