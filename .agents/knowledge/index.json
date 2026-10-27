@@ -446,5 +446,13 @@
     "module": "apps/nexusd",
     "category": "review",
     "summary": "保留Cancelled索引后的重复全表验证有累计成本；以未插桩基准定位优化，保持完整校验与原测试规模。"
+  },
+  {
+    "id": "n3-single-pass-prefix",
+    "file": "entries/2026-10-27-n3-staging-single-pass-prefix.md",
+    "date": "2026-10-27",
+    "module": "apps/nexusd",
+    "category": "implementation-pattern",
+    "summary": "每请求入口完整校验一次已确认 prefix，同请求复核只查绑定，提交摘要由入口 Sha256Stream 续算；字节预算须列出幂等重试比较路径。"
   }
 ]
