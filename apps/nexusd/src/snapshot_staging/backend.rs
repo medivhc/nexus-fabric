@@ -122,7 +122,12 @@ pub struct FileSnapshotStaging {
     last: Mutex<Option<UploadId>>,
     #[cfg(test)]
     before_lease: Mutex<Option<TestBeforeLease>>,
+    /// Non-aborting test hook: runs once when the named point is reached.
+    #[cfg(test)]
+    tamper: Mutex<Option<TestTamper>>,
 }
+#[cfg(test)]
+pub(super) type TestTamper = (&'static str, Box<dyn FnOnce() + Send>);
 impl std::fmt::Debug for FileSnapshotStaging {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileSnapshotStaging")
@@ -169,6 +174,16 @@ impl FileSnapshotStaging {
     }
     fn hit(&self, point: &str) -> Result<(), TaskError> {
         #[cfg(test)]
+        {
+            let mut tamper = lock(&self.tamper)?;
+            if tamper.as_ref().is_some_and(|(at, _)| *at == point) {
+                if let Some((_, f)) = tamper.take() {
+                    drop(tamper);
+                    f();
+                }
+            }
+        }
+        #[cfg(test)]
         if *lock(&self.fault)? == point {
             return Err(persistence(format!("test interruption at {point}")));
         }
@@ -179,6 +194,12 @@ impl FileSnapshotStaging {
     pub(super) fn set_fault(&self, point: &'static str) {
         if let Ok(mut x) = self.fault.lock() {
             *x = point
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn set_tamper(&self, point: &'static str, f: impl FnOnce() + Send + 'static) {
+        if let Ok(mut x) = self.tamper.lock() {
+            *x = Some((point, Box::new(f)))
         }
     }
     #[cfg(test)]
@@ -333,8 +354,8 @@ impl SnapshotService for FileSnapshotStaging {
                 ));
             }
         }
-        recovery::validate_all(self, &nodes, &l)?;
-        let result = ops::execute(self, &nodes, &mut l, context, &request)?;
+        let verified = recovery::validate_all(self, &nodes, &l)?;
+        let result = ops::execute(self, &nodes, &mut l, context, &request, &verified)?;
         lease.check()?;
         self.nodes()?;
         Ok(result)
@@ -350,4 +371,13 @@ pub(super) fn initialize_with_test_fault(
     point: &'static str,
 ) -> Result<StagingStatus, InitFailure> {
     init::initialize(config, budget, point)
+}
+
+/// Takes and resets this thread's blob-payload (hash_prefix, read) byte counters.
+#[cfg(test)]
+pub(super) fn test_take_blob_bytes() -> (u64, u64) {
+    (
+        io::TEST_BLOB_HASH_BYTES.with(|n| n.replace(0)),
+        io::TEST_BLOB_READ_BYTES.with(|n| n.replace(0)),
+    )
 }

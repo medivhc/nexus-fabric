@@ -30,6 +30,15 @@ const DIRECTORY_FLAGS: i32 = FILE_FLAGS | 0x10000; // O_DIRECTORY.
 const MAX_CHILDREN: usize = 1025;
 const MAX_RANGE: usize = 65_536;
 
+#[cfg(test)]
+thread_local! {
+    /// N3-12 §5 verification budget, per thread: prefix lengths requested from
+    /// `hash_prefix` on blob payload files.
+    pub(super) static TEST_BLOB_HASH_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Bytes actually read from blob payload files by any read primitive.
+    pub(super) static TEST_BLOB_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NodeId {
     pub(super) device: u64,
@@ -376,11 +385,17 @@ fn same_version(a: &Metadata, b: &Metadata) -> bool {
 struct PositionedReader<'a> {
     file: &'a File,
     offset: u64,
+    #[cfg(test)]
+    blob: bool,
 }
 
 impl Read for PositionedReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let count = self.file.read_at(bytes, self.offset)?;
+        #[cfg(test)]
+        if self.blob {
+            TEST_BLOB_READ_BYTES.with(|n| n.set(n.get() + count as u64));
+        }
         self.offset = self
             .offset
             .checked_add(count as u64)
@@ -390,6 +405,16 @@ impl Read for PositionedReader<'_> {
 }
 
 impl Regular {
+    /// Blob payloads live directly under an upload's `blobs/` directory.
+    #[cfg(test)]
+    fn is_blob_payload(&self) -> bool {
+        self.parent
+            .0
+            .named
+            .as_ref()
+            .is_some_and(|(_, name)| name == "blobs")
+    }
+
     pub(super) fn id(&self) -> NodeId {
         self.id
     }
@@ -419,7 +444,13 @@ impl Regular {
 
     fn read_exact_at(&self, offset: u64, bytes: &mut [u8]) -> IoResult<()> {
         match self.file.read_exact_at(bytes, offset) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                #[cfg(test)]
+                if self.is_blob_payload() {
+                    TEST_BLOB_READ_BYTES.with(|n| n.set(n.get() + bytes.len() as u64));
+                }
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 Err(corrupt("staging file ended before its declared range"))
             }
@@ -474,6 +505,8 @@ impl Regular {
         let mut reader = PositionedReader {
             file: &self.file,
             offset: 0,
+            #[cfg(test)]
+            blob: self.is_blob_payload(),
         }
         .take(take);
         let mut scratch = [0u8; MAX_RANGE];
@@ -524,6 +557,20 @@ impl Regular {
     }
 
     pub(super) fn hash_prefix(&self, prefix_len: u64) -> IoResult<Sha256Digest> {
+        self.hash_prefix_stream(prefix_len)
+            .map(nexus::n3_acceptance::Sha256Stream::finish)
+    }
+
+    /// Streams the first `prefix_len` bytes and returns the unfinished
+    /// SHA-256 state, so a caller can extend a verified prefix (N3-12 §5).
+    pub(super) fn hash_prefix_stream(
+        &self,
+        prefix_len: u64,
+    ) -> IoResult<nexus::n3_acceptance::Sha256Stream> {
+        #[cfg(test)]
+        if self.is_blob_payload() {
+            TEST_BLOB_HASH_BYTES.with(|n| n.set(n.get() + prefix_len));
+        }
         self.check()?;
         let before = self.file.metadata().map_err(persistence)?;
         regular_meta(&before, self.policy, self.limit)?;
@@ -535,16 +582,19 @@ impl Regular {
         let mut reader = PositionedReader {
             file: &self.file,
             offset: 0,
+            #[cfg(test)]
+            blob: self.is_blob_payload(),
         }
         .take(prefix_len);
-        let digest = nexus::n3_acceptance::sha256_reader(&mut reader).map_err(persistence)?;
+        let stream =
+            nexus::n3_acceptance::sha256_stream_reader(&mut reader).map_err(persistence)?;
         if reader.limit() != 0 {
             return Err(corrupt(
                 "staging file ended before the declared hash prefix",
             ));
         }
         self.finish_read(&before)?;
-        Ok(digest)
+        Ok(stream)
     }
 
     fn writer(&self) -> IoResult<File> {

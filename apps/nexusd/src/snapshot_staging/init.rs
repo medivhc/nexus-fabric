@@ -131,6 +131,8 @@ fn make(
         last: Mutex::new(None),
         #[cfg(test)]
         before_lease: Mutex::new(None),
+        #[cfg(test)]
+        tamper: Mutex::new(None),
     }
 }
 pub(super) fn load(

@@ -7,6 +7,29 @@ fn cleanup(r: &Record) -> Option<&Cleanup> {
         _ => None,
     }
 }
+/// Blob prefixes fully verified at request entry, with the SHA-256 state that
+/// covers them (N3-12 §5 每请求校验时机).
+#[derive(Default)]
+pub(super) struct Verified(BTreeMap<(UploadId, Sha256Digest), VerifiedPrefix>);
+pub(super) struct VerifiedPrefix {
+    pub(super) inode: io::NodeId,
+    pub(super) offset: u64,
+    pub(super) stream: nexus::n3_acceptance::Sha256Stream,
+}
+impl Verified {
+    pub(super) fn get(&self, id: &UploadId, blob: &Sha256Digest) -> Option<&VerifiedPrefix> {
+        self.0.get(&(id.clone(), blob.clone()))
+    }
+}
+/// How `validate_record` treats confirmed blob prefixes.
+enum Prefixes<'a> {
+    /// Re-hash every prefix (cold open, recovery).
+    Full,
+    /// Re-hash every prefix and keep its state (request entry).
+    Record(&'a mut Verified),
+    /// Prefixes verified at this request's entry are checked by binding only.
+    Trust(&'a Verified),
+}
 fn may_be_absent(r: &Record, _path: &str) -> bool {
     cleanup(r).is_some()
 }
@@ -50,7 +73,7 @@ pub(super) fn validate_all(
     _s: &FileSnapshotStaging,
     n: &Nodes,
     l: &Ledger,
-) -> Result<(), TaskError> {
+) -> Result<Verified, TaskError> {
     inventory(
         &n.namespace,
         &[
@@ -69,12 +92,29 @@ pub(super) fn validate_all(
             .map(|r| r.id.as_str().into())
             .collect::<Vec<_>>(),
     )?;
+    let mut verified = Verified::default();
     for r in &l.records {
-        validate_record(n, r)?
+        validate_record_with(n, r, Prefixes::Record(&mut verified))?
     }
-    Ok(())
+    Ok(verified)
 }
 pub(super) fn validate_record(n: &Nodes, r: &Record) -> Result<(), TaskError> {
+    validate_record_with(n, r, Prefixes::Full)
+}
+/// Re-checks a record later in the same request: prefixes verified at entry
+/// are trusted by inode and offset instead of being re-read.
+pub(super) fn validate_record_trusting(
+    n: &Nodes,
+    r: &Record,
+    verified: &Verified,
+) -> Result<(), TaskError> {
+    validate_record_with(n, r, Prefixes::Trust(verified))
+}
+fn validate_record_with(
+    n: &Nodes,
+    r: &Record,
+    mut prefixes: Prefixes<'_>,
+) -> Result<(), TaskError> {
     let Some(d) = upload(n, r)? else {
         return Ok(());
     };
@@ -148,16 +188,44 @@ pub(super) fn validate_record(n: &Nodes, r: &Record) -> Result<(), TaskError> {
                 continue;
             };
             let len = f.len()?;
-            if len < b.offset || f.hash_prefix(b.offset)? != b.prefix {
+            if len < b.offset {
                 return Err(corrupt("confirmed prefix missing or changed"));
             }
+            let trusted = match &prefixes {
+                Prefixes::Trust(v) => v
+                    .get(&r.id, &b.digest)
+                    .is_some_and(|p| p.offset == b.offset && p.inode == f.id()),
+                _ => false,
+            };
+            if !trusted {
+                let stream = f.hash_prefix_stream(b.offset)?;
+                if stream.clone().finish() != b.prefix {
+                    return Err(corrupt("confirmed prefix missing or changed"));
+                }
+                if let Prefixes::Record(v) = &mut prefixes {
+                    v.0.insert(
+                        (r.id.clone(), b.digest.clone()),
+                        VerifiedPrefix {
+                            inode: f.id(),
+                            offset: b.offset,
+                            stream,
+                        },
+                    );
+                }
+            }
+            // The pending chunk's old prefix is the range just verified when
+            // it has the same length and digest; check it again only otherwise.
+            let old_prefix_verified = |c: &Chunk| c.old == b.offset && c.old_prefix == b.prefix;
             if let Some(c) = chunk.filter(|c| c.blob == b.digest) {
                 if c.phase == "writing" {
                     if len != c.old {
                         return Err(corrupt("tail exists before ScratchReady"));
                     }
                 } else {
-                    if len < c.old || len > c.next || f.hash_prefix(c.old)? != c.old_prefix {
+                    if len < c.old
+                        || len > c.next
+                        || (!old_prefix_verified(c) && f.hash_prefix(c.old)? != c.old_prefix)
+                    {
                         return Err(corrupt("pending blob range changed"));
                     }
                     let actual = (len - c.old) as usize;
@@ -220,7 +288,7 @@ pub(super) fn recover(
         .clone();
     match r.intent {
         Some(Intent::Begin) => ops::finish_begin(s, n, l, id),
-        Some(Intent::Chunk(_)) => ops::finish_chunk(s, n, l, id),
+        Some(Intent::Chunk(_)) => ops::finish_chunk(s, n, l, id, None),
         Some(Intent::Seal) => ops::finish_seal(s, n, l, id),
         Some(Intent::Cleanup(_)) => ops::finish_cancel(s, n, l, id),
         None => Ok(()),
