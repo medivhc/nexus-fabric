@@ -348,7 +348,7 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 未定义性能预算的路径不得宣称“性能完成”。进入 hot path 后必须在 Contract 中增加 baseline、noise tolerance、warning threshold 与 blocking threshold。
 
 - **N3-12 staging PutChunk 校验预算**（requirement-change 2026-10-27，见 N3-12 §5「每请求校验时机」）：
-  - 机器门禁（确定性，计字节不计时间，读取层按文件角色计数）：单次 PutChunk 对 blob payload 的 `hash_prefix` 字节恰等于本请求入口时全部已确认 prefix 之和（入口完整校验不得删除、不得重复），且全部 blob payload 读取字节 ≤ 该和 + 1 个 chunk；Get 读取恰等于该和。续算机制为 `nexus::n3_acceptance::Sha256Stream`。单测 `snapshot_staging::tests::verification_budget::*`（含请求进行中篡改的推迟失败关闭、入口校验先于任何状态改变）。
+  - 机器门禁（确定性，计字节不计时间，读取层按文件角色计数）：单次 PutChunk 对 blob payload 的 `hash_prefix` 字节恰等于本请求入口时全部已确认 prefix 之和（入口完整校验不得删除、不得重复），且全部 blob payload 读取字节 ≤ 该和 + 1 个 chunk（全部落在已确认 prefix 内的幂等重试：≤ 该和 + 2×重试长度）；Get 读取恰等于该和。续算机制为 `nexus::n3_acceptance::Sha256Stream`。单测 `snapshot_staging::tests::verification_budget::*`（含请求进行中篡改的推迟失败关闭、入口校验先于任何状态改变）。
   - 时延基准（非门禁）：`snapshot_staging::tests::baseline::put_chunk_cost_by_upload_size`（`--release --ignored`）。baseline：2026-10-26 master，sandbox 无争用，32 MiB 上传 28.7 s；noise tolerance ±25%；warning：同条件 32 MiB > 15 s；blocking：> 30 s。
 
 ## Observability

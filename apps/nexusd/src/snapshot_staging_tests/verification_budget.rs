@@ -299,3 +299,74 @@ fn entry_verification_precedes_any_state_change() {
         );
     }
 }
+
+#[test]
+fn idempotent_retry_reads_only_its_own_range_twice() {
+    let data = payload(8 * CHUNK, 5);
+    let i = Input::new(&[("r.bin", data.as_slice())]);
+    let f = Fixture::new(MAX_INTEGER, 8);
+    let s = f.service();
+    let c = f.context();
+    let v = s.execute(&c, i.begin("retry")).unwrap();
+    let digest = i.files[0].sha256.clone();
+    for n in 0..4 {
+        s.execute(&c, put_request(&v.upload_id, &digest, &data, n))
+            .unwrap();
+    }
+    let confirmed = (4 * CHUNK) as u64;
+    let (hashed, read) = blob_bytes(|| {
+        let view = s
+            .execute(&c, put_request(&v.upload_id, &digest, &data, 1))
+            .unwrap();
+        assert_eq!(
+            view.blobs[0].durable_offset, confirmed,
+            "retry is idempotent"
+        );
+    });
+    assert_eq!(hashed, confirmed, "retry still verifies every prefix once");
+    assert!(
+        read >= confirmed && read <= confirmed + 2 * CHUNK as u64,
+        "retry blob reads {read} outside [{confirmed}, {confirmed} + 2 × retry length]"
+    );
+}
+
+#[test]
+fn recovered_chunk_then_new_chunk_commits_whole_prefix_digest() {
+    // Exemption (2): a request that first recovers a pending chunk and then
+    // appends must not continue the stale entry digest of the old offset.
+    let data = payload(8 * CHUNK, 11);
+    let i = Input::new(&[("p.bin", data.as_slice())]);
+    let f = Fixture::new(MAX_INTEGER, 8);
+    let s = f.service();
+    let c = f.context();
+    let v = s.execute(&c, i.begin("recover-then-write")).unwrap();
+    let digest = i.files[0].sha256.clone();
+    for n in 0..2 {
+        s.execute(&c, put_request(&v.upload_id, &digest, &data, n))
+            .unwrap();
+    }
+    s.set_fault("chunk_blob_durable");
+    assert!(
+        s.execute(&c, put_request(&v.upload_id, &digest, &data, 2))
+            .is_err()
+    );
+    s.set_fault("");
+    // Recovers chunk 2 at entry, then appends chunk 3 in the same request.
+    s.execute(&c, put_request(&v.upload_id, &digest, &data, 3))
+        .unwrap();
+    for n in 4..8 {
+        s.execute(&c, put_request(&v.upload_id, &digest, &data, n))
+            .unwrap();
+    }
+    let sealed = s
+        .execute(
+            &c,
+            SnapshotRequest::Seal {
+                upload_id: v.upload_id.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(sealed.state, UploadState::Staged);
+    drop(s);
+    FileSnapshotStaging::open(&f.root).unwrap();
+}
