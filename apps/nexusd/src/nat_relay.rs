@@ -577,7 +577,7 @@ impl TurnRelayProvider {
                 }
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by_key(|a| a.0);
         out
     }
 }
@@ -597,7 +597,7 @@ impl TurnRelayProvider {
             Ok(g) => g.keys().map(|k| FabricPeerId(*k)).collect(),
             Err(e) => e.into_inner().keys().map(|k| FabricPeerId(*k)).collect(),
         };
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by_key(|a| a.0);
         out
     }
 
