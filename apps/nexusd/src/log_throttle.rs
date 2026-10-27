@@ -9,7 +9,7 @@
 //!   随后清零。
 //!
 //! 状态按 `(tag, cause)` 分键：不同出站 / 不同失败原因互不吞日志。
-//! 稳态抑制期只做一次 `HashMap` 查找 + 一个 `u64` 自增，不分配大对象、不格式化文案。
+//! 稳态抑制路径用 `&str` 借用查找 + 一个 `u64` 自增，**不分配**、不格式化文案。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -26,11 +26,20 @@ pub(crate) struct ThrottleDecision {
     pub(crate) suppressed: u64,
 }
 
+/// 单个 `(tag, cause)` 的限频状态。
+#[derive(Debug, Clone, Copy)]
+struct KeyState {
+    last_emit: Instant,
+    suppressed: u64,
+}
+
 /// `(tag, cause)` 维度的限频状态（每个前端各持一份）。
+///
+/// 两层 `HashMap` 而不是 `HashMap<(String, String), _>`：借用 `&str` 逐层查找
+/// 即可命中的键，稳态抑制路径上不构造 owned key（零分配）。
 #[derive(Debug, Default)]
 pub(crate) struct KeyedLogThrottle {
-    last_emit: HashMap<(String, String), Instant>,
-    suppressed: HashMap<(String, String), u64>,
+    state: HashMap<String, HashMap<String, KeyState>>,
 }
 
 impl KeyedLogThrottle {
@@ -49,24 +58,37 @@ impl KeyedLogThrottle {
         now: Instant,
         interval: Duration,
     ) -> ThrottleDecision {
-        let key = (tag.to_string(), cause.to_string());
-        let due = self
-            .last_emit
-            .get(&key)
-            .is_none_or(|last| now.duration_since(*last) >= interval);
-        if due {
-            let suppressed = self.suppressed.remove(&key).unwrap_or(0);
-            self.last_emit.insert(key, now);
-            ThrottleDecision {
-                emit: true,
-                suppressed,
+        if let Some(entry) = self
+            .state
+            .get_mut(tag)
+            .and_then(|causes| causes.get_mut(cause))
+        {
+            if now.duration_since(entry.last_emit) >= interval {
+                let suppressed = entry.suppressed;
+                entry.suppressed = 0;
+                entry.last_emit = now;
+                return ThrottleDecision {
+                    emit: true,
+                    suppressed,
+                };
             }
-        } else {
-            *self.suppressed.entry(key).or_insert(0) += 1;
-            ThrottleDecision {
+            entry.suppressed += 1;
+            return ThrottleDecision {
                 emit: false,
                 suppressed: 0,
-            }
+            };
+        }
+        // 首次出现（或该键从未出现过）：分配键一次，立即发射。
+        self.state.entry(tag.to_string()).or_default().insert(
+            cause.to_string(),
+            KeyState {
+                last_emit: now,
+                suppressed: 0,
+            },
+        );
+        ThrottleDecision {
+            emit: true,
+            suppressed: 0,
         }
     }
 }
