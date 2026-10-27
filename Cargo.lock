@@ -1367,7 +1367,7 @@ name = "nexus-outbound-anytls"
 version = "0.1.0"
 dependencies = [
  "md5",
- "nexus-connectivity",
+ "nexus-proxy-config",
  "rcgen 0.13.2",
  "rustls",
  "sha2",

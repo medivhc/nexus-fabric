@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-proxy-config = { path = "../nexus-proxy-config" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 sha2 = "0.10.9"
