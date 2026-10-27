@@ -117,7 +117,7 @@ impl OutboundDialer for ShadowsocksCrateDialer {
             .flush()
             .map_err(|error| OutboundError::Io { kind: error.kind() })?;
 
-        // 握手完成后清空超时；中继层按自身节奏重设（与切换前 `SsTcpClient` 一致）。
+        // 握手完成后清空超时；中继层按自身节奏重设（与切换前的内嵌 SS TCP 行为一致）。
         stream
             .set_read_timeout(None)
             .map_err(|error| OutboundError::Io { kind: error.kind() })?;
