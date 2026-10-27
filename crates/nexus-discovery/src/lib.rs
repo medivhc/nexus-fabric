@@ -104,6 +104,14 @@ impl StaticDiscovery {
 pub trait Discovery {
     /// 解析 peer 当前已知的可达地址（可能为空）。
     fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr>;
+
+    /// 枚举本源当前知晓的 peer（默认空实现，不破坏既有实现）。
+    ///
+    /// 顺序不作保证；需要确定顺序的调用方自行排序（`DiscoveryHub` 按
+    /// PeerId 的 64-hex 升序输出）。
+    fn peers(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
 }
 
 impl Discovery for StaticDiscovery {
