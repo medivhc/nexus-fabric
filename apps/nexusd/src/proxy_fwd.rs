@@ -18,37 +18,13 @@ pub(crate) mod udp_relay;
 pub use udp_relay::build_udp_reply;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nexus_projection::tcp::TcpTerminator;
-use nexus_proxy_config::{OutboundConfig, OutboundKind};
+use nexus_proxy_config::OutboundKind;
 
 pub(crate) use adapter::OutboundDialer;
 pub use adapter::{EngineInitError, OutboundConfigError};
-
-/// 代理 dial 配置（TPROXY 旧拨号路径；S10 起由 `OutboundRegistry` 取代）。
-#[derive(Debug, Clone)]
-pub enum ProxyDialConfig {
-    Shadowsocks {
-        server: SocketAddr,
-        method: String,
-        password: String,
-    },
-    Trojan {
-        server: SocketAddr,
-        password: String,
-    },
-    TrojanTls {
-        server: SocketAddr,
-        password: String,
-        sni: String,
-        skip_verify: bool,
-    },
-    Socks5 {
-        server: SocketAddr,
-    },
-}
 
 /// 一个出站槽位（Q-4=A：多出站 + strict-first）。
 pub enum OutboundSlot {
@@ -304,151 +280,6 @@ pub struct ProxyFwdStats {
     pub udp_unsupported_other: u64,
     /// 限频抑制的 `udp_unsupported` 日志条数。
     pub udp_unsupported_log_suppressed: u64,
-}
-
-/// 从 `OutboundConfig` 解析 dial 配置（TPROXY 旧路径；S10 删除）。
-pub(crate) fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
-    let locator = o.locator.as_deref().filter(|s| !s.is_empty())?;
-    let server: SocketAddr = locator.parse().ok()?;
-    match o.kind {
-        OutboundKind::Shadowsocks => {
-            let password = o.password.clone().filter(|s| !s.is_empty())?;
-            let method = o
-                .method
-                .clone()
-                .unwrap_or_else(|| "chacha20-ietf-poly1305".to_string());
-            if method != "chacha20-ietf-poly1305" {
-                return None;
-            }
-            Some(ProxyDialConfig::Shadowsocks {
-                server,
-                method,
-                password,
-            })
-        }
-        OutboundKind::Trojan => {
-            let password = o.password.clone().filter(|s| !s.is_empty())?;
-            let use_tls = o.skip_cert_verify.unwrap_or(false) || o.alpn.is_some();
-            if use_tls {
-                Some(ProxyDialConfig::TrojanTls {
-                    server,
-                    password,
-                    sni: server.ip().to_string(),
-                    skip_verify: o.skip_cert_verify.unwrap_or(false),
-                })
-            } else {
-                Some(ProxyDialConfig::Trojan { server, password })
-            }
-        }
-        OutboundKind::Socks5 => Some(ProxyDialConfig::Socks5 { server }),
-        OutboundKind::Direct
-        | OutboundKind::Relay
-        | OutboundKind::Vmess
-        | OutboundKind::Anytls
-        | OutboundKind::Vless
-        | OutboundKind::Hysteria2 => None,
-    }
-}
-
-/// S2..S9 的 TPROXY 临时桥：旧 `ProxyDialConfig` → `OutboundDialer`。
-///
-/// TPROXY 的 registry 收敛在 S10 完成；在此之前用本桥保证 `StreamProxyEgress`
-/// 仍能按旧配置拨号。**语义变化**（随 Q-5/D1/「Trojan 恒 TLS」提前生效）：
-/// - SS TCP 走 `nexus-outbound-shadowsocks`（SIP004，§14-6）；
-/// - 明文 Trojan TCP 仍保留（`PlaintextTrojanDialer`，S10 删除）；
-/// - Trojan UDP 已按 §8.3.2 U3 退出（`Unsupported{TlsVariantNotSupported}`）。
-pub(crate) fn legacy_dialer(config: &ProxyDialConfig) -> Arc<dyn OutboundDialer> {
-    match config {
-        ProxyDialConfig::Socks5 { server } => Arc::new(adapter::legacy::Socks5Dialer::new(
-            "legacy".to_string(),
-            *server,
-        )),
-        ProxyDialConfig::Shadowsocks {
-            server, password, ..
-        } => Arc::new(adapter::legacy::ShadowsocksCrateDialer::new(
-            "legacy".to_string(),
-            *server,
-            password.clone(),
-        )),
-        ProxyDialConfig::Trojan { server, password } => Arc::new(PlaintextTrojanDialer {
-            server: *server,
-            password: password.clone(),
-        }),
-        ProxyDialConfig::TrojanTls {
-            server,
-            password,
-            sni,
-            skip_verify,
-        } => {
-            let mut tls =
-                nexus_proxy_transport::TrojanTlsConfig::new(*server, password.clone(), sni.clone());
-            tls.skip_cert_verify = *skip_verify;
-            Arc::new(adapter::legacy::TrojanProxyTransportDialer::new(
-                "legacy".to_string(),
-                tls,
-            ))
-        }
-    }
-}
-
-/// 明文 Trojan TCP（旧 TPROXY 行为；S10 删除，§14-5）。
-struct PlaintextTrojanDialer {
-    server: SocketAddr,
-    password: String,
-}
-
-impl OutboundDialer for PlaintextTrojanDialer {
-    fn kind(&self) -> OutboundKind {
-        OutboundKind::Trojan
-    }
-    fn tag(&self) -> &str {
-        "legacy"
-    }
-    fn dial_tcp(
-        &self,
-        target: SocketAddr,
-    ) -> Result<Box<dyn adapter::TunnelStream>, adapter::OutboundError> {
-        let config =
-            nexus_proxy_transport::TrojanProxyConfig::new(self.server, self.password.clone());
-        nexus_proxy_transport::trojan_connect(&config, target)
-            .map(|s| Box::new(PlainTcp(s)) as Box<dyn adapter::TunnelStream>)
-            .map_err(|_| adapter::OutboundError::Internal {
-                what: "plaintext trojan",
-            })
-    }
-    fn udp_capability(&self) -> nexus_proxy_config::UdpCapability {
-        nexus_proxy_config::UdpCapability::Unsupported {
-            reason: nexus_proxy_config::UdpUnsupportedReason::TlsVariantNotSupported,
-        }
-    }
-}
-
-/// 裸 TCP 流（legacy 桥）。
-struct PlainTcp(std::net::TcpStream);
-
-impl std::io::Read for PlainTcp {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        std::io::Read::read(&mut self.0, buf)
-    }
-}
-impl std::io::Write for PlainTcp {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        std::io::Write::write(&mut self.0, buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::Write::flush(&mut self.0)
-    }
-}
-impl adapter::TunnelStream for PlainTcp {
-    fn set_read_timeout(&mut self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.0.set_read_timeout(timeout)
-    }
-    fn set_write_timeout(&mut self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.0.set_write_timeout(timeout)
-    }
-    fn shutdown(&mut self) -> std::io::Result<()> {
-        self.0.shutdown(std::net::Shutdown::Write)
-    }
 }
 
 /// ProxyEngine 结构化错误（spec §5.4）。

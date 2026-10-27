@@ -438,24 +438,31 @@ fn build_proxy_engine_for_startup(
     proxy_yaml: Option<&str>,
     tun_enabled: bool,
     has_tproxy: bool,
-) -> Result<Option<nexusd::proxy_fwd::ProxyEngine>, ExitCode> {
+) -> Result<
+    (
+        Option<nexusd::proxy_fwd::ProxyEngine>,
+        Option<Arc<nexusd::proxy_fwd::OutboundRegistry>>,
+    ),
+    ExitCode,
+> {
     if !(tun_enabled || has_tproxy) {
-        return Ok(None);
+        return Ok((None, None));
     }
-    match nexusd::proxy_fwd::ProxyEngine::new(proxy_yaml) {
-        Ok(Some(engine)) => {
+    match nexusd::proxy_fwd::OutboundRegistry::build(proxy_yaml) {
+        Ok(None) => Ok((None, None)),
+        Ok(Some(registry)) => {
             // §12.1：非首个 wired 非法出站的启动 warn 行（不静默）。
-            for line in engine.registry().unsupported_warnings() {
+            for line in registry.unsupported_warnings() {
                 eprintln!("{line}");
             }
-            Ok(Some(engine))
+            let engine = nexusd::proxy_fwd::ProxyEngine::from_registry(Arc::clone(&registry));
+            Ok((engine, Some(registry)))
         }
-        Ok(None) => Ok(None),
         Err(nexusd::proxy_fwd::EngineInitError::NoUsableOutbound { .. }) => {
             eprintln!(
                 "[nexusd] dataplane: ProxyEngine unavailable (NO_USABLE_OUTBOUND); proxy flows answered with RST"
             );
-            Ok(None)
+            Ok((None, None))
         }
         Err(error) => {
             eprintln!("{}", proxy_engine_init_failure_json(&error));
@@ -535,6 +542,7 @@ fn run_dataplane(
     tun_mtu: u32,
     rule_engine: Option<ErasedRuleEngine>,
     proxy_engine: Option<nexusd::proxy_fwd::ProxyEngine>,
+    outbound_registry: Option<Arc<nexusd::proxy_fwd::OutboundRegistry>>,
     proxy_yaml: Option<String>,
     network_toml: Option<String>,
     flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
@@ -724,6 +732,7 @@ fn run_dataplane(
             &config,
             &tproxy_listen,
             proxy_yaml.as_deref(),
+            outbound_registry.clone(),
             &mut dp,
             Arc::clone(&shutdown),
         ),
@@ -880,6 +889,7 @@ fn setup_tproxy_frontend(
     config: &nexus_proxy_config::TproxyInboundConfig,
     listen: &str,
     proxy_yaml: Option<&str>,
+    outbound_registry: Option<Arc<nexusd::proxy_fwd::OutboundRegistry>>,
     dp: &mut nexusd::dataplane::Dataplane,
     shutdown: Arc<AtomicBool>,
 ) -> Option<TproxyFrontend> {
@@ -1050,8 +1060,9 @@ fn setup_tproxy_frontend(
         );
         return None;
     };
-    let proxy_egress: Option<Box<dyn ProxyFlowEgress>> = proxy_yaml
-        .and_then(nexusd::tproxy_egress::StreamProxyEgress::from_yaml)
+    // Q-5=B：TPROXY 与 TUN 共享同一批 dialer（同一份 registry）。
+    let proxy_egress: Option<Box<dyn ProxyFlowEgress>> = outbound_registry
+        .and_then(nexusd::tproxy_egress::StreamProxyEgress::from_registry)
         .map(|egress| Box::new(egress) as Box<dyn ProxyFlowEgress>);
     let transparent_config = TransparentConfig {
         udp_table_capacity: config.udp_table_capacity,
@@ -2022,12 +2033,12 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         None
     };
     // D1（spec §3.3 步骤 4）：spawn 之前构造；硬失败在此返回 exit 1（不 process::exit）。
-    let proxy_engine = match build_proxy_engine_for_startup(
+    let (proxy_engine, outbound_registry) = match build_proxy_engine_for_startup(
         loaded.proxy_yaml.as_deref(),
         tun_enabled(),
         has_tproxy,
     ) {
-        Ok(engine) => engine,
+        Ok(pair) => pair,
         Err(code) => return code,
     };
     let dataplane_handle = if tun_enabled() || has_tproxy {
@@ -2044,6 +2055,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         tun_mtu,
                         rule_engine,
                         proxy_engine,
+                        outbound_registry,
                         proxy_yaml,
                         network_toml,
                         flow_sessions_mode,

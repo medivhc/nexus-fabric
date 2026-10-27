@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use nexus_projection::egress::FlowKey;
 use nexus_projection::transparent::{ProxyEgressEvent, ProxyFlowEgress, TransparentFrontendError};
 
-use crate::proxy_fwd::ProxyDialConfig;
+use crate::proxy_fwd::{OutboundRegistry, OutboundSlot};
 
 const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -31,7 +32,7 @@ enum RelayEvent {
 
 /// 生产代理出口适配器。
 pub struct StreamProxyEgress {
-    outbounds: HashMap<String, ProxyDialConfig>,
+    registry: Arc<OutboundRegistry>,
     tcp: HashMap<FlowKey, Sender<RelayCmd>>,
     events_tx: Sender<RelayEvent>,
     events_rx: Receiver<RelayEvent>,
@@ -41,22 +42,17 @@ pub struct StreamProxyEgress {
 }
 
 impl StreamProxyEgress {
-    /// 从 `proxy.yaml` 构造；没有可拨号出站时返回 `None`。
+    /// 从共享注册表构造（Q-5=B：TUN 与 TPROXY 同一批 dialer 实例）。
+    ///
+    /// registry 无任何 dialer 时返回 `None`（等价旧 `outbounds.is_empty()`）。
     #[must_use]
-    pub fn from_yaml(proxy_yaml: &str) -> Option<Self> {
-        let config = nexus_proxy_config::parse(proxy_yaml).ok()?;
-        let mut outbounds = HashMap::new();
-        for outbound in &config.outbounds {
-            if let Some(dial) = crate::proxy_fwd::dial_config_from_outbound(outbound) {
-                outbounds.insert(outbound.tag.clone(), dial);
-            }
-        }
-        if outbounds.is_empty() {
+    pub fn from_registry(registry: Arc<OutboundRegistry>) -> Option<Self> {
+        if !registry.has_any_dialer() {
             return None;
         }
         let (events_tx, events_rx) = mpsc::channel();
         Some(Self {
-            outbounds,
+            registry,
             tcp: HashMap::new(),
             events_tx,
             events_rx,
@@ -66,13 +62,18 @@ impl StreamProxyEgress {
         })
     }
 
-    fn spawn_tcp_relay(&mut self, key: FlowKey, config: ProxyDialConfig, target: SocketAddrV4) {
+    fn spawn_tcp_relay(
+        &mut self,
+        key: FlowKey,
+        dialer: Arc<dyn crate::proxy_fwd::adapter::OutboundDialer>,
+        target: SocketAddrV4,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let events_tx = self.events_tx.clone();
         std::thread::Builder::new()
             .name("nexusd-tproxy-relay".to_string())
             .spawn(move || {
-                let mut stream = match dial_proxy_stream(&config, target.into()) {
+                let mut stream = match dialer.dial_tcp(target.into()) {
                     Ok(stream) => stream,
                     Err(e) => {
                         let _ = events_tx.send(RelayEvent::Failed(key, e.to_string()));
@@ -122,12 +123,17 @@ impl ProxyFlowEgress for StreamProxyEgress {
         orig_dst: SocketAddrV4,
         outbound_tag: &str,
     ) -> Result<(), TransparentFrontendError> {
-        let config = self.outbounds.get(outbound_tag).cloned().ok_or_else(|| {
-            TransparentFrontendError::OutboundUnresolved {
-                tag: outbound_tag.to_string(),
+        let Some(dialer) = self.registry.dialer(outbound_tag).cloned() else {
+            // 不可用槽位（ProtocolNotWired / Invalid）与「tag 不存在」同行为：
+            // 前端按 on_path_failure 处置；额外打结构化行（§12.3）。
+            if let Some(slot) = self.registry.unsupported(outbound_tag) {
+                log_outbound_unavailable(outbound_tag, slot);
             }
-        })?;
-        self.spawn_tcp_relay(key, config, orig_dst);
+            return Err(TransparentFrontendError::OutboundUnresolved {
+                tag: outbound_tag.to_string(),
+            });
+        };
+        self.spawn_tcp_relay(key, dialer, orig_dst);
         Ok(())
     }
 
@@ -168,15 +174,17 @@ impl ProxyFlowEgress for StreamProxyEgress {
                 tag: "<unset>".to_string(),
             }
         })?;
-        let config = self
-            .outbounds
-            .get(&tag)
-            .cloned()
-            .ok_or_else(|| TransparentFrontendError::OutboundUnresolved { tag: tag.clone() })?;
+        let dialer = self.registry.dialer(&tag).cloned().ok_or_else(|| {
+            if let Some(slot) = self.registry.unsupported(&tag) {
+                log_outbound_unavailable(&tag, slot);
+            }
+            TransparentFrontendError::OutboundUnresolved { tag: tag.clone() }
+        })?;
         let packet = synthetic_udp_packet(key, orig_dst, payload);
-        let forwarder = self.udp.entry(tag.clone()).or_insert_with(|| {
-            crate::proxy_fwd::udp_relay::UdpForwarder::new(crate::proxy_fwd::legacy_dialer(&config))
-        });
+        let forwarder = self
+            .udp
+            .entry(tag.clone())
+            .or_insert_with(|| crate::proxy_fwd::udp_relay::UdpForwarder::new(dialer));
         if forwarder.handle_packet(&packet) {
             self.udp_peers.insert(key, (key_peer(key), orig_dst));
             Ok(())
@@ -274,11 +282,22 @@ fn synthetic_udp_packet(key: FlowKey, orig_dst: SocketAddrV4, payload: &[u8]) ->
     pkt
 }
 
-fn dial_proxy_stream(
-    config: &ProxyDialConfig,
-    target: SocketAddr,
-) -> std::io::Result<Box<dyn crate::proxy_fwd::adapter::TunnelStream>> {
-    crate::proxy_fwd::legacy_dialer(config)
-        .dial_tcp(target)
-        .map_err(|e| std::io::Error::other(e.to_string()))
+/// §12.3：tag 不可用时的结构化行（TPROXY 无 SYN 时刻，仍给出 cause）。
+fn log_outbound_unavailable(tag: &str, slot: &OutboundSlot) {
+    match slot {
+        OutboundSlot::ProtocolNotWired { kind } => eprintln!(
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={} cause=PROTOCOL_NOT_WIRED detail=\"\"",
+            kind.as_str()
+        ),
+        OutboundSlot::Invalid { kind, cause } => eprintln!(
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={} cause={} detail=\"{}\"",
+            kind.as_str(),
+            cause.name(),
+            nexus::redact::sanitize(cause.detail())
+        ),
+        OutboundSlot::Dialer(dialer) => eprintln!(
+            "[proxy-fwd] event=outbound_unavailable tag={tag} kind={} cause=UNKNOWN_OUTBOUND detail=\"\"",
+            dialer.kind().as_str()
+        ),
+    }
 }

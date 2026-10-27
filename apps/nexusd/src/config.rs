@@ -1856,10 +1856,12 @@ mod tests {
         write(&d, PROXY_YAML, yaml_v1);
         let dir = ConfigDir::new(&d).unwrap();
         let old = load(&dir).unwrap();
-        // proxy.yaml 内容变更 → Hot
+        // proxy.yaml 内容变更 → NeedsRestart（Q-7=B：engine 只在启动构造）
         write(&d, PROXY_YAML, yaml_v2);
         let new = load(&dir).unwrap();
-        assert_eq!(classify_change(&old, &new), ChangeKind::Hot);
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        // 「只有规则/出站变化」也不再是 Hot（同一判据，术语保留以便审计）
+        assert_ne!(classify_change(&old, &new), ChangeKind::Hot);
         // daemon addr 变更 → NeedsRestart
         write(&d, DAEMON_TOML, "[localapi]\naddr = \"127.0.0.1:19999\"\n");
         let new2 = load(&dir).unwrap();
