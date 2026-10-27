@@ -151,6 +151,14 @@ pub trait RelayAddressBook: Send + Sync {
     fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr>;
     fn reload(&self) -> io::Result<()>;
     fn publish(&self, peer: [u8; 32], addr: SocketAddr) -> io::Result<()>;
+    /// Number of peer addresses currently visible in the book.
+    ///
+    /// `None` = the implementation cannot tell (test doubles). Production
+    /// books report `Some`, so the status block can explain "subscribed but no
+    /// book address" (product-review r1 MAJOR-2).
+    fn entry_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// File-backed address book (`peer_hex = "ip:port"` lines).
@@ -177,6 +185,10 @@ impl FileRelayAddressBook {
 impl RelayAddressBook for FileRelayAddressBook {
     fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr> {
         self.entries.lock().ok()?.get(peer).copied()
+    }
+
+    fn entry_count(&self) -> Option<usize> {
+        self.entries.lock().ok().map(|g| g.len())
     }
 
     fn reload(&self) -> io::Result<()> {
@@ -281,6 +293,9 @@ struct EstablishedRelay {
     conn: RelayConn,
     driver: Option<Arc<Driver>>,
     listener: Option<FabricListener>,
+    /// Why this slot is being torn down. Set by whoever removes the entry;
+    /// the default covers process shutdown.
+    release_reason: std::cell::Cell<&'static str>,
 }
 
 impl EstablishedRelay {
@@ -293,16 +308,25 @@ impl EstablishedRelay {
             "none"
         }
     }
+
+    /// Tag the teardown cause so the release line is self-explanatory.
+    fn released_because(self, reason: &'static str) -> Self {
+        self.release_reason.set(reason);
+        self
+    }
 }
 
 impl Drop for EstablishedRelay {
     fn drop(&mut self) {
         // Observable teardown: the driver's Shutdown + join happens here, which
-        // must never run while a provider lock is held.
+        // must never run while a provider lock is held. `hex64` matches the
+        // `provider_up peer=<hex64>` correlation key, and `reason=` keeps a
+        // normal replace from reading like a relay loss (spec §4.12.2).
         eprintln!(
-            "[nat-relay] relay slot released peer={} anchor={}",
-            &hex32(&self.conn.conn.peer.0)[..8],
-            self.anchor_label()
+            "[nat-relay] relay slot released peer={} anchor={} reason={}",
+            hex32(&self.conn.conn.peer.0),
+            self.anchor_label(),
+            self.release_reason.get()
         );
     }
 }
@@ -466,7 +490,9 @@ impl TurnRelayProvider {
             if established.keys().any(|holder| *holder != peer.0) {
                 return Err(RelayError::Capacity("relay slot busy".into()));
             }
-            established.remove(&peer.0)
+            established
+                .remove(&peer.0)
+                .map(|old| old.released_because("replace"))
         };
         // Driver teardown (Shutdown + join) must happen outside every lock.
         drop(replaced);
@@ -509,6 +535,7 @@ impl TurnRelayProvider {
                     conn: relay_conn.clone(),
                     driver: driver_anchor,
                     listener: listener_anchor,
+                    release_reason: std::cell::Cell::new("shutdown"),
                 },
             );
         }
@@ -539,7 +566,10 @@ impl TurnRelayProvider {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
             };
-            let entries: Vec<EstablishedRelay> = established.drain().map(|(_, v)| v).collect();
+            let entries: Vec<EstablishedRelay> = established
+                .drain()
+                .map(|(_, v)| v.released_because("provider-lost"))
+                .collect();
             entries.len()
         };
         // `EstablishedRelay` values were dropped when the drain result went out
@@ -650,7 +680,8 @@ impl RelayConnProvider for TurnRelayProvider {
             let taken = match self.established.lock() {
                 Ok(mut g) => g.remove(&peer.0),
                 Err(e) => e.into_inner().remove(&peer.0),
-            };
+            }
+            .map(|old| old.released_because("unsubscribe"));
             drop(taken);
         }
     }
@@ -832,6 +863,10 @@ impl DirRelayAddressBook {
 impl RelayAddressBook for DirRelayAddressBook {
     fn relay_addr(&self, peer: &[u8; 32]) -> Option<SocketAddr> {
         self.entries.lock().ok()?.get(peer).copied()
+    }
+
+    fn entry_count(&self) -> Option<usize> {
+        self.entries.lock().ok().map(|g| g.len())
     }
 
     fn reload(&self) -> io::Result<()> {
