@@ -1066,7 +1066,17 @@ mod tests {
             "flow-accept-* thread count difference must be 0"
         );
         // Process-level `flow-accept-<peer>` thread count returns to baseline.
-        let after = count_flow_accept();
+        // comm is truncated to 3 hex chars of the peer id, so a concurrently
+        // running test's thread can share the name for a moment; poll (bounded)
+        // so only a thread that never exits fails the check.
+        let mut after = count_flow_accept();
+        for _ in 0..250 {
+            if after == baseline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            after = count_flow_accept();
+        }
         assert_eq!(
             after, baseline,
             "process-level flow-accept-* count difference must be 0"

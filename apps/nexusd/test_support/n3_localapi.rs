@@ -96,7 +96,11 @@ pub fn exchange(addr: &str, raw: &[u8], half_close: bool) -> (u16, TaskEnvelope)
         .unwrap();
     stream.write_all(raw).unwrap();
     if half_close {
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        // The daemon may refuse early and close first; its complete response is
+        // still readable below, so a lost half-close is not a failure.
+        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "{e}");
+        }
     }
     let mut bytes = Vec::new();
     loop {
