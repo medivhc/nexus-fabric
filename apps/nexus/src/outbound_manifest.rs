@@ -1376,9 +1376,14 @@ mod tests {
             )),
             "x-sha1",
         );
+        // 计数来源：fixture 三个出站经 `label_for_verdict` 纯映射自嵌入的
+        // `docs/protocols/interop/verdicts.json` —— shadowsocks=PARTIAL、
+        // trojan=PARTIAL（fixes-5 把 trojan 由 BROKEN 翻转为 PARTIAL）、
+        // vmess=BROKEN。手工复算：PARTIAL 2 + BROKEN 1 + unverified 0 +
+        // not_claimed 0，全部条目都有 claim，故 not_claimed 为 0。
         let counts = interop_warning_counts();
-        assert_eq!(counts.partial, 1);
-        assert_eq!(counts.broken, 2);
+        assert_eq!(counts.partial, 2);
+        assert_eq!(counts.broken, 1);
         assert_eq!(counts.unverified, 0);
         assert_eq!(counts.not_claimed, 0);
     }
