@@ -129,3 +129,15 @@ fn request_validation_and_digest_cover_all_execution_inputs() {
     assert!(u64::from_value(Value::Integer(i128::from(MAX_INTEGER) + 1)).is_err());
     assert!(u64::from_value(Value::Integer(-1)).is_err());
 }
+
+#[test]
+fn sha256_stream_clone_extends_a_verified_prefix() {
+    let data: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+    let prefix = sha256_stream_reader(&data[..131_072]).unwrap();
+    assert_eq!(prefix.clone().finish(), sha256(&data[..131_072]));
+    let mut extended = prefix.clone();
+    extended.update(&data[131_072..]);
+    assert_eq!(extended.finish(), sha256(&data));
+    assert_eq!(sha256_reader(&data[..]).unwrap(), sha256(&data));
+    assert_eq!(Sha256Stream::default().finish(), sha256(b""));
+}

@@ -557,6 +557,16 @@ impl Regular {
     }
 
     pub(super) fn hash_prefix(&self, prefix_len: u64) -> IoResult<Sha256Digest> {
+        self.hash_prefix_stream(prefix_len)
+            .map(nexus::n3_acceptance::Sha256Stream::finish)
+    }
+
+    /// Streams the first `prefix_len` bytes and returns the unfinished
+    /// SHA-256 state, so a caller can extend a verified prefix (N3-12 §5).
+    pub(super) fn hash_prefix_stream(
+        &self,
+        prefix_len: u64,
+    ) -> IoResult<nexus::n3_acceptance::Sha256Stream> {
         #[cfg(test)]
         if self.is_blob_payload() {
             TEST_BLOB_HASH_BYTES.with(|n| n.set(n.get() + prefix_len));
@@ -576,14 +586,15 @@ impl Regular {
             blob: self.is_blob_payload(),
         }
         .take(prefix_len);
-        let digest = nexus::n3_acceptance::sha256_reader(&mut reader).map_err(persistence)?;
+        let stream =
+            nexus::n3_acceptance::sha256_stream_reader(&mut reader).map_err(persistence)?;
         if reader.limit() != 0 {
             return Err(corrupt(
                 "staging file ended before the declared hash prefix",
             ));
         }
         self.finish_read(&before)?;
-        Ok(digest)
+        Ok(stream)
     }
 
     fn writer(&self) -> IoResult<File> {

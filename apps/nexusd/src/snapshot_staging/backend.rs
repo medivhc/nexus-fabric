@@ -354,8 +354,8 @@ impl SnapshotService for FileSnapshotStaging {
                 ));
             }
         }
-        recovery::validate_all(self, &nodes, &l)?;
-        let result = ops::execute(self, &nodes, &mut l, context, &request)?;
+        let verified = recovery::validate_all(self, &nodes, &l)?;
+        let result = ops::execute(self, &nodes, &mut l, context, &request, &verified)?;
         lease.check()?;
         self.nodes()?;
         Ok(result)
