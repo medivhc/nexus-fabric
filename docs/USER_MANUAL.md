@@ -437,7 +437,7 @@ cargo build --workspace
   * 一个 TURN allocation 只安全服务 **1 个 peer**（单 relay 上限），多 peer relay 属后续工作。
 
 * **代码级校验**：`product.peer-source-wiring`（E4，fake doubles）；生产装配回归
-  `nexusd::tests::peer_source_discovery_production`（daemon 二进制的无 IPv4 降级、
+  `apps/nexusd/tests/peer_source_discovery_production.rs`（daemon 二进制的无 IPv4 降级、
   默认 per-self book 可见性；非真机）。真机 AC2/AC3 证据归 evidence 阶段。
 
 ### 4.2 Service
