@@ -127,8 +127,13 @@
     SYN-ACK）+ 计数 `proxy_dropped_no_proxy`（D2=C）；tag 可拨号 → proxy 转发；
   - `Direct` → 直连（MVP 计数 `direct_forwarded`，实际经系统路由）；
   - `Drop` → 计数 `dropped`。
-- **D3（DNS 拦截）**：UDP 目的端口 53 的包短路分类器 → `UnifiedDns::resolve()` →
-  构造 DNS 响应写回 TUN（`dns_answered` 计数；响应包源端口 53）。
+- **D3（DNS 拦截）**：UDP/53 的 IPv4 包短路分类器，提交给单 owner DNS 线程（见「DNS
+  服务面」）：`UnifiedDns::step()` 本地命中（Hosts/Mesh/FakeIp）→ 线程内构造响应；
+  `Upstream` → 非阻塞上游引擎；响应经有界 channel 回数据面并写回 TUN（`dns_answered`
+  计数；响应包源端口 53）。**两条入口、一条引擎**：TUN 与 TPROXY UDP/53 提交同一 DNS
+  线程，回程按 `DnsReply` 的 sink 判别（TUN 写设备 / `TransparentOutput::UdpReply` 走
+  tproxy 回程，Q-3/D-impl-2）。目的为 v6 的 53 本 run 不拦截（D-impl-7：0x86DD 全部
+  落 `ipv6.*` 计数，不静默）。
 - **D4（QoS）**：`[qos].enabled=true` 时，分类后、转发前经过 `CakeScheduler`：
   `enqueue()` 拒绝则计数 `qos_dropped`；`enabled=false` 时零开销直通
   （`qos_bypassed=true` 可观测）。
@@ -140,6 +145,36 @@
   dropped, dns_answered, qos_dropped }`，经 LocalAPI `/localapi/v0/dataplane/stats` 暴露。
 - 不变量：单 TUN（D1）；分类器是唯一分类入口（S29）；DNS 不泄露 mesh 内名
   （nexus-dns S-unified）；QoS 禁用时零开销（D4）。
+
+### DNS 服务面（R3，C5–C11；引擎契约见 `crates/nexus-dns/MODULE.md`）
+
+- **线程归属**：单一 DNS 线程（`nexusd-dns`）唯一持有 `UnifiedDns`、`FakeIpPool`、
+  `UpstreamEngine`、上游 socket 与缓存，无锁；dataplane 线程不持有 resolver。
+  `DnsService::start` 在 TUN 创建成功后调用；thread spawn 失败 → 数据面不启动
+  （不构造 `Dataplane`），状态 `service="failed"`，杜绝“dns_enabled 但无服务”的隐藏
+  Stub。no-tun 模式不启动 DNS 服务，`dns.enabled=false`、`service="disabled"`（SU-2）。
+- **队列/节奏**：dataplane→DNS 请求队列 256、DNS→dataplane 回包队列 256、TCP 回退
+  上限 32（`tcp_worker_queue`；当前实现为单查询在 `poll` 内联执行并受 R1 等待约束，
+  未单独起 worker 线程）、空闲 tick 5 ms、fake-ip 回收扫描 60 s、关闭 join 2 s。
+- **关闭语义**：数据面循环退出 → drop 请求发送端 → DNS 线程处理在途查询（≤2 s）→
+  join；超时记日志后继续，不 hang；结束后状态 `service="failed"`。
+- **上游**：明文 UDP/53（可带端口），≤8 台、声明序去重；`degraded`（连续失败 ≥3）
+  排在健康服务器之后；`TC=1` 可回退 TCP（实际等待 = min(`tcp_timeout_ms`, 剩余预算)，
+  剩余 ≤0 立即放弃并故障转移）；RCODE 失败、畸形响应、错源/错 txid/错 question 一律
+  不得误用。状态显式 `plaintext=true`（明文暴露面不隐藏）。
+- **状态面**：`/localapi/v0/dns/status` 返回 `dns` 对象：`enabled`、`service`、
+  `source="dataplane"`、`config_generation`（启动 = 1）、
+  `classes{hosts,mesh,proxy_classifier,upstream}`、
+  `proxy_policy{unmatched,unevaluable,rules,unevaluable_rules,default_proxied}`、
+  `upstream{state,plaintext,servers[],last_error}`、计数器（含 `classify_unevaluable`）、
+  `fake_ip{enabled,allocated,capacity,exhausted}`。进程级 `OnceLock` 只承载 LocalAPI
+  读口（第一个实例优先，D-impl-9）；example/E4 直接读 `DnsServiceHandle.status`。
+- **`dns_answered` 语义（修正）**：DNS 拦截产生的响应成功写入 TUN 的次数，含所有
+  rcode/class；TCP/53 的 RST 也计入；写失败另计 `dns_reply_write_failed`。等式：
+  `dns_answered = dns_noerror + dns_nodata + dns_nxdomain + dns_servfail + dns_refused
+  + dns_formerr + dns_tcp_refused`。
+- **日志**：统一 `[nexusd] dns` 前缀；每 `(event, reason)` 每 60 s ≤1 条；不记录用户
+  查询的域名（只记长度/类型/计数）。
 
 ### N1 组网接入（W1-W4，scenarios/product/n1_wireup.toml，2026-10-01 冻结）
 
@@ -241,15 +276,25 @@
  （`"A.B.C.D/N"` 字符串）；`network.toml` 缺失 → 空列表；
   解析失败 → 空列表 + warn（降级，不阻断 dataplane）；
   与 bypass CIDR 重叠 → 启动时 warn 日志，mesh 优先（分类器 S29 顺序不变）。
-- **R3（dns.toml 解析）**：`dns.toml` 解析为 `DnsUnifiedConfig` 并传入
-  `DataplaneConfig.dns_config`：
-  - 缺失 → `None`（Dataplane 用默认配置，行为不变）；
-  - 格式错误（TOML 语法错 / fake_ip_range 非法 CIDR / hosts 非法 IP）→
-    daemon 启动失败，exit 1，`{"code":"CONFIG"}`（§13.6）；
-  - 字段（`[dns]` 小节，不存在时读根级键）：`upstream`（字符串数组）、
-    `fake_ip_enabled`（bool，默认 true）、`fake_ip_range`（CIDR，
-    默认 `198.18.0.0/15`）、`mesh_suffix`（字符串，默认 `"mesh"`）、
-    `fake_ip_ttl_secs`（整数，默认 300）、`hosts`（表，域名→IP）。
+- **R3（dns.toml 严格 schema）**：DNS 子系统实际启用时解析为 `DnsFileConfig`
+  （`unified` + `mesh_hosts` + `proxy` + `upstream`）：
+  - 所有键必须在 `[dns]` 下；未知键、根级键 → 启动失败 `CONFIG`（exit 1，
+    `{"code":"CONFIG"}`，消息含键名）；
+  - 19 键（类型/默认/范围见 spec §4.6.1）：`upstream`（必填、≤8、去重保序）、
+    `fake_ip_enabled`、`fake_ip_range`（前缀 ≤30）、`mesh_suffix`、`fake_ip_ttl_secs`、
+    `hosts`、`ip_preference`、`unmatched`、`unevaluable`、`attempt_timeout_ms`、
+    `attempts_per_server`、`total_budget_ms`、`edns_udp_size`、`tcp_fallback`、
+    `tcp_timeout_ms`、`cache_max_entries`、`cache_max_ttl_secs`、`negative_ttl_secs`、
+    `max_inflight`；
+  - `[dns.mesh.hosts]`：mesh 名源（SU-3：loopback 拒绝、link-local 接受；地址必须落在
+    `[[vpi.routes]]` 或 `[[vpi.routes6]]`；有 mesh 表但无对应网段 → `CONFIG` 失败）；
+  - `unmatched=proxied` 必须有可用出站（判定 = `outbound_manifest::select_index`，
+    F1），否则 `CONFIG` 失败；
+  - `[tun].enabled=false` 时 DNS 子系统整体禁用：`dns.toml` 不解析、不校验、不建线程，
+    其非法内容不影响启动结论（SU-2）；
+  - `dns.toml` 缺失 = DNS 禁用：`enabled=false`、`service="disabled"`、不拦截 53。
+  - 落点：`config::parse_dns_config` + `assembly::build_dataplane_config`；旧的宽松
+    解析在 C11 的原子迁移中删除。
 - **R4（关闭顺序）**：Unix SIGTERM/SIGINT → 按 §13.4 反向关闭：
   LocalAPI 停收新查询 → **Workspace unmount（C1/D7）** → dataplane 线程停
   （join 1s 超时）→ `N1SessionManager::shutdown()`（join 5s 超时）→ TUN 随
