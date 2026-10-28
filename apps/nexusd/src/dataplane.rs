@@ -5922,4 +5922,55 @@ outbounds:
             .lookup(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(mapped.as_deref(), Some("local.example"));
     }
+
+    /// D-impl-8：AAAA 应答同样回填决策缓存（不只 A）。
+    #[test]
+    fn dns_reply_backfills_aaaa_answers() {
+        use crate::dns_service::{DnsReply, ReplySink};
+        use nexus_dns::wire::{DnsRcode, WireRecord};
+        use nexus_dns::{DnsQuery, DnsType};
+
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let mut dp = Dataplane::new(
+            Box::new(SharedTun {
+                inner: Arc::clone(&mock),
+            }),
+            DataplaneConfig::default(),
+            None,
+        )
+        .expect("dataplane");
+        let query = nexus_dns::wire::build_query(
+            &DnsQuery {
+                name: "v6.local".to_string(),
+                qtype: DnsType::Aaaa,
+            },
+            0x1234,
+            None,
+        );
+        let wire = nexus_dns::wire::build_answer(
+            &query,
+            &[WireRecord {
+                rtype: 28,
+                ttl_secs: 60,
+                address: Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            }],
+            DnsRcode::NoError,
+        )
+        .expect("answer");
+        dp.deliver_dns_reply(DnsReply {
+            client: "192.168.1.100:40000".parse().expect("client"),
+            server: "8.8.8.8:53".parse().expect("server"),
+            wire,
+            class: nexus_dns::DnsClass::Upstream,
+            rcode: 0,
+            sink: ReplySink::Tun,
+        });
+        assert_eq!(dp.stats().dns_noerror, 1);
+        let mapped = dp
+            .dns_cache_handle()
+            .lock()
+            .unwrap()
+            .lookup(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(mapped.as_deref(), Some("v6.local"));
+    }
 }
