@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::*;
 
 /// Real-time clock for wireup-style behavioral tests (AC-12 lives elsewhere).

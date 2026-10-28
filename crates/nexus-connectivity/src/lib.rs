@@ -1,15 +1,23 @@
-//! nexus-connectivity
+//! nexus-connectivity — **v9 CLI 产品线专属运行时（frozen，2026-10-26 划界）**
 //!
-//! 提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、
-//! Assisted/Relay Fallback 与 Link State。
+//! 本 crate 是 v9 时代 `nexus`（CLI）产品线的建连与组网运行时本体：虚拟子网隧道、
+//! bootstrap 入网、relay / FIB、mesh DNS、链路加密、QoS 控制器等能力由 CLI 的
+//! `subnet` / `mesh` / `proxy` / `connectivity` 命令面直接消费。
 //!
-//! 本 crate 是 **delivery 层共享底座**（ARCHITECTURE §11 Delivery Infrastructure）：
-//! - 保持领域中立：不持有 Plan/Session/Provider 等业务对象，不依赖
-//!   Planner/Session/Workspace 等业务逻辑层，只处理 locator / endpoint /
-//!   认证门控等传输语义；`evaluation` 模块为输出 DTO 而依赖 `nexus-domain`
-//!   的共享词汇（`ConnectivityEvaluation`），属于 DTO 依赖而非业务依赖；
-//! - 拒绝反向依赖 Workspace / Compute / Service 业务逻辑；
-//! - 规划（Plan）由 Planner 产出，本层只负责"按 locator 建连"并返回状态机结果。
+//! ## 演进纪律
+//! - **只修缺陷**：缺陷修复必须有 Red Evidence（现有行为违反既有契约或场景）；
+//!   安全修复、崩溃一致性修复按同一纪律（判据 F1–F7 见 MODULE.md `Lifecycle`）。
+//! - **禁入**：新功能、新模块、新 pub API、新协议/线格式字段、任何新入边。
+//! - **新栈不得依赖本 crate**：N1 运行时面（nexus-fabric / nexus-path /
+//!   nexus-nat-* / nexus-projection / nexus-network / nexus-dns / nexusd /
+//!   nexus-outbound-*）对本 crate 的直接依赖边必须为 0；
+//!   跨栈共享词汇在 `nexus-domain`（NAT 词汇、`ConnectivityEvaluation` DTO）、
+//!   `nexus-proxy-config`（出站身份/交接词汇）、`nexus-session`（durable record）、
+//!   `nexus-qos`（包调度与令牌桶；P3 落地）。
+//!
+//! 历史自述「delivery 层共享基础设施（`ARCHITECTURE.md` §11）」已失效：Delivery
+//! Infrastructure 的现实口径见 `ARCHITECTURE.md` §6（§11 是代理内核产品线，
+//! 旧引用本身有误）。
 //!
 //! 最小闭环（吸收开源标杆 WireGuard 的 W12：认证后才允许建连/改 Locator）：
 //! - `establish` 为确定性纯函数，相同输入必然相同输出；
@@ -642,91 +650,6 @@ impl<P: LinkProbe> LinkActivator<P> {
     }
 }
 
-// ---------- 链路 Durable Marker（v9 §15.2/§15.3：Session + Connectivity crash recovery） ----------
-
-/// 已建立链路的 durable marker：进程死亡后可恢复的最小链路状态。
-///
-/// 语义（诚实）：marker 只记录"crash 前存在一条已建立链路"这一事实。
-/// 进程死亡 = socket 死亡，冷启动 reconcile 必须把未 stale 的 marker 标为 stale
-/// （触发重建），不许假装链路还活着。stale marker 的清理/覆盖由 Composition Root 决定。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkMarker {
-    /// 稳定链路标识（如 `"direct/<peer>"`；同一标识只保留最新一条）。
-    pub link_id: String,
-    /// 链路类型。
-    pub kind: LinkKind,
-    /// 建连目标 locator。
-    pub locator: String,
-    /// 建立时间的 unix 秒（诊断用，不参与 reconcile 决策）。
-    pub established_at_unix: u64,
-    /// 是否已在冷启动 reconcile 中被标为 stale。
-    pub stale: bool,
-}
-
-impl LinkMarker {
-    /// 新建一条"已建立、未 stale"的 marker。
-    #[must_use]
-    pub fn established(
-        link_id: impl Into<String>,
-        kind: LinkKind,
-        locator: impl Into<String>,
-        established_at_unix: u64,
-    ) -> Self {
-        Self {
-            link_id: link_id.into(),
-            kind,
-            locator: locator.into(),
-            established_at_unix,
-            stale: false,
-        }
-    }
-}
-
-/// 链路 marker 存储契约（Portable；文件实现由 Composition Root 注入，
-/// 与 `nexus_session::SessionRecordStore` 同模式）。
-pub trait LinkMarkerStore {
-    /// 加载全部 marker；文件不存在视为 Ok(vec![])，损坏必须返回 Err（不静默丢弃）。
-    fn load(&self) -> Result<Vec<LinkMarker>, String>;
-    /// 按 `link_id` upsert 一条 marker（原子写）。
-    fn save(&mut self, marker: &LinkMarker) -> Result<(), String>;
-}
-
-/// 冷启动链路 marker reconcile 的结构化结果。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LinkReconcileReport {
-    /// 检查的 marker 数。
-    pub markers_checked: usize,
-    /// 本轮被标为 stale 的数量。
-    pub marked_stale: usize,
-}
-
-/// 冷启动 reconcile 链路 marker（幂等；v9 §15.3）。
-///
-/// 规则：
-/// - 未 stale 的 marker → 标为 stale 并回写（进程已死，其 socket 不可能存活）；
-/// - 已 stale → 跳过。
-///
-///   本函数只标记，不建连；重建是 connectivity 建立路径的职责（由调用方根据报告触发）。
-pub fn reconcile_link_markers<S: LinkMarkerStore>(
-    store: &mut S,
-) -> Result<LinkReconcileReport, String> {
-    let markers = store.load()?;
-    let mut report = LinkReconcileReport {
-        markers_checked: markers.len(),
-        marked_stale: 0,
-    };
-    for marker in markers {
-        if marker.stale {
-            continue;
-        }
-        let mut stale = marker.clone();
-        stale.stale = true;
-        store.save(&stale)?;
-        report.marked_stale += 1;
-    }
-    Ok(report)
-}
-
 // ---------- OutboundAdapter 接缝（PRODUCT §11.6） ----------
 
 /// 出站交接结果（离线 DTO，零真实网络）。
@@ -1148,77 +1071,5 @@ mod tests {
             err,
             ConnectivityError::AuthenticationRequired { ref locator } if locator == "edge-a.exit"
         ));
-    }
-
-    // ---------- 链路 marker 冷启动 reconcile ----------
-
-    /// 测试用内存 marker 存储（upsert 语义）。
-    #[derive(Debug, Default)]
-    struct MemLinkStore {
-        markers: Vec<LinkMarker>,
-    }
-
-    impl LinkMarkerStore for MemLinkStore {
-        fn load(&self) -> Result<Vec<LinkMarker>, String> {
-            Ok(self.markers.clone())
-        }
-
-        fn save(&mut self, marker: &LinkMarker) -> Result<(), String> {
-            if let Some(slot) = self
-                .markers
-                .iter_mut()
-                .find(|m| m.link_id == marker.link_id)
-            {
-                *slot = marker.clone();
-            } else {
-                self.markers.push(marker.clone());
-            }
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn established_marker_marked_stale_on_reconcile() {
-        let mut store = MemLinkStore::default();
-        store
-            .save(&LinkMarker::established(
-                "direct/peer-a",
-                LinkKind::Direct,
-                "10.0.0.5:4242",
-                1_700_000_000,
-            ))
-            .unwrap();
-        let report = reconcile_link_markers(&mut store).unwrap();
-        assert_eq!(report.markers_checked, 1);
-        assert_eq!(report.marked_stale, 1);
-        assert!(store.markers[0].stale);
-        // locator/kind 保留，供重建路径使用。
-        assert_eq!(store.markers[0].kind, LinkKind::Direct);
-    }
-
-    #[test]
-    fn reconcile_is_idempotent() {
-        let mut store = MemLinkStore::default();
-        store
-            .save(&LinkMarker::established(
-                "relay/peer-b",
-                LinkKind::Relay,
-                "relay-b.exit",
-                1_700_000_001,
-            ))
-            .unwrap();
-        let r1 = reconcile_link_markers(&mut store).unwrap();
-        assert_eq!(r1.marked_stale, 1);
-        let r2 = reconcile_link_markers(&mut store).unwrap();
-        assert_eq!(r2.markers_checked, 1);
-        assert_eq!(r2.marked_stale, 0, "must not re-mark stale markers");
-    }
-
-    #[test]
-    fn empty_store_reconciles_cleanly() {
-        let mut store = MemLinkStore::default();
-        let report = reconcile_link_markers(&mut store).unwrap();
-        assert_eq!(report.markers_checked, 0);
-        assert_eq!(report.marked_stale, 0);
     }
 }

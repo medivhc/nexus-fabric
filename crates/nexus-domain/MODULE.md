@@ -4,9 +4,11 @@
 
 定义稳定核心领域类型：Resource、Provider、Node、Intent、Constraint、Plan、Session、Measurement 及核心不变量。
 
+含跨栈 NAT 词汇（`nat::NatType` / `nat::StunMapping`）：v9 CLI 运行时与 N1 运行时共用的纯类型（2026-10-26 由 `nexus-connectivity::nat` 逐字迁入）。
+
 ## Non-Responsibilities
 
-不执行 I/O，不依赖平台 API，不做发现、网络建连、存储、调度或协议解析。
+不执行 I/O，不依赖平台 API，不做发现、网络建连、存储、调度或协议解析。不做 STUN 编解码、不建连（NAT 词汇只承载类型，不含行为）。
 
 `FlowContext.egress_hint` 的语义边界：它是“建议出口 tag”的**非身份、非资源**提示，
 只用于缩小 Provider 候选快照（`build_snapshot` 单候选过滤）；它不改变 Resource/
@@ -50,6 +52,14 @@ Provider 身份，不构成 Plan，也不表示出口已建立。`None` 表示�
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+
+跨栈 NAT 词汇（2026-10-26，P1 接缝①）：
+
+- `nat::NatType { FullCone, RestrictedCone, PortRestrictedCone, Symmetric, Unknown }`
+  （derives `Debug, Clone, Copy, PartialEq, Eq`，逐字迁自 `nexus-connectivity::nat`，
+  变体顺序与 doc 不变；线格式映射仍在 `nexus-nat-traversal::signal`）。
+- `nat::StunMapping { local: SocketAddr, public: SocketAddr }`（derives `Debug, Clone`）。
+- `nexus-connectivity` 以 `pub use nexus_domain::nat::{NatType, StunMapping}` 保旧路径。
 
 已实现（revision f8c7113+）：
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{FakeChannel, FakeSocket, ManualPunchClock};
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::{
     LocalCandidates, PortSample, PunchAnswer, PunchConfig, PunchFailReason, PunchResult,
     PunchSession, PunchStats,

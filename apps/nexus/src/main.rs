@@ -1313,7 +1313,7 @@ fn run_config(args: &[String]) -> i32 {
         Some(d) => d.to_string(),
         None => {
             eprintln!("error: missing --dir <config-dir>");
-            eprintln!("usage: nexus config get|set|list --dir <config-dir> [file]");
+            eprintln!("usage: nexus config get|set|list|check --dir <config-dir> [file]");
             return 2;
         }
     };
@@ -1341,6 +1341,24 @@ fn run_config(args: &[String]) -> i32 {
         result
     };
     match args.first().map(String::as_str) {
+        Some("check") => {
+            // spec §7.7 载体 2：只读、离线；stdout 单个 JSON 对象，
+            // interop 警示行走 stderr。只接受 proxy.yaml（其他已知文件名属用法错误）。
+            let file = match file_arg.as_deref() {
+                Some("proxy.yaml") => Some("proxy.yaml"),
+                Some(name) => {
+                    eprintln!("error: config check only accepts proxy.yaml (got '{name}')");
+                    return 2;
+                }
+                None => None,
+            };
+            let outcome = nexus::outbound_check::check(dir_path, file);
+            println!("{}", outcome.json);
+            for line in &outcome.stderr_lines {
+                eprintln!("{line}");
+            }
+            outcome.exit_code
+        }
         Some("get") => {
             let file = match file_arg {
                 Some(f) => f,
@@ -1416,7 +1434,7 @@ fn run_config(args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("usage: nexus config get|set|list --dir <config-dir> [file]");
+            eprintln!("usage: nexus config get|set|list|check --dir <config-dir> [file]");
             2
         }
     }

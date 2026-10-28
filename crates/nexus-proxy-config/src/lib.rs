@@ -17,6 +17,11 @@
 
 use std::collections::BTreeSet;
 
+/// 出站 UDP 能力声明（共享 DTO；CONTRACT：`UdpMode` 手写 `Debug` 脱敏）。
+pub mod udp;
+
+pub use udp::{UdpCapability, UdpMode, UdpUnsupportedReason};
+
 /// TPROXY 透明入站默认监听地址（spec §11.1 冻结端口 7895）。
 pub const TPROXY_DEFAULT_LISTEN: &str = "0.0.0.0:7895";
 
@@ -700,6 +705,13 @@ pub struct OutboundConfig {
     pub down: Option<String>,
     /// hysteria2 salamander 混淆密码（仅 hysteria2）。
     pub obfs_password: Option<String>,
+    /// trojan 第一响应守卫策略（仅 kind=trojan 生效；§11.9.3 / spec §8）：
+    /// `"strict"`（缺省）| `"signature"`。不存在 `off`/完全关闭语义。
+    /// 非 trojan 出站上的**合法值**被忽略（不生效、不报错），**非法值**硬失败。
+    pub fallback_guard: Option<String>,
+    /// trojan 就绪窗口毫秒覆盖（仅 kind=trojan 生效）：`None`/`0` = 自适应公式，
+    /// `n>0` 时实际等待 `min(n, 5000)`ms。非 trojan 出站同上（合法值忽略、非法值硬失败）。
+    pub ready_window_ms: Option<u64>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -979,6 +991,30 @@ fn opt_str(node: &Node, key: &str) -> Option<String> {
         .and_then(Node::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// 读取可选字符串字段，并**保留「存在但非法」的信号**（spec §8 的 presence-aware 提取）。
+///
+/// - `None`：字段缺失；
+/// - `Some(Ok(v))`：标量值（可能是空串——空串是非法值，不是「未配置」）；
+/// - `Some(Err(()))`：字段存在但不是标量（映射/序列）。
+///
+/// 不能用 [`opt_str`]：它过滤空串，会把 `fallback_guard: ""` 静默当成未配置。
+fn opt_str_present(node: &Node, key: &str) -> Option<Result<String, ()>> {
+    node.get(key)
+        .map(|n| n.as_str().map(str::to_string).ok_or(()))
+}
+
+/// 读取可选 u64 字段，并保留「存在但非整数」的原始文本（供错误消息原样引用）。
+///
+/// - `None`：字段缺失；
+/// - `Some(Ok(n))`：非负整数；
+/// - `Some(Err(raw))`：存在但不是非负整数（`raw` 为原始文本；非标量为 `<non-scalar>`）。
+fn opt_u64_present(node: &Node, key: &str) -> Option<Result<u64, String>> {
+    node.get(key).map(|n| match n.as_str() {
+        Some(s) => s.trim().parse::<u64>().map_err(|_| s.to_string()),
+        None => Err("<non-scalar>".to_string()),
+    })
 }
 
 /// 可选字符串列表（flow list `[a, b]` 或 `- ` 序列）。
@@ -1409,6 +1445,43 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let up = opt_str(item, "up");
             let down = opt_str(item, "down");
             let obfs_password = opt_str(item, "obfs_password");
+            // 新增字段的 presence-aware 提取 + 值域校验（spec §8）：
+            // 校验顺序 = 先按 trojan 值域校验（对所有 kind），再按 kind 决定是否生效。
+            // 「存在但非法」一律 CONFIG_INVALID —— 这是本 run 新增的 fail-closed 裁决，
+            // 比现状 header_format（仅在 kind==Trojan 块内校验、非 trojan 非法值被静默忽略）
+            // 更严；不写成「与既有/R2 惯例对齐」。
+            let fallback_guard = match opt_str_present(item, "fallback_guard") {
+                None => None,
+                Some(Ok(v)) if v == "strict" || v == "signature" => Some(v),
+                Some(Ok(v)) => {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{tag}].fallback_guard"),
+                        format!("fallback_guard must be 'strict' or 'signature', got '{v}'"),
+                    ));
+                }
+                Some(Err(())) => {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{tag}].fallback_guard"),
+                        "fallback_guard must be 'strict' or 'signature', got '<non-scalar>'",
+                    ));
+                }
+            };
+            let ready_window_ms = match opt_u64_present(item, "ready_window_ms") {
+                None => None,
+                Some(Ok(n)) if n <= 5000 => Some(n),
+                Some(Ok(n)) => {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{tag}].ready_window_ms"),
+                        format!("ready_window_ms must be in 0..=5000, got {n}"),
+                    ));
+                }
+                Some(Err(raw)) => {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{tag}].ready_window_ms"),
+                        format!("ready_window_ms must be in 0..=5000, got {raw}"),
+                    ));
+                }
+            };
             outbounds.push(OutboundConfig {
                 tag,
                 kind,
@@ -1429,6 +1502,8 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                 up,
                 down,
                 obfs_password,
+                fallback_guard,
+                ready_window_ms,
             });
         }
     }
@@ -2097,6 +2172,8 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
                 up: None,
                 down: None,
                 obfs_password: None,
+                fallback_guard: None,
+                ready_window_ms: None,
             })
         }
         "vmess" => Ok(OutboundConfig {
@@ -2119,6 +2196,8 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
             up: None,
             down: None,
             obfs_password: None,
+            fallback_guard: None,
+            ready_window_ms: None,
         }),
         other => Err((
             line.to_string(),
@@ -2683,6 +2762,131 @@ outbounds:
         assert!(err.reason.contains("header_format"), "{err:?}");
     }
 
+    /// 构造一份最小 proxy.yaml：单个出站 + 匹配规则（新增字段测试用）。
+    fn yaml_with_outbound(kind: &str, extra: &str) -> String {
+        format!(
+            "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: t
+outbounds:
+  - tag: t
+    kind: {kind}
+    locator: 127.0.0.1:443
+    password: pwd
+{extra}"
+        )
+    }
+
+    #[test]
+    fn fallback_guard_and_window_are_absent_by_default() {
+        let cfg = parse(&yaml_with_outbound("trojan", "")).expect("ok");
+        assert_eq!(cfg.outbounds[0].fallback_guard, None);
+        assert_eq!(cfg.outbounds[0].ready_window_ms, None);
+    }
+
+    #[test]
+    fn fallback_guard_accepts_strict_and_signature() {
+        for v in ["strict", "signature"] {
+            let cfg = parse(&yaml_with_outbound(
+                "trojan",
+                &format!("    fallback_guard: {v}\n"),
+            ))
+            .expect("legal value");
+            assert_eq!(cfg.outbounds[0].fallback_guard.as_deref(), Some(v));
+        }
+    }
+
+    #[test]
+    fn fallback_guard_rejects_off_and_every_other_string() {
+        // 不存在「完全关闭守卫」的官方开关（spec §8）：off/none/disabled/空串/其他
+        // 一律 CONFIG_INVALID，字段路径与消息逐字对齐。
+        for v in ["off", "none", "disabled", "bogus", "Strict", ""] {
+            let yaml = yaml_with_outbound("trojan", &format!("    fallback_guard: {v}\n"));
+            let err = parse(&yaml).expect_err("illegal value must fail");
+            assert_eq!(err.field, "outbounds[t].fallback_guard", "{v}");
+            assert_eq!(
+                err.reason,
+                format!("fallback_guard must be 'strict' or 'signature', got '{v}'")
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "CONFIG_INVALID [outbounds[t].fallback_guard]: \
+                     fallback_guard must be 'strict' or 'signature', got '{v}'"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn ready_window_accepts_zero_and_upper_bound() {
+        for (raw, expect) in [("0", 0u64), ("5000", 5000), ("1", 1)] {
+            let cfg = parse(&yaml_with_outbound(
+                "trojan",
+                &format!("    ready_window_ms: {raw}\n"),
+            ))
+            .expect("legal range");
+            assert_eq!(cfg.outbounds[0].ready_window_ms, Some(expect));
+        }
+    }
+
+    #[test]
+    fn ready_window_rejects_out_of_range_and_non_integer() {
+        for raw in ["5001", "999999", "-5", "abc", "12ms"] {
+            let yaml = yaml_with_outbound("trojan", &format!("    ready_window_ms: {raw}\n"));
+            let err = parse(&yaml).expect_err("illegal value must fail");
+            assert_eq!(err.field, "outbounds[t].ready_window_ms", "{raw}");
+            assert_eq!(
+                err.reason,
+                format!("ready_window_ms must be in 0..=5000, got {raw}")
+            );
+        }
+    }
+
+    #[test]
+    fn non_trojan_outbound_ignores_legal_values() {
+        // spec §8 的 kind 口径：非 trojan 出站上的**合法值**忽略（不生效、不报错）。
+        // 值域校验在 kind 分派之前执行（对所有 kind），是否生效由 arm 决定。
+        let cfg = parse(&yaml_with_outbound(
+            "direct",
+            "    fallback_guard: signature\n    ready_window_ms: 120\n",
+        ))
+        .expect("legal values on non-trojan outbound must parse");
+        assert_eq!(
+            cfg.outbounds[0].fallback_guard.as_deref(),
+            Some("signature")
+        );
+        assert_eq!(cfg.outbounds[0].ready_window_ms, Some(120));
+        assert_eq!(cfg.outbounds[0].kind.as_str(), "direct");
+
+        let cfg = parse(&yaml_with_outbound(
+            "vless",
+            "    uuid: 123e4567-e89b-12d3-a456-426614174000\n    tls: true\n    \
+             fallback_guard: strict\n    ready_window_ms: 0\n",
+        ))
+        .expect("legal values on vless outbound must parse");
+        assert_eq!(cfg.outbounds[0].fallback_guard.as_deref(), Some("strict"));
+        assert_eq!(cfg.outbounds[0].ready_window_ms, Some(0));
+        assert_eq!(cfg.outbounds[0].kind.as_str(), "vless");
+    }
+
+    #[test]
+    fn non_trojan_outbound_rejects_illegal_values() {
+        // 本 run 新增裁决：非法值硬失败（比现状 header_format 的「非 trojan 静默忽略」更严）。
+        let yaml = yaml_with_outbound("direct", "    fallback_guard: off\n");
+        let err = parse(&yaml).expect_err("illegal value must fail for any kind");
+        assert_eq!(err.field, "outbounds[t].fallback_guard");
+
+        let yaml = yaml_with_outbound("direct", "    ready_window_ms: 5001\n");
+        let err = parse(&yaml).expect_err("illegal range must fail for any kind");
+        assert_eq!(err.field, "outbounds[t].ready_window_ms");
+    }
+
     #[test]
     fn anytls_config_parses_all_fields() {
         let yaml = "\
@@ -2946,6 +3150,8 @@ mod subscription_online_tests {
             up: None,
             down: None,
             obfs_password: None,
+            fallback_guard: None,
+            ready_window_ms: None,
         }]
     }
 

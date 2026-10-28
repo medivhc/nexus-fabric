@@ -38,6 +38,8 @@ RFC 5766 TURN 的最小可用实现（client + 自测用最小 server），为�
 
 - `tokio`, `async-std`, 任何 async runtime
 - 自研 STUN 之外的 NAT 穿透库（P0 只需 TURN 中继，不做打洞）
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 

@@ -147,6 +147,35 @@ mod tests {
     }
 
     #[test]
+    fn await_tcp_response_strips_fast_open_response_once() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let adapter = Hysteria2Adapter::new("hy2", test_target(&server));
+        let mut client = adapter.connect().unwrap();
+        let stream = client.open_tcp("example.com:80").unwrap();
+        // fast-open：open_tcp 未剥离响应。
+        client
+            .await_tcp_response(stream, Duration::from_secs(5))
+            .unwrap();
+        // 剥离成功后读到的就是纯载荷（回显）。
+        client.stream_write(stream, b"hello").unwrap();
+        let mut buf = [0u8; 64];
+        let n = client
+            .stream_read(stream, &mut buf, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        // 幂等：响应已剥离，再次调用不消费载荷。
+        client
+            .await_tcp_response(stream, Duration::from_millis(1))
+            .unwrap();
+        client.stream_write(stream, b"world").unwrap();
+        let n = client
+            .stream_read(stream, &mut buf, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(&buf[..n], b"world");
+        client.stream_finish(stream);
+    }
+
+    #[test]
     fn loopback_tcp_stream_ids_step_by_4() {
         let server = TestServer::spawn("correct-password", true).unwrap();
         let adapter = Hysteria2Adapter::new("hy2", test_target(&server));

@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "generated_from_revision": "6ede7ece97495cbbc315d642c06b3f7f2b3778bf",
+  "generated_at": "2026-10-26T01:32:24Z",
+  "run_id": "protocol-interop-fixes-1",
+  "inputs_sha256": "6791f145464407652c26f40937a6c7e5b4fc0cfa2874bb12a19ef7cacc1a6603",
+  "protocols": {
+    "anytls": {
+      "origin": "matrix",
+      "verdict": "VERIFIED",
+      "scope": "FULL",
+      "claim": "USABLE",
+      "boundaries": [
+        "PRODUCT_UDP_NOT_IMPLEMENTED"
+      ],
+      "safety": []
+    },
+    "hysteria2": {
+      "origin": "matrix",
+      "verdict": "VERIFIED",
+      "scope": "FULL",
+      "claim": "USABLE",
+      "boundaries": [
+        "PROTOCOL_NOT_WIRED"
+      ],
+      "safety": []
+    },
+    "shadowsocks": {
+      "origin": "matrix",
+      "verdict": "PARTIAL",
+      "scope": "TCP_ONLY",
+      "claim": "USABLE_WITH_GAPS",
+      "boundaries": [
+        "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT",
+        "SHADOWSOCKS_NO_INTEROP_EVIDENCE",
+        "SHADOWSOCKS_UDP_LEGACY_NONCOMPLIANT"
+      ],
+      "safety": []
+    },
+    "socks5": {
+      "origin": "synthetic",
+      "verdict": "VERIFIED",
+      "scope": "LOCAL_E4",
+      "claim": "USABLE",
+      "boundaries": [],
+      "safety": []
+    },
+    "trojan": {
+      "origin": "matrix",
+      "verdict": "PARTIAL",
+      "scope": "TCP_ONLY",
+      "claim": "USABLE_WITH_GAPS",
+      "boundaries": [
+        "PRODUCT_UDP_NOT_IMPLEMENTED"
+      ],
+      "safety": [
+        "TROJAN_FALLBACK_FAIL_OPEN"
+      ]
+    },
+    "vless": {
+      "origin": "matrix",
+      "verdict": "VERIFIED",
+      "scope": "PROTOCOL_SUBSET",
+      "claim": "USABLE",
+      "boundaries": [
+        "VLESS_VISION_SPLICE_NOT_IMPLEMENTED",
+        "PRODUCT_UDP_NOT_IMPLEMENTED"
+      ],
+      "safety": []
+    },
+    "vmess": {
+      "origin": "synthetic",
+      "verdict": "BROKEN",
+      "scope": "NOT_IN_MATRIX",
+      "claim": "NOT_USABLE",
+      "boundaries": [
+        "PROTOCOL_NOT_WIRED"
+      ],
+      "safety": []
+    }
+  },
+  "messages": {
+    "VLESS_VISION_SPLICE_NOT_IMPLEMENTED": {
+      "severity": "info",
+      "text": "VLESS Vision 产品 splice 未实现；仅编码 addon。"
+    },
+    "PRODUCT_UDP_NOT_IMPLEMENTED": {
+      "severity": "warn",
+      "text": "产品级 UDP 未接线；UDP 流量将被丢弃。"
+    },
+    "TROJAN_FALLBACK_FAIL_OPEN": {
+      "severity": "security",
+      "text": "Trojan fallback 可能把服务端 404 当隧道数据；当前版本视为不安全。"
+    },
+    "TROJAN_PLAINTEXT_UNSUPPORTED": {
+      "severity": "security",
+      "text": "Trojan 明文不支持；必须显式声明 TLS（skip_cert_verify 或 alpn）。"
+    },
+    "SKIP_CERT_VERIFY": {
+      "severity": "security",
+      "text": "已关闭证书校验，存在中间人风险。"
+    },
+    "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT": {
+      "severity": "warn",
+      "text": "Shadowsocks 的 UDP 路径仍用旧实现的密钥派生：省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通；TCP 路径不受影响。"
+    },
+    "SHADOWSOCKS_NO_INTEROP_EVIDENCE": {
+      "severity": "warn",
+      "text": "Shadowsocks 的 UDP 路径未做参照端互操作验证；TCP 路径已有参照端互操作证据。"
+    },
+    "SHADOWSOCKS_UDP_LEGACY_NONCOMPLIANT": {
+      "severity": "warn",
+      "text": "Shadowsocks 的 UDP 路径仍是旧的 legacy 实现，产品级 UDP 未实现；UDP 流量不可依赖。"
+    },
+    "PROTOCOL_NOT_WIRED": {
+      "severity": "warn",
+      "text": "该协议在当前版本尚未接线；不能作为生产出口。"
+    },
+    "VERDICT_MISSING": {
+      "severity": "warn",
+      "text": "当前版本缺少该协议的互操作标注；按 unknown 处理。"
+    },
+    "NO_PROXY_YAML": {
+      "severity": "info",
+      "text": "未配置 proxy.yaml；代理出口不可用。"
+    },
+    "NO_USABLE_OUTBOUND": {
+      "severity": "warn",
+      "text": "没有已接线的代理出站可用；proxy.yaml 中没有可用的代理出口。"
+    },
+    "ENGINE_CONFIG_REQUIRES_RESTART": {
+      "severity": "info",
+      "text": "proxy.yaml 的变更只在 daemon 重启后生效。"
+    },
+    "ACTIVE_OUTBOUND_STALE_REQUIRES_RESTART": {
+      "severity": "warn",
+      "text": "proxy.yaml 已变更但 active 出站未重建；需重启 daemon。"
+    },
+    "DUPLICATE_OUTBOUND_TAG": {
+      "severity": "warn",
+      "text": "出站 tag 重复；日志/标注可能歧义。"
+    },
+    "ALPN_IGNORED": {
+      "severity": "info",
+      "text": "该协议不下发 ALPN；配置已忽略。"
+    },
+    "SNI_IGNORED_FOR_VLESS": {
+      "severity": "info",
+      "text": "VLESS 不使用 sni 字段；已忽略。"
+    },
+    "SERVERNAME_IGNORED_FOR_ANYTLS": {
+      "severity": "info",
+      "text": "AnyTLS 不使用 servername 字段；已忽略。"
+    },
+    "SERVERNAME_IGNORED_FOR_TROJAN": {
+      "severity": "info",
+      "text": "Trojan 不使用 servername 字段；已忽略。"
+    },
+    "UNSUPPORTED_OBFS": {
+      "severity": "security",
+      "text": "当前版本未接 obfs 插件；已 fail-closed。"
+    }
+  }
+}

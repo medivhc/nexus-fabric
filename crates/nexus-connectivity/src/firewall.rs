@@ -1,6 +1,6 @@
 //! Mesh 网络防火墙规则匹配引擎（内存骨架）。
 //!
-//! 本模块是 delivery 层共享底座的包过滤骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的包过滤骨架：
 //! - **规则**：每条 `FirewallRule` 描述 action + 五元组子集（src/dst IP、src/dst 端口、协议）；
 //! - **匹配**：`FirewallEngine::evaluate(&PacketContext)` 按规则顺序首匹配生效（first-match-wins）；
 //! - **默认策略**：未命中任何规则时走 `default_policy`（白名单模式默认 Deny）；

@@ -719,3 +719,54 @@ supply_chain = "version pinned by Cargo.lock (0.6.5); no new package and no othe
 review_basis = "peer-source-discovery-wiring spec §8.2: the mDNS pump needs SO_REUSEADDR + multicast join; apps/nexus already depends on the same version"
 approved = true
 approved_date = "2026-10-27"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexusd"
+crate = "rustls"
+version = "0.23"
+default_features = false
+features = ["ring", "std"]
+architecture_layer = "composition root (nexusd proxy-fwd): VLESS 可选外层 TLS 与 AnyTLS 每流 TLS 的 rustls ClientConnection/StreamOwned（spec §3.1/§3.2）。不新增内部依赖边：TLS 装配停留在 adapter 层，Core Planner 不感知。"
+feature_scope = "ring+std only (与 crates/nexus-outbound-hysteria2 同 feature 集); aws-lc-rs/tls12 显式关闭; 只使用 ClientConfig/ClientConnection/StreamOwned/RootCertStore/ServerName"
+license = "Apache-2.0 OR ISC OR MIT (allowlisted; same version already in tree via quinn-proto/nexus-outbound-hysteria2)"
+security = "no known advisories; RustSec checked by harness dependency-governance gate; 系统根加载失败时 fail-closed（TlsFailure::RootsUnavailable），不降级为 skip-verify"
+portability = "pure Rust + ring cc build (already accepted in tree); nexusd 为 platform host composition root，不属 portable core"
+supply_chain = "0.23.45 pinned by Cargo.lock (lockfile_required); 已作为 nexus-outbound-{trojan,anytls,vless}/quinn-proto 的传递依赖在树中，nexusd 新增的是直接引用而非新包，无 lock churn"
+os_transitive_deps = "none (ring cc build already accepted)"
+approved = true
+approved_date = "2026-10-26"
+review_basis = "outbound-adapter-wiring spec §3.1 握手第 2 步 + §3.2 握手第 2 步：VLESS/AnyTLS 需要 rustls 客户端完成 TLS 1.3/1.2 与 hostname 校验；与 nexus-outbound-hysteria2 同 crate/版本/feature 集，复用其 2026-10-04 六维修订"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexusd"
+crate = "rustls-native-certs"
+version = "0.8"
+default_features = false
+features = []
+architecture_layer = "composition root (nexusd proxy-fwd): skip_cert_verify=false 时加载平台系统信任根（spec §3.1/§3.2）"
+feature_scope = "no features; only rustls_native_certs::load_native_certs()"
+license = "Apache-2.0 OR ISC OR MIT (allowlisted; same version already in tree via nexus-outbound-hysteria2)"
+security = "loads platform trust store only; no network; no known advisories; RustSec checked via harness dependency-governance; 空 roots → RootsUnavailable fail-closed"
+portability = "platform trust store (Linux: /etc/ssl/certs or SSL_CERT_* env); nexusd 为 platform host composition root，非 portable core"
+supply_chain = "0.8.4 pinned by Cargo.lock (lockfile_required); 已在树中（nexus-outbound-hysteria2 直接依赖），无新包"
+os_transitive_deps = "none on Linux (openssl-probe reads /etc/ssl, no link); platform-gated schannel/security-framework already in tree"
+approved = true
+approved_date = "2026-10-26"
+review_basis = "outbound-adapter-wiring spec §3.1/§3.2 证书校验纪律：skip_verify=false → 系统根 + hostname 校验，RootsUnavailable 不得降级；alternatives: webpki-roots (新增静态 Mozilla bundle，被 hysteria2 评审拒绝) 不重复引入"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexusd"
+crate = "nexus-outbound-shadowsocks"
+version = "0.1.0"
+default_features = false
+features = []
+architecture_layer = "composition root (nexusd proxy-fwd): 步骤 4 把 SS TCP 生产路径从 daemon 内嵌 ss_std 切到 outbound crate 的 SIP004 会话（`SsStream`/`encode_request`/`SsTarget`/`SsMethod`/`Role`）。不新增架构边：consumer 是 composition root，crate 属 outbound 层（`policies/architecture.toml` 已声明 `nexus-connectivity`/`nexus-plugin` 边），Core Planner 不感知。"
+feature_scope = "workspace crate，无 feature 开关；只使用 SIP004 TCP 面（SsStream/encode_request/SsTarget/SsMethod/Role）。离线自洽 `ShadowsocksAdapter` 与 `write_record`/`read_record` 不在 nexusd 调用面内。"
+license = "Apache-2.0 OR MIT（workspace 统一 license，allowlisted）"
+security = "no known advisories；依赖 RustCrypto（chacha20poly1305/hkdf/sha1/sha2/md5）与 ring（SystemRandom），均为树中既有版本；RustSec 由 harness dependency-governance gate 检查"
+portability = "crate 为 workspace outbound 层（portable=false），无平台专有 API；nexusd 本就不是 portable core"
+supply_chain = "workspace path 依赖，无版本漂移；其第三方依赖已在 Cargo.lock 且各自有 [[dependency_reviews.direct]] 记录（chacha20poly1305/hkdf/sha1/sha2/md5/ring）；不引入新包、无 lock churn"
+os_transitive_deps = "none（ring 的 cc 构建已在树中并被既有评审接受）"
+approved = true
+approved_date = "2026-10-26"
+review_basis = "outbound-adapter-wiring spec §3.3「fixes-2 之后（步骤 4）」+ plan §7.2：TCP dialer 改为 crate 的 SIP004 实现，ss_std TCP 删除；alternatives: 继续保留 ss_std（与 spec §4.2 删除门禁冲突）、或把 SIP004 重写进 adapter（禁止：不在 adapter 重写协议栈）"

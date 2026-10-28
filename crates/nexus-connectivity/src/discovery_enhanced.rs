@@ -1,6 +1,6 @@
 //! 节点发现增强（多策略组合 + 去重 + 超时清理 + 上限驱逐，内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的节点发现增强骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的节点发现增强骨架：
 //! - **策略**：`DiscoveryStrategy` 三态——`Multicast` / `Bootstrap` / `Manual`，
 //!   可独立启用/停用；停用的策略 `advertise` 被静默忽略；
 //! - **配置**：`DiscoveryConfig { interval_ms, timeout_ms, max_peers }`，三者均须 > 0；

@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-管理 Plan 的运行生命周期、Replan、Structured Concurrency、LifecyclePhase 与 TerminalOutcome。
+管理 Plan 的运行生命周期、Replan、Structured Concurrency、LifecyclePhase 与 TerminalOutcome；也承载运行时 durable 记录（`SessionRecord` 与链路 `link_marker`）。
 
 ## Non-Responsibilities
 
@@ -78,6 +78,18 @@ N2 P0-4 增补（SessionManager，D1/D4/D7）：
   具象化；删掉它改"直接操作 SessionRecordStore"，会失去 Outcome 唯一写入点
   和 attach window 状态机的独立变化维度。
 
+已实现（2026-10-26，P1′ 接缝④：链路 durable marker 迁入）：
+
+- `link_marker::LinkMarker { link_id, kind, locator, established_at_unix, stale }`
+  + `LinkMarker::established(...)`；
+- `link_marker::LinkMarkerKind { Direct, Relay }` + `as_str()` / `parse()`
+  （锁定 `links.json` 的 `"direct"` / `"relay"` 字符串）；
+- `link_marker::LinkMarkerStore`（`load` / `save` upsert 契约）；
+- `link_marker::LinkReconcileReport { markers_checked, marked_stale }`；
+- `link_marker::reconcile_link_markers`（幂等；只标记不建连）。
+
+以上 5 项同时以 `nexus_session::{…}` 重导出。
+
 ## Verification
 
 ### N3 边界增补（待实现）
@@ -111,6 +123,13 @@ v9 §15.2/§15.3（Session 范围，`feature/crash-recovery`）：
 
 - Durable 状态：`SessionRecord { session, phase, outcome }`（轻量 marker）。
   文件实现由 Composition Root 注入（`SessionRecordStore` trait；见 `nexusd::recovery::FileSessionRecordStore`）。
+- Durable 状态（链路 marker，2026-10-26 接缝④迁入）：`link_marker::LinkMarker
+  { link_id, kind: LinkMarkerKind, locator, established_at_unix, stale }`。
+  文件实现由 Composition Root 注入（`LinkMarkerStore` trait；见
+  `nexusd::recovery::FileLinkMarkerStore`）。`links.json` 的字节格式（字段名、字典序、
+  `"direct"`/`"relay"` 字符串值）由 `apps/nexusd` 的 fixture 测试锁定，不随迁移改变。
+  冷启动 `link_marker::reconcile_link_markers` 把未 stale 的 marker 标为 stale（进程死亡
+  = socket 死亡，触发重建；已 stale → 跳过；幂等）；本函数只标记不建连。
 - 保真度契约：durable 记录只保留分类 + 失败原因字符串；`Failed` 的完整类型化
   `NexusError` 不持久化（load 时重建为 `Internal{message}`）。
 - 冷启动 `reconcile_session_records`（phase 感知，amendment B1/B2 2026-10-03）：

@@ -1328,14 +1328,14 @@ dependencies = [
 name = "nexus-nat-traversal"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-domain",
 ]
 
 [[package]]
 name = "nexus-nat-wireup"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-domain",
  "nexus-fabric",
  "nexus-nat-quality",
  "nexus-nat-traversal",
@@ -1672,6 +1672,7 @@ dependencies = [
  "nexus-network",
  "nexus-outbound-anytls",
  "nexus-outbound-hysteria2",
+ "nexus-outbound-shadowsocks",
  "nexus-outbound-trojan",
  "nexus-outbound-vless",
  "nexus-path",
@@ -1690,6 +1691,8 @@ dependencies = [
  "nexus-storage",
  "nexus-turn",
  "nexus-workspace",
+ "rustls",
+ "rustls-native-certs",
  "serde_json",
  "sha1",
  "signal-hook",

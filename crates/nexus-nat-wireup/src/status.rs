@@ -1,6 +1,6 @@
 //! Per-peer punch registry (observability; LocalAPI JSON source).
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_fabric::PeerId as FabricPeerId;
 use nexus_nat_traversal::{PunchFailReason, PunchPhase, PunchResult};
 

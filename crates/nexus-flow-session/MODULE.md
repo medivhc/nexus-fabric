@@ -58,6 +58,8 @@ smoltcp 会话的生命周期从属于 §10 Session（Session 进 Draining/Dispo
 - 平台专有 API（portable=false 但仍禁直调 OS；平台能力经 Composition Root 注入）。
 - `engineering/` 下的 Harness/Plugin。
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 

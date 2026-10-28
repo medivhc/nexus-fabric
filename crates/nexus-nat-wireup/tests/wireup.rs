@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::PunchChannel;
 use nexus_nat_traversal::{CandidateKind, PunchCandidate};
 use nexus_nat_wireup::channel::{STREAM_TYPE_PUNCH, deframe, frame_msg};

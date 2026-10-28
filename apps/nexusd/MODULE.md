@@ -42,6 +42,9 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：②`OutboundAdapter`（待 P2）/ ③CAKE（待 P3，新增 `nexus-qos` 后下沉），
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants
 
@@ -117,7 +120,8 @@
   不存在"Clash TUN 与 Mesh TUN 抢设备"（设计文档 §6）。
 - **D2（分类管线）**：从 TUN 读取的每个 IPv4 包 → `PacketClassifier::classify()`：
   - `Mesh{..}` → N1 转发（`network.toml` 未配置则计数 `mesh_dropped_no_n1`）；
-  - `Proxy` → proxy 转发（`proxy.yaml` 未配置则计数 `proxy_dropped_no_proxy`）；
+  - `Proxy` → 未配置/无可用出口 → SYN 直接回 RST（`craft_rst`，不进终结器、不回
+    SYN-ACK）+ 计数 `proxy_dropped_no_proxy`（D2=C）；tag 可拨号 → proxy 转发；
   - `Direct` → 直连（MVP 计数 `direct_forwarded`，实际经系统路由）；
   - `Drop` → 计数 `dropped`。
 - **D3（DNS 拦截）**：UDP 目的端口 53 的包短路分类器 → `UnifiedDns::resolve()` →
@@ -251,9 +255,14 @@
 - **R5（热加载分类）**：`network.toml` 内容变更 → `NeedsRestart`
   （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `Hot`
   （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）；
-  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）。
-- 不变量：TUN 失败仍致命（D1）；N1/DNS/Proxy 失败可降级（§13.3 原则）；
-  关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
+  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）；
+  `proxy.yaml` **内容变更 → `NeedsRestart`**（engine 只在启动构造，Q-7=B），
+  并发布 stale 面（`outbound.stale=true` + active/file tag/kind/sha1）。
+- 不变量：TUN 失败仍致命；N1/DNS 失败可降级；**Proxy 失败分层**：`proxy.yaml`
+  解析失败、rule engine 构建失败、以及首个 wired 出站非法（`SelectedInvalid`，
+  含域名不可解析）一律启动失败（stderr JSON + exit 1）；**仅**『无任何可用代理
+  出站』（`NoUsableOutbound`）降级为『无 proxy engine』，Proxy 流按 D2 回 RST
+  并计数。关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
 
 ### TCP 终结接线（S1-S11，scenarios/product/tcp_termination_wireup.toml，2026-10-01 冻结）
 
@@ -348,22 +357,52 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   - dial 失败 → `handle_fabric_rst(stream_id)`，`proxy_dropped_no_proxy += 1`；
   - 对端关闭 → `handle_fabric_fin/rst`；本地关闭 → 关 proxy 连接。
 - **P2（UDP 转发）**：`Classification::Proxy` 的 UDP 包 → `ProxyEngine`：
-  - 解析 IP/UDP 头 → 按 P3 选定协议的 UDP 中继发送；
-  - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；trojan：TCP 上的 UDP；
+  - 解析 IP/UDP 头 → `dialer.udp_capability()` 分派 → `UdpMode` 承载：
+    SOCKS5 = `Socks5Associate`；SS = `ShadowsocksAead`（仍由 `ss_std::SsUdp` 承载，
+    删除门归 fixes-6）；VLESS/AnyTLS = `Unsupported{NotWired}`；Trojan（恒 TLS）=
+    `Unsupported{TlsVariantNotSupported}`；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
+  - `Unsupported` → 丢包 + `udp_send_failed`/`udp_unsupported*` 计数 +
+    每 `(kind,tag)` 首次与每 10 s 一条限频日志，**绝不直连**；
   - 发送失败 → `proxy_dropped_no_proxy += 1`。
-- **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，选首个可用
-  `kind ∈ {shadowsocks, trojan, socks5}`（跳过 direct/relay/vmess）；
-  - 无可用出站 → 等价未配置（`proxy_dropped_no_proxy`）；
-  - `OutboundKind` 新增 `Socks5`（ additive；`locator` 为 `host:port`）。
+- **P3（出站选择，Q-4=A 多出站 + strict-first）**：`OutboundRegistry::build` 按
+  `outbound_manifest::select_index`（文件顺序首个 proxy+wired，**唯一定义**）遍历：
+  - 全部 wired 出站（socks5/shadowsocks/trojan/vless/anytls）建 dialer 入表，
+    **按规则 tag 选路**（不是只选一个）；
+  - direct/relay → `skipped(NotProxyKind)`；vmess/hysteria2 → `skipped(ProtocolNotWired)`
+    且进 `unsupported` 槽（运行期结构化错误）；
+  - 首个 wired 配置非法 → `SelectedInvalid`（**硬失败，不跳到下一个**）；
+    非首个 wired 配置非法 → `Invalid` 槽（启动 warn + 运行期 `InvalidOutbound`）；
+  - 无任何 proxy+wired → `NoUsableOutbound` → 无 engine（D1 降级）；
+  - `OutboundKind` 集合不变（`Socks5` 为既有 additive）。
 - **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
   dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
+  - **D2=C 无出口 RST**：无 engine 或 tag 不可用（`UnknownOutbound` /
+    `UnsupportedOutboundKind` / `InvalidOutbound`）→ **TCP SYN 当场回 RST**
+    （唯一发射点 `emit_proxy_egress_rst`；不进终结器、不回 SYN-ACK、
+    `stream_id=-`），每包恰好计一次 `proxy_dropped_no_proxy`（tag 不可用另加
+    `dropped++`）；UDP 维持丢包 + 计数（无 RST 语义）。
+  - **两态去重**：flow_mgr 开且无 engine 时，SYN 已发的 RST 记入
+    `proxy_egress_rst_pending`；`FlowSignal::TcpReset` 命中只做会话回收
+    + 既有 `dropped++`，不再发第二个 RST。
 - **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；
   UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
   完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
   （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
   发生时计数（不再是纯分类计数）。
+- **统计面（D3=A，15 个恒定字段）**：`tcp_streams`（Syn 数）/ `tcp_dials_ok` /
+  `tcp_dials_failed` / `tcp_dial_buffer_dropped_bytes` / `tcp_dial_buffer_overflow_resets` /
+  `udp_sent` / `udp_send_failed` + `tcp_streams_ok`（dial 成功进 relay）/
+  `tcp_bytes_up` / `tcp_bytes_down` / `udp_unsupported` / `udp_unsupported_vless` /
+  `udp_unsupported_anytls` / `udp_unsupported_other` / `udp_unsupported_log_suppressed`。
+  **不存在** `tcp_flows_rejected` / `tcp_dials_throttled`（不引入上限，不是 0 值字段）。
+  - **同步点唯一**：`Dataplane::poll_proxy_engine()` 每 tick 一次（`saturating_sub` delta）；
+    Proxy 分类分支不再同步（避免同 tick 两次 delta）。
+  - 字段语义写死：`proxy_tcp_streams` = 握手流数（Syn）；`proxy_tcp_streams_ok` =
+    dial 成功流数；`proxy_tcp_bytes` **自本版本起为真实上行字节**（旧值恒 0，修死计数）；
+    `proxy_tcp_bytes_down` 为下行；`proxy_dropped_no_proxy` 聚合「无出口」与「dial 失败」，
+    同一事件只加一次。
 
 ### Workspace 生产接线（C1/D1-D9，scenarios/product/daemon_workspace_mount.toml，2026-10-02 冻结）
 

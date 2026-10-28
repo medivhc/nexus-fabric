@@ -35,6 +35,8 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - `tokio` 及任何 async runtime（仓库 std-only 姿态；quinn-proto 为 sans-IO）。
 - Portable 模块中的平台专有 Framework/API。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 

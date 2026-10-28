@@ -1,0 +1,76 @@
+schema_version = 1
+id = "product.proxy-fwd-udp-unsupported"
+title = "VLESS / AnyTLS / TLS Trojan 作为 active outbound：UDP fail-closed（丢弃 + 分协议计数 + 限频日志）"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+
+[given]
+# 可执行 E4（example proxy_fwd_udp_unsupported --json，MockTun + 生产
+# Dataplane::process_one()）：
+# - VLESS、AnyTLS、TLS Trojan 各一轮：真实 ProxyEngine::new() 选中对应 kind
+#   （Q5=B：udp_capability = Unsupported{NotWired}；Trojan 的 TLS 变体恒为
+#   Unsupported{TlsVariantNotSupported} → 落 udp_unsupported_other）；
+# - 每轮注入 2 个业务 UDP 包，断言全部丢弃、udp_sent == 0、无直连；
+# - udp_unsupported 与分协议计数 > 0；同一 (kind,tag) 第二条日志被 10s
+#   限频抑制（udp.log_suppressed_positive），即每轮 suppressed >= 1；
+# - Trojan 轮另取 MockTun 写侧（`take_written`）为空：`不伪造回包` 由
+#   `udp.trojan_tun_written == 0` 钉住（SUG-2）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_fwd_udp_unsupported -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "udp.unsupported_positive"
+equals = true
+
+[[expect]]
+field = "udp.unsupported_vless_positive"
+equals = true
+
+[[expect]]
+field = "udp.unsupported_anytls_positive"
+equals = true
+
+[[expect]]
+field = "udp.unsupported_trojan_positive"
+equals = true
+
+[[expect]]
+field = "udp.unsupported_trojan_other_positive"
+equals = true
+
+[[expect]]
+field = "udp.sent"
+equals = 0
+
+[[expect]]
+field = "udp.direct_forwarded"
+equals = 0
+
+[[expect]]
+field = "udp.log_suppressed_positive"
+equals = true
+
+[[expect]]
+field = "udp.trojan_tun_written"
+equals = 0
+
+[[expect]]
+field = "proxy.dropped_no_proxy"
+non_empty = true
+
+[[expect]]
+field = "outbound.vless_kind"
+equals = "vless"
+
+[[expect]]
+field = "outbound.anytls_kind"
+equals = "anytls"
+
+[[expect]]
+field = "outbound.trojan_kind"
+equals = "trojan"

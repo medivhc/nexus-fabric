@@ -7,9 +7,9 @@ license.workspace = true
 description = "Relay-first NAT punch-through orchestration: candidate gathering, signaling codec, punch state machine (portable core, std-only)"
 
 [dependencies]
-# 合同澄清（Track A 授权）：复用 nexus-connectivity::nat::NatType。
+# 合同澄清（Track A 授权）：复用 `nexus-domain::nat::NatType`（P1 接缝① 迁入 domain）。
 # 合同正文 "[dependencies] 为空" 为笔误；std-only、无第三方依赖保持不变。
-nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-domain = { path = "../nexus-domain" }
 
 [dev-dependencies]
 
