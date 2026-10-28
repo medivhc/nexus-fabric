@@ -146,6 +146,45 @@
 - 不变量：单 TUN（D1）；分类器是唯一分类入口（S29）；DNS 不泄露 mesh 内名
   （nexus-dns S-unified）；QoS 禁用时零开销（D4）。
 
+### IPv6 数据面 slice 1（R3 C18/C19：计数 / 分类 / 能力表 / Mesh 原始转发）
+
+- **入口分派**：`0x86DD` 包在 DNS 拦截与所有 v4 路径**之前**进入专用分支；
+  不变量：**任何 0x86DD 包都落在一个 `ipv6.*` 计数上，绝不只增通用 `dropped`**
+  （AC10，S-V6-A 合并点起生效）。
+- **分类单一出口**：v6 与 v4 共用 `PacketClassifier`（经 `classify_with_cache`）；
+  v6 在委托规则引擎**之前**短路（D-impl-1）：`mesh_cidrs6` 命中 → `Mesh`，
+  `bypass_cidrs6` 命中 → `Direct`，其余 → `Proxy{outbound:"proxy"}`。禁止第二套
+  v6 判定（D-impl-10）。v6 不建 flow 会话（终结双栈归 S-V6-B）。
+- **解析口径**（spec §4.7.3）：扩展头链支持 `0`/`43`/`60`/`44`；`44` 不重组
+  （Fragment 头存在 → `ipv6.fragments`，仍按目的地址分类）；ESP/AH 不解析 L4、
+  按目的地址分类；>8 个扩展头或长度越界 → `ipv6.dropped_extension`（fail-closed）；
+  固定头/L4 截断 → `ipv6.dropped_truncated`。入站 v6 包**不校验** L4 校验和
+  （TUN 可能携带 CHECKSUM_PARTIAL）；我们构造的 v6 响应必须写完整校验和。
+- **多播**：`ff00::/8` → `ipv6.multicast`，只计数、不进分类转发（classifier 对
+  多播不特判，契约由单测钉住）。
+- **路径结果**：Mesh → N1 原始转发（`send_to_mesh(IpAddr::V6, bytes)`，
+  `ipv6.mesh_forwarded`）；无 v6 路由 / 无 sender → `ipv6.mesh_no_route` 且既有
+  `mesh_dropped_no_n1` 同步 +1。Direct → 只计数（`ipv6.classified_direct` +
+  `direct_forwarded`；本 run 无 v6 direct egress，与 v4 一样"计数可见"，不静默）。
+  Proxy → 阻断（Q4 已裁定，不是缺口）：`ipv6.classified_proxy` +
+  `ipv6.proxy_dropped` + 限流日志，不调用 ProxyEngine、不计 `proxy_dropped_no_proxy`。
+- **v6 DNS 不拦截**（D-impl-7）：`is_dns_query`/`is_dns_tcp_query` 保持 v4-only；
+  v6/53 落 Proxy → `ipv6.proxy_dropped` 可见，不是静默丢弃。
+- **计数归属**（D-impl-10）：`ipv6.packets` 对所有 0x86DD +1；其余字段每个维度
+  只加一个语义分量——传输层 `udp`/`tcp`、分类 `classified_*`、路径结果
+  `mesh_forwarded`/`mesh_no_route`/`proxy_dropped`、标志位
+  `fragments`/`multicast`/`dropped_*`。
+- **能力表**：`ipv6_paths` 是静态表（启动时由 `[[vpi.routes6]]` 与编译特性决定，
+  不随包变化）：`mesh = supported|unsupported`、`direct = supported`、
+  `proxy_tcp = proxy_udp = blocked`、`tun_address = unassigned`、`nat = unsupported`；
+  经 `/localapi/v0/dataplane/stats` 的 `ipv6_paths` 暴露，并与 `ingress_ip_family`
+  派生自同一张表（v6 mesh 路由在位 → `dual-stack`，否则 `ipv4`；N-8：禁止硬编码
+  `ipv4` 与能力表矛盾）。
+- **日志**（60 s / `(event, 判别字段)` 一条）：`ipv6_proxy_unsupported proto=<n>`、
+  `ipv6_fragment_dropped path=proxy`、`ipv6_ext_unsupported hdr=<n>`；计数不随限流丢失。
+- **不在本 slice**：v6 TCP 终结（S-V6-B）、v6 代理出口、v6 NAT/打洞、TUN v6 地址
+  分配（Q7）、v6 QoS 归因（`unknown → Normal`）。这些是显式取舍，状态表可见。
+
 ### DNS 服务面（R3，C5–C11；引擎契约见 `crates/nexus-dns/MODULE.md`）
 
 - **线程归属**：单一 DNS 线程（`nexusd-dns`）唯一持有 `UnifiedDns`、`FakeIpPool`、
