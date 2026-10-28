@@ -3026,6 +3026,12 @@ fn handle_localapi_request(
         }
         return Ok(());
     }
+    if path == "/localapi/v0/nat/chunks" {
+        // P0：chunk 路径计数（disabled 时全 0 + HTTP 200，不新增错误码）。
+        write_http_json(stream, 200, &nexusd::nat_chunk_stats::chunk_status())
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     let result: Result<Value, (String, String)> = match path {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
