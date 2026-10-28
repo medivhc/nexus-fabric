@@ -404,6 +404,18 @@ impl NatSwitching {
                 nexus_nat_wireup::channel::STREAM_TYPE_WORKSPACE_SYNC,
                 chunk,
             )?;
+            // N-1 (MSR-p0-n1-ruling-20261026, spec §19.3): FIN this per-chunk
+            // stream so quinn replenishes MAX_STREAMS. Body only.
+            {
+                let mut st = stream
+                    .state
+                    .lock()
+                    .map_err(|_| std::io::Error::other("stream lock poisoned"))?;
+                st.send_fin = true;
+            }
+            let _ = stream.tx.send(nexus_fabric::Cmd::Pump {
+                conn: stream.conn_id,
+            });
             return Ok(ChunkPath::Direct);
         }
         fallback(chunk)?;

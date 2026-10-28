@@ -556,6 +556,11 @@ fn run_dataplane(
     tun_excludes: Vec<([u8; 4], u8)>,
     tproxy_config: Option<nexus_proxy_config::TproxyInboundConfig>,
     tproxy_listen: String,
+    nat_slot: nexusd::nat_consumer::NatHandleSlot,
+    peer_map: Arc<dyn nexusd::mesh_peer_map::MeshPeerResolver>,
+    direct_gate: Arc<nexusd::nat_chunk_recv::DirectGate>,
+    nat_inbound_rx: std::sync::mpsc::Receiver<nexusd::nat_chunk_recv::NatInboundChunk>,
+    chunk_stats: Arc<nexusd::nat_chunk_stats::ChunkStats>,
 ) {
     use nexus_projection::TunDevice;
     // D1：TUN 模式创建单个 TUN；纯 TPROXY 模式使用 InertTun（不伪造数据面）。
@@ -762,6 +767,13 @@ fn run_dataplane(
         eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
     }
 
+    // P0：NAT chunk 消费接线（slot 可为空；空 = 全 fallback，诚实降级）。
+    dp.set_nat_path_slot(nat_slot);
+    dp.set_mesh_peer_resolver(peer_map);
+    dp.set_direct_gate(direct_gate);
+    dp.set_nat_inbound_rx(nat_inbound_rx);
+    dp.set_chunk_stats(chunk_stats);
+
     #[cfg(target_os = "linux")]
     let mut tproxy_frontend = match tproxy_config {
         Some(config) => setup_tproxy_frontend(
@@ -805,6 +817,8 @@ fn run_dataplane(
                 break;
             }
         }
+        // P0：每轮 drain direct chunk（不放进 process_one，Proxy 分支零改动）。
+        dp.pump_nat_inbound();
         if last_tproxy_publish.elapsed() >= std::time::Duration::from_secs(1) {
             nexusd::dataplane::publish_flow_sessions(dp.flow_sessions_state());
             nexusd::dataplane::publish_tproxy_counters(
@@ -1274,6 +1288,8 @@ impl NatSwitchRuntime {
         hub: Option<Arc<nexus_discovery::hub::DiscoveryHub>>,
         sessions: Option<Arc<nexus_network::n1::session::N1SessionManager>>,
         static_peers: Vec<N1PeerId>,
+        nat_slot: nexusd::nat_consumer::NatHandleSlot,
+        punch_clock: Arc<dyn nexus_nat_traversal::PunchClock>,
     ) -> Option<JoinHandle<()>> {
         if let Some(id) = &identity {
             eprintln!(
@@ -1336,10 +1352,16 @@ impl NatSwitchRuntime {
             my_id,
             local,
             Vec::new(), // STUN 样本由 worker 周期性喂入
-            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+            Arc::clone(&punch_clock),
         );
 
         nexusd::nat_status::publish_nat_status_source(Box::new(Arc::clone(&sw)));
+
+        // P0: expose the narrow consumer seam. The dataplane may already be
+        // running; an empty slot simply means "all chunks fallback".
+        let provider: Arc<dyn nexusd::nat_consumer::NatPathProvider> = sw.clone();
+        nat_slot.set(provider);
+        eprintln!("[nat-consumer] handle attached");
 
         // D5: one address book for the whole process (provider publish + feed
         // poll). `relay_book_dir` selects the shared-directory book; otherwise
@@ -2083,6 +2105,31 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         Ok(pair) => pair,
         Err(code) => return code,
     };
+    // NAT chunk consumer scaffolding (P0 §3.1.3): the slot and the single
+    // monotonic PunchClock are created before the dataplane thread starts. The
+    // slot stays empty until the NAT runtime is up (all chunks fallback in the
+    // meantime, which is the honest degraded mode).
+    let punch_clock: Arc<dyn nexus_nat_traversal::PunchClock> =
+        Arc::new(nexus_nat_wireup::SystemPunchClock::new());
+    let nat_slot = nexusd::nat_consumer::NatHandleSlot::new();
+    // Consumed by the direct-stream receiver spawned in the next commit;
+    // created here so the composition root owns one shared clock.
+    let direct_gate = Arc::new(nexusd::nat_chunk_recv::DirectGate::new(Arc::clone(
+        &punch_clock,
+    )));
+    let chunk_stats = Arc::new(nexusd::nat_chunk_stats::ChunkStats::default());
+    nexusd::nat_chunk_stats::publish_chunk_stats(Arc::clone(&chunk_stats));
+    nexusd::nat_chunk_stats::publish_nat_slot_for_status(nat_slot.clone());
+    let peer_map: Arc<dyn nexusd::mesh_peer_map::MeshPeerResolver> = Arc::new(
+        nexusd::mesh_peer_map::StaticMeshPeerMap::from_toml(loaded.network_toml.as_deref()),
+    );
+    let (nat_tx, nat_rx) = std::sync::mpsc::sync_channel::<nexusd::nat_chunk_recv::NatInboundChunk>(
+        nexusd::nat_chunk_recv::NAT_INBOUND_QUEUE_CAP,
+    );
+    let dp_nat_slot = nat_slot.clone();
+    let dp_peer_map = Arc::clone(&peer_map);
+    let dp_direct_gate = Arc::clone(&direct_gate);
+    let dp_chunk_stats = Arc::clone(&chunk_stats);
     let dataplane_handle = if tun_enabled() || has_tproxy {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
@@ -2110,6 +2157,11 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                             .as_ref()
                             .map(|(listen, _)| listen.clone())
                             .unwrap_or_else(|| "0.0.0.0:7895".to_string()),
+                        dp_nat_slot,
+                        dp_peer_map,
+                        dp_direct_gate,
+                        nat_rx,
+                        dp_chunk_stats,
                     );
                 })
                 .expect("spawn dataplane thread"),
@@ -2118,6 +2170,19 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         eprintln!("[nexusd] tun disabled; dataplane not started (no-tun mode)");
         None
     };
+
+    // 4b. P0：direct chunk 接收端（supervisor + per-(peer,conn) acceptor）。
+    // slot 空时轮询等待；与 dataplane 的 slot 共享同一实例。
+    match nexusd::nat_chunk_recv::spawn_nat_chunk_receiver(
+        nat_slot.clone(),
+        Arc::clone(&direct_gate),
+        nat_tx,
+        Arc::clone(&chunk_stats),
+        Arc::clone(&shutdown),
+    ) {
+        Ok(_handle) => {}
+        Err(e) => eprintln!("[nat-consumer] WARN: chunk receiver spawn failed ({e})"),
+    }
 
     // 5. LocalAPI 线程（R4：可经 shutdown 标志停止）。
     let localapi_addr = loaded.daemon.localapi_addr.clone();
@@ -2248,6 +2313,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 Some(Arc::clone(&n1.discovery)),
                 Some(Arc::clone(&n1.sessions)),
                 n1.static_peers.clone(),
+                nat_slot.clone(),
+                Arc::clone(&punch_clock),
             ))
         })() {
             Ok(handle) => handle,
@@ -2957,6 +3024,12 @@ fn handle_localapi_request(
                 write_http_json(stream, status, &body).map_err(|err| err.to_string())?;
             }
         }
+        return Ok(());
+    }
+    if path == "/localapi/v0/nat/chunks" {
+        // P0：chunk 路径计数（disabled 时全 0 + HTTP 200，不新增错误码）。
+        write_http_json(stream, 200, &nexusd::nat_chunk_stats::chunk_status())
+            .map_err(|e| e.to_string())?;
         return Ok(());
     }
     let result: Result<Value, (String, String)> = match path {
