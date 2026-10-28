@@ -199,6 +199,22 @@ fn run() -> serde_json::Value {
             "dns_response_received": dns_response_received,
             "qos_bypassed": dp.qos_bypassed(),
             "processed": processed,
+            // C18：0x86DD 包的归属（MSR-r3-plan-ruling-20261028 Q-1）。
+            "ipv6": {
+                "packets": stats.ipv6.packets,
+                "udp": stats.ipv6.udp,
+                "tcp": stats.ipv6.tcp,
+                "classified_mesh": stats.ipv6.classified_mesh,
+                "classified_direct": stats.ipv6.classified_direct,
+                "classified_proxy": stats.ipv6.classified_proxy,
+                "mesh_forwarded": stats.ipv6.mesh_forwarded,
+                "mesh_no_route": stats.ipv6.mesh_no_route,
+                "proxy_dropped": stats.ipv6.proxy_dropped,
+                "multicast": stats.ipv6.multicast,
+                "dropped_truncated": stats.ipv6.dropped_truncated,
+                "dropped_extension": stats.ipv6.dropped_extension,
+                "fragments": stats.ipv6.fragments,
+            },
         }
     })
 }

@@ -1879,8 +1879,6 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         } else {
             "resource-level"
         });
-    nexusd::dataplane::publish_runtime_basics(takeover_mode, "ipv4");
-
     // 2. 组装 DataplaneConfig（R2/R3；dns.toml 解析失败 → exit 1）。
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
         Ok(c) => c,
@@ -1889,6 +1887,13 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // T4b：发布 takeover/ingress + IPv6 能力表（N-8：地址族由能力表派生，
+    // 不再硬编码 "ipv4" 而与 ipv6_paths 自相矛盾）。
+    let ipv6_paths =
+        nexusd::dataplane::Ipv6Paths::from_capabilities(!dataplane_config.mesh_cidrs6.is_empty());
+    nexusd::dataplane::publish_runtime_basics(takeover_mode, ipv6_paths);
+    eprintln!("[nexusd] IPv6 capability table: {}", ipv6_paths.summary());
 
     // 3. R1：装配 N1 网桥 + 单一 discovery hub（失败 → 降级，dataplane 照常跑）。
     //

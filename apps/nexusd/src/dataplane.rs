@@ -102,6 +102,42 @@ impl TunDevice for InertTun {
     }
 }
 
+/// IPv6 数据面统计（spec §4.10.2；AC10 的"每个 0x86DD 包都可见"）。
+///
+/// 归属口径（D-impl-10）：`packets` 对**所有** 0x86DD 包 +1（含 multicast /
+/// 截断）；其余字段在各自维度上**只加一个语义分量**——传输层（`udp`/`tcp`）、
+/// 分类（`classified_*`）、路径结果（`mesh_forwarded`/`mesh_no_route`/
+/// `proxy_dropped`）、标志位（`fragments`/`multicast`/`dropped_*`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ipv6Stats {
+    /// 所有 0x86DD 包。
+    pub packets: u64,
+    /// UDP（next header 17）。
+    pub udp: u64,
+    /// TCP（next header 6）。
+    pub tcp: u64,
+    /// 分类为 Mesh。
+    pub classified_mesh: u64,
+    /// 分类为 Direct。
+    pub classified_direct: u64,
+    /// 分类为 Proxy。
+    pub classified_proxy: u64,
+    /// Mesh 原始转发成功（N1）。
+    pub mesh_forwarded: u64,
+    /// Mesh 分类但无 v6 路由 / 无 sender → 无法转发。
+    pub mesh_no_route: u64,
+    /// Proxy 分类的 v6 包（本 run 阻断，Q4）。
+    pub proxy_dropped: u64,
+    /// 多播（`ff00::/8`）：只计数，不进分类转发。
+    pub multicast: u64,
+    /// 固定头/扩展头/L4 截断。
+    pub dropped_truncated: u64,
+    /// 扩展头链非法（>8 个或长度越界）。
+    pub dropped_extension: u64,
+    /// 含 Fragment 头的包（不重组；只计数）。
+    pub fragments: u64,
+}
+
 /// 数据面统计（D6 可观测）。
 #[derive(Debug, Default, Clone)]
 pub struct DataplaneStats {
@@ -167,6 +203,8 @@ pub struct DataplaneStats {
     pub outbound_unresolved: u64,
     /// 新流没有域名缓存命中（spec §9.16 `domain_miss`）。
     pub domain_miss: u64,
+    /// IPv6 数据面计数（C18；`0x86DD` 全部可见）。
+    pub ipv6: Ipv6Stats,
 }
 
 /// S4: 终结流记录（事件分发用）。
@@ -183,8 +221,12 @@ struct TcpStreamInfo {
 pub struct DataplaneConfig {
     /// Mesh 网段 CIDR（字符串，如 "10.144.144.0/24"）。
     pub mesh_cidrs: Vec<String>,
+    /// Mesh 网段 CIDR（v6，来自 `network.toml [[vpi.routes6]]`）。
+    pub mesh_cidrs6: Vec<String>,
     /// Bypass/白名单 CIDR。
     pub bypass_cidrs: Vec<String>,
+    /// Bypass/白名单 CIDR（v6；默认 `fc00::/7`、`fe80::/10`、`::1/128`）。
+    pub bypass_cidrs6: Vec<String>,
     /// 是否启用 DNS 拦截。
     pub dns_enabled: bool,
     /// DNS 统一配置（dns.toml；仅在 DNS 子系统启用时存在）。
@@ -211,7 +253,9 @@ impl Default for DataplaneConfig {
     fn default() -> Self {
         Self {
             mesh_cidrs: Vec::new(),
+            mesh_cidrs6: Vec::new(),
             bypass_cidrs: Vec::new(),
+            bypass_cidrs6: Vec::new(),
             dns_enabled: false,
             dns_config: None,
             qos_enabled: false,
@@ -263,7 +307,9 @@ pub struct Dataplane {
     manager: PathManager,
     candidates: Vec<CandidatePath>,
     mesh_cidrs: Vec<IpCidr>,
+    mesh_cidrs6: Vec<IpCidr>,
     bypass_cidrs: Vec<IpCidr>,
+    bypass_cidrs6: Vec<IpCidr>,
     dns: Option<crate::dns_service::DnsServiceHandle>,
     qos: Option<CakeScheduler>,
     /// N1 发送桥（W1/W3）；`None` 时 Mesh 包走 D2 计数路径。
@@ -353,6 +399,8 @@ pub struct Dataplane {
     unavailable_log: crate::log_throttle::KeyedLogThrottle,
     /// DNS 运维日志限频状态（`dns_tcp_query_refused` 等）。
     dns_log: crate::log_throttle::KeyedLogThrottle,
+    /// IPv6 运维日志限频状态（`ipv6_proxy_unsupported` 等；60 s 窗口）。
+    ipv6_log: crate::log_throttle::KeyedLogThrottle,
     /// 透明前端管道（S42：TPROXY 生产装配）。
     transparent: Option<TransparentPipeline>,
     /// owner → listener 的 UDP 回包通道（`send_from` 在 listener 线程）。
@@ -404,8 +452,18 @@ impl Dataplane {
             .iter()
             .map(|s| parse_ip_cidr(s))
             .collect::<Result<Vec<_>, _>>()?;
+        let mesh_cidrs6 = config
+            .mesh_cidrs6
+            .iter()
+            .map(|s| parse_ip_cidr(s))
+            .collect::<Result<Vec<_>, _>>()?;
         let bypass_cidrs = config
             .bypass_cidrs
+            .iter()
+            .map(|s| parse_ip_cidr(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bypass_cidrs6 = config
+            .bypass_cidrs6
             .iter()
             .map(|s| parse_ip_cidr(s))
             .collect::<Result<Vec<_>, _>>()?;
@@ -440,7 +498,9 @@ impl Dataplane {
             manager,
             candidates,
             mesh_cidrs,
+            mesh_cidrs6,
             bypass_cidrs,
+            bypass_cidrs6,
             dns,
             qos,
             n1_sender: None,
@@ -491,6 +551,7 @@ impl Dataplane {
             proxy_egress_rst_pending: std::collections::HashSet::new(),
             unavailable_log: crate::log_throttle::KeyedLogThrottle::new(),
             dns_log: crate::log_throttle::KeyedLogThrottle::new(),
+            ipv6_log: crate::log_throttle::KeyedLogThrottle::new(),
             transparent: None,
             transparent_udp_reply_tx: None,
         })
@@ -1055,6 +1116,20 @@ impl Dataplane {
         }
     }
 
+    /// 双栈 mesh 网段（v4 + v6）合并视图：分类器只认一个 `Vec<IpCidr>`。
+    fn all_mesh_cidrs(&self) -> Vec<IpCidr> {
+        let mut all = self.mesh_cidrs.clone();
+        all.extend(self.mesh_cidrs6.iter().copied());
+        all
+    }
+
+    /// 双栈 bypass 网段（v4 + v6）合并视图。
+    fn all_bypass_cidrs(&self) -> Vec<IpCidr> {
+        let mut all = self.bypass_cidrs.clone();
+        all.extend(self.bypass_cidrs6.iter().copied());
+        all
+    }
+
     /// 处理单个包（非阻塞；无包时返回 `Ok(false)`）。
     ///
     /// 管线：读 TUN → DNS 短路（UDP dport 53）→ 分类 → [S1: TCP 终结] →
@@ -1097,8 +1172,8 @@ impl Dataplane {
         };
         let (classification, matched_rule) = {
             let classifier = PacketClassifier::new(
-                self.mesh_cidrs.clone(),
-                self.bypass_cidrs.clone(),
+                self.all_mesh_cidrs(),
+                self.all_bypass_cidrs(),
                 &*self.rules,
                 self.config.fake_ip_enabled,
                 &self.manager,
@@ -1616,6 +1691,13 @@ impl Dataplane {
         };
         let packet = self.buf[..n].to_vec();
 
+        // C18/D-impl-7：0x86DD 全部走专用分支（v6 DNS 不拦截）——必须早于
+        // 任何 v4 路径，保证"每个 0x86DD 包都落入 ipv6.*"。
+        if packet.first().map(|b| b >> 4) == Some(6) {
+            self.handle_ipv6(&packet, now_millis);
+            return Ok(true);
+        }
+
         // D3/C11：DNS 拦截（UDP/53 提交服务线程；TCP/53 无条件 RST）。
         if self.dns.is_some() {
             if is_dns_query(&packet) {
@@ -1787,6 +1869,146 @@ impl Dataplane {
             }
         }
         Ok(true)
+    }
+
+    /// IPv6 包处理（C18 / AC10）：每个 0x86DD 包都必须落在 `ipv6.*` 上。
+    ///
+    /// 单一分类出口：`classify_with_cache` → `PacketClassifier`（v6 在委托规则
+    /// 引擎前短路，D-impl-1）。本函数只做计数与按分类转发/阻断，**不重复判定**
+    /// v6（禁止第二套 v6 分类）。
+    ///
+    /// 口径（spec §4.7.3）：
+    /// - 固定头/扩展头截断 → `dropped_truncated`；>8 个扩展头 → `dropped_extension`；
+    /// - `ff00::/8` → `multicast`（只计数，不进分类转发）；
+    /// - 分片不重组：Fragment 头存在 → `fragments`，仍按目的地址分类；
+    /// - Mesh → N1 原始转发（失败/no sender → `mesh_no_route` + `mesh_dropped_no_n1`）；
+    /// - Direct → 只计数（本 run 无 v6 direct egress，与 §4.7.6 一致）；
+    /// - Proxy → 阻断 + `proxy_dropped` + 限流日志（Q4 已裁定，不是缺口）；
+    /// - v6 不建 flow 会话（flow-session 的双栈终结归 C20/C21）。
+    fn handle_ipv6(&mut self, packet: &[u8], now_millis: u64) {
+        use nexus_projection::ip::{IpParseError, parse_ip_packet};
+
+        self.with_stats(|s| s.ipv6.packets += 1);
+
+        if packet.len() < 40 {
+            self.with_stats(|s| s.ipv6.dropped_truncated += 1);
+            return;
+        }
+        let mut dst_octets = [0u8; 16];
+        dst_octets.copy_from_slice(&packet[24..40]);
+        if dst_octets[0] == 0xff {
+            // ff00::/8：多播只计数。
+            self.with_stats(|s| s.ipv6.multicast += 1);
+            return;
+        }
+
+        let mut protocol = None;
+        let mut has_fragment = false;
+        let mut unsupported_extension = None;
+        match parse_ip_packet(packet) {
+            Ok(view) => {
+                protocol = Some(view.protocol);
+                has_fragment = view.has_fragment_header;
+            }
+            Err(IpParseError::Truncated) => {
+                self.with_stats(|s| s.ipv6.dropped_truncated += 1);
+                return;
+            }
+            Err(IpParseError::TooManyExtensionHeaders) => {
+                self.with_stats(|s| s.ipv6.dropped_extension += 1);
+                return;
+            }
+            Err(IpParseError::NonFirstFragment) => {
+                // 非首片：不重组，仍按目的地址分类（§4.7.3）。
+                has_fragment = true;
+            }
+            Err(IpParseError::UnsupportedExtension(hdr)) => {
+                // ESP/AH：不解析 L4，按目的地址分类；日志单独可见。
+                unsupported_extension = Some(hdr);
+            }
+            // 防御分支：版本在入口已判定；族不符/校验和仅构造路径出现。
+            Err(_) => {
+                self.with_stats(|s| s.dropped += 1);
+                return;
+            }
+        }
+        if has_fragment {
+            self.with_stats(|s| s.ipv6.fragments += 1);
+        }
+        match protocol {
+            Some(6) => self.with_stats(|s| s.ipv6.tcp += 1),
+            Some(17) => self.with_stats(|s| s.ipv6.udp += 1),
+            _ => {}
+        }
+
+        let (classification, _) = self.classify_with_cache(packet, now_millis);
+        match classification {
+            Classification::Mesh { .. } => {
+                self.with_stats(|s| s.ipv6.classified_mesh += 1);
+                let sent = if self.config.n1_configured {
+                    match (&self.n1_sender, ip_dst_of(packet)) {
+                        (Some(sender), Some(dst)) => sender.send_to_mesh(dst, packet).is_ok(),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if sent {
+                    self.with_stats(|s| s.ipv6.mesh_forwarded += 1);
+                } else {
+                    self.with_stats(|s| {
+                        s.ipv6.mesh_no_route += 1;
+                        // AC6：无 v6 路由时既有 N1 失败计数同步 +1（语义不冲突）。
+                        s.mesh_dropped_no_n1 += 1;
+                    });
+                }
+            }
+            Classification::Direct => {
+                self.with_stats(|s| {
+                    s.ipv6.classified_direct += 1;
+                    // 与 v4 口径一致：Direct 可见地"被放行/计数"，不做 v6 直连出口。
+                    s.direct_forwarded += 1;
+                });
+            }
+            Classification::Proxy { .. } => {
+                self.with_stats(|s| {
+                    s.ipv6.classified_proxy += 1;
+                    s.ipv6.proxy_dropped += 1;
+                });
+                if has_fragment {
+                    if self.ipv6_log_should_emit("ipv6_fragment_dropped", "path=proxy") {
+                        eprintln!("[nexusd] ipv6 WARN event=ipv6_fragment_dropped path=proxy");
+                    }
+                }
+                if let Some(hdr) = unsupported_extension {
+                    let key = format!("hdr={hdr}");
+                    if self.ipv6_log_should_emit("ipv6_ext_unsupported", &key) {
+                        eprintln!("[nexusd] ipv6 WARN event=ipv6_ext_unsupported hdr={hdr}");
+                    }
+                }
+                let proto = protocol.map_or_else(|| "-".to_string(), |p| p.to_string());
+                if self.ipv6_log_should_emit("ipv6_proxy_unsupported", &format!("proto={proto}")) {
+                    eprintln!(
+                        "[nexusd] ipv6 WARN event=ipv6_proxy_unsupported proto={proto} packets=1"
+                    );
+                }
+            }
+            Classification::Drop { .. } => {
+                self.with_stats(|s| s.dropped += 1);
+            }
+        }
+    }
+
+    /// IPv6 运维日志限频（每 `(event, 判别字段)` 60 s 最多 1 行）。
+    fn ipv6_log_should_emit(&mut self, event: &str, key: &str) -> bool {
+        self.ipv6_log
+            .decide(
+                event,
+                key,
+                std::time::Instant::now(),
+                crate::log_throttle::IPV6_LOG_INTERVAL,
+            )
+            .emit
     }
 
     /// Direct 真转发（spec §9.9 / AC-G6-01..03）。
@@ -1980,8 +2202,8 @@ impl Dataplane {
         };
         let classification = {
             let classifier = PacketClassifier::new(
-                self.mesh_cidrs.clone(),
-                self.bypass_cidrs.clone(),
+                self.all_mesh_cidrs(),
+                self.all_bypass_cidrs(),
                 &*self.rules,
                 self.config.fake_ip_enabled,
                 &self.manager,
@@ -3072,17 +3294,86 @@ pub fn dataplane_stats_snapshot() -> DataplaneStats {
 
 // ===== 运行期状态（LocalAPI §9.16） =====
 
-/// 运行期状态快照（takeover / flow_sessions / os_assemble）。
+/// IPv6 能力表（静态，启动时由配置与编译特性决定；不随包变化）。
+///
+/// `proxy_tcp/proxy_udp="blocked"` 是 Q4 已裁定的产品行为，不是 TODO；
+/// `tun_address="unassigned"` 表示本 run 不做 TUN v6 地址分配（Q7）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Paths {
+    /// `supported` / `unsupported`（由 `[[vpi.routes6]]` 是否存在决定）。
+    pub mesh: &'static str,
+    /// 恒为 `supported`（分类 + 计数）。
+    pub direct: &'static str,
+    /// 恒为 `blocked`（本 run v6 代理 TCP 出口阻断）。
+    pub proxy_tcp: &'static str,
+    /// 恒为 `blocked`（本 run v6 代理 UDP 出口阻断）。
+    pub proxy_udp: &'static str,
+    /// 恒为 `unassigned`（TUN v6 地址分配不在本 run）。
+    pub tun_address: &'static str,
+    /// 恒为 `unsupported`（v6 NAT/打洞不在本 run）。
+    pub nat: &'static str,
+}
+
+impl Ipv6Paths {
+    /// 由装配事实派生能力表。
+    #[must_use]
+    pub fn from_capabilities(mesh_supported: bool) -> Self {
+        Self {
+            mesh: if mesh_supported {
+                "supported"
+            } else {
+                "unsupported"
+            },
+            direct: "supported",
+            proxy_tcp: "blocked",
+            proxy_udp: "blocked",
+            tun_address: "unassigned",
+            nat: "unsupported",
+        }
+    }
+
+    /// `/dataplane/stats` 的 `ipv6_paths` JSON 段。
+    #[must_use]
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mesh": self.mesh,
+            "direct": self.direct,
+            "proxy_tcp": self.proxy_tcp,
+            "proxy_udp": self.proxy_udp,
+            "tun_address": self.tun_address,
+            "nat": self.nat,
+        })
+    }
+
+    /// 启动期一次性 INFO 行（不参与限流）。
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "mesh={} direct={} proxy_tcp={} proxy_udp={} tun_address={} nat={}",
+            self.mesh, self.direct, self.proxy_tcp, self.proxy_udp, self.tun_address, self.nat
+        )
+    }
+}
+
+impl Default for Ipv6Paths {
+    fn default() -> Self {
+        Self::from_capabilities(false)
+    }
+}
+
+/// 运行期状态快照（takeover / flow_sessions / os_assemble / ipv6_paths）。
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeStatus {
     /// `system-level` / `resource-level`。
     pub takeover_mode: String,
-    /// `ipv4`。
+    /// `ipv4` / `dual-stack`（按 `ipv6_paths` 能力表派生，不硬编码）。
     pub ingress_ip_family: String,
     /// 流会话状态。
     pub flow_sessions: FlowSessionsState,
     /// OS 装配状态。
     pub os_assemble: OsAssembleStatus,
+    /// IPv6 静态能力表。
+    pub ipv6_paths: Ipv6Paths,
 }
 
 /// OS 装配可见状态。
@@ -3285,11 +3576,20 @@ fn runtime_slot() -> &'static Mutex<RuntimeStatus> {
     RUNTIME_STATUS.get_or_init(|| Mutex::new(RuntimeStatus::default()))
 }
 
-/// 发布 takeover/ingress 基本信息。
-pub fn publish_runtime_basics(takeover_mode: &str, ingress_ip_family: &str) {
+/// 发布 takeover/ingress 基本信息与 IPv6 能力表。
+///
+/// `ingress_ip_family` 由能力表派生（N-8：不得再硬编码 `"ipv4"` 与
+/// `ipv6_paths` 自相矛盾）：v6 mesh 路由在位 → `dual-stack`，否则 `ipv4`。
+pub fn publish_runtime_basics(takeover_mode: &str, ipv6_paths: Ipv6Paths) {
     if let Ok(mut status) = runtime_slot().lock() {
         status.takeover_mode = takeover_mode.to_string();
-        status.ingress_ip_family = ingress_ip_family.to_string();
+        status.ingress_ip_family = if ipv6_paths.mesh == "supported" {
+            "dual-stack"
+        } else {
+            "ipv4"
+        }
+        .to_string();
+        status.ipv6_paths = ipv6_paths;
     }
 }
 
@@ -3358,6 +3658,21 @@ pub fn dataplane_stats_json(
             "proxy_dial_buffer_dropped_bytes": stats.proxy_dial_buffer_dropped_bytes,
             "proxy_dial_buffer_overflow_resets": stats.proxy_dial_buffer_overflow_resets,
             "outbound_unresolved": stats.outbound_unresolved,
+            "ipv6": {
+                "packets": stats.ipv6.packets,
+                "udp": stats.ipv6.udp,
+                "tcp": stats.ipv6.tcp,
+                "classified_mesh": stats.ipv6.classified_mesh,
+                "classified_direct": stats.ipv6.classified_direct,
+                "classified_proxy": stats.ipv6.classified_proxy,
+                "mesh_forwarded": stats.ipv6.mesh_forwarded,
+                "mesh_no_route": stats.ipv6.mesh_no_route,
+                "proxy_dropped": stats.ipv6.proxy_dropped,
+                "multicast": stats.ipv6.multicast,
+                "dropped_truncated": stats.ipv6.dropped_truncated,
+                "dropped_extension": stats.ipv6.dropped_extension,
+                "fragments": stats.ipv6.fragments,
+            },
             "flow_sessions": {
                 "state": status.flow_sessions.state,
                 "reason": status.flow_sessions.reason,
@@ -3371,6 +3686,7 @@ pub fn dataplane_stats_json(
                 "excludes": status.os_assemble.excludes,
             },
         },
+        "ipv6_paths": status.ipv6_paths.json(),
         "tproxy": tproxy,
     })
 }
@@ -4049,6 +4365,7 @@ outbounds:
                 default_route: true,
                 excludes: 1,
             },
+            ipv6_paths: Ipv6Paths::from_capabilities(true),
         };
         let stats = DataplaneStats {
             direct_dropped_unsupported: 3,
@@ -5982,5 +6299,360 @@ outbounds:
             .unwrap()
             .lookup(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
         assert_eq!(mapped.as_deref(), Some("v6.local"));
+    }
+
+    // ===== C18：IPv6 计数 / Mesh 原始转发 / 能力表 =====
+
+    /// 无路由的 N1 发送器：模拟"mesh 分类但 v6 路由缺失"（AC6 的反例）。
+    struct NoRouteN1Sender;
+
+    impl N1Sender for NoRouteN1Sender {
+        fn send_to_mesh(
+            &self,
+            _dst: IpAddr,
+            _packet: &[u8],
+        ) -> Result<(), nexus_network::n1::N1Error> {
+            Err(nexus_network::n1::N1Error::PeerUnknown)
+        }
+    }
+
+    /// 双栈测试数据面：v6 mesh `fd00:144::/64`、v6 bypass 默认集合。
+    fn v6_dataplane() -> (Dataplane, Arc<Mutex<nexus_projection::MockTun>>) {
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test6")));
+        let tun = Box::new(SharedTun {
+            inner: Arc::clone(&mock),
+        });
+        let config = DataplaneConfig {
+            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
+            mesh_cidrs6: vec!["fd00:144::/64".to_string()],
+            bypass_cidrs: vec!["192.168.0.0/16".to_string()],
+            bypass_cidrs6: vec!["fc00::/7".to_string(), "fe80::/10".to_string()],
+            n1_configured: true,
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
+        dp.set_default_simple_engine().expect("default engine");
+        (dp, mock)
+    }
+
+    fn v6_udp(dst: &str, payload: &[u8]) -> Vec<u8> {
+        nexus_projection::ip::build_udp_packet(
+            "[fd00:144::1]:40000".parse().unwrap(),
+            format!("[{dst}]:8080").parse().unwrap(),
+            payload,
+        )
+        .expect("v6 udp packet")
+    }
+
+    fn v6_tcp(dst: &str) -> Vec<u8> {
+        // 最小 v6/TCP SYN。
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+        pkt[6] = 6;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&"fd00:144::1".parse::<Ipv6Addr>().unwrap().octets());
+        pkt[24..40].copy_from_slice(&dst.parse::<Ipv6Addr>().unwrap().octets());
+        pkt[40..42].copy_from_slice(&40000u16.to_be_bytes());
+        pkt[42..44].copy_from_slice(&80u16.to_be_bytes());
+        pkt[44..48].copy_from_slice(&1000u32.to_be_bytes());
+        pkt[52] = 0x50;
+        pkt[53] = 0x02;
+        pkt
+    }
+
+    /// 在 v6 包上插入一个 8B 扩展头（`extension` 为头类型，`next` 为链尾协议）。
+    fn with_extension(inner: Vec<u8>, extension: u8, next: u8) -> Vec<u8> {
+        let mut pkt = inner[..40].to_vec();
+        // 扩展头：[next header, length(units), 6B data]。
+        pkt.extend_from_slice(&[next, 0, 0, 0, 0, 0, 0, 0]);
+        pkt.extend_from_slice(&inner[40..]);
+        pkt[6] = extension;
+        let payload_len = (pkt.len() - 40) as u16;
+        pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        pkt
+    }
+
+    /// AC6：v6/UDP 目的 `fd00:144::6` → Mesh 原始转发，N1 收到 `IpAddr::V6`
+    /// 且包字节逐字一致。
+    #[test]
+    fn c18_ipv6_udp_mesh_is_raw_forwarded() {
+        let (mut dp, mock) = v6_dataplane();
+        let frames: CapturedFrames = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_sender(Arc::new(TestN1Sender {
+            frames: Arc::clone(&frames),
+        }));
+        let pkt = v6_udp("fd00:144::6", b"mesh6");
+        mock.lock().unwrap().inject(pkt.clone());
+        dp.process_one().expect("process v6 mesh");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.udp, 1);
+        assert_eq!(stats.ipv6.classified_mesh, 1);
+        assert_eq!(stats.ipv6.mesh_forwarded, 1);
+        assert_eq!(stats.ipv6.mesh_no_route, 0);
+        assert_eq!(stats.dropped, 0, "0x86DD must never bump generic dropped");
+        let captured = frames.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].0,
+            IpAddr::V6("fd00:144::6".parse::<Ipv6Addr>().unwrap())
+        );
+        assert_eq!(captured[0].1, pkt, "raw bytes must be forwarded verbatim");
+    }
+
+    /// AC6 反例：无 v6 路由 → `mesh_no_route` + `mesh_dropped_no_n1` 同步 +1。
+    #[test]
+    fn c18_ipv6_mesh_without_route_is_visible() {
+        let (mut dp, mock) = v6_dataplane();
+        dp.set_n1_sender(Arc::new(NoRouteN1Sender));
+        mock.lock().unwrap().inject(v6_udp("fd00:144::6", b"x"));
+        dp.process_one().expect("process v6 mesh no route");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.classified_mesh, 1);
+        assert_eq!(stats.ipv6.mesh_no_route, 1);
+        assert_eq!(stats.ipv6.mesh_forwarded, 0);
+        assert_eq!(stats.mesh_dropped_no_n1, 1);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC7：`fc00::5`（v6 bypass）→ Direct，只计数不转发。
+    #[test]
+    fn c18_ipv6_direct_is_counted() {
+        let (mut dp, mock) = v6_dataplane();
+        let before = dp.stats().direct_forwarded;
+        mock.lock().unwrap().inject(v6_udp("fc00::5", b"direct6"));
+        dp.process_one().expect("process v6 direct");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.classified_direct, 1);
+        assert_eq!(stats.direct_forwarded, before + 1);
+        assert_eq!(stats.ipv6.classified_proxy, 0);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC7：`2001:db8::20` → Proxy 阻断（`proxy_dropped`），通用 dropped 不增。
+    #[test]
+    fn c18_ipv6_proxy_is_blocked_not_dropped() {
+        let (mut dp, mock) = v6_dataplane();
+        let before = dp.stats();
+        mock.lock()
+            .unwrap()
+            .inject(v6_udp("2001:db8::20", b"proxy6"));
+        dp.process_one().expect("process v6 proxy");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.classified_proxy, 1);
+        assert_eq!(stats.ipv6.proxy_dropped, 1);
+        assert_eq!(stats.dropped, before.dropped);
+        assert_eq!(stats.proxy_forwarded, before.proxy_forwarded);
+        assert_eq!(stats.proxy_dropped_no_proxy, before.proxy_dropped_no_proxy);
+    }
+
+    /// AC7：`ff02::1` → 只计 `multicast`，不进分类转发。
+    #[test]
+    fn c18_ipv6_multicast_is_counted_only() {
+        let (mut dp, mock) = v6_dataplane();
+        mock.lock().unwrap().inject(v6_udp("ff02::1", b"mcast"));
+        dp.process_one().expect("process v6 multicast");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.multicast, 1);
+        assert_eq!(stats.ipv6.classified_mesh, 0);
+        assert_eq!(stats.ipv6.classified_direct, 0);
+        assert_eq!(stats.ipv6.classified_proxy, 0);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC10 类 6：截断包 → `dropped_truncated`，不增通用 dropped。
+    #[test]
+    fn c18_ipv6_truncated_is_visible() {
+        let (mut dp, mock) = v6_dataplane();
+        let mut short = vec![0u8; 24];
+        short[0] = 0x60;
+        short[6] = 17;
+        mock.lock().unwrap().inject(short);
+        dp.process_one().expect("process v6 truncated");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.dropped_truncated, 1);
+        assert_eq!(stats.ipv6.classified_proxy, 0);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC10 类 2：v6/TCP → `ipv6.tcp`（分类 + Proxy 阻断）。
+    #[test]
+    fn c18_ipv6_tcp_is_counted() {
+        let (mut dp, mock) = v6_dataplane();
+        mock.lock().unwrap().inject(v6_tcp("2001:db8::21"));
+        dp.process_one().expect("process v6 tcp");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.tcp, 1);
+        assert_eq!(stats.ipv6.udp, 0);
+        assert_eq!(stats.ipv6.classified_proxy, 1);
+        assert_eq!(stats.ipv6.proxy_dropped, 1);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC10 类 3：ICMPv6（无 L4 端口）→ 不建 flow，按目的分类。
+    #[test]
+    fn c18_ipv6_icmpv6_is_classified_not_flowed() {
+        let (mut dp, mock) = v6_dataplane();
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 58; // ICMPv6
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&"fd00:144::1".parse::<Ipv6Addr>().unwrap().octets());
+        pkt[24..40].copy_from_slice(&"2001:db8::22".parse::<Ipv6Addr>().unwrap().octets());
+        mock.lock().unwrap().inject(pkt);
+        dp.process_one().expect("process icmpv6");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.udp, 0);
+        assert_eq!(stats.ipv6.tcp, 0);
+        assert_eq!(stats.ipv6.classified_proxy, 1);
+        assert_eq!(stats.ipv6.proxy_dropped, 1);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC10 类 4：ESP（未知扩展头）→ 按目的分类，不解析 L4。
+    #[test]
+    fn c18_ipv6_esp_is_classified_not_dropped() {
+        let (mut dp, mock) = v6_dataplane();
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 50; // ESP
+        pkt[7] = 64;
+        pkt[24..40].copy_from_slice(&"2001:db8::23".parse::<Ipv6Addr>().unwrap().octets());
+        mock.lock().unwrap().inject(pkt);
+        dp.process_one().expect("process esp");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.classified_proxy, 1);
+        assert_eq!(stats.ipv6.proxy_dropped, 1);
+        assert_eq!(stats.ipv6.dropped_extension, 0);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC10 类 5：分片（首片 + 非首片）→ `fragments` 计数，仍按目的分类。
+    #[test]
+    fn c18_ipv6_fragments_are_counted_and_classified() {
+        let (mut dp, mock) = v6_dataplane();
+        let frames: CapturedFrames = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_sender(Arc::new(TestN1Sender {
+            frames: Arc::clone(&frames),
+        }));
+
+        let inner = v6_udp("fd00:144::6", b"frag");
+        let first = with_extension(inner.clone(), 44, 17);
+        let mut non_first = first.clone();
+        non_first[42..44].copy_from_slice(&8u16.to_be_bytes()); // offset = 1
+
+        mock.lock().unwrap().inject(first);
+        dp.process_one().expect("process first fragment");
+        mock.lock().unwrap().inject(non_first);
+        dp.process_one().expect("process non-first fragment");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 2);
+        assert_eq!(stats.ipv6.fragments, 2);
+        assert_eq!(stats.ipv6.classified_mesh, 2);
+        assert_eq!(
+            stats.ipv6.udp, 1,
+            "only the first fragment has an L4 header"
+        );
+        assert_eq!(stats.ipv6.mesh_forwarded, 2);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// 扩展头链 >8 → `dropped_extension`（fail-closed），不分类转发。
+    #[test]
+    fn c18_ipv6_too_many_extensions_is_dropped_extension() {
+        let (mut dp, mock) = v6_dataplane();
+        let mut pkt = vec![0u8; 40 + 9 * 8];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&(9 * 8u16).to_be_bytes());
+        pkt[6] = 0;
+        pkt[7] = 64;
+        pkt[24..40].copy_from_slice(&"fd00:144::6".parse::<Ipv6Addr>().unwrap().octets());
+        for i in 0..9 {
+            pkt[40 + i * 8] = if i == 8 { 17 } else { 0 };
+        }
+        mock.lock().unwrap().inject(pkt);
+        dp.process_one().expect("process too many extensions");
+
+        let stats = dp.stats();
+        assert_eq!(stats.ipv6.packets, 1);
+        assert_eq!(stats.ipv6.dropped_extension, 1);
+        assert_eq!(stats.ipv6.classified_mesh, 0);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    /// AC16：能力表组合（无 routes6 → unsupported；有 → supported）。
+    #[test]
+    fn c18_ipv6_paths_capability_table() {
+        let without = Ipv6Paths::from_capabilities(false);
+        assert_eq!(without.mesh, "unsupported");
+        assert_eq!(without.direct, "supported");
+        assert_eq!(without.proxy_tcp, "blocked");
+        assert_eq!(without.proxy_udp, "blocked");
+        assert_eq!(without.tun_address, "unassigned");
+        assert_eq!(without.nat, "unsupported");
+
+        let with = Ipv6Paths::from_capabilities(true);
+        assert_eq!(with.mesh, "supported");
+        assert_eq!(Ipv6Paths::default(), without);
+    }
+
+    /// AC12/AC16：`/dataplane/stats` 同时暴露 `ipv6` 与 `ipv6_paths`。
+    #[test]
+    fn c18_stats_json_exposes_ipv6_and_paths() {
+        let status = RuntimeStatus {
+            takeover_mode: "system-level".to_string(),
+            ingress_ip_family: "dual-stack".to_string(),
+            ipv6_paths: Ipv6Paths::from_capabilities(true),
+            ..RuntimeStatus::default()
+        };
+        let stats = DataplaneStats {
+            ipv6: Ipv6Stats {
+                packets: 7,
+                classified_proxy: 3,
+                proxy_dropped: 3,
+                ..Ipv6Stats::default()
+            },
+            ..DataplaneStats::default()
+        };
+        let json = dataplane_stats_json(true, &status, &stats, serde_json::json!({}));
+        assert_eq!(json["dataplane"]["ipv6"]["packets"], 7);
+        assert_eq!(json["dataplane"]["ipv6"]["classified_proxy"], 3);
+        assert_eq!(json["dataplane"]["ipv6"]["proxy_dropped"], 3);
+        assert_eq!(json["dataplane"]["ipv6"]["fragments"], 0);
+        assert_eq!(json["ipv6_paths"]["mesh"], "supported");
+        assert_eq!(json["ipv6_paths"]["proxy_tcp"], "blocked");
+        assert_eq!(json["ipv6_paths"]["proxy_udp"], "blocked");
+        assert_eq!(json["ipv6_paths"]["tun_address"], "unassigned");
+        assert_eq!(json["ipv6_paths"]["nat"], "unsupported");
+        assert_eq!(json["ingress_ip_family"], "dual-stack");
+    }
+
+    /// N-8：`ingress_ip_family` 由能力表派生，不再硬编码 "ipv4"。
+    #[test]
+    fn c18_publish_runtime_basics_derives_ingress_family() {
+        publish_runtime_basics("system-level", Ipv6Paths::from_capabilities(true));
+        assert_eq!(runtime_status_snapshot().ingress_ip_family, "dual-stack");
+        publish_runtime_basics("system-level", Ipv6Paths::from_capabilities(false));
+        assert_eq!(runtime_status_snapshot().ingress_ip_family, "ipv4");
+        assert_eq!(runtime_status_snapshot().ipv6_paths.mesh, "unsupported");
     }
 }
