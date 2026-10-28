@@ -1,0 +1,78 @@
+schema_version = 1
+id = "product.proxy-fwd-udp-vless-anytls"
+title = "nexusd 代理 UDP：VLESS / AnyTLS 出站经 TUN 与 TPROXY 转发 UDP（每目的地址一条代理流）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-proxy-udp"
+carrier = "n1-fabric"
+
+[given]
+topology = "loopback：两个本地 UDP echo（回 echo:+载荷）+ 本地 VLESS 节点（明文 TCP，只接受 command=UDP）+ 本地 AnyTLS 节点（TLS 自签，UoT v2 connect 模式）"
+tun = "MockTun + 生产 Dataplane / ProxyEngine：每协议向两个目的地址各发 2 个数据报"
+tproxy = "生产 StreamProxyEgress（TPROXY 前端代理出口）：每协议同一 flow key 2 个数据报"
+fixture_check = "同一 example 的 --self-test 用 crate 自带客户端（不经 nexusd）验证两个本地节点"
+offline = "no public network; std::net + threads"
+
+# 可执行 E4（PRODUCT §11.18.1）。旧实现 vless / anytls 的 UDP 为 Unsupported{NotWired}，
+# 全部丢弃并计 udp_unsupported → verdict FAIL（Red Evidence）。
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_fwd_udp_vless_anytls -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "vless.tun.replies_ok"
+equals = true
+
+[[expect]]
+field = "vless.tun.one_stream_per_destination"
+equals = true
+
+[[expect]]
+field = "vless.tun.udp_sent"
+equals = 4
+
+[[expect]]
+field = "vless.tun.udp_unsupported"
+equals = 0
+
+[[expect]]
+field = "vless.tun.direct_forwarded"
+equals = 0
+
+[[expect]]
+field = "vless.tproxy.replies_ok"
+equals = true
+
+[[expect]]
+field = "vless.tproxy.one_stream_per_destination"
+equals = true
+
+[[expect]]
+field = "anytls.tun.replies_ok"
+equals = true
+
+[[expect]]
+field = "anytls.tun.one_stream_per_destination"
+equals = true
+
+[[expect]]
+field = "anytls.tun.udp_sent"
+equals = 4
+
+[[expect]]
+field = "anytls.tun.udp_unsupported"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.direct_forwarded"
+equals = 0
+
+[[expect]]
+field = "anytls.tproxy.replies_ok"
+equals = true
+
+[[expect]]
+field = "anytls.tproxy.one_stream_per_destination"
+equals = true

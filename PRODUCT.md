@@ -1156,6 +1156,46 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
 - **仍不做（后续项）**：IPv6 透明代理、Windows/macOS TPROXY、DoH/DoT、mesh 流量经 TPROXY
   重建 L3 包（mesh/virtual CIDR、TUN 网段、代理服务器地址自动排除，走 TUN/显式路径）。
 
+#### 11.18.1 代理 UDP：VLESS / AnyTLS 出站（requirement-change，2026-10-28） {#11-tun-proxy-udp}
+
+> MATRIX P7（产品级 UDP）在 N1 的第一步（ADR 0001：新能力只在 `nexusd` 演进）。此前 nexusd
+> 对 vless / anytls 出站的 UDP 一律 `Unsupported{NotWired}`（丢包 + 计数），而两协议的 UDP
+> 帧在 crate 级已与参照端互通（MATRIX `UdpEcho` PASS，`CrateDirect`）。
+
+- **范围**：nexusd TUN 与 TPROXY 两个前端中，经规则选中 `vless` / `anytls` 出站的 UDP 流
+  （两前端共用 `proxy_fwd::udp_relay::UdpForwarder`）。TLS Trojan、未接线的 Hysteria2 / VMess
+  不变：仍 `Unsupported`，丢包 + 计数 + 限频日志，绝不直连、不伪造回包。`nexus proxy`
+  （frozen）不涉及。
+- **承载**：每个（出站，UDP 目的地址）一条代理流，传输参数与该出站的 TCP 拨号相同：
+  - `vless`：VLESS 请求 `command = UDP (0x02)`、目标 = 目的地址、不带 flow（Vision 不用于
+    UDP）；读到响应头后，数据报按 u16 大端长度前缀成帧（crate `encode_udp_datagram`）。
+  - `anytls`：新 AnyTLS 会话上开一条 UoT v2 connect 模式 stream（魔法地址
+    `sp.v2.udp-over-tcp.arpa`，目标 = 目的地址；crate `client_open_uot_stream`），数据报按
+    u16 长度前缀成帧放入 PSH（crate `encode_uot_datagram`）。
+- **生命周期**：
+  - 目的地址的第一个数据报触发建流；建流在 dataplane 线程之外进行，不阻塞其他流。
+  - 建流期间到达的数据报按序排队，每个目的地址最多 64 个；超出的丢弃并计 `udp_send_failed`。
+  - 建流失败 → 已排队的数据报丢弃，每个计一次 `udp_send_failed`，并打一条限频日志；下一个
+    数据报重新建流，但与上次失败至少间隔 1 s，间隔内的数据报丢弃并计数。
+  - 空闲 60 s（既有 `UDP_FLOW_TIMEOUT`）关闭代理流并回收其读线程；对端关闭或出错同样关闭
+    回收，下一个数据报重新建流。
+  - 每个 forwarder 同时存在的代理流上限 1024（既有 `MAX_UDP_FLOWS`）；超出时新目的地址的
+    数据报丢弃并计 `udp_send_failed`。
+- **回包**：代理流读出的每个数据报作为来自该目的地址的回包写回（TUN：重构 IPv4/UDP 包，
+  源 = 目的地址；TPROXY：经 §11.18「UDP 回包源地址」以 `orig_dst` 发出）。
+- **计数**：写入代理流的数据报计 `udp_sent`；vless / anytls 不再计
+  `udp_unsupported{,_vless,_anytls}`（两字段保留，恒为 0）。
+- **不做**：XUDP / mux、UDP over Vision、FullCone 语义（每个目的地址独立一条流，不承诺共享
+  源端口）、Hysteria2 / Trojan UDP。
+- **E4 场景**：`scenarios/product/proxy_fwd_udp_vless_anytls.toml`（`carrier = "n1-fabric"`）——
+  本地 VLESS（明文）与 AnyTLS（TLS 自签）节点把 UDP 中继到两个本地 UDP echo：
+  - TUN 轮（MockTun + 生产 `Dataplane` / `ProxyEngine`）：每协议向两个目的地址各发 2 个数据报，
+    断言 4 个回包源地址与载荷正确、节点上每个目的地址恰好 1 条流、`udp_sent = 4`、
+    `udp_unsupported = 0`、无直连。
+  - TPROXY 轮（生产 `StreamProxyEgress`）：每协议 2 个数据报，经 `UdpReply` 回到同一 flow key。
+  - `product.proxy-fwd-udp-unsupported` 同步改为只覆盖 TLS Trojan（删除其 VLESS / AnyTLS 期望）。
+  - 旧实现两协议 UDP 全部丢弃 → FAIL（Red Evidence）。
+
 ### 11.19 HTTP/混合代理入站（HTTP & mixed proxy inbound，2026-09-25） {#11-http-mixed-inbound}
 
 §11.4 的 SOCKS5 入站是唯一显式代理入口，导致系统代理接管（§13 WinINET）后，浏览器 /
