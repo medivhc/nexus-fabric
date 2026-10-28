@@ -91,7 +91,8 @@ fn map_dns(err: DnsError) -> NexusError {
         | DnsError::LoopDetected(name)
         | DnsError::NegativeCached(name)
         | DnsError::InvalidQuery(name)
-        | DnsError::UnknownServer(name) => NexusError::DnsResolutionFailed { name },
+        | DnsError::UnknownServer(name)
+        | DnsError::NameNotFound(name) => NexusError::DnsResolutionFailed { name },
     }
 }
 

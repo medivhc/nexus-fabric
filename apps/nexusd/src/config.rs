@@ -1330,6 +1330,7 @@ pub fn parse_dns_toml(text: &str) -> Result<nexus_dns::DnsUnifiedConfig, String>
         mesh_suffix,
         fake_ip_ttl_secs,
         hosts,
+        ip_preference: nexus_dns::IpPreference::PreferV4,
     })
 }
 

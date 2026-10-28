@@ -26,7 +26,8 @@ pub mod wire;
 pub use mesh::StaticMeshResolver;
 pub use unified::{
     DEFAULT_FAKE_IP_RANGE, DEFAULT_FAKE_IP_TTL_SECS, DEFAULT_MESH_SUFFIX, DnsClass,
-    DnsUnifiedConfig, FakeIpPool, MeshNameResolver, ProxyClassifier, UnifiedAnswer, UnifiedDns,
+    DnsUnifiedConfig, FakeIpPool, MeshNameResolver, ProxyClassifier, ResolveStep, UnifiedAnswer,
+    UnifiedDns,
 };
 pub use wire::{
     DnsQuestion, DnsRcode, DnsWireError, UpstreamReply, WireRecord, build_answer, build_error,
@@ -90,6 +91,8 @@ pub enum DnsError {
     InvalidQuery(String),
     /// 多 server 路由（§11.5）：规则或兜底引用的 server tag 未定义。
     UnknownServer(String),
+    /// mesh 名未在静态表命中（R3；不向上游泄露内部名）。
+    NameNotFound(String),
 }
 
 impl std::fmt::Display for DnsError {
@@ -100,6 +103,7 @@ impl std::fmt::Display for DnsError {
             Self::NegativeCached(name) => write!(f, "dns query {name} is negative-cached"),
             Self::InvalidQuery(name) => write!(f, "invalid dns query: {name:?}"),
             Self::UnknownServer(tag) => write!(f, "dns server '{tag}' is not defined"),
+            Self::NameNotFound(name) => write!(f, "dns name '{name}' not found"),
         }
     }
 }

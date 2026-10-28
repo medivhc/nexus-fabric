@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
-use super::{DnsError, DnsQuery, DnsType, Resolver};
+use super::{DnsError, DnsQuery, DnsType, IpPreference, Resolver};
 
 /// Fake-IP 默认池：`198.18.0.0/15`（RFC 2544 benchmarking，与 Clash 兼容）。
 pub const DEFAULT_FAKE_IP_RANGE: &str = "198.18.0.0/15";
@@ -21,7 +21,7 @@ pub const DEFAULT_MESH_SUFFIX: &str = "mesh";
 pub const DEFAULT_FAKE_IP_TTL_SECS: u64 = 300;
 
 /// 统一 DNS 配置（对应 `dns.toml [dns]`）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsUnifiedConfig {
     /// 上游 DNS 地址（`dns.toml` 声明；由 Composition Root 读取并据此构造
     /// 注入 `UnifiedDns` 的上游 `Resolver`，本 struct 内不直接使用）。
@@ -38,6 +38,8 @@ pub struct DnsUnifiedConfig {
     pub fake_ip_ttl_secs: u64,
     /// 自定义 hosts：`(域名, IP)` 精确匹配，最高优先级。
     pub hosts: Vec<(String, IpAddr)>,
+    /// 地址族偏好（D-impl-5：仅门控 Upstream/Mesh/Hosts 的查询 qtype）。
+    pub ip_preference: IpPreference,
 }
 
 impl Default for DnsUnifiedConfig {
@@ -52,6 +54,7 @@ impl Default for DnsUnifiedConfig {
             mesh_suffix: DEFAULT_MESH_SUFFIX.to_string(),
             fake_ip_ttl_secs: DEFAULT_FAKE_IP_TTL_SECS,
             hosts: Vec::new(),
+            ip_preference: IpPreference::PreferV4,
         }
     }
 }
@@ -133,6 +136,18 @@ impl DnsClass {
             Self::Upstream => "Upstream",
         }
     }
+}
+
+/// 两阶段解析结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveStep {
+    /// 本地已有完整答案（含 NODATA 空答案）。
+    Local(UnifiedAnswer),
+    /// 需要上游解析；`class` 保留分类供计数/策略使用。
+    Upstream {
+        /// 命中的分类（FakeIp 关闭时也会走上游）。
+        class: DnsClass,
+    },
 }
 
 /// 统一应答。
@@ -376,21 +391,29 @@ impl UnifiedDns {
         DnsClass::Upstream
     }
 
-    /// 解析查询（`now_secs` 为调用方提供的单调秒数）。
+    /// 两阶段解析：本地可判定则返回 `Local`，否则交上游引擎。
+    ///
+    /// qtype 语义（D-impl-4，A/AAAA）：族不符 → `Local` NODATA；mesh 未知名
+    /// → `NameNotFound`（NXDOMAIN，不向上游泄露）；fake-ip 开启时代理类 AAAA
+    /// → NODATA 且不消耗地址。非 A/AAAA qtype 由服务面用 [`Self::classify`]
+    /// 短路（`DnsType` 不建模其它类型），语义见 MODULE。
     ///
     /// # Errors
     ///
     /// - 空名 → `InvalidQuery`；
-    /// - 未知 mesh 域名 → `ResolutionFailed`（不向公网泄露内部名）；
-    /// - fake-ip 池耗尽 → `ResolutionFailed`；
-    /// - 上游失败透传其 `DnsError`。
-    pub fn resolve(&mut self, query: &DnsQuery, now_secs: u64) -> Result<UnifiedAnswer, DnsError> {
+    /// - 未知 mesh 域名 → `NameNotFound`；
+    /// - fake-ip 池耗尽 → `ResolutionFailed`。
+    pub fn step(&mut self, query: &DnsQuery, now_secs: u64) -> Result<ResolveStep, DnsError> {
         if query.name.is_empty() {
             return Err(DnsError::InvalidQuery(query.name.clone()));
         }
         let name = query.name.to_lowercase();
-        match self.classify(&name) {
+        let class = self.classify(&name);
+        match class {
             DnsClass::Hosts => {
+                if self.preference_blocks(query.qtype) {
+                    return Ok(local_nodata(query, class));
+                }
                 let ip = self
                     .config
                     .hosts
@@ -398,48 +421,84 @@ impl UnifiedDns {
                     .find(|(h, _)| h.to_lowercase() == name)
                     .map(|(_, ip)| *ip)
                     .expect("classify returned Hosts so entry exists");
-                Ok(UnifiedAnswer {
+                if !matches_family(ip, query.qtype) {
+                    return Ok(local_nodata(query, class));
+                }
+                Ok(ResolveStep::Local(UnifiedAnswer {
                     name: query.name.clone(),
-                    class: DnsClass::Hosts,
+                    class,
                     records: vec![ip],
                     from_cache: false,
-                })
+                }))
             }
-            DnsClass::Mesh => match self.mesh.resolve_mesh(&name) {
-                Some(ip) => Ok(UnifiedAnswer {
-                    name: query.name.clone(),
-                    class: DnsClass::Mesh,
-                    records: vec![ip],
-                    from_cache: false,
-                }),
-                None => Err(DnsError::ResolutionFailed(format!(
-                    "unknown mesh name '{name}'"
-                ))),
-            },
+            DnsClass::Mesh => {
+                if self.preference_blocks(query.qtype) {
+                    return Ok(local_nodata(query, class));
+                }
+                match self.mesh.resolve_mesh(&name) {
+                    Some(ip) if matches_family(ip, query.qtype) => {
+                        Ok(ResolveStep::Local(UnifiedAnswer {
+                            name: query.name.clone(),
+                            class,
+                            records: vec![ip],
+                            from_cache: false,
+                        }))
+                    }
+                    // 名字存在但无该族记录 → NODATA。
+                    Some(_) => Ok(local_nodata(query, class)),
+                    None => Err(DnsError::NameNotFound(name)),
+                }
+            }
             DnsClass::FakeIp => {
                 if !self.config.fake_ip_enabled {
-                    return self.resolve_upstream(query, DnsClass::FakeIp);
+                    if self.preference_blocks(query.qtype) {
+                        return Ok(local_nodata(query, class));
+                    }
+                    return Ok(ResolveStep::Upstream { class });
                 }
                 if query.qtype == DnsType::Aaaa {
-                    // fake-ip 仅 IPv4；AAAA 返回空应答，不消耗地址。
-                    return Ok(UnifiedAnswer {
-                        name: query.name.clone(),
-                        class: DnsClass::FakeIp,
-                        records: Vec::new(),
-                        from_cache: false,
-                    });
+                    // fake-ip 仅 IPv4；AAAA 恒 NODATA，不消耗地址（AC8a）。
+                    return Ok(local_nodata(query, class));
                 }
                 let had = self.pool.lookup_ip_of(&name).is_some();
                 let ip = self.pool.allocate(&name, now_secs)?;
-                Ok(UnifiedAnswer {
+                Ok(ResolveStep::Local(UnifiedAnswer {
                     name: query.name.clone(),
-                    class: DnsClass::FakeIp,
+                    class,
                     records: vec![IpAddr::V4(ip)],
                     from_cache: had,
-                })
+                }))
             }
-            DnsClass::Upstream => self.resolve_upstream(query, DnsClass::Upstream),
+            DnsClass::Upstream => {
+                if self.preference_blocks(query.qtype) {
+                    return Ok(local_nodata(query, class));
+                }
+                Ok(ResolveStep::Upstream { class })
+            }
         }
+    }
+
+    /// 解析查询（C3 的兼容薄封装：`step` + 注入 upstream；C11 删除）。
+    ///
+    /// # Errors
+    ///
+    /// - 空名 → `InvalidQuery`；
+    /// - 未知 mesh 域名 → `NameNotFound`；
+    /// - fake-ip 池耗尽 → `ResolutionFailed`；
+    /// - 上游失败透传其 `DnsError`。
+    pub fn resolve(&mut self, query: &DnsQuery, now_secs: u64) -> Result<UnifiedAnswer, DnsError> {
+        match self.step(query, now_secs)? {
+            ResolveStep::Local(answer) => Ok(answer),
+            ResolveStep::Upstream { class } => self.resolve_upstream(query, class),
+        }
+    }
+
+    /// `v4_only`/`v6_only` 只门控 A/AAAA 查询（D-impl-5）。
+    fn preference_blocks(&self, qtype: DnsType) -> bool {
+        matches!(
+            (self.config.ip_preference, qtype),
+            (IpPreference::V4Only, DnsType::Aaaa) | (IpPreference::V6Only, DnsType::A)
+        )
     }
 
     fn resolve_upstream(
@@ -447,7 +506,7 @@ impl UnifiedDns {
         query: &DnsQuery,
         class: DnsClass,
     ) -> Result<UnifiedAnswer, DnsError> {
-        self.upstream_calls += 1;
+        self.note_upstream_answer();
         let records = self.upstream.resolve(query)?;
         Ok(UnifiedAnswer {
             name: query.name.clone(),
@@ -474,10 +533,37 @@ impl UnifiedDns {
         self.upstream_calls
     }
 
+    /// 记录一次上游应答（服务面在异步引擎回包时调用）。
+    pub fn note_upstream_answer(&mut self) {
+        self.upstream_calls += 1;
+    }
+
+    /// fake-ip 池容量（主机地址数，含网络/广播保留）。
+    #[must_use]
+    pub fn fake_ip_capacity(&self) -> u32 {
+        self.pool.capacity()
+    }
+
     /// fake-ip 池当前映射数。
     #[must_use]
     pub fn fake_ip_count(&self) -> usize {
         self.pool.len()
+    }
+}
+
+fn local_nodata(query: &DnsQuery, class: DnsClass) -> ResolveStep {
+    ResolveStep::Local(UnifiedAnswer {
+        name: query.name.clone(),
+        class,
+        records: Vec::new(),
+        from_cache: false,
+    })
+}
+
+fn matches_family(addr: IpAddr, qtype: DnsType) -> bool {
+    match qtype {
+        DnsType::A => addr.is_ipv4(),
+        DnsType::Aaaa => addr.is_ipv6(),
     }
 }
 
@@ -523,13 +609,9 @@ mod tests {
     const MESH_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 144, 144, 6));
     const UPSTREAM_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
 
-    fn unified() -> UnifiedDns {
+    fn unified_with(config: DnsUnifiedConfig) -> UnifiedDns {
         let mut mesh_map = HashMap::new();
         mesh_map.insert("xc-pc-linux.mesh".to_string(), MESH_IP);
-        let config = DnsUnifiedConfig {
-            hosts: vec![("local.dev".to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST))],
-            ..Default::default()
-        };
         UnifiedDns::new(
             config,
             Box::new(MapMesh { map: mesh_map }),
@@ -539,6 +621,13 @@ mod tests {
             Box::new(ConstUpstream(UPSTREAM_IP)),
         )
         .expect("config valid")
+    }
+
+    fn unified() -> UnifiedDns {
+        unified_with(DnsUnifiedConfig {
+            hosts: vec![("local.dev".to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST))],
+            ..Default::default()
+        })
     }
 
     fn a(name: &str) -> DnsQuery {
@@ -581,7 +670,7 @@ mod tests {
     fn unknown_mesh_name_does_not_leak_upstream() {
         let mut dns = unified();
         let err = dns.resolve(&a("ghost.mesh"), 1000).unwrap_err();
-        assert!(matches!(err, DnsError::ResolutionFailed(_)));
+        assert!(matches!(err, DnsError::NameNotFound(ref n) if n == "ghost.mesh"));
         assert_eq!(dns.upstream_call_count(), 0);
     }
 
@@ -727,5 +816,197 @@ mod tests {
         assert!(pool.contains(ip));
         let v = u32::from_be_bytes(ip.octets());
         assert_eq!(v & 0xFFFE_0000, 0xC612_0000);
+    }
+
+    fn aaaa(name: &str) -> DnsQuery {
+        DnsQuery {
+            name: name.to_string(),
+            qtype: DnsType::Aaaa,
+        }
+    }
+
+    #[test]
+    fn step_returns_local_for_hosts_and_mesh() {
+        let mut dns = unified();
+        match dns.step(&a("local.dev"), 1000).unwrap() {
+            ResolveStep::Local(ans) => {
+                assert_eq!(ans.class, DnsClass::Hosts);
+                assert_eq!(ans.records, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+            }
+            ResolveStep::Upstream { .. } => panic!("hosts must be local"),
+        }
+        match dns.step(&a("xc-pc-linux.mesh"), 1000).unwrap() {
+            ResolveStep::Local(ans) => {
+                assert_eq!(ans.class, DnsClass::Mesh);
+                assert_eq!(ans.records, vec![MESH_IP]);
+            }
+            ResolveStep::Upstream { .. } => panic!("mesh must be local"),
+        }
+        // step 本身不触发上游、不增加计数。
+        assert_eq!(dns.upstream_call_count(), 0);
+    }
+
+    #[test]
+    fn step_returns_upstream_for_bypass() {
+        let mut dns = unified();
+        match dns.step(&a("direct.example.org"), 1000).unwrap() {
+            ResolveStep::Upstream { class } => assert_eq!(class, DnsClass::Upstream),
+            ResolveStep::Local(_) => panic!("bypass must go upstream"),
+        }
+        assert_eq!(dns.upstream_call_count(), 0);
+    }
+
+    #[test]
+    fn step_unknown_mesh_is_name_not_found() {
+        let mut dns = unified();
+        let err = dns.step(&a("ghost.mesh"), 1000).unwrap_err();
+        assert!(matches!(err, DnsError::NameNotFound(ref n) if n == "ghost.mesh"));
+        assert_eq!(dns.upstream_call_count(), 0);
+    }
+
+    #[test]
+    fn hosts_family_mismatch_is_nodata() {
+        let mut dns = unified();
+        match dns.step(&aaaa("local.dev"), 1000).unwrap() {
+            ResolveStep::Local(ans) => {
+                assert_eq!(ans.class, DnsClass::Hosts);
+                assert!(ans.records.is_empty());
+            }
+            ResolveStep::Upstream { .. } => panic!("hosts must be local NODATA"),
+        }
+    }
+
+    #[test]
+    fn mesh_family_mismatch_is_nodata_not_error() {
+        let mut dns = unified();
+        match dns.step(&aaaa("xc-pc-linux.mesh"), 1000).unwrap() {
+            ResolveStep::Local(ans) => {
+                assert_eq!(ans.class, DnsClass::Mesh);
+                assert!(ans.records.is_empty());
+            }
+            ResolveStep::Upstream { .. } => panic!("mesh family mismatch must be local NODATA"),
+        }
+        assert_eq!(dns.upstream_call_count(), 0);
+    }
+
+    #[test]
+    fn fake_ip_aaaa_is_nodata_without_allocation_via_step() {
+        let mut dns = unified();
+        match dns.step(&aaaa("proxy.example.com"), 1000).unwrap() {
+            ResolveStep::Local(ans) => {
+                assert_eq!(ans.class, DnsClass::FakeIp);
+                assert!(ans.records.is_empty());
+            }
+            ResolveStep::Upstream { .. } => panic!("fake-ip AAAA must be local NODATA"),
+        }
+        assert_eq!(dns.fake_ip_count(), 0);
+    }
+
+    #[test]
+    fn ip_preference_v4_only_blocks_aaaa_but_not_fake_ip_a() {
+        let mut dns = unified_with(DnsUnifiedConfig {
+            hosts: vec![("local.dev".to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST))],
+            ip_preference: IpPreference::V4Only,
+            ..Default::default()
+        });
+        // Upstream / Mesh / Hosts 的 AAAA → NODATA。
+        for name in ["direct.example.org", "xc-pc-linux.mesh", "local.dev"] {
+            match dns.step(&aaaa(name), 1000).unwrap() {
+                ResolveStep::Local(ans) => {
+                    assert!(ans.records.is_empty(), "{name} should be NODATA");
+                }
+                ResolveStep::Upstream { .. } => panic!("{name} AAAA must be NODATA"),
+            }
+        }
+        // A 正常走上游。
+        assert!(matches!(
+            dns.step(&a("direct.example.org"), 1000).unwrap(),
+            ResolveStep::Upstream { .. }
+        ));
+        // proxied A 仍是 fake-ip（不受偏好影响）。
+        match dns.step(&a("proxy.example.com"), 1000).unwrap() {
+            ResolveStep::Local(ans) => {
+                assert_eq!(ans.class, DnsClass::FakeIp);
+                assert_eq!(ans.records.len(), 1);
+            }
+            ResolveStep::Upstream { .. } => panic!("fake-ip A must stay local"),
+        }
+        assert_eq!(dns.upstream_call_count(), 0);
+    }
+
+    #[test]
+    fn ip_preference_v6_only_blocks_a_but_not_fake_ip_a() {
+        let mut dns = unified_with(DnsUnifiedConfig {
+            hosts: vec![("local.dev".to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST))],
+            ip_preference: IpPreference::V6Only,
+            ..Default::default()
+        });
+        for name in ["direct.example.org", "xc-pc-linux.mesh", "local.dev"] {
+            match dns.step(&a(name), 1000).unwrap() {
+                ResolveStep::Local(ans) => {
+                    assert!(ans.records.is_empty(), "{name} A should be NODATA");
+                }
+                ResolveStep::Upstream { .. } => panic!("{name} A must be NODATA"),
+            }
+        }
+        assert!(matches!(
+            dns.step(&aaaa("direct.example.org"), 1000).unwrap(),
+            ResolveStep::Upstream { .. }
+        ));
+        // fake-ip 是内部 v4 机制，A 仍分配地址。
+        match dns.step(&a("proxy.example.com"), 1000).unwrap() {
+            ResolveStep::Local(ans) => assert_eq!(ans.records.len(), 1),
+            ResolveStep::Upstream { .. } => panic!("fake-ip A must stay local"),
+        }
+    }
+
+    #[test]
+    fn prefer_v4_and_prefer_v6_are_noop_for_both_families() {
+        for preference in [IpPreference::PreferV4, IpPreference::PreferV6] {
+            let mut dns = unified_with(DnsUnifiedConfig {
+                ip_preference: preference,
+                ..Default::default()
+            });
+            assert!(matches!(
+                dns.step(&a("direct.example.org"), 1000).unwrap(),
+                ResolveStep::Upstream { .. }
+            ));
+            assert!(matches!(
+                dns.step(&aaaa("direct.example.org"), 1000).unwrap(),
+                ResolveStep::Upstream { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn fake_ip_disabled_aaaa_goes_upstream() {
+        let mut dns = unified_with(DnsUnifiedConfig {
+            fake_ip_enabled: false,
+            ..Default::default()
+        });
+        match dns.step(&aaaa("proxy.example.com"), 1000).unwrap() {
+            ResolveStep::Upstream { class } => assert_eq!(class, DnsClass::FakeIp),
+            ResolveStep::Local(_) => panic!("disabled fake-ip must go upstream"),
+        }
+        let ans = dns.resolve(&aaaa("proxy.example.com"), 1000).unwrap();
+        assert_eq!(ans.class, DnsClass::FakeIp);
+        assert_eq!(ans.records, vec![UPSTREAM_IP]);
+        assert_eq!(dns.upstream_call_count(), 1);
+        assert_eq!(dns.fake_ip_count(), 0);
+    }
+
+    #[test]
+    fn fake_ip_capacity_exposed() {
+        let dns = unified();
+        assert_eq!(dns.fake_ip_capacity(), 131_072);
+    }
+
+    #[test]
+    fn resolve_wrapper_uses_step_then_upstream() {
+        let mut dns = unified();
+        let ans = dns.resolve(&a("direct.example.org"), 1000).unwrap();
+        assert_eq!(ans.class, DnsClass::Upstream);
+        assert_eq!(ans.records, vec![UPSTREAM_IP]);
+        assert_eq!(dns.upstream_call_count(), 1);
     }
 }
