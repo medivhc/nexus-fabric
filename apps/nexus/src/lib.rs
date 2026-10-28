@@ -5648,6 +5648,16 @@ fn trojan_tunnel_inner(
                     Some(Ok(n)) => {
                         up.enqueue(&cbuf[..n]);
                         progressed = true;
+                        // 守卫只针对「客户端尚未载荷」：客户端发出请求后，`HTTP/`
+                        // 是目标自己的应答（如明文 HTTP），不再判 fallback；已暂存
+                        // 的首包前缀按序交付。
+                        if late_guard {
+                            late_guard = false;
+                            if !late_probe.is_empty() {
+                                down.enqueue(&late_probe);
+                                late_probe.clear();
+                            }
+                        }
                     }
                     Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Some(Err(_)) => c_open = false,
