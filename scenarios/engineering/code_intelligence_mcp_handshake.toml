@@ -9,6 +9,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#10-mcp-integration"
 # "协议层错误走 JSON-RPC error，而不是伪装成 Nexus verdict"。
 # 诚实边界：这条场景证明的是"我们的 server 与我们的 client 互操作正确"；第三方 MCP 客户端
 # 在本仓库两个宿主上都不存在，与真实客户端的互操作**未经验证**（MODULE.md 已照此声明）。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

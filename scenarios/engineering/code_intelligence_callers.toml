@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteri
 
 # 锚点：fixtures/code-intel/src/transport.rs:64:8 = `pub fn dispatch_dyn`。
 # 调用点唯一：src/lib.rs 的 Scheduler::tick 内 `transport::dispatch_dyn(...)`。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"

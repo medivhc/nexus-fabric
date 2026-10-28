@@ -3,6 +3,7 @@ id = "product.daemon-real-host-flow"
 title = "真实 TCP 交付：host 服务端 AUTH 门控 + 真实帧流 + ECHO 业务往返"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 delivery = "real-transport"

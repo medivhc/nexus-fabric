@@ -3,6 +3,7 @@ id = "product.fabric-egress-domain"
 title = "域名规则：DNS 嗅探 → 域名命中 Egress{peer}，响应建缓存，后续包继承决策"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6.4"
+carrier = "n1-fabric"
 
 [given]
 topology = "two Projections (A + B) with MockTun, mock peer link (example binary)"

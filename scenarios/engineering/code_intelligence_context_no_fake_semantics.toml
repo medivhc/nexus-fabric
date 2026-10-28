@@ -7,6 +7,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#12-failure-semantics"
 # 把 provider 二进制指到一个不存在的路径，使"语义层挂了"成为确定事件。
 # 这条场景钉的是最容易被做坏的一点：实现者为了不让 context 失败，
 # 把语义查询的失败悄悄吞掉、或反过来把"查不到"写成"该模块没有实现"。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

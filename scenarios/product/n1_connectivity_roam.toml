@@ -3,6 +3,7 @@ id = "product.n1-connectivity-roam"
 title = "N1 装配漫游：VPI 子网内 TCP 传文件，中途改一端 underlay 地址不断流、CID 不变"
 evidence_strength = "E4"
 requirement = "v9 §1/§8/§10/§12 N1 Universal Connectivity；白皮书 §6；M1–M7"
+carrier = "n1-fabric"
 
 [given]
 topology = "xc-pc-linux 真机；example 内双节点，各自 unshare(CLONE_NEWNET) 隔离 netns；新 netns 第一件事拉起 lo（教训 os-assemble-lo-unshare），再建 TUN（LinuxTunAdapter/TunVpi）、配 VPI 子网 IP、加路由"

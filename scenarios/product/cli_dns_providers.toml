@@ -3,6 +3,7 @@ id = "product.cli-dns-providers"
 title = "nexus CLI thin-client：dns providers 无 daemon 路由 → 显式 UNSUPPORTED（--json）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "v9-connectivity"
 
 [given]
 domain_state = "dns providers ready (upstream addrs + exit rules + server routing)"

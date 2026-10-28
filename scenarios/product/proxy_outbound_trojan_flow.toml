@@ -3,6 +3,7 @@ id = "product.proxy-outbound-trojan-flow"
 title = "节点加密出站数据面：SOCKS5 会话经 Trojan(TLS) 隧道出站（loopback trojan 节点 + echo 目标）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: echo target + local trojan TLS node (rcgen self-signed) + nexus proxy (outbound=trojan-node) + raw SOCKS5 client"

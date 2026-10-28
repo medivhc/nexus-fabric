@@ -8,6 +8,7 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # 所以这里直接钉 PASS + results 非空（与 code_intelligence_symbol.toml 同一环境前提、同一口径），
 # 而不是给 verdict 一个 one_of 容忍区间：one_of 里放进 FAIL 等于放弃断言，
 # 排除 BLOCKED 又会在没有 rust-analyzer 的宿主上把环境问题报成性质红。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

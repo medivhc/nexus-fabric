@@ -3,6 +3,7 @@ id = "product.secure-state"
 title = "CLI 状态文件加密：--encrypt-state 加密落盘 + status 解密读回（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-secure-state"
+carrier = "v9-connectivity"
 
 [given]
 state_cidr = "10.99.0.0/24"

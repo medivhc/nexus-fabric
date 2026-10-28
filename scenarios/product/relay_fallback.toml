@@ -3,6 +3,7 @@ id = "product.relay-fallback"
 title = "NAT 打洞失败：RelayChannel 中继回退转发数据完成闭环"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 resource = "p2p-relay"

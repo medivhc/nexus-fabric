@@ -3,6 +3,7 @@ id = "product.peer-source-wiring"
 title = "生产 peer 源接线：发现 → 订阅 → 容量仲裁触发（daemon 装配，fake relay）"
 evidence_strength = "E4"
 requirement = "spec §7 AC16 / §4.2 / §4.4.2 / §4.5.1"
+carrier = "n1-fabric"
 
 [given]
 assembly = "nexus::network::build_session_manager_with_discovery：network.toml 只有 peer_id + [vpi]，[[peers]] 为空，mdns=None"

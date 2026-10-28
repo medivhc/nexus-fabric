@@ -3,6 +3,7 @@ id = "product.config-hot-reload-watch"
 title = "配置热加载真实文件轮询：临时文件修改驱动 revision 前进"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-config-hot-reload-real"
+carrier = "v9-connectivity"
 
 [given]
 watch_interval_ms = 50

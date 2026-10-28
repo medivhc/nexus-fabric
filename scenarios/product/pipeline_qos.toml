@@ -3,6 +3,7 @@ id = "product.pipeline-qos"
 title = "数据面管线：QoS 令牌桶在隧道出向真实生效（注入逻辑时钟确定性推进）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-dataplane-pipeline"
+carrier = "v9-connectivity"
 
 [given]
 egress_max_bytes_per_sec = 1000

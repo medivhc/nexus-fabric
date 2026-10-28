@@ -3,6 +3,7 @@ id = "engineering.bench-gate-verdicts"
 title = "nexus-harness bench 运行加密数据面性能基准并输出预算 verdict（P3.7）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-bench-gate"
+carrier = "engineering"
 
 [given]
 repository = "initialized"

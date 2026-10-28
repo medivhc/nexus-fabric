@@ -3,6 +3,7 @@ id = "product.proxy-tun-inbound"
 title = "TUN 透明入站：IPv4/TCP|UDP 包解析 -> FlowContext(vpi) -> 规则路由 -> FlowDecisionCache + 统一 RuleEngine（E4，MemoryVpi 离线）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "wintun/VPI 读原始 IP 包（E4 用 nexus-connectivity::MemoryVpi 注入，离线确定性）"

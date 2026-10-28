@@ -10,6 +10,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resou
 # 归一化后按组件比较，所以必须 QUERY_INVALID，且发生在 spawn 之前。
 # 解析后的真实目标：engineering/nexus-harness/fixtures/code-intel/src/../../../src/main.rs
 #   = engineering/nexus-harness/src/main.rs（存在，因此不是"文件不存在"这类失败）
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (不启动 language server)"

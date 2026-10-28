@@ -3,6 +3,7 @@ id = "product.unified-classifier"
 title = "统一包分类器：mesh/proxy/bypass 三路分类 + EWMA 选路 + FlowContext 生成"
 evidence_strength = "E4"
 requirement = "docs/DAEMON_ARCHITECTURE.md#12.5"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback; 纯内存包分类，无真实 TUN"

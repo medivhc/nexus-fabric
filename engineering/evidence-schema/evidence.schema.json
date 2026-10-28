@@ -117,6 +117,38 @@
         },
         "additionalProperties": false
       }
+    },
+    "carriers": {
+      "description": "Per-carrier scenario counts (only written when scenarios were executed).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "carrier_coverage": {
+      "description": "Scenario carrier declaration coverage (only written when scenarios were executed).",
+      "type": "object",
+      "required": [
+        "scenarios_total",
+        "declared",
+        "missing"
+      ],
+      "properties": {
+        "scenarios_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "declared": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missing": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

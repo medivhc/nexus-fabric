@@ -3,6 +3,7 @@ id = "product.proxy-fwd"
 title = "Proxy 生产转发：TUN 包经代理协议真实转发（P1-P5）"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "n1-fabric"
 
 [given]
 delivery = "real-proxy"

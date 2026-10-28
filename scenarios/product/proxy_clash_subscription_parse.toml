@@ -3,6 +3,7 @@ id = "product.proxy-clash-subscription-parse"
 title = "Clash 订阅 base64 解码后逐行解析 ss/vmess 节点，未知协议行显式拒绝"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 input = "fixed base64 subscription: 1 ss:// + 1 vmess:// + 1 trojan:// (unknown) line"

@@ -3,6 +3,7 @@ id = "engineering.code-intelligence-diagnostics-advisory"
 title = "diagnostics 输出结构化 DTO 且 authority 恒为 advisory，不产出 correctness PASS（提案 §7/§16.10）"
 evidence_strength = "E4"
 requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#7-compiler-truth-remains-separate"
+carrier = "engineering"
 
 [given]
 repository = "initialized"

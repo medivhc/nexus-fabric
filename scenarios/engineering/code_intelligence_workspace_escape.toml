@@ -10,6 +10,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resou
 # 现在 validate_scope 先做归一化的仓库归属判定，因此必须是 WORKSPACE_UNRESOLVED，
 # 且 provider 字段根本不出现（没起进程）。
 # 解析后的 workspace 根 = 仓库根的父目录（Windows: D:/next；Linux: $HOME），确在仓库外。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (不启动 language server)"

@@ -3,6 +3,7 @@ id = "product.plugin-dial-ss"
 title = "插件接入真实拨号：ss 出站配 xor 插件 dial，线字节被混淆且业务数据正确"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#7.3"
+carrier = "v9-connectivity"
 
 [given]
 topology = "自研 echo server（真机 127.0.0.1:0，扮演 plugin-aware ss 节点）；client 用 ss OutboundConfig{obfs=xor} 经 dial_with_obfs 拨号"

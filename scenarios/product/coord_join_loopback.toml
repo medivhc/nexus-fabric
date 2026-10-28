@@ -3,6 +3,7 @@ id = "product.coord-join-loopback"
 title = "协调全链路（E5）：loopback TCP 注册→领号→拉取→建连→互通"
 evidence_strength = "E5"
 requirement = "PRODUCT.md#12-coord"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.99.0.0/24"

@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#12-failure-semantics"
 
 # --provider-binary 指向必然不存在的可执行文件：验证失败路径是显式 BLOCKED，
 # 而不是 verdict=PASS + results=[]（后者会让 Agent 误以为"该符号无人引用"）。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"

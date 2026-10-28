@@ -3,6 +3,7 @@ id = "product.proxy-trojan-node-config"
 title = "Trojan 节点配置解析（两节点 + 缺 password 拒绝）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-trojan-node-config"
+carrier = "v9-connectivity"
 
 [given]
 topology = "offline pure YAML->typed structs parse; no network"

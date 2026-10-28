@@ -3,6 +3,7 @@ id = "product.tproxy-inbound-linux"
 title = "TPROXY Linux 前端：TCP/UDP 原始目的地、单 socket、回包源地址逻辑（E4，进程内）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example tproxy_inbound_e4 --json，进程内闭环，不依赖特权）：

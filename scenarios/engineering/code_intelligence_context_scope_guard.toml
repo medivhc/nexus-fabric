@@ -9,6 +9,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resou
 # 而是把"为什么不跑"写成可见状态 —— 因为从成员目录启动会把 47 个 crate 全灌进索引
 # （实测冷启动 30–90s 且 ready 常常不收敛），有界预算兜不住，
 # 与其给一份"少得看起来像结论"的锚点，不如明说这次没有语义证据。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

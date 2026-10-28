@@ -3,6 +3,7 @@ id = "product.tun-flow-sessions-auto"
 title = "流会话 auto 三态：首包链计数 / 无 provider / 显式禁用（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example tun_flow_sessions_auto --json）：真实注入 UDP/TCP 包。

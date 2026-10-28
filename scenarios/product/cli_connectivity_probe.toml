@@ -3,6 +3,7 @@ id = "product.cli-connectivity-probe"
 title = "nexus CLI thin-client：connectivity probe 无 daemon 路由 → 显式 UNSUPPORTED（--json）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "v9-connectivity"
 
 [given]
 domain_state = "link probe ready (in-memory LinkProbe, direct ok / relay mixed)"

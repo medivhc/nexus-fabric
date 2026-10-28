@@ -3,6 +3,7 @@ id = "product.config-hot-reload"
 title = "配置热加载：校验门控通过才推进 revision"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-config-hot-reload"
+carrier = "v9-connectivity"
 
 [given]
 watch_interval_ms = 1000

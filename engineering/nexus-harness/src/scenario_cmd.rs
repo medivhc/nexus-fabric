@@ -14,7 +14,10 @@
 //!（extras 在 envelope 字段之后插入，键冲突时覆盖）。
 
 use crate::commands;
+use crate::config::Config;
+use crate::env::Repo;
 use crate::evidence::{self, Bindings};
+use crate::evidence_index;
 use crate::scenario;
 use serde_json::{Value, json};
 
@@ -28,9 +31,11 @@ pub fn dispatch(args: &[String]) -> Outcome {
     match sub {
         "list" => list(),
         "run" => run_one(args.get(1).map(String::as_str).unwrap_or("")),
+        "index" => index(&args[1..]),
         _ => (
             "BLOCKED".to_string(),
-            "usage: nexus-harness scenario <list|run> [--json]; run needs a scenario id"
+            "usage: nexus-harness scenario <list|run|index> [--json]; run needs a scenario id; \
+             index needs --write or --check"
                 .to_string(),
             vec![("command".to_string(), json!("scenario"))],
         ),
@@ -42,7 +47,23 @@ fn list() -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let scenarios = scenario::load_all(&config.scenarios_dir, SCAN_SUBDIRS);
+    let (scenarios, load_errors) =
+        scenario::load_all_reporting(&config.scenarios_dir, SCAN_SUBDIRS);
+    if !load_errors.is_empty() {
+        // fail-closed：加载失败不能退化成「少几个场景的 PASS 列表」。
+        return (
+            "BLOCKED".to_string(),
+            format!(
+                "{} scenario file(s) failed to load:\n{}",
+                load_errors.len(),
+                load_errors.join("\n")
+            ),
+            vec![
+                ("command".to_string(), json!("scenario list")),
+                ("scenarios".to_string(), json!([])),
+            ],
+        );
+    }
     let arr: Vec<Value> = scenarios
         .iter()
         .map(|s| {
@@ -51,6 +72,7 @@ fn list() -> Outcome {
                 "subdir": s.subdir,
                 "summary": s.title,
                 "requires": scenario::scenario_requires(s),
+                "carrier": s.carrier.as_str(),
             })
         })
         .collect();
@@ -62,6 +84,119 @@ fn list() -> Outcome {
             ("scenarios".to_string(), json!(arr)),
         ],
     )
+}
+
+/// `scenario index --write|--check`：仓库内证据索引（P4）。
+///
+/// 与 `architecture_gate` 共用 `evidence_index::check`，单一实现。
+fn index(args: &[String]) -> Outcome {
+    let (repo, config) = match commands::setup() {
+        Ok(x) => x,
+        Err(o) => return o,
+    };
+    let want_write = args.iter().any(|a| a == "--write");
+    let want_check = args.iter().any(|a| a == "--check");
+    if want_write == want_check {
+        return (
+            "BLOCKED".to_string(),
+            "usage: nexus-harness scenario index <--write|--check> [--json]".to_string(),
+            vec![("command".to_string(), json!("scenario index"))],
+        );
+    }
+    if want_write {
+        write_index(&repo, &config)
+    } else {
+        check_index(&repo, &config)
+    }
+}
+
+fn index_outcome(verdict: &str, message: String, detail: String) -> Outcome {
+    (
+        verdict.to_string(),
+        message,
+        vec![
+            ("command".to_string(), json!("scenario index")),
+            ("path".to_string(), json!(evidence_index::INDEX_PATH)),
+            ("detail".to_string(), json!(detail)),
+        ],
+    )
+}
+
+fn write_index(repo: &Repo, config: &Config) -> Outcome {
+    let mut rows = match evidence_index::collect(config) {
+        Ok(rows) => rows,
+        Err(errors) => {
+            return index_outcome(
+                "FAIL",
+                format!("{} scenario/index error(s)", errors.len()),
+                errors.join("\n"),
+            );
+        }
+    };
+    let path = repo.root.join(evidence_index::INDEX_PATH);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => match evidence_index::parse(&text) {
+            Ok(rows) => Some(rows),
+            Err(errors) => {
+                return index_outcome(
+                    "FAIL",
+                    "existing index is malformed".to_string(),
+                    errors.join("\n"),
+                );
+            }
+        },
+        Err(_) => None,
+    };
+    // Q3：id 已存在且 carrier 未变 → 保留既有 first_revision（列名是「首次记录」，
+    // 每次刷新会让列名说谎并产生 338 行噪声）。
+    if let Some(existing) = existing {
+        for row in &mut rows {
+            if let Some(prev) = existing
+                .iter()
+                .find(|p| p.id == row.id && p.carrier == row.carrier)
+            {
+                row.first_revision = prev.first_revision.clone();
+            }
+        }
+    }
+    let latest = evidence_index::latest_revision(config);
+    let text = evidence_index::render(&rows, latest.as_deref());
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return index_outcome("FAIL", format!("mkdir failed: {e}"), String::new());
+        }
+    }
+    if let Err(e) = std::fs::write(&path, &text) {
+        return index_outcome("FAIL", format!("write failed: {e}"), String::new());
+    }
+    // 写盘后自跑 check（自证一致，不通过即报错）。
+    match evidence_index::check(repo, config) {
+        Ok(detail) => index_outcome(
+            "PASS",
+            format!(
+                "wrote {} rows (revision seed: {})",
+                rows.len(),
+                latest.as_deref().unwrap_or("unrecorded")
+            ),
+            detail,
+        ),
+        Err(errors) => index_outcome(
+            "FAIL",
+            "index written but self-check failed".to_string(),
+            errors.join("\n"),
+        ),
+    }
+}
+
+fn check_index(repo: &Repo, config: &Config) -> Outcome {
+    match evidence_index::check(repo, config) {
+        Ok(detail) => index_outcome("PASS", detail.clone(), detail),
+        Err(errors) => index_outcome(
+            "FAIL",
+            format!("{} index mismatch(es)", errors.len()),
+            errors.join("\n"),
+        ),
+    }
 }
 
 fn run_one(name: &str) -> Outcome {

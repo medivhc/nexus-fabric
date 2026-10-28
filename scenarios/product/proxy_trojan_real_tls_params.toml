@@ -3,6 +3,7 @@ id = "product.proxy-trojan-real-tls-params"
 title = "Trojan 真实 TLS 参数（skip-cert-verify + ALPN 协商 + 数据往返）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-trojan-real-tls"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: TLS server (ALPN list) + TLS client (skip-verify)"

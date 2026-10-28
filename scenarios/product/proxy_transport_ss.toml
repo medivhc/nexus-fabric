@@ -3,6 +3,7 @@ id = "product.proxy-transport-ss"
 title = "ProxyTransport：QUIC over Shadowsocks 会话（T1/T3/T4/T6）"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#3.5"
+carrier = "n1-fabric"
 
 [given]
 topology = "self-built minimal ss server (SsStream seal/open); A dials B via ss handshake; QUIC over AEAD-sealed length-prefixed TCP (T1)"

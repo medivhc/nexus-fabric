@@ -3,6 +3,7 @@ id = "product.proxy-ipcidr-rule-match"
 title = "目的为 IP literal 命中 IP-CIDR 规则 -> 走指定 relay 策略组"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "socks5 (reuse nexus-ingress Socks5Handshake)"

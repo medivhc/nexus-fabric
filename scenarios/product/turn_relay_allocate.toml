@@ -8,6 +8,7 @@ requirement = "PRODUCT.md#12-turn"
 # 编解码正确性与分配状态机：Allocate Request 构造 + XOR-RELAYED-ADDRESS 解析 +
 # MESSAGE-INTEGRITY（HMAC-SHA1）往返 + MockTurnTransport 驱动 401 挑战 -> 凭证重发 ->
 # Allocated。真实公网 TURN 服务器 Allocate 与中继数据转发 pump 冻结在 P3（E5 外部观察）。
+carrier = "v9-connectivity"
 
 [given]
 resource = "p2p-turn-relay"

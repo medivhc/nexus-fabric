@@ -3,6 +3,7 @@ id = "product.schedule-flow"
 title = "计划任务：at 到期触发一次、every 重排续触发、cancel 阻止、持久化重载"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#14-schedule"
+carrier = "v9-connectivity"
 
 [when]
 command = "cargo run --quiet -p nexus --example schedule_flow -- --json"

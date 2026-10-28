@@ -3,6 +3,7 @@ id = "product.multipath-quic-seq"
 title = "多路径序号源：fabric 层 datagram 序号 + 回绕感知重排"
 evidence_strength = "E4"
 requirement = "GAP-2"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback UDP, two FabricConn endpoints in one process (example binary)"

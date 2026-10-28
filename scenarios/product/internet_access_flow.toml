@@ -3,6 +3,7 @@ id = "product.internet-access-flow"
 title = "InternetAccess 从 Ingress 经 SessionManager/Policy/Planner 创建网络会话"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#network"
+carrier = "v9-connectivity"
 
 [given]
 ingress = "portable-flow-context"

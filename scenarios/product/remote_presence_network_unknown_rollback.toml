@@ -3,6 +3,7 @@ id = "product.remote-presence-network-unknown-rollback"
 title = "Node A 经网络发现协议查询未发布 Peer，返回 PeerUnknown 并结构化拒绝"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 requester = "node-a"

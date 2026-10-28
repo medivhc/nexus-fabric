@@ -3,6 +3,7 @@ id = "product.daemon-run-remote-service-flow"
 title = "nexus thin-client run service：进程内 SDK 执行远程服务闭环（诚实化）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 daemon = "nexusd"

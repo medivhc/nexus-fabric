@@ -3,6 +3,7 @@ id = "product.composition-root"
 title = "Composition Root 接线：N1/DNS/配置装配进 nexusd（E4）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#13"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example composition_root_wiring --json，进程内闭环，无需特权）：

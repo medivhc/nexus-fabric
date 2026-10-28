@@ -3,6 +3,7 @@ id = "product.identity-auto-exchange"
 title = "多节点身份密钥自动交换：首次 TOFU 学习 -> 二次验证 -> 身份替换拒绝"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-identity-auto-exchange"
+carrier = "v9-connectivity"
 
 [given]
 key_exchange = "X25519 mixed DH (static+ephemeral) + HKDF-SHA256"

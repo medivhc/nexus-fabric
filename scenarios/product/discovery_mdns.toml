@@ -3,6 +3,7 @@ id = "product.discovery-mdns"
 title = "mDNS 局域网互发现：双节点 PTR/SRV/TXT/A 完整往返"
 evidence_strength = "E4"
 requirement = "DESIGN.md#8.2"
+carrier = "v9-connectivity"
 
 [given]
 network = "同子网组播 224.0.0.251:5353；单进程双节点（SO_REUSEADDR），经 loopback 组播互发现"

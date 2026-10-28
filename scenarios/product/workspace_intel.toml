@@ -3,6 +3,7 @@ id = "product.workspace-intel"
 title = "Workspace Intelligence（v9 §21）：访问轨迹 → WorkingSet 预测 → Prefetch → 缺失对象走 Planner"
 evidence_strength = "E4"
 requirement = "v9 §21 Workspace Intelligence"
+carrier = "v9-connectivity"
 
 [given]
 description = "独立 crate nexus-workspace-intel（可丢失重建，与权威模型物理隔离）：AccessTrace 记访问轨迹；WorkspaceGraph = 静态 containment + 观测共现；WorkingSetEstimator 纯函数打分；PrefetchScheduler 只定预取什么/何时/并发/预算（不选 Provider/Path）；缺失 Object → ResourceDeliveryRequest → Core Planner 取回"

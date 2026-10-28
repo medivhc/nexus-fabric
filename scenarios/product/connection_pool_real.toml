@@ -3,6 +3,7 @@ id = "product.connection-pool-real"
 title = "连接池真实工厂：loopback echo TCP 复用 / 上限保护 / 句柄回收"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-connection-pool-real"
+carrier = "v9-connectivity"
 
 [given]
 pool = { max_idle = 2, max_total = 3, idle_timeout_ms = 100000 }

@@ -3,6 +3,7 @@ id = "product.workspace-sync-conflict-converge"
 title = "冲突收敛：先 resolve 者赢，双端最终单 head"
 evidence_strength = "E4"
 requirement = "v9 §18 + C2-D7（先 resolve 者赢；协议传播 resolution；conflict-state 交换帧；禁止双端各解各的）"
+carrier = "n1-fabric"
 
 [given]
 description = "A/B 离线各改同一文件 conflict.txt（分叉）；A sync B → 产生 ConflictObject（heads 不变）；A 和 B 同时 resolve（先后相差极小）；再双向 sync"
