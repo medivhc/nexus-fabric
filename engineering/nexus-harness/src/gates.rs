@@ -777,7 +777,7 @@ fn changed_member_names(
 
 /// Light architecture gate: every `crates/*` workspace member must be declared
 /// in policies/architecture.toml [[crate]] (apps/engineering are hosts/tooling).
-pub fn architecture_gate(config: &Config, _budget: GateBudget) -> Gate {
+pub fn architecture_gate(repo: &Repo, config: &Config, _budget: GateBudget) -> Gate {
     let policy = config.policies_dir.join("architecture.toml");
     let text = match std::fs::read_to_string(&policy) {
         Ok(t) => t,
@@ -814,19 +814,30 @@ pub fn architecture_gate(config: &Config, _budget: GateBudget) -> Gate {
         .filter(|name| !declared.iter().any(|d| d == name))
         .collect();
 
-    if missing.is_empty() {
-        Gate::ok(
-            "architecture-policy",
-            &format!("{} crates declared", declared.len()),
-        )
-    } else {
-        Gate::fail(
+    if !missing.is_empty() {
+        return Gate::fail(
             "architecture-policy",
             &format!(
                 "crates/ members missing from architecture.toml: {}",
                 missing.join(", ")
             ),
-        )
+        );
+    }
+    // 证据索引一致性（与 `scenario index --check` 共用 evidence_index::check；
+    // 进程内调用，不 shell-out —— 判定随本次构建的 source_revision 绑定）。
+    // 放在 policy 校验之后：policy 缺失/畸形的既有早退路径不变。
+    match crate::evidence_index::check(repo, config) {
+        Ok(detail) => Gate::ok(
+            "architecture-policy",
+            &format!(
+                "{} crates declared; evidence index: {detail}",
+                declared.len()
+            ),
+        ),
+        Err(errors) => Gate::fail(
+            "architecture-policy",
+            &format!("evidence index mismatch:\n{}", errors.join("\n")),
+        ),
     }
 }
 
@@ -3180,13 +3191,84 @@ mod tests {
             bind_working_tree_digest: true,
             verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
-        let g = architecture_gate(&cfg, GateBudget::unlimited());
+        let g = architecture_gate(&Repo { root: tmp.clone() }, &cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("read failed"), "{}", g.detail);
         std::fs::write(tmp.join("architecture.toml"), "not = = toml").unwrap();
-        let g = architecture_gate(&cfg, GateBudget::unlimited());
+        let g = architecture_gate(&Repo { root: tmp.clone() }, &cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("parse failed"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn arch_cfg(tmp: &std::path::Path) -> Config {
+        Config {
+            policies_dir: tmp.to_path_buf(),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.join("evidence"),
+            crates_dir: tmp.join("crates"),
+            engineering_dir: tmp.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
+        }
+    }
+
+    #[test]
+    fn architecture_gate_fails_on_index_drift() {
+        // policy 合法但索引与场景集不一致（索引里有未知 id）→ FAIL。
+        let tmp = std::env::temp_dir().join(format!("harness-arch-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("docs")).unwrap();
+        std::fs::write(tmp.join("architecture.toml"), "[crate]\n").unwrap();
+        let mut rows = vec![crate::evidence_index::Row {
+            id: "product.ghost".to_string(),
+            carrier: crate::scenario::Carrier::V9Connectivity,
+            command_carrier: "cargo -p nexus".to_string(),
+            requirement: None,
+            first_revision: None,
+        }];
+        rows[0].first_revision = Some("unrecorded".to_string());
+        std::fs::write(
+            tmp.join(crate::evidence_index::INDEX_PATH),
+            crate::evidence_index::render(&rows, None),
+        )
+        .unwrap();
+        let g = architecture_gate(
+            &Repo { root: tmp.clone() },
+            &arch_cfg(&tmp),
+            GateBudget::unlimited(),
+        );
+        assert_eq!(g.verdict, "FAIL", "{}", g.detail);
+        assert!(g.detail.contains("evidence index mismatch"), "{}", g.detail);
+        assert!(g.detail.contains("product.ghost"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn architecture_gate_passes_on_clean_index() {
+        // policy 合法 + 零场景 + 空索引 → PASS（detail 附索引摘要）。
+        let tmp = std::env::temp_dir().join(format!("harness-arch-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("docs")).unwrap();
+        std::fs::write(tmp.join("architecture.toml"), "[crate]\n").unwrap();
+        std::fs::write(
+            tmp.join(crate::evidence_index::INDEX_PATH),
+            crate::evidence_index::render(&[], None),
+        )
+        .unwrap();
+        let g = architecture_gate(
+            &Repo { root: tmp.clone() },
+            &arch_cfg(&tmp),
+            GateBudget::unlimited(),
+        );
+        assert_eq!(g.verdict, "PASS", "{}", g.detail);
+        assert!(
+            g.detail.contains("evidence index: 0 rows, 0 carriers"),
+            "{}",
+            g.detail
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
