@@ -196,6 +196,7 @@
 | product.n3-submit | n1-fabric | cargo -p nexusd | PRODUCT.md#17-n3-task | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.n3-timeout | n1-fabric | cargo -p nexusd | PRODUCT.md#17-n3-task | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.n3-unsupported-isolation | n1-fabric | cargo -p nexusd | PRODUCT.md#17-n3-task | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.nexusd-trojan-credential-probe | n1-fabric | cargo -p nexusd | PRODUCT.md#11-trojan-credential-probe | unrecorded |
 | product.node-disjoint | v9-connectivity | cargo -p nexus | PRODUCT.md#12.55-node-disjoint | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.node-priority | v9-connectivity | cargo -p nexus | PRODUCT.md#12-node-priority | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.node-tags | v9-connectivity | cargo -p nexus | PRODUCT.md#12-node-tags | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |

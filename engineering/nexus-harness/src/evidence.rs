@@ -1048,8 +1048,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// AC-14 的 P4 期内 fast 代理：用真实仓库 338 场景构造结果，验证
-    /// `carrier_coverage` 为 338/338/0、五值求和 == 338、gates carrier ∈ 闭集。
+    /// AC-14 的 P4 期内 fast 代理：用真实仓库 339 场景构造结果，验证
+    /// `carrier_coverage` 为 339/339/0、五值求和 == 339、gates carrier ∈ 闭集。
     #[test]
     fn evidence_header_carrier_coverage_matches_repo_scenarios() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
@@ -1058,7 +1058,7 @@ mod tests {
             &base.scenarios_dir,
             &["product", "engineering", "platform", "regression"],
         );
-        assert_eq!(loaded.len(), 338, "repository scenario count");
+        assert_eq!(loaded.len(), 339, "repository scenario count");
         let scenarios: Vec<ScenarioResult> = loaded
             .iter()
             .map(|s| carrier_result(&s.id, s.carrier))
@@ -1089,10 +1089,10 @@ mod tests {
                 .unwrap();
         assert_eq!(
             summary["carrier_coverage"],
-            json!({"scenarios_total": 338, "declared": 338, "missing": 0})
+            json!({"scenarios_total": 339, "declared": 339, "missing": 0})
         );
         assert_eq!(summary["carriers"]["v9-connectivity"], json!(191));
-        assert_eq!(summary["carriers"]["n1-fabric"], json!(109));
+        assert_eq!(summary["carriers"]["n1-fabric"], json!(110));
         assert_eq!(summary["carriers"]["shared-leaf"], json!(1));
         assert_eq!(summary["carriers"]["engineering"], json!(29));
         assert_eq!(summary["carriers"]["external"], json!(8));
@@ -1102,7 +1102,7 @@ mod tests {
             .values()
             .map(|v| v.as_u64().unwrap())
             .sum();
-        assert_eq!(sum, 338, "five carrier values must sum to 338");
+        assert_eq!(sum, 339, "five carrier values must sum to 339");
 
         let checks: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("gates.json")).unwrap())

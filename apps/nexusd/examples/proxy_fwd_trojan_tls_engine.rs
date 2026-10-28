@@ -185,32 +185,38 @@ fn run() -> serde_json::Value {
         node_listener
             .set_nonblocking(true)
             .map_err(|e| e.to_string())?;
-        let mut accepted = None;
-        for _ in 0..50 {
-            match node_listener.accept() {
-                Ok((stream, _)) => {
-                    accepted = Some(stream);
-                    break;
+        // §11.9.5：nexusd 先发凭据探测连接（目标为保留域）；真实节点解析失败即关闭，
+        // 这里同样关闭并继续等流连接。
+        let (mut tcp, mut conn, header) = loop {
+            let mut accepted = None;
+            for _ in 0..50 {
+                match node_listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted = Some(stream);
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => return Err(format!("trojan node accept: {e}")),
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => return Err(format!("trojan node accept: {e}")),
             }
-        }
-        let mut tcp = accepted.ok_or("no trojan node connection within window")?;
-        tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| e.to_string())?;
-        tcp.set_write_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| e.to_string())?;
+            let mut tcp = accepted.ok_or("no trojan node connection within window")?;
+            tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
+            tcp.set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| e.to_string())?;
+            tcp.set_write_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| e.to_string())?;
+            let mut conn = rustls::ServerConnection::new(Arc::clone(&srv_cfg))
+                .map_err(|e| format!("tls server conn: {e}"))?;
+            let header = read_trojan_header(&mut rustls::Stream::new(&mut conn, &mut tcp))?;
+            let target = parse_request(PASSWORD, &header).map_err(|e| format!("{e:?}"))?;
+            if target.host_label() != "credential-probe.nexus.invalid" {
+                break (tcp, conn, header);
+            }
+        };
         connected_clone.store(true, Ordering::SeqCst);
-
-        let mut conn = rustls::ServerConnection::new(Arc::clone(&srv_cfg))
-            .map_err(|e| format!("tls server conn: {e}"))?;
         let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
-
-        let header = read_trojan_header(&mut tls)?;
         let target = parse_request(PASSWORD, &header).map_err(|e| format!("{e:?}"))?;
         let target_ip: Ipv4Addr = target
             .host_label()

@@ -122,7 +122,10 @@
     可选 `alpn: Vec<String>`、`skip_cert_verify: bool`、`header_format: "standard"|"singbox"`
     （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`；
     可选 `fallback_guard: Option<String>`（`"strict"`|`"signature"`）与
-    `ready_window_ms: Option<u64>`（`0..=5000`），校验语义见上节。
+    `ready_window_ms: Option<u64>`（`0..=5000`），校验语义见上节；可选
+    `credential_probe: Option<bool>`（PRODUCT §11.9.5，只由 nexusd 消费，缺省视为 `true`；
+    presence-aware：非布尔 → `CONFIG_INVALID [outbounds[<tag>].credential_probe]`，非 trojan
+    出站上合法值忽略、非法值硬失败）。
   - 混淆插件（§7.3，二期）：任意 TCP 出站（ss/trojan）可选 `obfs: String`（插件名，
     如 `"xor"`；缺省/空 = plain 直通）与 `obfs_key: String`（插件参数 key，如 xor 的
     key 材料）；`obfs` 指向未知插件名 → dial 时直接失败（硬校验，不静默回退明文）。
