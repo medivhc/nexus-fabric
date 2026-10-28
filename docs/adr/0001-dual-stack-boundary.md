@@ -64,7 +64,7 @@
 |---|---|---|---|---|---|
 | ① | `NatType` / `StunMapping` | `nexus-connectivity::nat` | `nexus-domain::nat` | P1 | 已迁（`nexus-connectivity` 以 `pub use` 保旧路径） |
 | ② | `OutboundAdapter` / `OutboundHandoff` | `nexus-connectivity` | `nexus-proxy-config::outbound_seam` | P2 | **已落地**（2026-10-28）：条件生效已解除，见 run dual-stack-convergence P2 与 MSR-dualstack-p2-gate-verified-20261028 |
-| ③ | CAKE + 令牌桶 | `nexus-connectivity::{cake,qos,bandwidth_policy}` | 新叶子 crate `nexus-qos` | P3 | planned（进入条件：P1/P1′ 已合入 master） |
+| ③ | CAKE + 令牌桶 | `nexus-connectivity::{cake,qos}` | 新叶子 crate `nexus-qos` | P3 | **已落地**（2026-10-28，P3）：`cake` 定义整体下沉，`qos` 仅以 `pub use` 消费；`bandwidth_policy` 无 qos 依赖，不属本接缝 |
 | ④ | `LinkMarker` / `LinkMarkerStore` / `LinkReconcileReport` / `reconcile_link_markers` | `nexus-connectivity` | `nexus-session::link_marker` | P1′ | 已迁（`links.json` 字节格式不变） |
 
 ## 共享叶判据
@@ -83,7 +83,7 @@
 | `nexus-domain` | NAT 词汇（`nat::NatType` / `StunMapping`）、`ConnectivityEvaluation` DTO、核心领域类型 |
 | `nexus-proxy-config` | 出站身份 / 交接词汇（`OutboundKind`；② 的目标落点） |
 | `nexus-session` | durable record（`SessionRecord`、`link_marker::*`） |
-| `nexus-qos` | 包调度与令牌桶（P3 落地） |
+| `nexus-qos` | 包调度与令牌桶（已落地 P3） |
 
 ## 被取代的旧口径清单
 
@@ -113,8 +113,10 @@
 - **传递残差（登记，不判）**：`nexusd → nexus → nexus-connectivity`（`nexusd` 直接依赖
   `nexus`，而 `nexus` 是 v9 命令面本体）；P2 未落地前 `nexusd → nexus-outbound-* →
   nexus-connectivity` 亦为传递路径。二者都不属于"直接边"判据。
-- **`nexus-qos` 未落地**：ADR 中 ③ 与"共享叶清单"里 `nexus-qos` 条目为 `planned`；
-  在 P3 落地前不得引用其 API。
+- **`nexus-qos` 已落地（P3，2026-10-28）**：CAKE 调度器与令牌桶三类型定义已在叶子
+  crate；`nexus-connectivity` 以 `pub use` 重导出保持旧路径兼容。`QosController`
+  （含 `QosClock` / `MonotonicClock` / `QosConfig` / 统计快照）仍在 connectivity，
+  不随本接缝下沉（归期见冻结件 §6 #13）。
 - **P1′ 的 breaking 变更**：`LinkMarker` / `LinkMarkerStore` / `LinkReconcileReport` /
   `reconcile_link_markers` 4 个公开项从 `nexus-connectivity` **删除**（不是保留别名）。
   这与 P1（`NatType` / `StunMapping` 以 `pub use` 保旧路径）的不对称是**有意**的：
