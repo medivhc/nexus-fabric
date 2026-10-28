@@ -22,11 +22,3 @@
 {"ts":1793099334549,"op":"apply_dry_run","ifname":"lo","result":"ok"}
 {"ts":1793099334549,"op":"cleanup_start","ifname":"lo"}
 {"ts":1793099334549,"op":"cleanup_done","ifname":"lo","addrs_removed":"0","routes_removed":"0"}
-{"ts":1793163804378,"op":"apply_start","ifname":"lo","tun_ip":"10.99.0.1","dry_run":"true"}
-{"ts":1793163804378,"op":"apply_dry_run","ifname":"lo","result":"ok"}
-{"ts":1793163804378,"op":"cleanup_start","ifname":"lo"}
-{"ts":1793163804378,"op":"cleanup_done","ifname":"lo","addrs_removed":"0","routes_removed":"0"}
-{"ts":1793163809754,"op":"apply_start","ifname":"lo","tun_ip":"10.99.0.1","dry_run":"true"}
-{"ts":1793163809754,"op":"apply_dry_run","ifname":"lo","result":"ok"}
-{"ts":1793163809754,"op":"cleanup_start","ifname":"lo"}
-{"ts":1793163809754,"op":"cleanup_done","ifname":"lo","addrs_removed":"0","routes_removed":"0"}
