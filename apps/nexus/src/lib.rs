@@ -21,6 +21,18 @@ mod trojan_guard;
 /// 非阻塞中继写状态机（relay pump 共享；crate 私有，不扩大 public surface）。
 mod pending_write;
 
+/// 出站 UDP 抽象（spec §4.6；C2 只建类型/会话，C4 接 `proxy_serve_once`）。
+#[allow(dead_code)] // C4 接线前无生产调用方（plan §3.2 C2 阶段）。
+mod udp_outbound;
+
+/// VLESS over TCP 的 UDP 会话（spec §4.1）。
+#[allow(dead_code)] // C4 接线前无生产调用方（plan §3.2 C2 阶段）。
+mod udp_session_vless;
+
+/// AnyTLS UoT 会话（spec §4.2）。
+#[allow(dead_code)] // C4 接线前无生产调用方（plan §3.2 C2 阶段）。
+mod udp_session_anytls;
+
 /// Linux durable Artifact receiver shared by the CLI and daemon composition roots.
 #[cfg(target_os = "linux")]
 pub mod artifact_download;
