@@ -40,7 +40,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-connectivity"
-allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement", "nexus-proxy-config"]
+allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement", "nexus-proxy-config", "nexus-qos"]
 portable = false
 layer = "delivery"
 
@@ -53,6 +53,12 @@ layer = "portable-core"
 [[crate]]
 name = "nexus-proxy-config"
 allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-qos"
+allowed_internal_dependencies = []
 portable = true
 layer = "portable-core"
 
@@ -226,7 +232,7 @@ layer = "outbound"
 
 [[crate]]
 name = "nexus-harness"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-dns", "nexus-domain", "nexus-platform", "nexus-projection"]
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-dns", "nexus-domain", "nexus-platform", "nexus-projection", "nexus-qos"]
 portable = false
 layer = "engineering"
 

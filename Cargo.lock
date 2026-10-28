@@ -1557,6 +1557,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-qos"
+version = "0.1.0"
+
+[[package]]
 name = "nexus-registry"
 version = "0.1.0"
 dependencies = [
