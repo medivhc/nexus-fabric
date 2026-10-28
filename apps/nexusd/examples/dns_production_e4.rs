@@ -77,11 +77,28 @@ struct Dnsmasq {
 
 impl Dnsmasq {
     fn start(tag: &str) -> Result<Self, String> {
+        // 端口探测（bind :0 → 释放）到 dnsmasq 实际 bind 之间存在窗口期；
+        // 并行跑 scenario 时偶发被其他进程抢占，表现为 readiness 超时。
+        // 重试换端口，避免把环境竞态记成 upstream 失败证据。
+        let mut last = String::new();
+        for attempt in 0..3 {
+            match Self::try_start(tag, attempt) {
+                Ok(started) => return Ok(started),
+                Err(e) => {
+                    last = e;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        Err(last)
+    }
+
+    fn try_start(tag: &str, attempt: u32) -> Result<Self, String> {
         let port = free_udp_port()?;
-        let dir = TempDir::new(&format!("dnsmasq-{tag}"));
+        let dir = TempDir::new(&format!("dnsmasq-{tag}-{attempt}"));
         let log = dir.0.join("dnsmasq.log");
         let stderr = File::create(&log).map_err(|e| format!("dnsmasq log: {e}"))?;
-        let child = Command::new("/usr/sbin/dnsmasq")
+        let mut child = Command::new("/usr/sbin/dnsmasq")
             .args([
                 "--no-daemon",
                 &format!("--port={port}"),
@@ -100,7 +117,15 @@ impl Dnsmasq {
             .stderr(Stdio::from(stderr))
             .spawn()
             .map_err(|e| format!("spawn dnsmasq: {e}"))?;
-        wait_dnsmasq(port)?;
+        if let Err(e) = wait_dnsmasq(port) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            return Err(format!(
+                "{e} (attempt {attempt}, port {port}, stderr: {})",
+                log_text.trim()
+            ));
+        }
         Ok(Self {
             child,
             log,
