@@ -20,10 +20,15 @@ use std::net::IpAddr;
 use nexus_domain::NetworkPlanExtension;
 
 pub mod unified;
+pub mod wire;
 
 pub use unified::{
     DEFAULT_FAKE_IP_RANGE, DEFAULT_FAKE_IP_TTL_SECS, DEFAULT_MESH_SUFFIX, DnsClass,
     DnsUnifiedConfig, FakeIpPool, MeshNameResolver, ProxyClassifier, UnifiedAnswer, UnifiedDns,
+};
+pub use wire::{
+    DnsQuestion, DnsRcode, DnsWireError, UpstreamReply, WireRecord, build_answer, build_error,
+    build_query, parse_question, parse_response, patch_id,
 };
 
 // ---------- 查询 / 记录 ----------
