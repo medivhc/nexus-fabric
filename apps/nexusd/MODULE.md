@@ -44,7 +44,8 @@
 - 通过“便利”依赖绕过公开领域边界。
 - `nexus-connectivity`（v9 CLI 产品线运行时，frozen）：
   接缝 ①（NAT 词汇）/ ②（出站交接词汇）/ ③（CAKE）/ ④（LinkMarker）
-  **均已清零**，本 crate 无任何直接依赖边与源码引用；跨栈共享词汇见
+  **均已清零**，本 crate 无任何直接依赖边与源码引用，且**无反向依赖例外**
+  （不设临时放行、不设 allow 条目）；跨栈共享词汇见
   `nexus-domain` / `nexus-proxy-config` / `nexus-qos` / `nexus-session`。
   见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
