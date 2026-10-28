@@ -3102,7 +3102,7 @@ mod tests {
             214,
             "210 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 209);
+        assert_eq!(examples.len(), 210);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(
