@@ -52,6 +52,7 @@
 | product.bandwidth-qos | v9-connectivity | nexus-harness run | PRODUCT.md#12-bandwidth-qos | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.boost-v1 | n1-fabric | cargo -p nexus-projection | docs/DAEMON_ARCHITECTURE.md#12 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.bootstrap-join | v9-connectivity | cargo -p nexus-harness | PRODUCT.md#bootstrap-join | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.cac1-proxy-v6-echo | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.certificate-manager | v9-connectivity | cargo -p nexus | PRODUCT.md#12-certificate-manager | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.cli-compute-jobs | v9-connectivity | cargo -p nexus | PRODUCT.md#9-observability | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.cli-connectivity-candidates | v9-connectivity | cargo -p nexus | PRODUCT.md#9-observability | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
