@@ -126,7 +126,7 @@ pub struct UpstreamServerSnapshot {
 }
 
 /// UDP/TCP I/O seam. Production uses [`RealTransport`]; tests script it.
-trait UpstreamTransport {
+trait UpstreamTransport: Send {
     fn bind_udp(&mut self, server: SocketAddr) -> std::io::Result<u64>;
     fn send_udp(&mut self, sock: u64, wire: &[u8], server: SocketAddr) -> std::io::Result<()>;
     fn recv_udp(&mut self, sock: u64) -> std::io::Result<Option<(SocketAddr, Vec<u8>)>>;
@@ -936,10 +936,9 @@ fn encode_name(name: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use nexus_dns::wire::WireRecord;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone)]
     enum Script {
@@ -1044,17 +1043,17 @@ mod tests {
         }
     }
 
-    struct SharedFake(Rc<RefCell<FakeTransport>>);
+    struct SharedFake(Arc<Mutex<FakeTransport>>);
 
     impl UpstreamTransport for SharedFake {
         fn bind_udp(&mut self, _server: SocketAddr) -> std::io::Result<u64> {
-            let mut fake = self.0.borrow_mut();
+            let mut fake = self.0.lock().expect("fake transport lock");
             fake.next += 1;
             Ok(fake.next)
         }
 
         fn send_udp(&mut self, sock: u64, wire: &[u8], server: SocketAddr) -> std::io::Result<()> {
-            let mut fake = self.0.borrow_mut();
+            let mut fake = self.0.lock().expect("fake transport lock");
             fake.sent.push((sock, server, wire.to_vec()));
             let script = fake.script.pop_front().unwrap_or(Script::Silent);
             let packets = fake.produce(&script, wire, server);
@@ -1065,13 +1064,8 @@ mod tests {
         }
 
         fn recv_udp(&mut self, sock: u64) -> std::io::Result<Option<(SocketAddr, Vec<u8>)>> {
-            Ok(self
-                .0
-                .borrow_mut()
-                .inbox
-                .entry(sock)
-                .or_default()
-                .pop_front())
+            let mut fake = self.0.lock().expect("fake transport lock");
+            Ok(fake.inbox.entry(sock).or_default().pop_front())
         }
 
         fn close_udp(&mut self, _sock: u64) {}
@@ -1082,7 +1076,7 @@ mod tests {
             wire: &[u8],
             timeout: Duration,
         ) -> std::io::Result<Vec<u8>> {
-            let mut fake = self.0.borrow_mut();
+            let mut fake = self.0.lock().expect("fake transport lock");
             fake.tcp_waits.push(timeout);
             if fake.tcp_error {
                 return Err(std::io::Error::new(
@@ -1119,10 +1113,10 @@ mod tests {
     fn build(
         ports: &[u16],
         tweak: impl FnOnce(&mut UpstreamConfig),
-    ) -> (UpstreamEngine, Rc<RefCell<FakeTransport>>) {
+    ) -> (UpstreamEngine, Arc<Mutex<FakeTransport>>) {
         let mut cfg = default_cfg(ports.iter().map(|p| addr(*p)).collect());
         tweak(&mut cfg);
-        let fake = Rc::new(RefCell::new(FakeTransport::default()));
+        let fake = Arc::new(Mutex::new(FakeTransport::default()));
         let engine = UpstreamEngine::with_transport(cfg, Box::new(SharedFake(fake.clone())))
             .expect("engine builds");
         (engine, fake)
@@ -1150,8 +1144,9 @@ mod tests {
         }
     }
 
-    fn sent_to(fake: &Rc<RefCell<FakeTransport>>) -> Vec<SocketAddr> {
-        fake.borrow()
+    fn sent_to(fake: &Arc<Mutex<FakeTransport>>) -> Vec<SocketAddr> {
+        fake.lock()
+            .expect("fake transport lock")
             .sent
             .iter()
             .map(|(_, server, _)| *server)
@@ -1186,7 +1181,7 @@ mod tests {
         let mut out = Vec::new();
         engine.poll(t0 + Duration::from_millis(499), &mut out);
         assert!(out.is_empty());
-        assert_eq!(fake.borrow().sent.len(), 1);
+        assert_eq!(fake.lock().expect("fake transport lock").sent.len(), 1);
 
         engine.poll(t0 + Duration::from_millis(500), &mut out);
         assert_eq!(sent_to(&fake), vec![addr(5301), addr(5301)]);
@@ -1215,24 +1210,27 @@ mod tests {
     #[test]
     fn r2_rejects_wrong_source_txid_and_question_then_accepts() {
         let (mut engine, fake) = build(&[5301], |cfg| cfg.attempt_timeout_ms = 5000);
-        fake.borrow_mut().script.push_back(Script::Burst(vec![
-            Script::WrongSource {
-                rcode: DnsRcode::NoError,
-                records: vec![(A, v4("1.2.3.4"))],
-                ttl: 60,
-            },
-            Script::MismatchedTxid {
-                rcode: DnsRcode::NoError,
-                records: vec![(A, v4("1.2.3.4"))],
-                ttl: 60,
-            },
-            Script::MismatchedQuestion,
-            Script::Answer {
-                rcode: DnsRcode::NoError,
-                records: vec![(A, v4("5.6.7.8"))],
-                ttl: 60,
-            },
-        ]));
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Burst(vec![
+                Script::WrongSource {
+                    rcode: DnsRcode::NoError,
+                    records: vec![(A, v4("1.2.3.4"))],
+                    ttl: 60,
+                },
+                Script::MismatchedTxid {
+                    rcode: DnsRcode::NoError,
+                    records: vec![(A, v4("1.2.3.4"))],
+                    ttl: 60,
+                },
+                Script::MismatchedQuestion,
+                Script::Answer {
+                    rcode: DnsRcode::NoError,
+                    records: vec![(A, v4("5.6.7.8"))],
+                    ttl: 60,
+                },
+            ]));
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("r2.example", A), t0)
@@ -1255,15 +1253,22 @@ mod tests {
             cfg.tcp_timeout_ms = 2000;
             cfg.total_budget_ms = 4000;
         });
-        fake.borrow_mut().script.push_back(Script::Truncated);
-        fake.borrow_mut().tcp_answer = Some((DnsRcode::NoError, vec![(A, v4("1.2.3.4"))], 60));
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Truncated);
+        fake.lock().expect("fake transport lock").tcp_answer =
+            Some((DnsRcode::NoError, vec![(A, v4("1.2.3.4"))], 60));
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("tc.example", A), t0)
             .expect("submit");
         let mut out = Vec::new();
         engine.poll(t0 + Duration::from_millis(100), &mut out);
-        assert_eq!(fake.borrow().tcp_waits, vec![Duration::from_millis(2000)]);
+        assert_eq!(
+            fake.lock().expect("fake transport lock").tcp_waits,
+            vec![Duration::from_millis(2000)]
+        );
         assert_eq!(engine.stats().tcp_fallbacks, 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rcode, 0);
@@ -1273,14 +1278,21 @@ mod tests {
             cfg.tcp_timeout_ms = 2000;
             cfg.total_budget_ms = 4000;
         });
-        fake.borrow_mut().script.push_back(Script::Truncated);
-        fake.borrow_mut().tcp_answer = Some((DnsRcode::NoError, Vec::new(), 0));
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Truncated);
+        fake.lock().expect("fake transport lock").tcp_answer =
+            Some((DnsRcode::NoError, Vec::new(), 0));
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("tc2.example", A), t0)
             .expect("submit");
         engine.poll(t0 + Duration::from_millis(3500), &mut out);
-        assert_eq!(fake.borrow().tcp_waits, vec![Duration::from_millis(500)]);
+        assert_eq!(
+            fake.lock().expect("fake transport lock").tcp_waits,
+            vec![Duration::from_millis(500)]
+        );
     }
 
     #[test]
@@ -1289,14 +1301,22 @@ mod tests {
             cfg.tcp_timeout_ms = 2000;
             cfg.total_budget_ms = 4000;
         });
-        fake.borrow_mut().script.push_back(Script::Truncated);
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Truncated);
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("tc3.example", A), t0)
             .expect("submit");
         let mut out = Vec::new();
         engine.poll(t0 + Duration::from_millis(4000), &mut out);
-        assert!(fake.borrow().tcp_waits.is_empty());
+        assert!(
+            fake.lock()
+                .expect("fake transport lock")
+                .tcp_waits
+                .is_empty()
+        );
         assert_eq!(engine.stats().tcp_fallbacks_failed, 1);
         assert_eq!(engine.stats().failovers, 1);
         assert_eq!(sent_to(&fake), vec![addr(5301), addr(5302)]);
@@ -1308,11 +1328,14 @@ mod tests {
         let t0 = Instant::now();
 
         // Positive with TTL above the cap.
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::NoError,
-            records: vec![(A, v4("1.2.3.4"))],
-            ttl: 5000,
-        });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::NoError,
+                records: vec![(A, v4("1.2.3.4"))],
+                ttl: 5000,
+            });
         engine
             .submit(client(), server(), question("pos.example", A), t0)
             .expect("submit");
@@ -1326,7 +1349,7 @@ mod tests {
         assert!(!cache[0].negative);
 
         // Cache hit answers without touching the transport.
-        let before = fake.borrow().sent.len();
+        let before = fake.lock().expect("fake transport lock").sent.len();
         engine
             .submit(
                 client(),
@@ -1336,16 +1359,19 @@ mod tests {
             )
             .expect("submit");
         engine.poll(t0 + Duration::from_millis(2), &mut out);
-        assert_eq!(fake.borrow().sent.len(), before);
+        assert_eq!(fake.lock().expect("fake transport lock").sent.len(), before);
         assert_eq!(engine.stats().cache_hits, 1);
         assert_eq!(&out[0].wire[0..2], &0x1234u16.to_be_bytes());
 
         // TTL 0 is not cached.
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::NoError,
-            records: vec![(A, v4("1.2.3.5"))],
-            ttl: 0,
-        });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::NoError,
+                records: vec![(A, v4("1.2.3.5"))],
+                ttl: 0,
+            });
         engine
             .submit(client(), server(), question("zero.example", A), t0)
             .expect("submit");
@@ -1358,11 +1384,14 @@ mod tests {
         );
 
         // NXDOMAIN is negatively cached for negative_ttl_secs.
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::NxDomain,
-            records: Vec::new(),
-            ttl: 0,
-        });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::NxDomain,
+                records: Vec::new(),
+                ttl: 0,
+            });
         engine
             .submit(client(), server(), question("nx.example", A), t0)
             .expect("submit");
@@ -1374,7 +1403,7 @@ mod tests {
             .expect("negative cached");
         assert!(negative.negative);
         assert_eq!(negative.rcode, 3);
-        let before = fake.borrow().sent.len();
+        let before = fake.lock().expect("fake transport lock").sent.len();
         engine
             .submit(
                 client(),
@@ -1384,7 +1413,7 @@ mod tests {
             )
             .expect("submit");
         engine.poll(t0 + Duration::from_millis(5), &mut out);
-        assert_eq!(fake.borrow().sent.len(), before);
+        assert_eq!(fake.lock().expect("fake transport lock").sent.len(), before);
     }
 
     #[test]
@@ -1392,11 +1421,14 @@ mod tests {
         let (mut engine, fake) = build(&[5301], |cfg| cfg.cache_max_entries = 2);
         let t0 = Instant::now();
         for (name, ttl) in [("a.example", 100), ("b.example", 200), ("c.example", 300)] {
-            fake.borrow_mut().script.push_back(Script::Answer {
-                rcode: DnsRcode::NoError,
-                records: vec![(A, v4("1.2.3.4"))],
-                ttl,
-            });
+            fake.lock()
+                .expect("fake transport lock")
+                .script
+                .push_back(Script::Answer {
+                    rcode: DnsRcode::NoError,
+                    records: vec![(A, v4("1.2.3.4"))],
+                    ttl,
+                });
             engine
                 .submit(client(), server(), question(name, A), t0)
                 .expect("submit");
@@ -1428,23 +1460,29 @@ mod tests {
     #[test]
     fn formerr_with_edns_retries_once_without_opt() {
         let (mut engine, fake) = build(&[5301], |_| {});
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::FormErr,
-            records: Vec::new(),
-            ttl: 0,
-        });
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::NoError,
-            records: vec![(A, v4("9.9.9.9"))],
-            ttl: 60,
-        });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::FormErr,
+                records: Vec::new(),
+                ttl: 0,
+            });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::NoError,
+                records: vec![(A, v4("9.9.9.9"))],
+                ttl: 60,
+            });
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("edns.example", A), t0)
             .expect("submit");
         let mut out = Vec::new();
         engine.poll(t0 + Duration::from_millis(1), &mut out);
-        let sent = fake.borrow().sent.clone();
+        let sent = fake.lock().expect("fake transport lock").sent.clone();
         assert_eq!(sent.len(), 2);
         let first = wire::parse_question(&sent[0].2).expect("first query");
         let second = wire::parse_question(&sent[1].2).expect("second query");
@@ -1458,16 +1496,22 @@ mod tests {
     #[test]
     fn servfail_and_refused_fail_over_to_the_next_server() {
         let (mut engine, fake) = build(&[5301, 5302], |_| {});
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::Refused,
-            records: Vec::new(),
-            ttl: 0,
-        });
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::NoError,
-            records: vec![(A, v4("8.8.4.4"))],
-            ttl: 60,
-        });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::Refused,
+                records: Vec::new(),
+                ttl: 0,
+            });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::NoError,
+                records: vec![(A, v4("8.8.4.4"))],
+                ttl: 60,
+            });
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("failover.example", A), t0)
@@ -1498,7 +1542,7 @@ mod tests {
         });
         let mut out = Vec::new();
         for i in 0..3 {
-            fake.borrow_mut().script = VecDeque::from([
+            fake.lock().expect("fake transport lock").script = VecDeque::from([
                 Script::Silent,
                 Script::Silent,
                 Script::Answer {
@@ -1520,7 +1564,7 @@ mod tests {
         assert_eq!(engine.stats().failovers, 3);
 
         // The next query starts on the healthy server.
-        fake.borrow_mut().script = VecDeque::from([Script::Answer {
+        fake.lock().expect("fake transport lock").script = VecDeque::from([Script::Answer {
             rcode: DnsRcode::NoError,
             records: vec![(A, v4("1.1.1.1"))],
             ttl: 60,
@@ -1529,7 +1573,7 @@ mod tests {
         engine
             .submit(client(), server(), question("after.example", A), t)
             .expect("submit");
-        let sent = fake.borrow().sent.clone();
+        let sent = fake.lock().expect("fake transport lock").sent.clone();
         assert_eq!(sent.last().expect("send").1, addr(5302));
         engine.poll(t + Duration::from_millis(1), &mut out);
     }
@@ -1538,11 +1582,14 @@ mod tests {
     fn non_a_aaaa_qtype_is_preserved_and_not_cached() {
         let (mut engine, fake) = build(&[5301], |_| {});
         for _ in 0..2 {
-            fake.borrow_mut().script.push_back(Script::Answer {
-                rcode: DnsRcode::NoError,
-                records: Vec::new(),
-                ttl: 0,
-            });
+            fake.lock()
+                .expect("fake transport lock")
+                .script
+                .push_back(Script::Answer {
+                    rcode: DnsRcode::NoError,
+                    records: Vec::new(),
+                    ttl: 0,
+                });
         }
         let t0 = Instant::now();
         for round in 0..2 {
@@ -1557,7 +1604,7 @@ mod tests {
             let mut out = Vec::new();
             engine.poll(t0 + Duration::from_millis(round + 1), &mut out);
         }
-        let sent = fake.borrow().sent.clone();
+        let sent = fake.lock().expect("fake transport lock").sent.clone();
         assert_eq!(sent.len(), 2);
         assert_eq!(wire::parse_question(&sent[0].2).expect("query").qtype, 65);
         assert!(engine.cache_snapshot().is_empty());
@@ -1566,11 +1613,14 @@ mod tests {
     #[test]
     fn aaaa_answers_are_cached_with_the_same_ttl_rules() {
         let (mut engine, fake) = build(&[5301], |_| {});
-        fake.borrow_mut().script.push_back(Script::Answer {
-            rcode: DnsRcode::NoError,
-            records: vec![(AAAA, "2001:db8::1".parse().expect("v6"))],
-            ttl: 120,
-        });
+        fake.lock()
+            .expect("fake transport lock")
+            .script
+            .push_back(Script::Answer {
+                rcode: DnsRcode::NoError,
+                records: vec![(AAAA, "2001:db8::1".parse().expect("v6"))],
+                ttl: 120,
+            });
         let t0 = Instant::now();
         engine
             .submit(client(), server(), question("v6.example", AAAA), t0)

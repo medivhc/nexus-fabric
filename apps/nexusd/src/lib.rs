@@ -8,6 +8,8 @@ pub mod dataplane;
 pub mod discovery_runtime;
 /// DNS-time proxy classification from the `proxy.yaml` domain subset.
 pub mod dns_classify;
+/// DNS service thread: single owner + bounded queues (wired in C11).
+pub mod dns_service;
 /// DNS service snapshot (`/dns/status`); wired in C11.
 pub mod dns_status;
 /// Non-blocking upstream DNS engine (pending table/retry/failover/cache).

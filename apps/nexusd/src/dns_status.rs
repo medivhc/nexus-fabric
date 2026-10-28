@@ -313,10 +313,6 @@ impl DnsStatus {
     }
 
     /// Mutate in place (service thread only; tests may drive it directly).
-    ///
-    /// `dead_code`: the only production caller is the DNS service thread added
-    /// in C9; the helper lands first so its locking contract is unit-tested.
-    #[allow(dead_code)]
     pub(crate) fn update(&self, f: impl FnOnce(&mut DnsStatusSnapshot)) {
         let mut guard = self
             .inner
