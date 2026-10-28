@@ -1028,13 +1028,20 @@ mod tests {
         let derive = parsed
             .message("SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT")
             .unwrap();
-        // fixes-6 fix-D：文案改成按表面限定，TUN 面缺陷与产品面合规各一句，
-        // 不再用「UDP / TCP」两字母表达；此处改钉两个表面名，语义守卫不变。
+        // fixes-6 fix-D：文案改成按表面限定，TUN 面缺陷与产品面合规各一句；
+        // 此处钉两个表面名，语义守卫不变。
         assert!(derive.text.contains("nexusd/TUN"), "{}", derive.text);
         assert!(derive.text.contains("产品 SOCKS5 表面"), "{}", derive.text);
         assert!(
             !derive.text.contains("与标准 SS 服务端不可互通"),
             "the blanket incompatibility claim is false for the product surface: {}",
+            derive.text
+        );
+        // fixes-6 r3 F-1：旧 KDF 只存在于 TUN 的 UDP 一侧（TCP 已切到 crate 的
+        // SIP004 实现），UDP 限定一旦丢失，该句对 TUN TCP 就是反向误导。
+        assert!(
+            derive.text.contains("UDP"),
+            "the derive warning must keep its UDP qualifier: {}",
             derive.text
         );
         let interop = parsed.message("SHADOWSOCKS_NO_INTEROP_EVIDENCE").unwrap();

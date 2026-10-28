@@ -80,7 +80,7 @@
     },
     "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT": {
       "severity": "warn",
-      "text": "nexusd/TUN 表面的 Shadowsocks 实现仍用旧密钥派生（省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通）；产品 SOCKS5 表面的线格式已合 SIP004。"
+      "text": "nexusd/TUN 表面的 Shadowsocks UDP 实现仍用旧密钥派生（省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通）；TUN 与产品 SOCKS5 表面的 TCP 线格式已合 SIP004。"
     },
     "SHADOWSOCKS_NO_INTEROP_EVIDENCE": {
       "severity": "warn",

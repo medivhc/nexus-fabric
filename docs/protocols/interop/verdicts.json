@@ -3,7 +3,7 @@
   "generated_from_revision": "e1bb2770074b533bbe6ddba7dd37f5a1426d312f",
   "generated_at": "2026-10-26T01:32:24Z",
   "run_id": "protocol-interop-fixes-1",
-  "inputs_sha256": "a73d0603911d62c00f79348978d9089a0de249cff9e9db2b5c2329e67ffa10d6",
+  "inputs_sha256": "7dbe473ec145f9500e9532f8587675cf63a0e046f5e50d8d45d336964d40f921",
   "protocols": {
     "anytls": {
       "origin": "matrix",
@@ -102,7 +102,7 @@
     },
     "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT": {
       "severity": "warn",
-      "text": "nexusd/TUN 表面的 Shadowsocks 实现仍用旧密钥派生（省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通）；产品 SOCKS5 表面的线格式已合 SIP004。"
+      "text": "nexusd/TUN 表面的 Shadowsocks UDP 实现仍用旧密钥派生（省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通）；TUN 与产品 SOCKS5 表面的 TCP 线格式已合 SIP004。"
     },
     "SHADOWSOCKS_NO_INTEROP_EVIDENCE": {
       "severity": "warn",
