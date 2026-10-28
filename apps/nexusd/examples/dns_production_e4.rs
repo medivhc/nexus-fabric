@@ -15,12 +15,13 @@
 #![forbid(unsafe_code)]
 
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nexus_projection::ip::build_udp_packet;
 use nexus_projection::{MockTun, TunDevice};
 use nexusd::config::ConfigDir;
 use nexusd::dataplane::Dataplane;
@@ -500,6 +501,17 @@ fn suite_upstream() -> Result<Value, String> {
     // AC12: status/cache come from the production handle, not the demo runtime.
     let final_status = env.status_snapshot();
     let cache = nexusd::dns_status::cache_entries();
+    // AC12 恒等式：dns_answered 是 7 个 rcode/类别计数之和（MODULE.md §DNS）。
+    // 由真实数据面计数计算，不写死。
+    let counters = env.stats();
+    let rcode_sum = counters.dns_noerror
+        + counters.dns_nodata
+        + counters.dns_nxdomain
+        + counters.dns_servfail
+        + counters.dns_refused
+        + counters.dns_formerr
+        + counters.dns_tcp_refused;
+    let equation_ok = counters.dns_answered == rcode_sum;
     let ac12_ok = final_status.enabled
         && final_status.service.as_str() == "running"
         && final_status.upstream.plaintext
@@ -555,8 +567,15 @@ fn suite_upstream() -> Result<Value, String> {
             "negative_cached": negative_cached,
         },
         "ac5": {"ok": ac5_ok && dnsmasq.port() != 0},
-        "ac12": {"ok": ac12_ok, "cache_entries": cache.len()},
-        "ok": ac1_ok && failover_ok && cache_ok && nxdomain_first && negative_cached && ac12_ok && ac5_ok,
+        "ac12": {
+            "ok": ac12_ok,
+            "cache_entries": cache.len(),
+            "dns_answered": counters.dns_answered,
+            "rcode_sum": rcode_sum,
+            "equation_ok": equation_ok,
+        },
+        "ok": ac1_ok && failover_ok && cache_ok && nxdomain_first && negative_cached && ac12_ok
+            && equation_ok && ac5_ok,
     }))
 }
 
@@ -688,6 +707,8 @@ fn suite_degradation() -> Result<Value, String> {
         }
     }
     let status = env.status_snapshot();
+    let last_error = status.upstream.last_error.clone().unwrap_or_default();
+    let last_error_nonempty = !last_error.is_empty();
     let all_dead_ok =
         servfails == 3 && env.stats().dns_servfail >= 3 && status.upstream.state == "failed";
 
@@ -744,12 +765,14 @@ fn suite_degradation() -> Result<Value, String> {
     // AC8b: invalid dns.toml + no-tun starts, tun-enabled exits 1 CONFIG.
     let ac8b = ac8b_subprocess()?;
 
-    let ok = all_dead_ok && tcp_ok && pool_ok && disabled_ok && ac8b.ok;
+    let ok = all_dead_ok && last_error_nonempty && tcp_ok && pool_ok && disabled_ok && ac8b.ok;
     Ok(json!({
         "ac13": {
             "all_dead_ok": all_dead_ok,
             "dns_servfail": env.stats().dns_servfail,
             "upstream_state": status.upstream.state,
+            "last_error": last_error,
+            "last_error_nonempty": last_error_nonempty,
             "tcp_refused": tcp_ok,
             "dns_tcp_refused": env.stats().dns_tcp_refused,
             "pool_exhausted": pool_ok,
@@ -933,8 +956,35 @@ fn suite_aaaa() -> Result<Value, String> {
         && off_aaaa.answers == vec![IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2))]
         && off.status_snapshot().fake_ip.allocated == 0;
 
-    // group6's v6 datapath classification depends on C18 (ipv6.* counters).
-    let ok = ac8a_ok && group1_ok && group4_ok && group5_ok && group6_ok;
+    // AC8 group6 v6 datapath: aim a v6/UDP packet at the real AAAA answer on the
+    // same production Dataplane. `2001:db8::2` is neither mesh nor bypass, so
+    // the v6 classifier must take Proxy and the unwired UDP path must block it.
+    let v6_dst = match off_aaaa.answers.first() {
+        Some(IpAddr::V6(v6)) => *v6,
+        _ => return Err("group6 v6 datapath: AAAA answer missing".to_string()),
+    };
+    let v6_before = off.stats().ipv6;
+    off.mock.lock().unwrap().inject(
+        v6_udp_packet(v6_dst, b"group6-datapath")
+            .map_err(|e| format!("group6 v6 packet: {e:?}"))?,
+    );
+    for _ in 0..50 {
+        let _ = off.dp.tick(now_millis());
+        let now = off.stats().ipv6;
+        if now.classified_proxy > v6_before.classified_proxy
+            || now.proxy_dropped > v6_before.proxy_dropped
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let v6_after = off.stats().ipv6;
+    // 口径：增量（注入前后差值），与 `ac4.proxy_dropped_delta` 同风格。
+    let v6_classified_proxy = v6_after.classified_proxy - v6_before.classified_proxy;
+    let v6_proxy_dropped = v6_after.proxy_dropped - v6_before.proxy_dropped;
+    let group6_datapath_ok = v6_classified_proxy == 1 && v6_proxy_dropped == 1;
+
+    let ok = ac8a_ok && group1_ok && group4_ok && group5_ok && group6_ok && group6_datapath_ok;
     Ok(json!({
         "ac8a": {
             "nodata": nodata_ok,
@@ -955,7 +1005,12 @@ fn suite_aaaa() -> Result<Value, String> {
             "group4": group4_ok,
             "group5": group5_ok,
             "group6": group6_ok,
-            "group6_v6_datapath": "pending C18 (ipv6.classified_proxy/proxy_dropped)",
+            "group6_v6_datapath": {
+                "dst": v6_dst.to_string(),
+                "classified_proxy": v6_classified_proxy,
+                "proxy_dropped": v6_proxy_dropped,
+            },
+            "group6_v6_datapath_ok": group6_datapath_ok,
         },
         "ok": ok,
     }))
@@ -996,6 +1051,18 @@ fn dns_query_packet(name: &str, qtype: u16, txid: u16) -> Vec<u8> {
         40_000,
         53,
         &dns,
+    )
+}
+
+/// v6/UDP 包（校验和由 `build_udp_packet` 写全）。
+fn v6_udp_packet(
+    dst: Ipv6Addr,
+    payload: &[u8],
+) -> Result<Vec<u8>, nexus_projection::ip::IpParseError> {
+    build_udp_packet(
+        "[fd00:144::1]:40000".parse().expect("static v6 source"),
+        SocketAddr::new(IpAddr::V6(dst), 8080),
+        payload,
     )
 }
 

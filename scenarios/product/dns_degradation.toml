@@ -16,6 +16,11 @@ command = "cargo run --quiet -p nexusd --example dns_production_e4 -- --json --s
 field = "ac13.all_dead_ok"
 equals = true
 
+# AC12 可观测性：上游全不可达后聚合 last_error 必须非空（以真实快照计算）。
+[[expect]]
+field = "ac13.last_error_nonempty"
+equals = true
+
 [[expect]]
 field = "ac13.upstream_state"
 equals = "failed"

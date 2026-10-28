@@ -81,6 +81,11 @@ equals = true
 field = "ac12.ok"
 equals = true
 
+# AC12 恒等式：dns_answered == Σ(noerror,nodata,nxdomain,servfail,refused,formerr,tcp_refused)。
+[[expect]]
+field = "ac12.equation_ok"
+equals = true
+
 [[expect]]
 field = "verdict"
 equals = "PASS"

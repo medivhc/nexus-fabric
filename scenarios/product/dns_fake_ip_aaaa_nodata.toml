@@ -44,6 +44,16 @@ equals = true
 field = "ac8.group6"
 equals = true
 
+# AC8 组 6 v6-datapath：以真实 AAAA 答案（2001:db8::2）为目的注入 v6/UDP，
+# 同一生产 Dataplane 上计 1 次 Proxy 分类 + 1 次阻断（增量口径）。
+[[expect]]
+field = "ac8.group6_v6_datapath.classified_proxy"
+equals = 1
+
+[[expect]]
+field = "ac8.group6_v6_datapath.proxy_dropped"
+equals = 1
+
 [[expect]]
 field = "verdict"
 equals = "PASS"
