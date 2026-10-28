@@ -19,9 +19,11 @@ use std::net::IpAddr;
 
 use nexus_domain::NetworkPlanExtension;
 
+pub mod mesh;
 pub mod unified;
 pub mod wire;
 
+pub use mesh::StaticMeshResolver;
 pub use unified::{
     DEFAULT_FAKE_IP_RANGE, DEFAULT_FAKE_IP_TTL_SECS, DEFAULT_MESH_SUFFIX, DnsClass,
     DnsUnifiedConfig, FakeIpPool, MeshNameResolver, ProxyClassifier, UnifiedAnswer, UnifiedDns,
