@@ -1,0 +1,91 @@
+schema_version = 1
+id = "product.ipv6-tcp-termination"
+title = "IPv6 TCP 终结（AC9 无条件部分）：Mesh 双向回显 + Proxy 终结/RST"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+
+[given]
+# AC9 **无条件部分**，不含 CAC-1（Proxy 端到端回显，plan §6.1 留合并门补跑）。
+# 装配链：ConfigDir → config::load → assembly::build_dataplane_config
+# → Dataplane::new(SharedTun(MockTun), cfg, None)（Proxy 段注入 ProxyEngine）。
+# Mesh 回显腿把 `::1/128` 作为测试 mesh 路由（无 root 无法绑定 ULA），
+# B 侧用生产 `TcpRelay` 真实 dial `[::1]:<echo>`。
+# Proxy 段用 Shadowsocks 出站：adapter 不支持 v6 目标 → UnsupportedTarget → RST。
+
+[when]
+command = "cargo run --quiet -p nexusd --example ipv6_tcp_termination_e4 -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# Mesh：v6 SYN [fd00:144::6]:80 → SYN-ACK（post-fixup 源 = 原始目的、校验和自校验）。
+[[expect]]
+field = "mesh.mesh.fd00_synack_ok"
+equals = true
+
+# Mesh：SYN STREAM 帧载荷目标逐字为 [fd00:144::6]:80。
+[[expect]]
+field = "mesh.mesh.mesh_syn_target_ok"
+equals = true
+
+# Mesh 回显腿：SYN-ACK 校验和 + B 侧真实 dial [::1] 成功。
+[[expect]]
+field = "mesh.mesh.echo_synack_ok"
+equals = true
+
+[[expect]]
+field = "mesh.mesh.dial_ok"
+equals = true
+
+# 双向字节一致（上行 hello / 下行 echo / 客户端 TUN 读回）。
+[[expect]]
+field = "mesh.mesh.bytes_up"
+equals = true
+
+[[expect]]
+field = "mesh.mesh.bytes_down"
+equals = true
+
+[[expect]]
+field = "mesh.mesh.client_received"
+equals = true
+
+[[expect]]
+field = "mesh.mesh.bytes_match"
+equals = true
+
+# Proxy：终结完成（SYN-ACK；源 = 原始目的 2001:db8::20）。
+[[expect]]
+field = "proxy.proxy.synack_ok"
+equals = true
+
+# Proxy：不支持 v6 的 dialect → RST（可见），且 ipv6.proxy_dropped 不增。
+[[expect]]
+field = "proxy.proxy.rst_seen"
+equals = true
+
+[[expect]]
+field = "proxy.proxy.rst_checksum_ok"
+equals = true
+
+[[expect]]
+field = "proxy.proxy.ipv6_tcp"
+equals = 2
+
+[[expect]]
+field = "proxy.proxy.classified_proxy"
+equals = 2
+
+[[expect]]
+field = "proxy.proxy.ipv6_proxy_dropped"
+equals = 0
+
+# 既有 proxy_* 失败计数恰好一次（不误计/不重复）。
+[[expect]]
+field = "proxy.proxy.proxy_tcp_streams"
+equals = 1
+
+[[expect]]
+field = "proxy.proxy.proxy_dropped_no_proxy"
+equals = 1
