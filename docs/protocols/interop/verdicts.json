@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "generated_from_revision": "6ede7ece97495cbbc315d642c06b3f7f2b3778bf",
+  "generated_from_revision": "e1bb2770074b533bbe6ddba7dd37f5a1426d312f",
   "generated_at": "2026-10-26T01:32:24Z",
   "run_id": "protocol-interop-fixes-1",
-  "inputs_sha256": "c9cf4a3aead35ed942f3a7c7904c3ed088a1d6f45c90e429700f635fe1bf6566",
+  "inputs_sha256": "fbbd29f17d793e7ed19d4a6183183be2cc1ae4b7a131355e7e9aa52524fb2ffa",
   "protocols": {
     "anytls": {
       "origin": "matrix",
@@ -17,9 +17,9 @@
     },
     "hysteria2": {
       "origin": "matrix",
-      "verdict": "VERIFIED",
-      "scope": "FULL",
-      "claim": "USABLE",
+      "verdict": "PARTIAL",
+      "scope": "PROTOCOL_SUBSET",
+      "claim": "USABLE_WITH_GAPS",
       "boundaries": [
         "PROTOCOL_NOT_WIRED"
       ],

@@ -925,17 +925,17 @@ def render_matrix(
     lines.append("## 产品级 UDP（不参与协议 verdict）")
     lines.append("")
     if product_udp_rows:
-        detail = ""
+        parts = []
         if product_udp_ok:
-            detail += f"已可用（产品级 `UdpEcho` PASS）：{'、'.join(product_udp_ok)}；"
+            parts.append(f"已可用（产品级 `UdpEcho` PASS）：{'、'.join(product_udp_ok)}")
         if product_udp_gap:
-            detail += (
+            parts.append(
                 f"仍为 `NOT_IMPLEMENTED`/未通过：{'、'.join(product_udp_gap)}"
-                "（出站无 UDP 帧路径，按 fail-closed 丢弃，不直连）；"
+                "（出站无 UDP 帧路径，按 fail-closed 丢弃，不直连）"
             )
         lines.append(
             "产品 SOCKS5 UDP ASSOCIATE 入口与出站帧路径按协议分别取证：`UdpEcho` 为产品级 required 格，"
-            "`UdpEchoCrate` 为 crate 级诊断格（不参与 verdict）。" + detail
+            "`UdpEchoCrate` 为 crate 级诊断格（不参与 verdict）。" + "；".join(parts) + "。"
         )
     else:
         lines.append(
