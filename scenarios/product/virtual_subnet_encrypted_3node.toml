@@ -3,6 +3,7 @@ id = "product.virtual-subnet-encrypted-3node"
 title = "加密虚拟子网三节点链路转发（A—B—C，B 每跳重加密）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-virtual-subnet-networking"
+carrier = "v9-connectivity"
 
 [given]
 command = "virtual subnet encrypted 3node"

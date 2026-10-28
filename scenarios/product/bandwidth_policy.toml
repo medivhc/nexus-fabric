@@ -3,6 +3,7 @@ id = "product.bandwidth-policy"
 title = "带宽分配策略：按组/按节点配额、优先级与超额处理"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-bandwidth-policy"
+carrier = "v9-connectivity"
 
 [given]
 group_quota_bytes_per_sec = 1000

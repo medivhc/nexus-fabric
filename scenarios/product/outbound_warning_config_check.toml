@@ -3,6 +3,7 @@ id = "product.outbound-warning-config-check"
 title = "出站 interop 警示（config check 载体）：SS partial / VMess broken 有警示行，VLESS verified 无警示"
 evidence_strength = "E3"
 requirement = "apps/nexus/MODULE.md#出站-interop-标注步骤-3"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E3（example outbound_warning_config_check --json）：

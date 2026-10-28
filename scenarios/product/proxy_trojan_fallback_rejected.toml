@@ -3,6 +3,7 @@ id = "product.proxy-trojan-fallback-rejected"
 title = "Trojan fallback fail-closed：错密码时服务端 fallback 的 404 页面绝不上交客户端（本地 E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: local HTTP 404 fallback target + local trojan TLS node (rcgen self-signed) wrong-password path + nexus proxy (outbound=trojan-node, password mismatch) + raw SOCKS5 client"

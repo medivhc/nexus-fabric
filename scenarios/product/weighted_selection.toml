@@ -3,6 +3,7 @@ id = "product.weighted-selection"
 title = "加权选择：权重按代价反比分配，流按权重比例分散"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12.52-weighted-selection"
+carrier = "v9-connectivity"
 
 [given]
 topology = "asymmetric diamond: A-B(10ms)-D cost 20, A-C(10ms)-D(20ms) cost 30; K=2 gives 2 NextHops"

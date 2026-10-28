@@ -3,6 +3,7 @@ id = "product.boost-v1"
 title = "Network Boost v1：[boost] 配置驱动激进切路参数 + EWMA 选路 + 建连竞速"
 evidence_strength = "E4"
 requirement = "docs/DAEMON_ARCHITECTURE.md#12"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback; network.toml 含 [boost] enabled=true (hysteresis 10%, hold 1s, race_on_connect=true)"

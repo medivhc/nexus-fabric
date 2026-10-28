@@ -3,6 +3,7 @@ id = "product.proxy-trojan-header-format"
 title = "Trojan 请求头官方线上格式（含 CMD 字节；字节级互操作断言）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-trojan-header-format"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: TLS server + TLS client (rustls/ring), rcgen self-signed"

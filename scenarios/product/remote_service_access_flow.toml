@@ -3,6 +3,7 @@ id = "product.remote-service-access-flow"
 title = "Node A 经静态发现/规划/会话/建连/Token 门控/Transport 访问 Node B 的 Service 资源"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 node_a = "requester"

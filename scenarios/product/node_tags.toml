@@ -3,6 +3,7 @@ id = "product.node-tags"
 title = "Mesh 节点分组标签：打标、按标签过滤与路由选择"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-node-tags"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

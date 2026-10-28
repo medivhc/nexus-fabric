@@ -3,6 +3,7 @@ id = "product.proxy-engine-stage-json"
 title = "A4：启动失败按阶段（config_load / rule_engine_init / proxy_engine_init）输出 JSON + exit 1；按 hint 修复后必须能启动"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#统一数据面装配"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_engine_stage_json --json）：真实 `nexusd <config-dir>`

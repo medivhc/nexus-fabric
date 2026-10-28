@@ -3,6 +3,7 @@ id = "product.observability-dns-cache"
 title = "§9 可观察性：dns cache 输出正/负缓存快照（挂 DnsRuntime snapshot API）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "n1-fabric"
 
 [given]
 resolver = "memory-mock"

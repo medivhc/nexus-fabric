@@ -3,6 +3,7 @@ id = "product.bootstrap-join"
 title = "Bootstrap 自动入网：PSK 全握手 E2E（JoinInit→JoinReply→Register→Ack→GetPeers→PeerList）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#bootstrap-join"
+carrier = "v9-connectivity"
 
 [given]
 

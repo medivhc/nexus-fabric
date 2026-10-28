@@ -3,6 +3,7 @@ id = "product.observability-plan-explain"
 title = "§9 可观察性：plan explain 输出 Plan + DecisionTrace 结构化拒绝原因"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "n1-fabric"
 
 [given]
 planner = "filter/score (kube-scheduler inspired)"

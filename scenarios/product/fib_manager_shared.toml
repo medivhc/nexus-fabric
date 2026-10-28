@@ -3,6 +3,7 @@ id = "product.fib-manager-shared"
 title = "FibManager 多线程共享：并发读 + 写触发重算"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12.54-fib-manager-shared"
+carrier = "v9-connectivity"
 
 [given]
 topology = "diamond: A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms)"

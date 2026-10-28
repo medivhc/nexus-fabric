@@ -3,6 +3,7 @@ id = "product.n3-localapi-v1-boundary"
 title = "真实 daemon 的版本化 Task LocalAPI 认证与能力边界"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#17-n3-task"
+carrier = "n1-fabric"
 [given]
 # 只验协议、拒绝与能力门禁，不代替完整 Submit/执行 E4。
 [when]

@@ -3,6 +3,7 @@ id = "product.fabric-path-basic"
 title = "路径层基本选路：多候选路径打分选优 + hysteresis"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#4"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback UDP, PathManager with direct + mock TURN candidates (example binary)"

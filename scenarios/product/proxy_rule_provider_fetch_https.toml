@@ -3,6 +3,7 @@ id = "product.proxy-rule-provider-fetch-https"
 title = "rule-providers https 在线拉取：本地 TLS server 驱动真实 CachedHttpProviderFetcher"
 evidence_strength = "E5"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 command = "rule-providers https url fetch"

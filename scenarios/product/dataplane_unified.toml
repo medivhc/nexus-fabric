@@ -3,6 +3,7 @@ id = "product.dataplane-unified"
 title = "统一数据面装配：TUN→分类→DNS→QoS→转发全链路（E4）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#6"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example dataplane_unified --json，进程内闭环，mock TUN）：

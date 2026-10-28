@@ -3,6 +3,7 @@ id = "product.daemon-real-host-auth-denied"
 title = "§6 real transport：错误 token 被服务端 AUTH 门控拒绝，客户端透传 AUTH_DENIED（不再抹成 connect 失败）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 provider = "host real listener with AUTH gate (token tk-ok)"

@@ -3,6 +3,7 @@ id = "product.remote-connectivity-failure-rollback"
 title = "远程建连失败时按逆序幂等回滚到 Disposed 且 Owner 唯一提交 Failed"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 node_a = "requester"

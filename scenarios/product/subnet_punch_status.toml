@@ -3,6 +3,7 @@ id = "product.subnet-punch-status"
 title = "打洞状态观察通道：punch 结果持久化 → subnet status 复查 subnet.punch"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-punch-cli"
+carrier = "v9-connectivity"
 
 [given]
 delivery = "real-udp-loopback"

@@ -4,6 +4,7 @@ title = "真实固定Commit冻结、本机认证有界上传及durable续传"
 evidence_strength = "E4"
 platform = "linux"
 requirement = "PRODUCT.md#179-n3-12"
+carrier = "external"
 [given]
 [when]
 command = "python3 engineering/verifiers/n3_snapshot_staging.py"

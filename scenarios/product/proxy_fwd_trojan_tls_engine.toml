@@ -3,6 +3,7 @@ id = "product.proxy-fwd-trojan-tls-engine"
 title = "TLS Trojan 经 nexusd 引擎（Dataplane::tick + ProxyEngine + MockTun）真实 TCP 中继"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_fwd_trojan_tls_engine --json）：

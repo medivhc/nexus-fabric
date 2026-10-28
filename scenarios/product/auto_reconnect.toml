@@ -3,6 +3,7 @@ id = "product.auto-reconnect"
 title = "自动断线重连（指数退避 + 最大重试 + 状态机）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-auto-reconnect"
+carrier = "v9-connectivity"
 
 [given]
 max_retries = 3

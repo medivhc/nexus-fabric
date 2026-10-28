@@ -3,6 +3,7 @@ id = "product.daemon-workspace-mount"
 title = "nexusd Workspace 生产接线：workspace.toml → FsContentStore → FUSE 挂载 → LocalAPI commit → 优雅关闭/重启/orphan 清理"
 evidence_strength = "E4"
 requirement = "v9#22"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example daemon_workspace_mount_e4 --json，拉起真实 nexusd 子进程）：

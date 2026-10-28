@@ -3,6 +3,7 @@ id = "product.daemon-run-workspace-flow"
 title = "nexus run workspace 暂无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 daemon = "nexusd"

@@ -3,6 +3,7 @@ id = "product.bandwidth-qos"
 title = "带宽控制 / QoS 令牌桶限流（初始突发 + 平均速率整形 + 按连接统计）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-bandwidth-qos"
+carrier = "v9-connectivity"
 
 [given]
 rate_bps = 1000

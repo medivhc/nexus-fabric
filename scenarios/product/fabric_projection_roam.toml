@@ -3,6 +3,7 @@ id = "product.fabric-projection-roam"
 title = "投影层漫游：路径切换时 TUN 包流不中断、不丢包"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback, Projection + MockTun + mock PathManager event (example binary)"

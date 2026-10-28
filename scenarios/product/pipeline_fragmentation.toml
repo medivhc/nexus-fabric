@@ -3,6 +3,7 @@ id = "product.pipeline-fragmentation"
 title = "数据面管线：报文超过 MTU 被分片，对端重组后逐字节完整一致"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-dataplane-pipeline"
+carrier = "v9-connectivity"
 
 [given]
 max_fragment_size = 64

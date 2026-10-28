@@ -3,6 +3,7 @@ id = "product.certificate-manager"
 title = "证书管理：过期三态分类与原子轮换"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-certificate-manager"
+carrier = "v9-connectivity"
 
 [given]
 cert_path = "/etc/nexus/cert.pem"

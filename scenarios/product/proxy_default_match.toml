@@ -3,6 +3,7 @@ id = "product.proxy-default-match"
 title = "未命中任何具体规则 -> MATCH 兜底规则出站"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "socks5 (reuse nexus-ingress Socks5Handshake)"

@@ -3,6 +3,7 @@ id = "product.firewall-rules"
 title = "Mesh 网络防火墙规则匹配引擎（默认拒绝白名单 + first-match-wins）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-firewall-rules"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

@@ -3,6 +3,7 @@ id = "product.proxy-vmess-adapter"
 title = "OutboundAdapter 接缝：VMess AEAD 出站被规则选中并自洽加解密（离线）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 outbound = "tag=vm-out, kind=vmess, method=chacha20-poly1305, uuid"

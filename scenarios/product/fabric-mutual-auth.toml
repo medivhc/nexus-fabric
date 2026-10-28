@@ -3,6 +3,7 @@ id = "product.fabric-mutual-auth"
 title = "独立进程 Fabric 双向 TLS 身份门禁与真实加密流"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#17-n3-task"
+carrier = "n1-fabric"
 [given]
 # 本机独立 requester/provider 进程，不称跨平台两真机 E5。
 [when]

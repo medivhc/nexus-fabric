@@ -3,6 +3,7 @@ id = "product.fragmentation"
 title = "分片传输：分片重组、幂等、超时 GC 与缓冲上限"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-fragmentation"
+carrier = "v9-connectivity"
 
 [given]
 max_fragment_size = 64

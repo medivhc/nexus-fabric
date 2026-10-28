@@ -3,6 +3,7 @@ id = "product.discovery-enhanced"
 title = "节点发现增强：去重 upsert、策略门控、超时清理与上限驱逐"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-discovery-enhanced"
+carrier = "v9-connectivity"
 
 [given]
 interval_ms = 1000

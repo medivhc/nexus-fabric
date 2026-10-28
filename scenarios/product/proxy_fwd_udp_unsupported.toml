@@ -3,6 +3,7 @@ id = "product.proxy-fwd-udp-unsupported"
 title = "VLESS / AnyTLS / TLS Trojan 作为 active outbound：UDP fail-closed（丢弃 + 分协议计数 + 限频日志）"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_fwd_udp_unsupported --json，MockTun + 生产

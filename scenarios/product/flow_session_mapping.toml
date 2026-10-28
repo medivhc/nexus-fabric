@@ -3,6 +3,7 @@ id = "product.flow-session-mapping"
 title = "TUN 数据面流→会话映射：首包走 §10 链建会话，已建流走快路径（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#tun-ingress-session-chain"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example flow_session_mapping --json，进程内闭环，mock TUN）：

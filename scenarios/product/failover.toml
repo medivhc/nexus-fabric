@@ -3,6 +3,7 @@ id = "product.failover"
 title = "故障转移：主备切换、连续退备与自动回切"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-failover"
+carrier = "v9-connectivity"
 
 [given]
 primary = "primary"

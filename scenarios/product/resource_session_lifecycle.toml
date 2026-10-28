@@ -3,6 +3,7 @@ id = "product.resource-session-lifecycle"
 title = "Resource 使用遵守 Resolve -> Plan -> Session -> Connectivity -> Execute"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#session"
+carrier = "v9-connectivity"
 
 [given]
 resource = "service://example"

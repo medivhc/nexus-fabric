@@ -3,6 +3,7 @@ id = "product.multipath"
 title = "多路径调度：三种策略 + 接收端重排缓冲"
 evidence_strength = "E4"
 requirement = "docs/DAEMON_ARCHITECTURE.md#12.6"
+carrier = "n1-fabric"
 
 [given]
 topology = "纯内存；3 个 mock egress（mesh/proxy/turn，权重默认 1）；harness 直接调用 nexus-projection::multipath"

@@ -3,6 +3,7 @@ id = "product.workspace-sync-authz"
 title = "serve_sync 成员授权：非成员被明确拒绝，不泄露数据"
 evidence_strength = "E4"
 requirement = "白皮书 §成员与策略权威 + C2-D4（serve_sync 前置成员授权；第一版静态成员列表；未授权返回明确拒绝帧）"
+carrier = "n1-fabric"
 
 [given]
 description = "B 端 workspace 配置静态成员列表（含 A 的 PeerId，不含 E）；E 建立 fabric 连接（传输层认证通过）后发起 sync；A 发起 sync 作为对照"

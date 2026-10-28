@@ -3,6 +3,7 @@ id = "product.pairing"
 title = "设备配对：配对码生成、双节点配对流程、信任建立"
 evidence_strength = "E4"
 requirement = ".agents/plans/pairing-plan.md"
+carrier = "v9-connectivity"
 
 [given]
 setup = "两个独立配置目录 <a-dir> 和 <b-dir>；A 为邀请方，B 为加入方"

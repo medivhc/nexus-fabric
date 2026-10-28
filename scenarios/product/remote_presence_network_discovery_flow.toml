@@ -3,6 +3,7 @@ id = "product.remote-presence-network-discovery-flow"
 title = "Node A 经网络发现协议从 Node B 拉取动态 Presence 并完成远程闭环"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 requester = "node-a"

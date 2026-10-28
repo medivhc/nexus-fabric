@@ -3,6 +3,7 @@ id = "product.proxy-fwd-tun-production"
 title = "TUN 生产 TCP Proxy 经 Dataplane::process_one()+MockTun 真实转发"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_fwd_tun_production --json，进程内闭环，mock TUN）：

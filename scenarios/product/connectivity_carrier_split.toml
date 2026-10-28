@@ -3,6 +3,7 @@ id = "product.connectivity-carrier-split"
 title = "Connectivity 双 trait 解耦：VPI（IP 包）与 PacketCarrier（承载帧）注入编排，认证门控生效"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#network"
+carrier = "v9-connectivity"
 
 [given]
 vpi = "mock-virtual-packet-interface"

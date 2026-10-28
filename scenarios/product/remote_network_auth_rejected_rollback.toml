@@ -3,6 +3,7 @@ id = "product.remote-network-auth-rejected-rollback"
 title = "远程网络会话令牌不匹配时认证门控拒绝并按逆序幂等回滚"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 node_a = "requester"
