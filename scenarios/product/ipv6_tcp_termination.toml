@@ -3,6 +3,7 @@ id = "product.ipv6-tcp-termination"
 title = "IPv6 TCP 终结（AC9 无条件部分）：Mesh 双向回显 + Proxy 终结/RST"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
 
 [given]
 # AC9 **无条件部分**，不含 CAC-1（Proxy 端到端回显，plan §6.1 留合并门补跑）。

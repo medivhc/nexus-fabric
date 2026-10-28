@@ -3,6 +3,7 @@ id = "product.dns-fake-ip-aaaa-nodata"
 title = "AC8a：fake-ip 开启时代理类 AAAA 恒 NODATA（不消耗地址）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
 
 [given]
 # 三个名字覆盖 domain / domain_suffix / geosite-unevaluable→proxied。

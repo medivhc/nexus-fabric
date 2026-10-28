@@ -3,6 +3,7 @@ id = "product.dns-upstream-real"
 title = "DNS 真实上游：dnsmasq 2.90 + 生产装配路径（AC1/AC2/AC5/AC12）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
 
 [given]
 # `dns_production_e4 --suite upstream` 从生产装配链出发：

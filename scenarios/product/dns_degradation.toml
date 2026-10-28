@@ -3,6 +3,7 @@ id = "product.dns-degradation"
 title = "DNS 降级矩阵：上游全挂/池耗尽/TCP RST/禁用/AC8b（AC5/AC13）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
 
 [given]
 # 生产装配路径；上游全死 → SERVFAIL + upstream.state=failed；

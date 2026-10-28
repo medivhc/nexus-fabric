@@ -3,6 +3,7 @@ id = "product.dns-mesh-names"
 title = "DNS Mesh 名源：dns.toml [dns.mesh.hosts] 静态表（AC3/AC8 group3）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
 
 [given]
 # 生产装配路径 + 真实 dnsmasq；mesh 名本地回答，未知 mesh 名 NXDOMAIN 且不泄漏上游。

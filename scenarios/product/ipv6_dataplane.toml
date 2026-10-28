@@ -3,6 +3,7 @@ id = "product.ipv6-dataplane"
 title = "IPv6 数据面 slice 1：0x86DD 计数/分类/Mesh 原始转发/能力表（AC6/AC7/AC10/AC16）"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#6"
+carrier = "n1-fabric"
 
 [given]
 # `ipv6_dataplane_e4 --json` 从生产装配链出发：
