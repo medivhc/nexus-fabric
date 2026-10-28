@@ -9,7 +9,8 @@
 //! 热加载分级（与 `config.rs` 文档一致）：
 //! | 变更类型 | 行为 |
 //! |---|----|
-//! | proxy.yaml / dns.toml 内容变更 | 热生效（规则、记录类纯数据） |
+//! | proxy.yaml 内容变更 | 需重启（engine 只在启动构造） |
+//! | dns.toml 内容变更 | 需重启（dns service owns sockets/cache） |
 //! | network.toml 内容变更 | 热生效（peer 列表等；端口类变更由 N1 侧自行决定） |
 //! | daemon.toml localapi_addr 变更 | 需重启（warning，不自动重启） |
 //! | 任一文件新增/删除 | 需重启（子系统启停需重新装配，warning） |
@@ -123,6 +124,10 @@ fn watch_loop(dir: ConfigDir, mut current: LoadedConfig, tx: Sender<ReloadEvent>
                 let reason = if changed.iter().any(|f| f == config::PROXY_YAML) {
                     // Q-7=B：proxy.yaml 固定句式（§7.6.1）。
                     "proxy.yaml changed: outbound engine requires daemon restart".to_string()
+                } else if changed.iter().any(|f| f == config::DNS_TOML) {
+                    // AC14(3)：dns.toml 固定句式（Q8）。
+                    "config change requires restart: dns.toml (dns service owns sockets/cache)"
+                        .to_string()
                 } else {
                     format!(
                         "files {changed:?} require daemon restart to take effect; \
@@ -167,18 +172,27 @@ mod tests {
         let yaml_v1 = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         let yaml_v2 = "schema_version: 1\nrules:\n  - tag: r2\n    kind: domain\n    match: x.com\n    action:\n      - kind: select_outbound\n        tag: d\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         write(&d, config::PROXY_YAML, yaml_v1);
-        write(&d, config::DNS_TOML, "servers = [\"1.1.1.1\"]\n");
+        write(&d, config::DNS_TOML, "[dns]\nupstream = [\"1.1.1.1\"]\n");
         let dir = ConfigDir::new(&d).unwrap();
         let current = config::load(&dir).unwrap();
         let (tx, rx) = channel();
         let _h = spawn(dir.clone(), current, tx);
 
-        // Hot 路径仍存在：已有 dns.toml 的**内容**变更 → Applied
-        write(&d, config::DNS_TOML, "servers = [\"8.8.8.8\"]\n");
+        // Q8/AC14(3)：已有 dns.toml 的**内容**变更 → NeedsRestart + 固定日志原文。
+        write(&d, config::DNS_TOML, "[dns]\nupstream = [\"8.8.8.8\"]\n");
         let ev = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("expected Applied event for dns.toml");
-        assert!(matches!(ev, ReloadEvent::Applied { .. }), "got {ev:?}");
+            .expect("expected NeedsRestart event for dns.toml");
+        match ev {
+            ReloadEvent::NeedsRestart { files, reason } => {
+                assert_eq!(files, vec![config::DNS_TOML.to_string()]);
+                assert_eq!(
+                    reason,
+                    "config change requires restart: dns.toml (dns service owns sockets/cache)"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
 
         // proxy.yaml 内容变更 → NeedsRestart（Q-7=B：engine 只在启动构造）
         write(&d, config::PROXY_YAML, yaml_v2);

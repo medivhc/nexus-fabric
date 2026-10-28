@@ -1947,7 +1947,7 @@ fn inbound_signatures(yaml: Option<&str>) -> Option<Vec<InboundSignature>> {
 ///
 /// 保守策略：目前仅做文件级判断——
 /// - `proxy.yaml` 内容变更 → Hot（规则类数据）
-/// - `dns.toml` 内容变更 → Hot（上游变更热生效，R5）
+/// - `dns.toml` 内容变更 → NeedsRestart（DNS 服务持有 socket/缓存，R5/Q8）
 /// - `network.toml` 内容变更 → NeedsRestart（mesh CIDR 属重启类，R5/§13.6）
 /// - `daemon.toml` 的 `localapi_addr` 变更 → NeedsRestart
 /// - `daemon.toml` 的 `[qos]` 小节变更 → NeedsRestart（子系统启停/重配）

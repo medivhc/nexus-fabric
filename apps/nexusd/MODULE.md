@@ -186,7 +186,8 @@
   写 TUN 失败 → 计数丢弃（不 panic）。
 - **W3（接口边界）**：`nexus-network` 新增 `N1MeshBridge`（`n1/bridge.rs`）：
   - 持有 `N1SessionManager`（连接表）+ `Ipv4Route` 路由表（复用 pump.rs 逻辑）；
-  - `send_to_mesh(dst: Ipv4Addr, packet: &[u8]) -> Result<(), N1Error>`；
+  - `send_to_mesh(dst: IpAddr, packet: &[u8]) -> Result<(), N1Error>`（IPv4/IPv6，
+    v6 路由来自 `[[vpi.routes6]]`）；
   - **不修改** M1-M7 冻结行为（`VpiPump`、`N1SessionManager` 核心逻辑不动）。
 - **W4（配置）**：`network.toml` 的 N1 配置（peer 列表、mesh CIDR）经
   `DataplaneConfig` 传给 dataplane；未配置 N1 时保持 D2 计数行为。
@@ -293,16 +294,19 @@
   - `[tun].enabled=false` 时 DNS 子系统整体禁用：`dns.toml` 不解析、不校验、不建线程，
     其非法内容不影响启动结论（SU-2）；
   - `dns.toml` 缺失 = DNS 禁用：`enabled=false`、`service="disabled"`、不拦截 53。
-  - 落点：`config::parse_dns_config` + `assembly::build_dataplane_config`；旧的宽松
-    解析在 C11 的原子迁移中删除。
+  - 落点：`config::parse_dns_toml(text, network_toml, has_usable_outbound)`（三参数：
+    mesh 网段归属 + 可用出站上下文）+ `assembly::build_dataplane_config`；旧的宽松
+    解析已在 C11 原子迁移中删除。
 - **R4（关闭顺序）**：Unix SIGTERM/SIGINT → 按 §13.4 反向关闭：
   LocalAPI 停收新查询 → **Workspace unmount（C1/D7）** → dataplane 线程停
   （join 1s 超时）→ `N1SessionManager::shutdown()`（join 5s 超时）→ TUN 随
   dataplane 线程退出关闭 → exit 0；任一步超时 → warn 日志后强制继续，不无限等。
   （ProxyEngine 尚无独立运行时，步骤为 no-op，记 info。）
 - **R5（热加载分类）**：`network.toml` 内容变更 → `NeedsRestart`
-  （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `Hot`
-  （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）；
+  （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `NeedsRestart`
+  （DNS 服务持有 socket 与缓存；固定日志原文
+  `[nexusd] WARN: config change requires restart: dns.toml (dns service owns sockets/cache)`）；
+  `dns.toml` 增删 → `NeedsRestart`（子系统启停）；
   `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）；
   `proxy.yaml` **内容变更 → `NeedsRestart`**（engine 只在启动构造，Q-7=B），
   并发布 stale 面（`outbound.stale=true` + active/file tag/kind/sha1）。
@@ -312,7 +316,7 @@
   出站』（`NoUsableOutbound`）降级为『无 proxy engine』，Proxy 流按 D2 回 RST
   并计数。关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
 
-### TCP 终结接线（S1-S11，scenarios/product/tcp_termination_wireup.toml，2026-10-01 冻结）
+### TCP 终结接线（S1-S11，engineering/e2e/test-plans/tcp_termination_wireup.toml，2026-10-01 冻结）
 
 - **S1（终结范围）**：IPv4 + proto 6 的包，且 `PacketClassifier` 分类为
   `Mesh{..}` 或 `Proxy` 时，进入 smoltcp 终结
