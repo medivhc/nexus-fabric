@@ -31,7 +31,7 @@ use nexus_projection::classifier::DropReason;
 use nexus_projection::classifier::{Classification, PacketClassifier};
 use nexus_projection::dns::{DEFAULT_DNS_CACHE_ENTRIES, DnsCache};
 use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
-use nexus_projection::routing::{IpCidr, parse_ipv4_dst};
+use nexus_projection::routing::IpCidr;
 use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
@@ -1078,8 +1078,8 @@ impl Dataplane {
                 return (classification_from_target(&cached.target), None);
             }
         }
-        let domain = parse_ipv4_dst(packet).and_then(|dst| {
-            let ip = IpAddr::V4(Ipv4Addr::from(dst));
+        // C17：目的地址取两族（v6 命中缓存键本就支持，D-impl-8）。
+        let domain = ip_dst_of(packet).and_then(|ip| {
             let hit = self
                 .dns_cache
                 .lock()
@@ -1713,7 +1713,7 @@ impl Dataplane {
                     .proxy_engine
                     .as_mut()
                     .map(|e| e.handle_packet(&packet, outbound));
-                let key = FlowKey::parse_ipv4(&packet);
+                let key = FlowKey::parse(&packet).ok();
                 match outcome {
                     Some(Ok(result)) => {
                         self.write_proxy_tun_packets(result.tun_packets);
@@ -1937,9 +1937,9 @@ impl Dataplane {
             (Some(m), Some(d)) => (m, d),
             _ => return true,
         };
-        let key = match FlowKey::parse_ipv4(packet) {
-            Some(k) => k,
-            None => return true,
+        let key = match FlowKey::parse(packet) {
+            Ok(k) => k,
+            Err(_) => return true,
         };
         debug_assert_eq!(key.proto, IpProto::Udp);
         let hint = egress_hint(classification);
@@ -1961,8 +1961,8 @@ impl Dataplane {
 
     /// Phase C：转发 Active 后 flush 的 UDP 缓冲包（重分类后按 Mesh/Proxy 转发）。
     fn forward_buffered_udp(&mut self, packet: &[u8]) {
-        let domain = parse_ipv4_dst(packet).and_then(|dst| {
-            let ip = IpAddr::V4(Ipv4Addr::from(dst));
+        // C17：目的地址取两族（v6 命中缓存键本就支持，D-impl-8）。
+        let domain = ip_dst_of(packet).and_then(|ip| {
             let hit = self
                 .dns_cache
                 .lock()
@@ -2042,23 +2042,25 @@ impl Dataplane {
             (Some(m), Some(d)) => (m, d),
             _ => return true,
         };
-        let key = match FlowKey::parse_ipv4(packet) {
-            Some(k) => k,
-            None => return true, // 解析失败走旧路径（防御）。
+        let key = match FlowKey::parse(packet) {
+            Ok(k) => k,
+            Err(_) => return true, // 解析失败走旧路径（防御）。
         };
         debug_assert_eq!(key.proto, IpProto::Tcp);
         let is_syn = is_tcp_syn(packet);
         let hint = egress_hint(classification);
         match mgr.on_packet_with_hint(key, packet, is_syn, deps, now, hint) {
             FlowDecision::NewSession { session_id } => {
-                // 待 TcpEvent::Syn 到达时绑定 stream_id。
-                let four = FourTuple {
-                    src_ip: key.src_ip,
-                    src_port: key.src_port,
-                    dst_ip: key.dst_ip,
-                    dst_port: key.dst_port,
-                };
-                self.flow_pending.insert(four, session_id);
+                // 待 TcpEvent::Syn 到达时绑定 stream_id（本 slice 的终结器仍是 v4）。
+                if let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (key.src_ip, key.dst_ip) {
+                    let four = FourTuple {
+                        src_ip: src_ip.octets(),
+                        src_port: key.src_port,
+                        dst_ip: dst_ip.octets(),
+                        dst_port: key.dst_port,
+                    };
+                    self.flow_pending.insert(four, session_id);
+                }
                 true
             }
             FlowDecision::Forward { .. } => true,
@@ -2176,11 +2178,16 @@ impl Dataplane {
                     // 找该流的 smoltcp 连接，发 RST（不静默黑洞，D4）。
                     // 优先用已绑定的 stream_id；握手未完成时按 FourTuple 直接重置。
                     // 若 smoltcp 未产生 RST 包，直接构造一个（E4 可观察性）。
-                    let four = FourTuple {
-                        src_ip: key.src_ip,
-                        src_port: key.src_port,
-                        dst_ip: key.dst_ip,
-                        dst_port: key.dst_port,
+                    // C17：FlowKey 已泛化为 IpAddr；本 slice 的终结器仍是 v4，
+                    // 没有 v4 四元组的 key 直接回收会话（v6 终结归 C21）。
+                    let four = match (key.src_ip, key.dst_ip) {
+                        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => Some(FourTuple {
+                            src_ip: src_ip.octets(),
+                            src_port: key.src_port,
+                            dst_ip: dst_ip.octets(),
+                            dst_port: key.dst_port,
+                        }),
+                        _ => None,
                     };
                     let rst_pkts = match self.flow_stream_id_for_key(&key) {
                         Some(sid) => {
@@ -2188,7 +2195,10 @@ impl Dataplane {
                             self.flow_tcp_streams.remove(&sid);
                             pkts
                         }
-                        None => self.tcp.reset_by_tuple(&four),
+                        None => four
+                            .as_ref()
+                            .map(|four| self.tcp.reset_by_tuple(four))
+                            .unwrap_or_default(),
                     };
                     // 确保有 RST 包；没有则构造。
                     let has_rst = rst_pkts.iter().any(|p| {
@@ -2200,9 +2210,10 @@ impl Dataplane {
                     });
                     if !has_rst {
                         // 直接写 TUN（不经过 fixup_tun_packet，后者只认 smoltcp iface IP）。
-                        let rst = Self::craft_rst(&key);
-                        let _ = self.tun.write(&rst);
-                        self.with_stats(|s| s.tun_written += 1);
+                        if let Some(rst) = Self::craft_rst(&key) {
+                            let _ = self.tun.write(&rst);
+                            self.with_stats(|s| s.tun_written += 1);
+                        }
                     }
                     self.write_tun_packets(rst_pkts);
                     if let Some(mgr) = self.flow_mgr.as_mut() {
@@ -2247,8 +2258,14 @@ impl Dataplane {
     }
 
     /// 构造 TCP RST 包（回退路径；src/dst 互换）。
-    fn craft_rst(key: &FlowKey) -> Vec<u8> {
+    ///
+    /// 本 slice 只支持 v4 流（v6 TCP 终结/回退归 C20–C21）；v6 key → `None`
+    /// （调用方不写包、只计数，绝不发畸形包）。
+    fn craft_rst(key: &FlowKey) -> Option<Vec<u8>> {
         use nexus_projection::tcp::{ip_checksum, tcp_checksum};
+        let (IpAddr::V4(dst_ip), IpAddr::V4(src_ip)) = (key.dst_ip, key.src_ip) else {
+            return None;
+        };
         let mut pkt = vec![0u8; 40]; // 20 IP + 20 TCP
         pkt[0] = 0x45;
         pkt[2] = 0;
@@ -2256,8 +2273,8 @@ impl Dataplane {
         pkt[6] = 0x40;
         pkt[8] = 64;
         pkt[9] = 6;
-        pkt[12..16].copy_from_slice(&key.dst_ip); // src = server
-        pkt[16..20].copy_from_slice(&key.src_ip); // dst = client
+        pkt[12..16].copy_from_slice(&dst_ip.octets()); // src = server
+        pkt[16..20].copy_from_slice(&src_ip.octets()); // dst = client
         pkt[20..22].copy_from_slice(&key.dst_port.to_be_bytes());
         pkt[22..24].copy_from_slice(&key.src_port.to_be_bytes());
         // seq/ack = 0；flags = RST|ACK.
@@ -2265,9 +2282,9 @@ impl Dataplane {
         pkt[33] = 0x14;
         let c = ip_checksum(&pkt[..20]);
         pkt[10..12].copy_from_slice(&c.to_be_bytes());
-        let c2 = tcp_checksum(key.dst_ip, key.src_ip, &pkt[20..]);
+        let c2 = tcp_checksum(dst_ip.octets(), src_ip.octets(), &pkt[20..]);
         pkt[36..38].copy_from_slice(&c2.to_be_bytes());
-        pkt
+        Some(pkt)
     }
 
     /// D2 唯一 RST 发射点（spec §4.5.2 伪码逐行）。
@@ -2283,10 +2300,11 @@ impl Dataplane {
         if !is_tcp_syn(packet) {
             return;
         }
-        let rst = Self::craft_rst(key);
-        match self.tun.write(&rst) {
-            Ok(_) => self.with_stats(|s| s.tun_written += 1),
-            Err(_) => self.with_stats(|s| s.dropped += 1),
+        if let Some(rst) = Self::craft_rst(key) {
+            match self.tun.write(&rst) {
+                Ok(_) => self.with_stats(|s| s.tun_written += 1),
+                Err(_) => self.with_stats(|s| s.dropped += 1),
+            }
         }
         eprintln!(
             "[nexusd] dataplane: proxy egress unavailable; sent RST stream_id=- counter=proxy_dropped_no_proxy"
@@ -2417,10 +2435,12 @@ impl Dataplane {
                     // Phase B：绑定 §10 Session（SYN 包建会话时已记入 flow_pending）。
                     if let Some(four) = self.tcp.lookup_id(stream_id) {
                         if let Some(session_id) = self.flow_pending.remove(&four) {
+                            // C17：FlowKey 现在持 IpAddr；本 slice 的终结器仍是
+                            // v4（FourTuple 的 [u8;4] 由 C21 泛化）。
                             let key = FlowKey {
-                                src_ip: four.src_ip,
+                                src_ip: IpAddr::V4(Ipv4Addr::from(four.src_ip)),
                                 src_port: four.src_port,
-                                dst_ip: four.dst_ip,
+                                dst_ip: IpAddr::V4(Ipv4Addr::from(four.dst_ip)),
                                 dst_port: four.dst_port,
                                 proto: IpProto::Tcp,
                             };
@@ -4289,7 +4309,7 @@ outbounds:
         mock.lock().unwrap().inject(udp.clone());
         assert!(dp.process_one().expect("mesh udp"));
         assert_eq!(dp.flow_planner_calls(), 1, "planner must run for Mesh");
-        let udp_key = FlowKey::parse_ipv4(&udp).expect("udp key");
+        let udp_key = FlowKey::parse(&udp).expect("udp key");
         assert!(
             dp.flow_session_for_key(&udp_key).is_some(),
             "Mesh flow must own a session"
@@ -4319,7 +4339,7 @@ outbounds:
         mock.lock().unwrap().inject(syn.clone());
         assert!(dp.process_one().expect("mesh syn"));
         assert_eq!(dp.flow_planner_calls(), 2, "planner must run for Mesh TCP");
-        let tcp_key = FlowKey::parse_ipv4(&syn).expect("tcp key");
+        let tcp_key = FlowKey::parse(&syn).expect("tcp key");
         assert!(dp.flow_session_for_key(&tcp_key).is_some());
         assert_eq!(dp.stats().dropped, 0);
     }
