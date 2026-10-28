@@ -5903,19 +5903,28 @@ fn log_udp_rejected(
 }
 
 /// 一次路由观测（`flow_opened` 日志与 `udp_send_failed` 的 tag 来源）。
+#[derive(Clone)]
 struct UdpRouteRecord {
     target: TargetAddr,
     tag: String,
     kind: OutboundKind,
 }
 
-/// 路由侧状态（出站工厂缓存 + 已消费的能力模式 + 最近一次路由）。
+/// 路由侧状态（出站工厂缓存 + 已消费的能力模式 + 最近一次路由 + 关联内已打开 flow 的去重观测）。
 #[derive(Default)]
 struct RouterState {
     cache: HashMap<String, Result<Arc<dyn UdpOutbound>, UdpDropReason>>,
     modes: BTreeSet<&'static str>,
     last: Option<UdpRouteRecord>,
+    /// 关联内已路由过的 (target, tag) 去重序列（上限 `UDP_ROUTING_FLOW_LOG`）。
+    ///
+    /// spec §9.1 第 7 步要求产品 UDP JSON 能断言 `routing.flows[0].outbound_kind`；
+    /// 只记录路由事实，不参与数据面决策。
+    flows: Vec<UdpRouteRecord>,
 }
+
+/// 产品 UDP JSON 里保留的 flow 观测条数上限（避免大关联把 JSON 撑爆）。
+const UDP_ROUTING_FLOW_LOG: usize = 16;
 
 /// 产品 UDP 路由：`ProxyService` 规则 → `OutboundConfig` → `build_udp_outbound`（带缓存）。
 struct ProductUdpRouter {
@@ -5978,6 +5987,23 @@ impl ProductUdpRouter {
                 )
             })
     }
+
+    /// 关联内已路由的 flow 序列（去重、稳定序；spec §9.1 第 7 步的 `routing.flows`）。
+    fn flow_records(&self) -> Vec<Value> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flows
+            .iter()
+            .map(|record| {
+                json!({
+                    "target": record.target.to_destination_string(),
+                    "outbound_tag": record.tag,
+                    "outbound_kind": record.kind.as_str(),
+                })
+            })
+            .collect()
+    }
 }
 
 impl UdpOutboundRouter for ProductUdpRouter {
@@ -5988,14 +6014,24 @@ impl UdpOutboundRouter for ProductUdpRouter {
         // flow key 的 tag 取出站自报值（与规则决策同源，避免两处来源漂移）。
         let tag = outbound.tag().to_string();
         let kind = outbound.kind();
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last = Some(UdpRouteRecord {
+        let record = UdpRouteRecord {
             target: target.clone(),
             tag: tag.clone(),
             kind,
-        });
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let duplicate = state
+            .flows
+            .last()
+            .is_some_and(|last| last.target == record.target && last.tag == record.tag);
+        if !duplicate && state.flows.len() < UDP_ROUTING_FLOW_LOG {
+            state.flows.push(record.clone());
+        }
+        state.last = Some(record);
+        drop(state);
         Ok(RoutedOutbound { tag, outbound })
     }
 }
@@ -6159,6 +6195,8 @@ struct UdpRunOutcome {
     error: Option<(&'static str, String)>,
     stats: UdpStats,
     modes: Vec<&'static str>,
+    /// 关联内已路由的 flow 观测（spec §9.1 第 7 步：`routing.flows[]`）。
+    flows: Vec<Value>,
 }
 
 impl UdpRunOutcome {
@@ -6175,6 +6213,7 @@ impl UdpRunOutcome {
                 ..UdpStats::default()
             },
             modes: Vec::new(),
+            flows: Vec::new(),
         }
     }
 }
@@ -6531,6 +6570,7 @@ fn udp_association_run(
         error: None,
         stats,
         modes: router.modes(),
+        flows: router.flow_records(),
     })
 }
 
@@ -6584,6 +6624,10 @@ fn udp_associate_json(
             "effective_concurrency": 1,
         },
         "udp": udp_stats_json(&run.stats),
+        // spec §9.1 第 7 步：产品 UDP 也要能断言出站种类（TCP 的 `routing.*` 逐字不变）。
+        "routing": {
+            "flows": run.flows,
+        },
     });
     payload["udp"]["modes"] = json!(run.modes);
     if let Some((code, message)) = run.error {

@@ -289,8 +289,13 @@ pub fn run_cell(cfg: &InteropProbeConfig, cli: &ProbeCli) -> Result<CellEvidence
         events.emit("INFO", "selfcheck_ok", "NONE", "target reachable");
     }
 
+    // 目标端计数基线：回环自检本身会给 UdpEcho 目标发 1 包，产品格断言必须看增量。
+    let target_udp_baseline = target_set.as_ref().map_or(0, |set| {
+        set.stats.to_json()["udp_datagrams"].as_u64().unwrap_or(0)
+    });
+
     events.emit("INFO", "cell_start", "NONE", "cell execution started");
-    let outcome = if synthetic {
+    let mut outcome = if synthetic {
         match crate_direct::run_cell(cfg, &dir) {
             Ok(outcome) => outcome,
             Err(detail) => return Err(ProbeError::CellPanic { detail }),
@@ -308,14 +313,45 @@ pub fn run_cell(cfg: &InteropProbeConfig, cli: &ProbeCli) -> Result<CellEvidence
             vision::run_cell(cfg).map_err(|detail| ProbeError::CellPanic { detail })?
         } else {
             match carrier {
-                Carrier::ProductSocks5 => {
-                    product::run_cell(cfg).map_err(|detail| ProbeError::CellPanic { detail })?
-                }
+                Carrier::ProductSocks5 => product::run_cell(cfg, &dir)
+                    .map_err(|detail| ProbeError::CellPanic { detail })?,
                 Carrier::CrateDirect => crate_direct::run_cell(cfg, &dir)
                     .map_err(|detail| ProbeError::CellPanic { detail })?,
             }
         }
     };
+    // spec §9.1 第 7 步 / §9.3-6：UdpEcho 的 PASS 必须伴随目标端真实收包；
+    // 未实现协议的 fail-closed 格必须目标端零收包（无直连、无伪造回包）。
+    if cfg.cell == Cell::UdpEcho
+        && let Some(target_set) = target_set.as_ref()
+    {
+        let total = target_set.stats.to_json()["udp_datagrams"]
+            .as_u64()
+            .unwrap_or(0);
+        let delta = total.saturating_sub(target_udp_baseline);
+        outcome.notes.push(format!(
+            "target_udp_baseline={target_udp_baseline} target_udp_delta={delta}"
+        ));
+        let downgrade = match outcome.verdict {
+            Verdict::Pass => delta == 0,
+            Verdict::NotImplemented => delta != 0,
+            _ => false,
+        };
+        if downgrade {
+            outcome.notes.push(format!(
+                "target_stats_assertion_failed udp_datagrams_delta={delta} verdict={}",
+                outcome.verdict.label()
+            ));
+            outcome.verdict = Verdict::Fail;
+            outcome.error = Some(ErrorInfo {
+                class: ErrorClass::ENexusUdp,
+                message: format!(
+                    "target datagram delta {delta} contradicts the product udp verdict"
+                ),
+                first_failure_artifact: Some("target.json".into()),
+            });
+        }
+    }
     notes.extend(outcome.notes.iter().cloned());
     if let Some(target_set) = target_set.as_ref() {
         let target_path = dir.join("target.json");

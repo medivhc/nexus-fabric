@@ -1,4 +1,5 @@
-//! crate 直调载波（AC-05）：VLESS/AnyTLS/Hysteria2 的 UDP，Trojan/SS 合成格，QPACK 诊断。
+//! crate 直调载波（AC-05）：VLESS/AnyTLS/Hysteria2 的 UDP（`UdpEchoCrate` diag），
+//! Trojan/SS 合成格，QPACK 诊断。
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -24,11 +25,11 @@ use crate::util;
 /// crate 直调入口。
 pub fn run_cell(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, String> {
     match (cfg.protocol, cfg.cell) {
-        (Protocol::Vless, Cell::UdpEcho) => vless_udp(cfg),
-        (Protocol::Anytls, Cell::UdpEcho) => anytls_udp(cfg),
-        (Protocol::Hysteria2, Cell::UdpEcho) => hysteria2_udp(cfg),
+        (Protocol::Vless, Cell::UdpEcho | Cell::UdpEchoCrate) => vless_udp(cfg),
+        (Protocol::Anytls, Cell::UdpEcho | Cell::UdpEchoCrate) => anytls_udp(cfg),
+        (Protocol::Hysteria2, Cell::UdpEcho | Cell::UdpEchoCrate) => hysteria2_udp(cfg),
         (Protocol::Hysteria2, Cell::QpackDiag) => hysteria2_qpack_diag(cfg, cell_dir),
-        (Protocol::Trojan, Cell::UdpEcho) => {
+        (Protocol::Trojan, Cell::UdpEcho | Cell::UdpEchoCrate) => {
             write_manifest(
                 cell_dir,
                 "trojan-udp-not-implemented",
@@ -40,17 +41,17 @@ pub fn run_cell(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, St
                         "encode_request_fmt（仅 CMD 0x01）",
                     ),
                     (
-                        "crates/nexus-ingress/src/lib.rs",
-                        "232-241",
-                        "SOCKS5 BND/UDP ASSOCIATE 明确拒绝",
+                        "apps/nexus/src/udp_outbound.rs",
+                        "build_udp_outbound",
+                        "Trojan → Unsupported{NotWired}（出站无 UDP 帧 API）",
                     ),
                 ],
             )?;
             Ok(Outcome::not_implemented(
-                "Trojan UDP 路径未实现（产品入口 + 出站均无）",
+                "Trojan UDP 路径未实现（crate 直调无 UDP 帧 API；产品入口见 UdpEcho 行）",
             ))
         }
-        (Protocol::Shadowsocks, Cell::UdpEcho) => {
+        (Protocol::Shadowsocks, Cell::UdpEcho | Cell::UdpEchoCrate) => {
             write_manifest(
                 cell_dir,
                 "shadowsocks-udp-not-implemented",
@@ -62,14 +63,14 @@ pub fn run_cell(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, St
                         "SsStream 仅 TCP SIP004 AEAD seal/open（无 UDP 关联）",
                     ),
                     (
-                        "crates/nexus-ingress/src/lib.rs",
-                        "232-241",
-                        "SOCKS5 BND/UDP ASSOCIATE 明确拒绝",
+                        "apps/nexus/src/udp_outbound.rs",
+                        "build_udp_outbound",
+                        "Trojan → Unsupported{NotWired}（出站无 UDP 帧 API）",
                     ),
                 ],
             )?;
             Ok(Outcome::not_implemented(
-                "Shadowsocks UDP 路径未实现（产品入口 + 出站均无）",
+                "Shadowsocks UDP 路径未实现（crate 直调无 UDP 帧 API；产品入口见 UdpEcho 行）",
             ))
         }
         (Protocol::Trojan, Cell::BadConfig) => {
@@ -450,7 +451,7 @@ fn hysteria2_qpack_diag(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Out
     }
 }
 
-fn write_manifest(
+pub(crate) fn write_manifest(
     cell_dir: &Path,
     tag: &str,
     reason: &str,
