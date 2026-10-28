@@ -210,8 +210,8 @@ pub struct DataplaneStats {
 /// S4: 终结流记录（事件分发用）。
 #[derive(Debug, Clone, Copy)]
 struct TcpStreamInfo {
-    /// 原始目的（STREAM 帧经 N1 路由用）。
-    dst: SocketAddrV4,
+    /// 原始目的（STREAM 帧经 N1 路由用；v4/v6 双栈，C21）。
+    dst: SocketAddr,
     /// 是否 Proxy 分类（true → 只计数，不经 N1）。
     proxy: bool,
 }
@@ -1943,8 +1943,16 @@ impl Dataplane {
 
         let (classification, _) = self.classify_with_cache(packet, now_millis);
         match classification {
-            Classification::Mesh { .. } => {
+            Classification::Mesh { ref path, .. } => {
                 self.with_stats(|s| s.ipv6.classified_mesh += 1);
+                // C21：v6 TCP 走终结器（本地 SYN-ACK + STREAM 帧），
+                // 与 v4 Mesh TCP 同一条路径；UDP 等仍按原始包转发。
+                if protocol == Some(6) {
+                    let _ = path;
+                    self.handle_tcp_terminated(packet, &classification);
+                    self.dispatch_tcp_events();
+                    return;
+                }
                 let sent = if self.config.n1_configured {
                     match (&self.n1_sender, ip_dst_of(packet)) {
                         (Some(sender), Some(dst)) => sender.send_to_mesh(dst, packet).is_ok(),
@@ -1970,26 +1978,50 @@ impl Dataplane {
                     s.direct_forwarded += 1;
                 });
             }
-            Classification::Proxy { .. } => {
-                self.with_stats(|s| {
-                    s.ipv6.classified_proxy += 1;
-                    s.ipv6.proxy_dropped += 1;
-                });
-                if has_fragment && self.ipv6_log_should_emit("ipv6_fragment_dropped", "path=proxy")
-                {
-                    eprintln!("[nexusd] ipv6 WARN event=ipv6_fragment_dropped path=proxy");
-                }
-                if let Some(hdr) = unsupported_extension {
-                    let key = format!("hdr={hdr}");
-                    if self.ipv6_log_should_emit("ipv6_ext_unsupported", &key) {
-                        eprintln!("[nexusd] ipv6 WARN event=ipv6_ext_unsupported hdr={hdr}");
+            Classification::Proxy { ref outbound } => {
+                self.with_stats(|s| s.ipv6.classified_proxy += 1);
+                // C21：v6 代理类 TCP 现在终结并拨号（Q4 的 v6 出口阻断只保留
+                // UDP/分片/扩展头不可解析路径）。失败走既有 proxy_* 计数，
+                // 不额外计 `ipv6.proxy_dropped`（该计数只表示"未接线丢弃"）。
+                let tcp_wired = protocol == Some(6) && self.proxy_engine.is_some();
+                if tcp_wired {
+                    let outcome = self
+                        .proxy_engine
+                        .as_mut()
+                        .map(|e| e.handle_packet(packet, outbound));
+                    match outcome {
+                        Some(Ok(result)) => {
+                            self.write_proxy_tun_packets(result.tun_packets);
+                            self.record_proxy_stream_failures(result.stream_events);
+                            if result.forwarded {
+                                self.with_stats(|s| s.proxy_forwarded += 1);
+                            }
+                        }
+                        Some(Err(_)) | None => {
+                            self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                        }
                     }
-                }
-                let proto = protocol.map_or_else(|| "-".to_string(), |p| p.to_string());
-                if self.ipv6_log_should_emit("ipv6_proxy_unsupported", &format!("proto={proto}")) {
-                    eprintln!(
-                        "[nexusd] ipv6 WARN event=ipv6_proxy_unsupported proto={proto} packets=1"
-                    );
+                } else {
+                    self.with_stats(|s| s.ipv6.proxy_dropped += 1);
+                    if has_fragment
+                        && self.ipv6_log_should_emit("ipv6_fragment_dropped", "path=proxy")
+                    {
+                        eprintln!("[nexusd] ipv6 WARN event=ipv6_fragment_dropped path=proxy");
+                    }
+                    if let Some(hdr) = unsupported_extension {
+                        let key = format!("hdr={hdr}");
+                        if self.ipv6_log_should_emit("ipv6_ext_unsupported", &key) {
+                            eprintln!("[nexusd] ipv6 WARN event=ipv6_ext_unsupported hdr={hdr}");
+                        }
+                    }
+                    let proto = protocol.map_or_else(|| "-".to_string(), |p| p.to_string());
+                    if self
+                        .ipv6_log_should_emit("ipv6_proxy_unsupported", &format!("proto={proto}"))
+                    {
+                        eprintln!(
+                            "[nexusd] ipv6 WARN event=ipv6_proxy_unsupported proto={proto} packets=1"
+                        );
+                    }
                 }
             }
             Classification::Drop { .. } => {
@@ -2051,7 +2083,12 @@ impl Dataplane {
         for event in self.tcp.poll() {
             match event {
                 TcpEvent::Syn { stream_id, dst, .. } => {
-                    if self.direct_tcp.open(stream_id, dst).is_err() {
+                    // Direct 出口仍是 v4（本 run 只接线 Proxy/Mesh 的 v6）。
+                    let SocketAddr::V4(dst4) = dst else {
+                        out.extend(self.tcp.handle_fabric_rst(stream_id));
+                        continue;
+                    };
+                    if self.direct_tcp.open(stream_id, dst4).is_err() {
                         out.extend(self.tcp.handle_fabric_rst(stream_id));
                     } else {
                         self.with_stats(|s| s.direct_tcp_dial_ok += 1);
@@ -2272,16 +2309,14 @@ impl Dataplane {
         let hint = egress_hint(classification);
         match mgr.on_packet_with_hint(key, packet, is_syn, deps, now, hint) {
             FlowDecision::NewSession { session_id } => {
-                // 待 TcpEvent::Syn 到达时绑定 stream_id（本 slice 的终结器仍是 v4）。
-                if let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (key.src_ip, key.dst_ip) {
-                    let four = FourTuple {
-                        src_ip: src_ip.octets(),
-                        src_port: key.src_port,
-                        dst_ip: dst_ip.octets(),
-                        dst_port: key.dst_port,
-                    };
-                    self.flow_pending.insert(four, session_id);
-                }
+                // 待 TcpEvent::Syn 到达时绑定 stream_id（C21：FourTuple 已双栈）。
+                let four = FourTuple {
+                    src_ip: key.src_ip,
+                    src_port: key.src_port,
+                    dst_ip: key.dst_ip,
+                    dst_port: key.dst_port,
+                };
+                self.flow_pending.insert(four, session_id);
                 true
             }
             FlowDecision::Forward { .. } => true,
@@ -2320,7 +2355,7 @@ impl Dataplane {
                 // S5-Mesh：STREAM DATA 帧经 N1 发送。
                 let frame = encode_stream_frame(stream_id, 0x00, bytes);
                 let n = bytes.len() as u64;
-                if self.send_mesh_tcp_frame((*info.dst.ip()).into(), &frame) {
+                if self.send_mesh_tcp_frame(info.dst.ip(), &frame) {
                     self.with_stats(|s| s.mesh_tcp_bytes += n);
                 }
             }
@@ -2399,16 +2434,12 @@ impl Dataplane {
                     // 找该流的 smoltcp 连接，发 RST（不静默黑洞，D4）。
                     // 优先用已绑定的 stream_id；握手未完成时按 FourTuple 直接重置。
                     // 若 smoltcp 未产生 RST 包，直接构造一个（E4 可观察性）。
-                    // C17：FlowKey 已泛化为 IpAddr；本 slice 的终结器仍是 v4，
-                    // 没有 v4 四元组的 key 直接回收会话（v6 终结归 C21）。
-                    let four = match (key.src_ip, key.dst_ip) {
-                        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => Some(FourTuple {
-                            src_ip: src_ip.octets(),
-                            src_port: key.src_port,
-                            dst_ip: dst_ip.octets(),
-                            dst_port: key.dst_port,
-                        }),
-                        _ => None,
+                    // C21：FourTuple 已双栈，v4/v6 都能按 tuple 重置。
+                    let four = FourTuple {
+                        src_ip: key.src_ip,
+                        src_port: key.src_port,
+                        dst_ip: key.dst_ip,
+                        dst_port: key.dst_port,
                     };
                     let rst_pkts = match self.flow_stream_id_for_key(&key) {
                         Some(sid) => {
@@ -2416,10 +2447,7 @@ impl Dataplane {
                             self.flow_tcp_streams.remove(&sid);
                             pkts
                         }
-                        None => four
-                            .as_ref()
-                            .map(|four| self.tcp.reset_by_tuple(four))
-                            .unwrap_or_default(),
+                        None => self.tcp.reset_by_tuple(&four),
                     };
                     // 确保有 RST 包；没有则构造。
                     let has_rst = rst_pkts.iter().any(|p| {
@@ -2483,29 +2511,48 @@ impl Dataplane {
     /// 本 slice 只支持 v4 流（v6 TCP 终结/回退归 C20–C21）；v6 key → `None`
     /// （调用方不写包、只计数，绝不发畸形包）。
     fn craft_rst(key: &FlowKey) -> Option<Vec<u8>> {
+        use nexus_projection::ip::tcp_udp_checksum_v6;
         use nexus_projection::tcp::{ip_checksum, tcp_checksum};
-        let (IpAddr::V4(dst_ip), IpAddr::V4(src_ip)) = (key.dst_ip, key.src_ip) else {
-            return None;
-        };
-        let mut pkt = vec![0u8; 40]; // 20 IP + 20 TCP
-        pkt[0] = 0x45;
-        pkt[2] = 0;
-        pkt[3] = 40;
-        pkt[6] = 0x40;
-        pkt[8] = 64;
-        pkt[9] = 6;
-        pkt[12..16].copy_from_slice(&dst_ip.octets()); // src = server
-        pkt[16..20].copy_from_slice(&src_ip.octets()); // dst = client
-        pkt[20..22].copy_from_slice(&key.dst_port.to_be_bytes());
-        pkt[22..24].copy_from_slice(&key.src_port.to_be_bytes());
-        // seq/ack = 0；flags = RST|ACK.
-        pkt[32] = 0x50;
-        pkt[33] = 0x14;
-        let c = ip_checksum(&pkt[..20]);
-        pkt[10..12].copy_from_slice(&c.to_be_bytes());
-        let c2 = tcp_checksum(dst_ip.octets(), src_ip.octets(), &pkt[20..]);
-        pkt[36..38].copy_from_slice(&c2.to_be_bytes());
-        Some(pkt)
+        match (key.dst_ip, key.src_ip) {
+            (IpAddr::V4(dst_ip), IpAddr::V4(src_ip)) => {
+                let mut pkt = vec![0u8; 40]; // 20 IP + 20 TCP
+                pkt[0] = 0x45;
+                pkt[2] = 0;
+                pkt[3] = 40;
+                pkt[6] = 0x40;
+                pkt[8] = 64;
+                pkt[9] = 6;
+                pkt[12..16].copy_from_slice(&dst_ip.octets()); // src = server
+                pkt[16..20].copy_from_slice(&src_ip.octets()); // dst = client
+                pkt[20..22].copy_from_slice(&key.dst_port.to_be_bytes());
+                pkt[22..24].copy_from_slice(&key.src_port.to_be_bytes());
+                // seq/ack = 0；flags = RST|ACK.
+                pkt[32] = 0x50;
+                pkt[33] = 0x14;
+                let c = ip_checksum(&pkt[..20]);
+                pkt[10..12].copy_from_slice(&c.to_be_bytes());
+                let c2 = tcp_checksum(dst_ip.octets(), src_ip.octets(), &pkt[20..]);
+                pkt[36..38].copy_from_slice(&c2.to_be_bytes());
+                Some(pkt)
+            }
+            (IpAddr::V6(dst_ip), IpAddr::V6(src_ip)) => {
+                let mut pkt = vec![0u8; 60]; // 40 IPv6 + 20 TCP
+                pkt[0] = 0x60;
+                pkt[4..6].copy_from_slice(&20u16.to_be_bytes()); // payload length
+                pkt[6] = 6;
+                pkt[7] = 64;
+                pkt[8..24].copy_from_slice(&dst_ip.octets()); // src = server
+                pkt[24..40].copy_from_slice(&src_ip.octets()); // dst = client
+                pkt[40..42].copy_from_slice(&key.dst_port.to_be_bytes());
+                pkt[42..44].copy_from_slice(&key.src_port.to_be_bytes());
+                pkt[52] = 0x50;
+                pkt[53] = 0x14;
+                let c2 = tcp_udp_checksum_v6(dst_ip, src_ip, 6, &pkt[40..]);
+                pkt[56..58].copy_from_slice(&c2.to_be_bytes());
+                Some(pkt)
+            }
+            _ => None,
+        }
     }
 
     /// D2 唯一 RST 发射点（spec §4.5.2 伪码逐行）。
@@ -2656,12 +2703,11 @@ impl Dataplane {
                     // Phase B：绑定 §10 Session（SYN 包建会话时已记入 flow_pending）。
                     if let Some(four) = self.tcp.lookup_id(stream_id) {
                         if let Some(session_id) = self.flow_pending.remove(&four) {
-                            // C17：FlowKey 现在持 IpAddr；本 slice 的终结器仍是
-                            // v4（FourTuple 的 [u8;4] 由 C21 泛化）。
+                            // C21：FourTuple 已双栈，直接构造 FlowKey。
                             let key = FlowKey {
-                                src_ip: IpAddr::V4(Ipv4Addr::from(four.src_ip)),
+                                src_ip: four.src_ip,
                                 src_port: four.src_port,
-                                dst_ip: IpAddr::V4(Ipv4Addr::from(four.dst_ip)),
+                                dst_ip: four.dst_ip,
                                 dst_port: four.dst_port,
                                 proto: IpProto::Tcp,
                             };
@@ -2678,7 +2724,7 @@ impl Dataplane {
                         // S4-Mesh：STREAM SYN 帧经 N1 发送（按原始目的路由）。
                         let payload = encode_syn_payload(&dst.ip().to_string(), dst.port());
                         let frame = encode_stream_frame(stream_id, STREAM_SYN, &payload);
-                        self.send_mesh_tcp_frame((*dst.ip()).into(), &frame);
+                        self.send_mesh_tcp_frame(dst.ip(), &frame);
                     }
                 }
                 TcpEvent::Data {
@@ -2714,7 +2760,7 @@ impl Dataplane {
                             // S6-Mesh：STREAM FIN/RST 帧经 N1 发送。
                             let flag = if reset { STREAM_RST } else { STREAM_FIN };
                             let frame = encode_stream_frame(stream_id, flag, &[]);
-                            self.send_mesh_tcp_frame((*info.dst.ip()).into(), &frame);
+                            self.send_mesh_tcp_frame(info.dst.ip(), &frame);
                         }
                         // S6-Proxy：S4 已计流数，无额外动作。
                     }
