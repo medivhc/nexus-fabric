@@ -355,7 +355,7 @@ fn section_ac7() -> Result<Value, String> {
         && stats.ipv6.multicast == 1
         && stats.dropped == 0
         && env.paths.proxy_udp == "blocked"
-        && env.paths.proxy_tcp == "blocked";
+        && env.paths.proxy_tcp == "supported";
     Ok(json!({
         "verdict": if ok { "PASS" } else { "FAIL" },
         "ipv6": stats_json(&stats.ipv6),
@@ -447,7 +447,7 @@ fn section_ac16() -> Result<Value, String> {
     let ok = without.paths.mesh == "unsupported"
         && with.paths.mesh == "supported"
         && with.paths.direct == "supported"
-        && with.paths.proxy_tcp == "blocked"
+        && with.paths.proxy_tcp == "supported"
         && with.paths.proxy_udp == "blocked"
         && with.paths.tun_address == "unassigned"
         && with.paths.nat == "unsupported"

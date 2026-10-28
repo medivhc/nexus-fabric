@@ -223,7 +223,7 @@ equals = "supported"
 
 [[expect]]
 field = "sections.ac16.with_routes6.proxy_tcp"
-equals = "blocked"
+equals = "supported"
 
 [[expect]]
 field = "sections.ac16.with_routes6.proxy_udp"

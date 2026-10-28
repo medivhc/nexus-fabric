@@ -3341,7 +3341,10 @@ pub fn dataplane_stats_snapshot() -> DataplaneStats {
 
 /// IPv6 能力表（静态，启动时由配置与编译特性决定；不随包变化）。
 ///
-/// `proxy_tcp/proxy_udp="blocked"` 是 Q4 已裁定的产品行为，不是 TODO；
+/// `proxy_udp="blocked"` 是 Q4 已裁定的产品行为，不是 TODO；`proxy_tcp`
+/// 原同为 `blocked`，C21 接线（终结 + 经出站 adapter 拨号）落地后与事实
+/// 漂移，合并门以 requirement-change 对齐为 `supported`
+/// （RC-r3-f3-proxytcp-20261028；CAC-1 端到端回显实测为据）；
 /// `tun_address="unassigned"` 表示本 run 不做 TUN v6 地址分配（Q7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv6Paths {
@@ -3349,7 +3352,8 @@ pub struct Ipv6Paths {
     pub mesh: &'static str,
     /// 恒为 `supported`（分类 + 计数）。
     pub direct: &'static str,
-    /// 恒为 `blocked`（本 run v6 代理 TCP 出口阻断）。
+    /// 恒为 `supported`（v6 代理 TCP 经出站引擎终结 + 拨号；方言不支持
+    /// v6 目标时可见失败 RST；引擎未配置时按既有 `proxy_dropped` 计数）。
     pub proxy_tcp: &'static str,
     /// 恒为 `blocked`（本 run v6 代理 UDP 出口阻断）。
     pub proxy_udp: &'static str,
@@ -3370,7 +3374,7 @@ impl Ipv6Paths {
                 "unsupported"
             },
             direct: "supported",
-            proxy_tcp: "blocked",
+            proxy_tcp: "supported",
             proxy_udp: "blocked",
             tun_address: "unassigned",
             nat: "unsupported",
@@ -6682,7 +6686,7 @@ outbounds:
         let without = Ipv6Paths::from_capabilities(false);
         assert_eq!(without.mesh, "unsupported");
         assert_eq!(without.direct, "supported");
-        assert_eq!(without.proxy_tcp, "blocked");
+        assert_eq!(without.proxy_tcp, "supported");
         assert_eq!(without.proxy_udp, "blocked");
         assert_eq!(without.tun_address, "unassigned");
         assert_eq!(without.nat, "unsupported");
@@ -6716,7 +6720,7 @@ outbounds:
         assert_eq!(json["dataplane"]["ipv6"]["proxy_dropped"], 3);
         assert_eq!(json["dataplane"]["ipv6"]["fragments"], 0);
         assert_eq!(json["ipv6_paths"]["mesh"], "supported");
-        assert_eq!(json["ipv6_paths"]["proxy_tcp"], "blocked");
+        assert_eq!(json["ipv6_paths"]["proxy_tcp"], "supported");
         assert_eq!(json["ipv6_paths"]["proxy_udp"], "blocked");
         assert_eq!(json["ipv6_paths"]["tun_address"], "unassigned");
         assert_eq!(json["ipv6_paths"]["nat"], "unsupported");

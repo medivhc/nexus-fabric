@@ -176,7 +176,7 @@
   `fragments`/`multicast`/`dropped_*`。
 - **能力表**：`ipv6_paths` 是静态表（启动时由 `[[vpi.routes6]]` 与编译特性决定，
   不随包变化）：`mesh = supported|unsupported`、`direct = supported`、
-  `proxy_tcp = proxy_udp = blocked`、`tun_address = unassigned`、`nat = unsupported`；
+  `proxy_tcp = supported`（合并门 RC-r3-f3-proxytcp-20261028 对齐 C21 接线事实；CAC-1 实测）、`proxy_udp = blocked`、`tun_address = unassigned`、`nat = unsupported`；
   经 `/localapi/v0/dataplane/stats` 的 `ipv6_paths` 暴露，并与 `ingress_ip_family`
   派生自同一张表（v6 mesh 路由在位 → `dual-stack`，否则 `ipv4`；N-8：禁止硬编码
   `ipv4` 与能力表矛盾）。
