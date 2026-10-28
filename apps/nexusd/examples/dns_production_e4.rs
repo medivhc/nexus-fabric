@@ -477,12 +477,25 @@ fn suite_upstream() -> Result<Value, String> {
         && !cache.is_empty();
 
     // AC5 (enabled side): all classes true and service running.
-    let ac5_ok = snapshot.enabled
-        && snapshot.service.as_str() == "running"
-        && snapshot.classes.hosts == false
-        && snapshot.classes.mesh == false
-        && snapshot.classes.proxy_classifier == false
-        && snapshot.classes.upstream
+    let mut ac5_dns = base_dns_toml(&[format!("127.0.0.1:{port}")], false);
+    ac5_dns.push_str(
+        "[dns.hosts]\n\"local5.example\" = \"10.9.9.9\"\n[dns.mesh.hosts]\n\"peer.mesh\" = \"10.144.144.6\"\n",
+    );
+    let ac5_env = build_env(
+        "ac5",
+        Some(&ac5_dns),
+        Some(&network_toml(false)),
+        Some(&three_rule_yaml()),
+        true,
+    )?;
+    let ac5_status = ac5_env.status_snapshot();
+    let ac5_ok = ac5_status.enabled
+        && ac5_status.service.as_str() == "running"
+        && ac5_status.classes.hosts
+        && ac5_status.classes.mesh
+        && ac5_status.classes.proxy_classifier
+        && ac5_status.classes.upstream
+        && snapshot.enabled
         && dnsmasq
             .log_text()
             .contains("query[A] example.com from 127.0.0.1");
