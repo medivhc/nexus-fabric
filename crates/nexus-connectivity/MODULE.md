@@ -27,6 +27,7 @@
 - `nexus-platform`
 - `nexus-domain`（仅 `evaluation` 模块：`ConnectivityEvaluation` DTO 输出词汇）
 - `nexus-measurement`（仅 `evaluation` 模块：`LinkMeasurement` 事实输入）
+- `nexus-proxy-config`（出站身份/交接词汇；定义已下沉，本 crate 仅重导出）
 
 （P3 起将新增 `nexus-qos`，届时 CAKE 与令牌桶作为叶子 crate 下沉；本轮不加。）
 
@@ -111,17 +112,17 @@
 `activate` 是确定性策略编排（探测结果来自注入的 `LinkProbe`，不自行发起网络 I/O）；
 NAT/中继场景的物理建连（组合根 transport::connect）发生在激活决策之后。
 
-### 冻结契约（OutboundAdapter 接缝，PRODUCT §11.6）
+### 已下沉契约（OutboundAdapter 接缝，PRODUCT §11.6）
 
-- `trait OutboundAdapter`：一种真实出站协议实现（Direct / Relay / Shadowsocks）的领域中立接缝：
-  - `fn outbound_kind(&self) -> &'static str`（"direct" / "relay" / "shadowsocks"）；
-  - `fn tag(&self) -> &str`；
-  - `fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError>`（离线交接，零真实网络）。
-- `OutboundHandoff { kind, tag, locator }`：离线交接结果 DTO。
-- Deletion Test（AGENTS.md §12）成立：Shadowsocks 是首个带真实 AEAD 加解密的出站，与仅做
-  可达性探测的 Direct/Relay 构成独立变化维度；DirectAdapter / RelayAdapter 复用既有
-  `LinkProbe` 语义，`LinkActivator` / `LinkKind` / `LinkProbe` / `LinkSelection` 既有行为不变。
-- trait 保持领域中立、可移植；具体 AEAD 加密实现位于 `nexus-outbound-shadowsocks`（portable=false）。
+- **定义已下沉**：`OutboundHandoff` / `OutboundAdapter` / `OutboundHandoffError` 现定义于
+  `nexus-proxy-config::outbound_seam`（2026-10-28，接缝 ② P2）；本 crate 只做
+  `pub use` 重导出，旧路径 `nexus_connectivity::OutboundAdapter` 等源码兼容。
+- `handoff` 的错误类型为 `OutboundHandoffError`；`ConnectivityError` 不再出现在该签名。
+- 本 crate 不新增出站语义；`LinkActivator` / `LinkKind` / `LinkProbe` / `LinkSelection`
+  既有行为不变（Direct/Relay 的 adapter 形态不由本 crate 提供）。
+- Deletion Test（AGENTS.md §12）判定保留：Shadowsocks 是首个带真实 AEAD 加解密的出站，
+  与仅做可达性探测的 Direct/Relay 构成独立变化维度。
+- 具体 AEAD 加密实现位于 `nexus-outbound-shadowsocks`（portable=false）。
 
 ### 冻结契约（VirtualSubnet 静态路由 P1，PRODUCT §12.5）
 

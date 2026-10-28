@@ -501,11 +501,14 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 该 trait 属推测性设计，已在第 1/3 步判停并推迟）。
 
 ```text
-OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
+OutboundAdapter trait（nexus-proxy-config，领域中立、可移植；经 nexus-connectivity 重导出）
   -> DirectAdapter / RelayAdapter（复用既有 LinkProbe 可达性语义，行为不变）
   -> ShadowsocksAdapter（nexus-outbound-shadowsocks：AEAD 封装）
   -> Composition Root 按 tag 注册 adapter；规则选定出站 tag -> 取对应 adapter 承接流量
 ```
+
+> 2026-10-28（接缝 ② P2）：上表的 trait 与 DTO 定义已下沉 `nexus-proxy-config::outbound_seam`；
+> `nexus-connectivity` 仅 `pub use` 重导出保持源码兼容，行为不变。
 
 - Shadowsocks 出站：配置 `{tag, server, port, method, password}`；本期冻结 method 为
   `chacha20-ietf-poly1305`（纯 Rust AEAD，已实测 wasm32-wasip1 可编译、license/advisory

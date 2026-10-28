@@ -10,7 +10,7 @@ description = "Hysteria2 outbound adapter: QUIC (quinn-proto sans-IO) + minimal 
 workspace = true
 
 [dependencies]
-nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-proxy-config = { path = "../nexus-proxy-config" }
 # QUIC：复用 workspace 已有的 quinn-proto 0.11（vendor patch），sans-IO + 自写同步 driver；
 # 不引入 quiche（见 MODULE.md QUIC 选型结论）。
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "ring"] }

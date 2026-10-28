@@ -40,7 +40,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-connectivity"
-allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement"]
+allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement", "nexus-proxy-config"]
 portable = false
 layer = "delivery"
 
@@ -190,37 +190,37 @@ layer = "platform-adapter"
 
 [[crate]]
 name = "nexus-outbound-shadowsocks"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-vmess"
-allowed_internal_dependencies = ["nexus-connectivity"]
+allowed_internal_dependencies = ["nexus-proxy-config"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-trojan"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-anytls"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-vless"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-hysteria2"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-fabric", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-fabric", "nexus-plugin"]
 portable = false
 layer = "outbound"
 

@@ -63,7 +63,7 @@
 | # | 接缝 | 现址 | 目标归属 | 期 | 状态 |
 |---|---|---|---|---|---|
 | ① | `NatType` / `StunMapping` | `nexus-connectivity::nat` | `nexus-domain::nat` | P1 | 已迁（`nexus-connectivity` 以 `pub use` 保旧路径） |
-| ② | `OutboundAdapter` / `OutboundHandoff` | `nexus-connectivity` | `nexus-proxy-config::outbound_seam` | P2 | **条件生效**：待 R2（outbound-adapter-wiring）最终冻结版 v1.4 的契约评审追认；未追认则 DEFERRED |
+| ② | `OutboundAdapter` / `OutboundHandoff` | `nexus-connectivity` | `nexus-proxy-config::outbound_seam` | P2 | **已落地**（2026-10-28）：条件生效已解除，见 run dual-stack-convergence P2 与 MSR-dualstack-p2-gate-verified-20261028 |
 | ③ | CAKE + 令牌桶 | `nexus-connectivity::{cake,qos,bandwidth_policy}` | 新叶子 crate `nexus-qos` | P3 | planned（进入条件：P1/P1′ 已合入 master） |
 | ④ | `LinkMarker` / `LinkMarkerStore` / `LinkReconcileReport` / `reconcile_link_markers` | `nexus-connectivity` | `nexus-session::link_marker` | P1′ | 已迁（`links.json` 字节格式不变） |
 

@@ -6,11 +6,15 @@
 （入站监听、规则表、策略组、出站定义），并做结构化校验。这是 Nexus 首个配置
 文件入口。
 
+出站身份/离线交接词汇（`outbound_seam`：`OutboundHandoff` / `OutboundAdapter` /
+`OutboundHandoffError`）——自 `nexus-connectivity` 下沉。
+
 ## Non-Responsibilities
 
 - 不执行规则匹配、不选择出站、不发起网络 I/O；
 - 不解析 Clash YAML 配置语法（仅解析 Clash/通用 base64 订阅的「节点 URI 列表」形态，§11.8）；
 - 不持有运行时状态（选中项、measurement 缓存），只负责一次性配置装载与校验。
+- 不选择出站、不发起 I/O、不持有 socket（身份/交接词汇不含数据面）。
 
 ## Inputs
 
@@ -32,6 +36,18 @@
   其中 `NoDatagramMode` 与四个 additive `UdpMode` 变体**保留但无生产者**（N4）。
 - 三类型为共享 DTO（CLI/daemon 共用），**不进入** `OutboundConfig`/`OutboundKind`
   字段集合（AC-CFG-1 不变）；本模块仍零第三方依赖、零 I/O。
+
+## Public API（出站身份/离线交接词汇，接缝 ②）
+
+- 全路径 `outbound_seam::*`（不额外做 crate 根 `pub use`，避免两套路径）：
+  - `outbound_seam::OutboundHandoff { kind, tag, locator }`：离线交接结果 DTO；
+  - `outbound_seam::OutboundAdapter`：`outbound_kind()` / `tag()` /
+    `handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError>`；
+  - `outbound_seam::OutboundHandoffError { InvalidLocator { locator } }`：
+    **保留变体、当前无生产者**（签名预留；6 个实现均不产生错误——离线交接不校验
+    可达性，不做静默删除）。与 `udp::UdpUnsupportedReason::NoDatagramMode` 同口径。
+- 三类型原定义于 `nexus-connectivity`，2026-10-28（P2）下沉至此；由
+  `nexus-connectivity` 以 `pub use` 重导出保持旧路径源码兼容。
 
 ## Allowed Dependencies
 
