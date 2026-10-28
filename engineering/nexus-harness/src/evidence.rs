@@ -4,7 +4,7 @@
 use crate::config::Config;
 use crate::env::Repo;
 use crate::gates::Gate;
-use crate::scenario::ScenarioResult;
+use crate::scenario::{Carrier, ScenarioResult};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
@@ -257,22 +257,48 @@ pub fn write_evidence(
     preserve_stale_if_bindings_differ(repo, &dir, &bindings_json)?;
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
 
-    let summary = json!({
-        "schema_version": 1,
-        "command": "verify",
-        "verdict": verdict,
-        "message": message,
-        "id": id,
-        "created_at": created_at_iso8601(),
-        "bindings": bindings_json,
-        "timing": {
-            "total_ms": timing.total_ms,
-            "started_at": timing.started_at,
-            "deadline_ms": timing.deadline_ms,
-            "deadline_exceeded": timing.deadline_exceeded,
-            "prebuild_ms": timing.prebuild_ms,
-        },
-    });
+    let summary = {
+        let mut summary = json!({
+            "schema_version": 1,
+            "command": "verify",
+            "verdict": verdict,
+            "message": message,
+            "id": id,
+            "created_at": created_at_iso8601(),
+            "bindings": bindings_json,
+            "timing": {
+                "total_ms": timing.total_ms,
+                "started_at": timing.started_at,
+                "deadline_ms": timing.deadline_ms,
+                "deadline_exceeded": timing.deadline_exceeded,
+                "prebuild_ms": timing.prebuild_ms,
+            },
+        });
+        // carrier 统计只在真的有场景结果时写出：fast 无场景执行时 0/0/0
+        // 会被误读成「全覆盖」，故缺省不写该块。
+        if !scenarios.is_empty() {
+            let mut counts: std::collections::BTreeMap<Carrier, usize> =
+                Carrier::ALL.into_iter().map(|c| (c, 0)).collect();
+            for s in scenarios {
+                *counts.entry(s.carrier).or_insert(0) += 1;
+            }
+            let carriers = counts
+                .iter()
+                .map(|(c, n)| (c.as_str().to_string(), json!(n)))
+                .collect::<serde_json::Map<String, Value>>();
+            let total = scenarios.len();
+            // ScenarioResult.carrier 非 Option ⇒ 全部已声明；missing 恒为 0，
+            // 但仍按声明/缺失计数字段输出，供 AC-14 机读。
+            let declared = total;
+            summary["carriers"] = Value::Object(carriers);
+            summary["carrier_coverage"] = json!({
+                "scenarios_total": total,
+                "declared": declared,
+                "missing": total - declared,
+            });
+        }
+        summary
+    };
     let gates_json: Vec<Value> = gates
         .iter()
         .map(|g| {
@@ -291,6 +317,7 @@ pub fn write_evidence(
         .map(|s| {
             json!({
                 "id": s.id,
+                "carrier": s.carrier.as_str(),
                 "verdict": s.verdict,
                 "detail": s.detail,
                 "duration_ms": s.duration_ms,
@@ -925,6 +952,166 @@ mod tests {
         assert_eq!(checks["gates"][0]["skipped_by_deadline"], json!(false));
         assert_eq!(checks["scenarios"][0]["duration_ms"], json!(5));
         assert_eq!(checks["scenarios"][0]["timed_out"], json!(false));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn carrier_result(id: &str, carrier: Carrier) -> ScenarioResult {
+        ScenarioResult {
+            id: id.to_string(),
+            carrier,
+            verdict: "PASS".to_string(),
+            detail: "ok".to_string(),
+            duration_ms: 1,
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn evidence_header_carrier_fields() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let base = Config::load(&repo).expect("config must load");
+        let tmp = std::env::temp_dir().join(format!("harness-ev-carrier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = Config {
+            evidence_dir: tmp.join("evidence"),
+            ..base
+        };
+        let bindings = bindings("rev-carrier");
+        let gates = vec![Gate::ok("whitespace", "ok")];
+        let timing = VerifyTiming {
+            total_ms: 1,
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            deadline_ms: None,
+            deadline_exceeded: false,
+            prebuild_ms: 0,
+        };
+
+        // 空场景切片：不写 carriers / carrier_coverage（避免 0/0/0 被误读为全覆盖）。
+        let id = write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "empty",
+            &gates,
+            &[],
+            &bindings,
+            &timing,
+        )
+        .unwrap();
+        let dir = config.evidence_dir.join(format!("verify-{id}"));
+        let summary: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert!(summary.get("carriers").is_none(), "{summary}");
+        assert!(summary.get("carrier_coverage").is_none(), "{summary}");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 非空：字段齐全，且 gates.json.scenarios[].carrier 透传。
+        std::fs::create_dir_all(&tmp).unwrap();
+        let scenarios = vec![
+            carrier_result("a", Carrier::V9Connectivity),
+            carrier_result("b", Carrier::N1Fabric),
+            carrier_result("c", Carrier::N1Fabric),
+            carrier_result("d", Carrier::SharedLeaf),
+            carrier_result("e", Carrier::Engineering),
+            carrier_result("f", Carrier::External),
+        ];
+        let id = write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "non-empty",
+            &gates,
+            &scenarios,
+            &bindings,
+            &timing,
+        )
+        .unwrap();
+        let dir = config.evidence_dir.join(format!("verify-{id}"));
+        let summary: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["carriers"]["v9-connectivity"], json!(1));
+        assert_eq!(summary["carriers"]["n1-fabric"], json!(2));
+        assert_eq!(summary["carriers"]["shared-leaf"], json!(1));
+        assert_eq!(summary["carriers"]["engineering"], json!(1));
+        assert_eq!(summary["carriers"]["external"], json!(1));
+        assert_eq!(
+            summary["carrier_coverage"],
+            json!({"scenarios_total": 6, "declared": 6, "missing": 0})
+        );
+        let checks: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("gates.json")).unwrap())
+                .unwrap();
+        assert_eq!(checks["scenarios"][1]["carrier"], json!("n1-fabric"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// AC-14 的 P4 期内 fast 代理：用真实仓库 338 场景构造结果，验证
+    /// `carrier_coverage` 为 338/338/0、五值求和 == 338、gates carrier ∈ 闭集。
+    #[test]
+    fn evidence_header_carrier_coverage_matches_repo_scenarios() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let base = Config::load(&repo).expect("config must load");
+        let loaded = crate::scenario::load_all(
+            &base.scenarios_dir,
+            &["product", "engineering", "platform", "regression"],
+        );
+        assert_eq!(loaded.len(), 338, "repository scenario count");
+        let scenarios: Vec<ScenarioResult> = loaded
+            .iter()
+            .map(|s| carrier_result(&s.id, s.carrier))
+            .collect();
+        let tmp = std::env::temp_dir().join(format!("harness-ev-coverage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = Config {
+            evidence_dir: tmp.join("evidence"),
+            ..base
+        };
+        let bindings = Bindings::current(&repo, &config);
+        let gates = vec![Gate::ok("product-scenarios", "ok")];
+        let timing = VerifyTiming {
+            total_ms: 1,
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            deadline_ms: None,
+            deadline_exceeded: false,
+            prebuild_ms: 0,
+        };
+        let id = write_evidence(
+            &repo, &config, "PASS", "coverage", &gates, &scenarios, &bindings, &timing,
+        )
+        .unwrap();
+        let dir = config.evidence_dir.join(format!("verify-{id}"));
+        let summary: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            summary["carrier_coverage"],
+            json!({"scenarios_total": 338, "declared": 338, "missing": 0})
+        );
+        assert_eq!(summary["carriers"]["v9-connectivity"], json!(191));
+        assert_eq!(summary["carriers"]["n1-fabric"], json!(109));
+        assert_eq!(summary["carriers"]["shared-leaf"], json!(1));
+        assert_eq!(summary["carriers"]["engineering"], json!(29));
+        assert_eq!(summary["carriers"]["external"], json!(8));
+        let sum: u64 = summary["carriers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, 338, "five carrier values must sum to 338");
+
+        let checks: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("gates.json")).unwrap())
+                .unwrap();
+        let closed: Vec<Value> = Carrier::ALL.iter().map(|c| json!(c.as_str())).collect();
+        for s in checks["scenarios"].as_array().unwrap() {
+            let c = s["carrier"].clone();
+            assert!(closed.contains(&c), "carrier {c} not in closed set");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
