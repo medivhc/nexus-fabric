@@ -156,18 +156,23 @@ fn proxy_yaml() -> String {
 }
 
 fn assemble(tag: &str, routes6: &[&str], with_proxy: bool) -> Result<Env, String> {
+    assemble_yaml(tag, routes6, with_proxy.then(proxy_yaml))
+}
+
+/// 按给定 proxy.yaml 文本装配（`assemble` 的泛化版；CAC-1 各方言腿用）。
+fn assemble_yaml(tag: &str, routes6: &[&str], yaml: Option<String>) -> Result<Env, String> {
     let dir = TempDir::new(tag);
     std::fs::write(dir.0.join("daemon.toml"), daemon_toml()).map_err(|e| e.to_string())?;
     std::fs::write(dir.0.join("network.toml"), network_toml(routes6)).map_err(|e| e.to_string())?;
-    if with_proxy {
-        std::fs::write(dir.0.join("proxy.yaml"), proxy_yaml()).map_err(|e| e.to_string())?;
+    if let Some(text) = &yaml {
+        std::fs::write(dir.0.join("proxy.yaml"), text).map_err(|e| e.to_string())?;
     }
     let config_dir = ConfigDir::new(&dir.0).map_err(|e| e.to_string())?;
     let loaded = nexusd::config::load(&config_dir).map_err(|e| e.to_string())?;
     let config = nexusd::assembly::build_dataplane_config(&loaded)?;
     let mock = Arc::new(Mutex::new(MockTun::new("mockv6tcp")));
     let mut dp = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None)?;
-    if with_proxy {
+    if yaml.is_some() {
         let engine = nexusd::proxy_fwd::ProxyEngine::new(loaded.proxy_yaml.as_deref())
             .map_err(|e| format!("engine init: {e:?}"))?
             .ok_or_else(|| "proxy engine not constructed".to_string())?;
@@ -182,6 +187,595 @@ fn assemble(tag: &str, routes6: &[&str], with_proxy: bool) -> Result<Env, String
         dp,
         mock,
         frames,
+    })
+}
+
+// ---------- CAC-1（合并门补跑；plan §6.1 / 冻结件 rev3 §7.3） ----------
+//
+// 冻结断言四条：① TUN 注入精确 v6 TCP SYN、目的为代理类 v6 目标（不走 fake-ip）；
+// ② A 完成 v6 TCP 终结（SYN-ACK、校验和正确）；③ `dial_through_proxy` 经 adapter
+// 接受 v6 目标、到达 v6 echo server；④ 上下行双向回显一致、`proxy_*` 计数按既有
+// 语义增长、`ipv6.proxy_dropped` 不增长。
+// 断言边界与 AC9 分开（plan §6.1 写死）：AC9 断言回显**不得**出现（SS 拒例 → RST），
+// CAC-1 正例断言回显**必须**出现。方言覆盖（收官报告补跑清单）：socks5 / VLESS /
+// AnyTLS v6 正例 + SS / Trojan v6 拒例。三个正例的 server 都是进程内最小实现
+// （socks5 手写、VLESS 用 nexus-outbound-vless 的 server 侧编解码、AnyTLS 用
+// nexus-outbound-anytls 的 server_handshake/帧 API + loopback 自签身份），
+// 只处理一条连接、只做目标记录 + 真实 dial + 双向中继——被测路径（生产
+// Dataplane + ProxyEngine + adapter 客户端）与真实部署完全一致。
+
+const CAC1_PAYLOAD: &[u8] = b"cac1-v6-echo";
+const CAC1_PASSWORD: &str = "cac1-password";
+
+/// mock server 观测到的目标：(是否为 v6 目标, 地址文本, 端口)。
+type Cac1Obs = Arc<Mutex<Option<(bool, String, u16)>>>;
+
+fn cac1_obs() -> Cac1Obs {
+    Arc::new(Mutex::new(None))
+}
+
+/// 发现本机一个稳定的全局 v6 地址（`/proc/net/if_inet6`，scope=global、
+/// 非临时地址）。CAC-1 正例的目标不能用 `::1`：数据面 v6 bypass 默认集
+/// （assembly 的 `DEFAULT_BYPASS_CIDRS6` = ULA / link-local / `::1/128`）
+/// 把 loopback 分类为 Direct 而非 Proxy；全局单播地址不在 bypass、不在
+/// mesh 路由内 → Proxy 分类，且本机真实可达（echo 就绑在该地址上）。
+fn discover_global_v6() -> Option<Ipv6Addr> {
+    let text = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 6 || f[3] != "00" {
+            continue;
+        }
+        let flags = u32::from_str_radix(f[4], 16).unwrap_or(0);
+        if flags & 0x01 != 0 {
+            continue; // 临时地址（隐私扩展），跳过
+        }
+        let raw = u128::from_str_radix(f[0], 16).ok()?;
+        return Some(Ipv6Addr::from(raw));
+    }
+    None
+}
+
+/// 实时回显服务（绑指定 v6 地址，accept 循环 + 逐块回显；与 `start_echo` 的
+/// read-to-end 语义不同——代理中继是交互式的，不能等 FIN 才回）。
+fn start_echo_rt(addr: Ipv6Addr) -> Result<u16, String> {
+    let listener = TcpListener::bind((addr, 0)).map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// 双向字节中继（两条 copy 线程，EOF 时半关闭对端写方向）。
+fn relay_bidir(a: std::net::TcpStream, b: std::net::TcpStream) {
+    fn pump(mut r: std::net::TcpStream, mut w: std::net::TcpStream) {
+        let _ = std::io::copy(&mut r, &mut w);
+        let _ = w.shutdown(Shutdown::Write);
+    }
+    let a2 = a.try_clone();
+    let b2 = b.try_clone();
+    let (Ok(a2), Ok(b2)) = (a2, b2) else { return };
+    let t = std::thread::spawn(move || pump(a2, b2));
+    pump(b, a);
+    let _ = t.join();
+}
+
+/// 单出站 proxy.yaml（与 `proxy_yaml()` 同构，只换 outbound 段）。
+fn cac1_yaml(kind: &str, extra: &str) -> String {
+    format!(
+        "schema_version: 1\n\
+         rules:\n\
+         \x20 - tag: r1\n\
+         \x20   kind: match\n\
+         \x20   action:\n\
+         \x20     - kind: select_outbound\n\
+         \x20       tag: proxy\n\
+         groups: []\n\
+         outbounds:\n\
+         \x20 - tag: proxy\n\
+         \x20   kind: {kind}\n\
+         {extra}"
+    )
+}
+
+/// 最小 socks5 server（无认证；记录 CONNECT 的 ATYP/地址/端口后真实 dial 并中继）。
+fn spawn_socks5(obs: Cac1Obs) -> Result<u16, String> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        let Ok((mut c, _)) = listener.accept() else {
+            return;
+        };
+        let mut h = [0u8; 2];
+        if c.read_exact(&mut h).is_err() || h[0] != 5 {
+            return;
+        }
+        let mut methods = vec![0u8; h[1] as usize];
+        if c.read_exact(&mut methods).is_err() || c.write_all(&[5, 0]).is_err() {
+            return;
+        }
+        let mut req = [0u8; 4];
+        if c.read_exact(&mut req).is_err() {
+            return;
+        }
+        let atyp = req[3];
+        let addr: IpAddr = match atyp {
+            0x01 => {
+                let mut a = [0u8; 4];
+                if c.read_exact(&mut a).is_err() {
+                    return;
+                }
+                IpAddr::V4(a.into())
+            }
+            0x04 => {
+                let mut a = [0u8; 16];
+                if c.read_exact(&mut a).is_err() {
+                    return;
+                }
+                IpAddr::V6(a.into())
+            }
+            _ => return,
+        };
+        let mut pb = [0u8; 2];
+        if c.read_exact(&mut pb).is_err() {
+            return;
+        }
+        let dport = u16::from_be_bytes(pb);
+        *obs.lock().unwrap() = Some((atyp == 0x04, addr.to_string(), dport));
+        let Ok(target) = std::net::TcpStream::connect((addr, dport)) else {
+            return;
+        };
+        if c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+            return;
+        }
+        relay_bidir(c, target);
+    });
+    Ok(port)
+}
+
+/// 最小 VLESS server（用 nexus-outbound-vless 的 server 侧 `decode_request` /
+/// `encode_response`；记录目标后真实 dial 并中继）。
+fn spawn_vless(obs: Cac1Obs) -> Result<u16, String> {
+    use nexus_outbound_vless::{
+        VlessError, VlessResponse, VlessTarget, decode_request, encode_response,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        let Ok((mut c, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        let parsed = loop {
+            if c.read_exact(&mut byte).is_err() {
+                return;
+            }
+            buf.push(byte[0]);
+            match decode_request(&buf) {
+                Ok(v) => break Some(v),
+                Err(VlessError::TruncatedHeader) if buf.len() < 1024 => continue,
+                Err(_) => break None,
+            }
+        };
+        let Some((req, used)) = parsed else { return };
+        let Some(target) = req.target else { return };
+        let (is_v6, ip) = match target {
+            VlessTarget::Ipv6(ip) => (true, IpAddr::V6(ip)),
+            VlessTarget::Ipv4(ip) => (false, IpAddr::V4(ip)),
+            VlessTarget::Domain(_) => return,
+        };
+        *obs.lock().unwrap() = Some((is_v6, ip.to_string(), req.port));
+        let Ok(mut target_stream) = std::net::TcpStream::connect((ip, req.port)) else {
+            return;
+        };
+        let resp = encode_response(&VlessResponse {
+            version: 0,
+            addon: Vec::new(),
+        });
+        if c.write_all(&resp).is_err() || target_stream.write_all(&buf[used..]).is_err() {
+            return;
+        }
+        relay_bidir(c, target_stream);
+    });
+    Ok(port)
+}
+
+/// 最小 AnyTLS server（nexus-outbound-anytls 的 `server_handshake` + 帧 API +
+/// loopback 自签身份；首个 PSH 的 SOCKS5 地址即目标，真实 dial 后单线程轮询中继）。
+fn spawn_anytls(obs: Cac1Obs) -> Result<u16, String> {
+    use nexus_outbound_anytls::{
+        AnyTlsCommand, DEFAULT_PADDING_SCHEME, decode_socks5_addr, generate_loopback_identity,
+        read_frame, server_config, server_handshake, write_frame,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(sock_ctl) = sock.try_clone() else {
+            return;
+        };
+        let Ok(identity) = generate_loopback_identity() else {
+            return;
+        };
+        let Ok(cfg) = server_config(&identity) else {
+            return;
+        };
+        let Ok(conn) = rustls::ServerConnection::new(Arc::new(cfg)) else {
+            return;
+        };
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        // 读超时把 read_frame 变成轮询拍（单线程同时喂目标 socket 的回程数据）。
+        let _ = sock_ctl.set_read_timeout(Some(Duration::from_millis(200)));
+        if server_handshake(&mut tls, CAC1_PASSWORD, DEFAULT_PADDING_SCHEME).is_err() {
+            return;
+        }
+        let mut sid: u32 = 0;
+        let mut target: Option<std::net::TcpStream> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        'outer: while std::time::Instant::now() < deadline {
+            match read_frame(&mut tls) {
+                Ok(frame) => match frame.cmd {
+                    AnyTlsCommand::Syn => sid = frame.stream_id,
+                    AnyTlsCommand::Psh if target.is_none() => {
+                        let Ok((t, consumed)) = decode_socks5_addr(&frame.data) else {
+                            return;
+                        };
+                        let (is_v6, ip) = match t {
+                            nexus_outbound_anytls::AnyTlsTarget::Ipv6(seg, _) => {
+                                (true, IpAddr::V6(seg.into()))
+                            }
+                            nexus_outbound_anytls::AnyTlsTarget::Ipv4(oct, _) => {
+                                (false, IpAddr::V4(oct.into()))
+                            }
+                            nexus_outbound_anytls::AnyTlsTarget::Domain(_, _) => return,
+                        };
+                        *obs.lock().unwrap() = Some((is_v6, ip.to_string(), t.port()));
+                        let Ok(mut ts) = std::net::TcpStream::connect((ip, t.port())) else {
+                            return;
+                        };
+                        let _ = ts.set_nonblocking(true);
+                        if write_frame(&mut tls, AnyTlsCommand::SynAck, sid, &[]).is_err() {
+                            return;
+                        }
+                        if frame.data.len() > consumed
+                            && ts.write_all(&frame.data[consumed..]).is_err()
+                        {
+                            return;
+                        }
+                        target = Some(ts);
+                    }
+                    AnyTlsCommand::Psh => {
+                        if let Some(ts) = target.as_mut() {
+                            if ts.write_all(&frame.data).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    AnyTlsCommand::Fin => break 'outer,
+                    _ => {}
+                },
+                Err(_) => {
+                    // 读超时 = 本拍无帧；其它错误也退出（证据由客户端侧断言呈现）。
+                    if target.is_none() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+            if let Some(ts) = target.as_mut() {
+                let mut buf = [0u8; 8192];
+                match ts.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = write_frame(&mut tls, AnyTlsCommand::Fin, sid, &[]);
+                        break 'outer;
+                    }
+                    Ok(n) => {
+                        if write_frame(&mut tls, AnyTlsCommand::Psh, sid, &buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    });
+    Ok(port)
+}
+
+/// accept 即关的 listener（Trojan 拒例：TLS 握手立即 EOF → dial 快速失败）。
+fn spawn_accept_close() -> Result<u16, String> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    Ok(port)
+}
+
+/// CAC-1 正例腿：注入 v6 SYN → [::1]:echo（Proxy 分类）→ 终结 → adapter dial
+/// 进程内 server → server 真实 dial v6 echo → 双向回显 + 计数断言。
+fn cac1_positive_leg(
+    tag: &str,
+    yaml: String,
+    obs: &Cac1Obs,
+    dst: IpAddr,
+    echo_port: u16,
+) -> Result<Value, String> {
+    let mut env = assemble_yaml(tag, &["fd00:144::/64"], Some(yaml))?;
+    let dst_s = dst.to_string();
+    env.inject(v6_tcp(
+        CLIENT6,
+        &dst_s,
+        42000,
+        echo_port,
+        7000,
+        0,
+        0x02,
+        &[],
+    ))?;
+    let first = env.written();
+    let (src, _, sp, dp, srv_seq, flags, _) = first
+        .first()
+        .and_then(|p| tcp_fields(p))
+        .ok_or_else(|| "cac1: no SYN-ACK".to_string())?;
+    let synack_ok = src == dst
+        && (sp, dp) == (echo_port, 42000)
+        && flags & 0x12 == 0x12
+        && v6_checksum_ok(&first[0]);
+    env.inject(v6_tcp(
+        CLIENT6,
+        &dst_s,
+        42000,
+        echo_port,
+        7001,
+        srv_seq.wrapping_add(1),
+        0x10,
+        &[],
+    ))?;
+    env.inject(v6_tcp(
+        CLIENT6,
+        &dst_s,
+        42000,
+        echo_port,
+        7001,
+        srv_seq.wrapping_add(1),
+        0x18,
+        CAC1_PAYLOAD,
+    ))?;
+    let mut echo_ok = false;
+    let mut rst_seen = false;
+    for tick in 0..2000u64 {
+        let _ = env.dp.tick(tick);
+        for p in env.written() {
+            if has_flag(&p, 0x04) {
+                rst_seen = true;
+            }
+            if let Some((s, _, sport, _, _, _, _)) = tcp_fields(&p) {
+                if s == dst && sport == echo_port && payload_of(&p) == CAC1_PAYLOAD {
+                    echo_ok = true;
+                }
+            }
+        }
+        if echo_ok {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let stats = env.dp.stats();
+    let observed = obs.lock().unwrap().clone();
+    let target_ok = matches!(&observed, Some((true, a, p)) if a == &dst_s && *p == echo_port);
+    let ok = synack_ok
+        && echo_ok
+        && !rst_seen
+        && target_ok
+        && stats.ipv6.proxy_dropped == 0
+        && stats.proxy_tcp_streams_ok == 1;
+    Ok(json!({
+        "synack_ok": synack_ok,
+        "echo_ok": echo_ok,
+        "rst_seen": rst_seen,
+        "target_ok": target_ok,
+        "observed": observed.map(|(v6, a, p)| json!({"v6": v6, "addr": a, "port": p})),
+        "ipv6_tcp": stats.ipv6.tcp,
+        "classified_proxy": stats.ipv6.classified_proxy,
+        "ipv6_proxy_dropped": stats.ipv6.proxy_dropped,
+        "proxy_tcp_streams": stats.proxy_tcp_streams,
+        "proxy_tcp_streams_ok": stats.proxy_tcp_streams_ok,
+        "proxy_tcp_bytes_down": stats.proxy_tcp_bytes_down,
+        "ok": ok,
+    }))
+}
+
+/// CAC-1 拒例腿：终结成立（SYN-ACK）但出站方言拒 v6 目标 → RST、零回显、
+/// streams_ok == 0（与 AC9 的 SS 断言同向；本腿覆盖 Trojan，SS 腿复用 AC9 形态）。
+fn cac1_reject_leg(tag: &str, yaml: String) -> Result<Value, String> {
+    let mut env = assemble_yaml(tag, &["fd00:144::/64"], Some(yaml))?;
+    env.inject(v6_tcp(CLIENT6, PROXY_DST, 41000, 80, 5000, 0, 0x02, &[]))?;
+    let first = env.written();
+    let (src, _, sp, dp, srv_seq, flags, _) = first
+        .first()
+        .and_then(|p| tcp_fields(p))
+        .ok_or_else(|| "cac1-reject: no SYN-ACK".to_string())?;
+    let synack_ok = src == PROXY_DST.parse::<IpAddr>().unwrap()
+        && (sp, dp) == (80, 41000)
+        && flags & 0x12 == 0x12
+        && v6_checksum_ok(&first[0]);
+    env.inject(v6_tcp(
+        CLIENT6,
+        PROXY_DST,
+        41000,
+        80,
+        5001,
+        srv_seq.wrapping_add(1),
+        0x10,
+        &[],
+    ))?;
+    env.inject(v6_tcp(
+        CLIENT6,
+        PROXY_DST,
+        41000,
+        80,
+        5001,
+        srv_seq.wrapping_add(1),
+        0x18,
+        CAC1_PAYLOAD,
+    ))?;
+    let mut rst_seen = false;
+    let mut echo_seen = false;
+    for tick in 0..1500u64 {
+        let _ = env.dp.tick(tick);
+        for p in env.written() {
+            if has_flag(&p, 0x04) {
+                rst_seen = true;
+            }
+            if payload_of(&p) == CAC1_PAYLOAD {
+                echo_seen = true;
+            }
+        }
+        if rst_seen {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let stats = env.dp.stats();
+    let ok = synack_ok
+        && rst_seen
+        && !echo_seen
+        && stats.proxy_tcp_streams_ok == 0
+        && stats.ipv6.proxy_dropped == 0;
+    Ok(json!({
+        "synack_ok": synack_ok,
+        "rst_seen": rst_seen,
+        "echo_seen": echo_seen,
+        "ipv6_tcp": stats.ipv6.tcp,
+        "classified_proxy": stats.ipv6.classified_proxy,
+        "ipv6_proxy_dropped": stats.ipv6.proxy_dropped,
+        "proxy_tcp_streams": stats.proxy_tcp_streams,
+        "proxy_tcp_streams_ok": stats.proxy_tcp_streams_ok,
+        "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
+        "ok": ok,
+    }))
+}
+
+fn cac1_leg(_tag: &str, r: Result<Value, String>) -> Value {
+    match r {
+        Ok(mut v) => {
+            if v.get("ok").is_none() {
+                v["ok"] = json!(false);
+            }
+            v
+        }
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+/// CAC-1 全腿（`--cac1` 模式）：socks5 / VLESS / AnyTLS 正例 + Trojan / SS 拒例。
+fn run_cac1() -> Value {
+    let Some(echo_addr) = discover_global_v6() else {
+        return json!({"verdict": "FAIL", "cac1": {"error": "no stable global v6 address on this host", "ok": false}});
+    };
+    let echo_port = match start_echo_rt(echo_addr) {
+        Ok(p) => p,
+        Err(e) => return json!({"verdict": "FAIL", "cac1": {"error": e, "ok": false}}),
+    };
+    let echo_dst = IpAddr::V6(echo_addr);
+    let obs5 = cac1_obs();
+    let socks5 = cac1_leg(
+        "socks5",
+        spawn_socks5(Arc::clone(&obs5)).and_then(|port| {
+            cac1_positive_leg(
+                "cac1-socks5",
+                cac1_yaml("socks5", &format!("    locator: 127.0.0.1:{port}\n")),
+                &obs5,
+                echo_dst,
+                echo_port,
+            )
+        }),
+    );
+    let obsv = cac1_obs();
+    let vless = cac1_leg(
+        "vless",
+        spawn_vless(Arc::clone(&obsv)).and_then(|port| {
+            cac1_positive_leg(
+                "cac1-vless",
+                cac1_yaml(
+                    "vless",
+                    &format!(
+                        "    locator: 127.0.0.1:{port}\n    uuid: 11111111-1111-4111-8111-111111111111\n"
+                    ),
+                ),
+                &obsv,
+                echo_dst,
+                echo_port,
+            )
+        }),
+    );
+    let obsa = cac1_obs();
+    let anytls = cac1_leg(
+        "anytls",
+        spawn_anytls(Arc::clone(&obsa)).and_then(|port| {
+            cac1_positive_leg(
+                "cac1-anytls",
+                cac1_yaml(
+                    "anytls",
+                    &format!(
+                        "    locator: 127.0.0.1:{port}\n    password: {CAC1_PASSWORD}\n    skip_cert_verify: true\n"
+                    ),
+                ),
+                &obsa,
+                echo_dst,
+                echo_port,
+            )
+        }),
+    );
+    let trojan = cac1_leg(
+        "trojan",
+        spawn_accept_close().and_then(|port| {
+            cac1_reject_leg(
+                "cac1-trojan",
+                cac1_yaml(
+                    "trojan",
+                    &format!(
+                        "    locator: 127.0.0.1:{port}\n    password: {CAC1_PASSWORD}\n    skip_cert_verify: true\n"
+                    ),
+                ),
+            )
+        }),
+    );
+    let ss = cac1_leg("ss", cac1_reject_leg("cac1-ss", proxy_yaml()));
+    let ok = [&socks5, &vless, &anytls, &trojan, &ss]
+        .iter()
+        .all(|v| v["ok"] == Value::Bool(true));
+    json!({
+        "verdict": if ok { "PASS" } else { "FAIL" },
+        "cac1": {
+            "socks5": socks5,
+            "vless": vless,
+            "anytls": anytls,
+            "trojan": trojan,
+            "ss": ss,
+            "ok": ok,
+        },
     })
 }
 
@@ -533,7 +1127,11 @@ fn section_proxy() -> Result<Value, String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let json_mode = args.iter().any(|a| a == "--json");
-    let out = run();
+    let out = if args.iter().any(|a| a == "--cac1") {
+        run_cac1()
+    } else {
+        run()
+    };
     if json_mode {
         println!("{}", serde_json::to_string(&out).unwrap());
     } else {
