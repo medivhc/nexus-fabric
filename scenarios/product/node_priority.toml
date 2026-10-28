@@ -3,6 +3,7 @@ id = "product.node-priority"
 title = "节点优先级：按优先级/延迟/带宽选择最优路由"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-node-priority"
+carrier = "v9-connectivity"
 
 [given]
 priority_node_a = 10

@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resou
 
 # 写能力不进入 Agent-facing API：CLI 层即拒绝，不依赖 provider 侧自觉。
 # 与单元测试（LSP 方法白名单）互为冗余防线。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"

@@ -7,6 +7,7 @@ requirement = "PRODUCT.md#17-n3-task"
 # N3 contract-first: future verifier, not a delivered runtime.
 # Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
 # nexus-session nexus-control-api apps/nexus apps/nexusd
+carrier = "n1-fabric"
 
 [given]
 topology = "separate requester/provider processes; local E4, not Windows/Linux E5"

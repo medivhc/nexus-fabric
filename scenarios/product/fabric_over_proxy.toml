@@ -4,6 +4,7 @@ title = "N1 建连自动回退：直连 QUIC 被 iptables DROP 黑洞后，自�
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#3.5 fabric-over-proxy"
 requires_root = true
+carrier = "n1-fabric"
 
 [given]
 topology = "xc-pc-linux 真机 + root；父进程建 veth 对并起本地 SOCKS5（10.200.0.254:1080）；子进程 unshare(CLONE_NEWNET) 持 veth 另一端（10.200.0.1/24），同一 netns 内跑 A/B 两个逻辑节点"

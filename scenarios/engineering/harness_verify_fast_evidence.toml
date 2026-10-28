@@ -3,6 +3,7 @@ id = "engineering.harness-verify-fast-evidence"
 title = "绿色仓库中 nexus-harness verify --fast 产生绑定 revision 的 PASS Evidence"
 evidence_strength = "E4"
 requirement = "DEVELOPMENT.md#6"
+carrier = "engineering"
 
 [given]
 workspace = "green"

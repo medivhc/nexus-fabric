@@ -26,7 +26,7 @@
 
 use std::io::{Read, Write};
 
-use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
+use nexus_proxy_config::outbound_seam::{OutboundAdapter, OutboundHandoff, OutboundHandoffError};
 use sha2::{Digest, Sha256};
 
 // ---------- 结构化错误 ----------
@@ -1023,7 +1023,7 @@ impl OutboundAdapter for AnyTlsAdapter {
         &self.tag
     }
 
-    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError> {
+    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError> {
         Ok(OutboundHandoff {
             kind: self.outbound_kind().to_string(),
             tag: self.tag.clone(),

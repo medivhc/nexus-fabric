@@ -3,6 +3,7 @@ id = "product.proxy-fwd-fail-closed"
 title = "Proxy 出站不可达：dial 失败 → RST，不直连、不黑洞（E4）"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_fwd_fail_closed --json，进程内闭环，mock TUN）：

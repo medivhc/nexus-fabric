@@ -3,6 +3,7 @@ id = "product.n1-connectivity-roam-realnet"
 title = "N1 真实网络漫游：双真实接口，B 端删 WiFi 次 IP 后传输不中断、CID 不变"
 evidence_strength = "E5"
 requirement = "v9 §1/§8/§10/§12 N1 Universal Connectivity；白皮书 §6；M1–M7；用户关键验收场景（2026-09-29）"
+carrier = "n1-fabric"
 
 [given]
 topology = "xc-pc-linux 真机；双真实物理接口（无 netns/veth）：A 绑 172.168.12.97:9000（enp5s0 有线），B 绑 172.168.9.99（wlp6s0 WiFi 次 IP，需预配）；各自建 TUN（nrtun0/nrtun1）、配 VPI 子网 10.144.0.0/24"

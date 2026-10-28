@@ -2,6 +2,7 @@ schema_version = 1
 id = "regression.session-outcome-exactly-once"
 title = "取消、成功、断链竞争时 TerminalOutcome 只提交一次"
 evidence_strength = "E3"
+carrier = "n1-fabric"
 
 [given]
 race = ["worker_success", "cancel_requested", "network_disconnect"]

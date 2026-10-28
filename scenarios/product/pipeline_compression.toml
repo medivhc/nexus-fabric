@@ -3,6 +3,7 @@ id = "product.pipeline-compression"
 title = "数据面管线：真实 gzip 经隧道端到端往返，可压缩负载正压缩率，不可压缩负载无损"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-dataplane-pipeline"
+carrier = "v9-connectivity"
 
 [given]
 algorithm = "gzip"

@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#5-context-budget"
 
 # 同一位置（Egress::send 声明）的 references 命中数 > 2，因此 --max-results 2
 # 必然触发截断；count 报告截断前的完整命中数。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"

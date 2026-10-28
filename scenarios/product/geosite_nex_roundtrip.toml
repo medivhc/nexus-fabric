@@ -3,6 +3,7 @@ id = "product.geosite-nex-roundtrip"
 title = "geosite.nex 二进制格式 roundtrip：构造 → 解析 → 注入 → 路由断言"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 command = "geosite.nex format roundtrip"

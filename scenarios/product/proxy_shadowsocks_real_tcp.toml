@@ -3,6 +3,7 @@ id = "product.proxy-shadowsocks-real-tcp"
 title = "Shadowsocks 真实 TCP 会话闭环：loopback server+client，AEAD 握手+目标地址送达+payload 往返"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: echo target + SS server + SS client"

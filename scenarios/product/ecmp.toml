@@ -3,6 +3,7 @@ id = "product.ecmp"
 title = "ECMP 等代价多路径：多条等代价最短路 → FIB 多下一跳"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-ecmp"
+carrier = "v9-connectivity"
 
 [given]
 topology = "diamond: A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms); A->D has two 20ms equal-cost paths"

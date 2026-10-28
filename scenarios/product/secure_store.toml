@@ -3,6 +3,7 @@ id = "product.secure-store"
 title = "加密持久化：DPAPI + machine-id 派生 AEAD 文件 store（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-secure-store"
+carrier = "v9-connectivity"
 
 [given]
 machine_id_ok = "0123456789abcdef0123456789abcdef"

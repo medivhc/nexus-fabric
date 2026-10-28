@@ -3,6 +3,7 @@ id = "product.proxy-redaction-parity"
 title = "A6：口令脱敏装配级 parity（真实畸形 proxy.yaml 启动 + CLI check，marker 0 命中）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_redaction_parity --json）：marker 串

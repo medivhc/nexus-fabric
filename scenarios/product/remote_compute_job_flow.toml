@@ -3,6 +3,7 @@ id = "product.remote-compute-job-flow"
 title = "Node A 经远程闭环向 Node B 提交计算作业并取回结果帧"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 node_a = "requester"

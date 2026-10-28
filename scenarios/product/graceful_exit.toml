@@ -3,6 +3,7 @@ id = "product.graceful-exit"
 title = "节点优雅退出：Active→Draining→Exiting→Exited 状态机与宽限期排空"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-graceful-exit"
+carrier = "v9-connectivity"
 
 [given]
 grace_period_ms = 1000

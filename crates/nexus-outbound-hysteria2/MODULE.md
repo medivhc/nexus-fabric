@@ -5,7 +5,7 @@
 
 ## Responsibility
 
-实现 `nexus_connectivity::OutboundAdapter` 的 **Hysteria2** 出站实现：
+实现 `nexus_proxy_config::outbound_seam::OutboundAdapter` 的 **Hysteria2** 出站实现：
 QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理。
 
 提供：
@@ -113,6 +113,7 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 ## Outputs
 
 - `OutboundAdapter::handoff` → `OutboundHandoff { kind = "hysteria2", tag, locator }`；
+  错误类型为 `OutboundHandoffError`（当前无生产者，见 proxy-config MODULE）；
 - `Hysteria2Client`：`open_tcp` / `await_tcp_response` / `stream_read` /
   `stream_write` / `stream_finish`、`alloc_udp_session` / `send_udp` /
   `recv_udp`；
@@ -149,7 +150,7 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 
 ## Allowed Dependencies
 
-- `nexus-connectivity`（OutboundAdapter 接缝）；
+- `nexus-proxy-config`（出站身份/交接词汇 `outbound_seam::OutboundAdapter`）；
 - 已评审入仓第三方：`quinn-proto 0.11`（vendor patch，`rustls`+`ring`
   features；与 `nexus-fabric` 同源）、`rustls 0.23`（`ring`+`std`）、
   `rustls-native-certs 0.8`（系统根证书）、`ring 0.17`（系统 RNG +
@@ -160,5 +161,6 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 ## Forbidden Dependencies
 
 - `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
-  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
-  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
+  接缝 ② 已于 2026-10-28（P2）清除：出站身份/交接词汇定义于 `nexus-proxy-config`，
+  本 crate 对 `nexus-connectivity` 的直接边为 0
+  （见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`）。

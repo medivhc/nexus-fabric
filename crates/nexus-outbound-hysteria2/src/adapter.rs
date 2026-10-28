@@ -4,7 +4,7 @@
 //! [`Hysteria2Adapter::connect`]（阻塞：QUIC 握手 + H3 认证）完成，
 //! 由 Composition Root 按需调用。
 
-use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
+use nexus_proxy_config::outbound_seam::{OutboundAdapter, OutboundHandoff, OutboundHandoffError};
 
 use super::Hysteria2Error;
 use super::client::Hysteria2Client;
@@ -60,7 +60,7 @@ impl OutboundAdapter for Hysteria2Adapter {
         &self.tag
     }
 
-    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError> {
+    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError> {
         Ok(OutboundHandoff {
             kind: self.outbound_kind().to_string(),
             tag: self.tag.clone(),

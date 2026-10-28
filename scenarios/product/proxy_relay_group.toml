@@ -3,6 +3,7 @@ id = "product.proxy-relay-group"
 title = "relay 链式策略组把流量先经 A 再交 B，断言两跳均经过"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 group_kind = "relay"

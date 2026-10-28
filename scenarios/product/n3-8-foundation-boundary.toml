@@ -3,6 +3,7 @@ id = "product.n3-8-foundation-boundary"
 title = "真实 daemon 显式根、唯一 SessionManager 与有限 Task 能力边界"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#175-n3-8"
+carrier = "external"
 [given]
 [when]
 command = "python3 engineering/verifiers/n3_foundation_boundary.py"

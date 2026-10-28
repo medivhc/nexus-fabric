@@ -3,6 +3,7 @@ id = "product.proxy-socks5-domain-rule-forward"
 title = "SOCKS5 CONNECT 命中 DOMAIN-SUFFIX 规则 -> 走 direct 出站"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "socks5 (reuse nexus-ingress Socks5Handshake)"

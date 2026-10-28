@@ -3,6 +3,7 @@ id = "product.graceful-exit-real"
 title = "优雅退出真实再见帧 wire codec + 真实墙钟宽限期 drain"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-graceful-exit-real"
+carrier = "v9-connectivity"
 
 [given]
 grace_period_ms = 500

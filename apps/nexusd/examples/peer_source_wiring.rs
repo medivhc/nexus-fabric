@@ -254,7 +254,7 @@ fn run() -> serde_json::Value {
         srflx: None,
         srflx_stun: None,
         srflx_turn: None,
-        nat_type: nexus_connectivity::nat::NatType::Unknown,
+        nat_type: nexus_domain::nat::NatType::Unknown,
     };
     let sw = NatSwitching::new(
         driver,

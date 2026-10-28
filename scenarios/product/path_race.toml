@@ -3,6 +3,7 @@ id = "product.path-race"
 title = "路径层建连竞速：staggered 并行尝试，延迟注入的慢路径 vs 快路径，选中快路径"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#4.4"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback, fake PathConnector with injected latency (slow 800ms vs fast 50ms)"

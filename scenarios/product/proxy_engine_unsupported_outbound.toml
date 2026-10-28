@@ -3,6 +3,7 @@ id = "product.proxy-engine-unsupported-outbound"
 title = "A11：非首个 wired 非法（启动 warn + 运行期结构化错误 + RST，不回退）；Q-2：NoUsableOutbound 降级"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#统一数据面装配"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_engine_unsupported_outbound --json）：

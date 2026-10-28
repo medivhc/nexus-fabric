@@ -3,6 +3,7 @@ id = "product.transparent-rule-consistency"
 title = "同一规则/目的地：TUN 分类与 TPROXY 决策一致（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example transparent_rule_consistency --json）：同一 DomainRuleEngine、

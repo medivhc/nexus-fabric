@@ -3,6 +3,7 @@ id = "product.hole-punch-multi"
 title = "P4.2 多候选并发打洞：先到先用成功 + 全候选耗尽 relay 回退"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-holepunch-multi"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

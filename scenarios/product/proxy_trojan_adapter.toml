@@ -3,6 +3,7 @@ id = "product.proxy-trojan-adapter"
 title = "Trojan TLS loopback 出站闭环（rcgen 自签 + 公钥 pin + 正确密码 + payload 往返）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-trojan"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: trojan server + trojan client"

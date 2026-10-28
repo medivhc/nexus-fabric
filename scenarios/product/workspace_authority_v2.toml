@@ -3,6 +3,7 @@ id = "product.workspace-authority-v2"
 title = "Workspace 权威模型 v2：内容哈希 CommitId + Conflict 持久化 + Head 交换"
 evidence_strength = "E4"
 requirement = "v9 §17/§18 + requirement-change workspace-authority-v2"
+carrier = "n1-fabric"
 
 [given]
 description = "双端独立建仓；内容哈希决定 CommitId（无序列号）；离线分叉后 Head 交换判定 Diverged；同路径冲突落持久化 ConflictObject；resolve 后 Merge Commit（双 parent）；跨端同一提交对象 ID 一致"

@@ -3,6 +3,7 @@ id = "product.plugin-dial-unknown"
 title = "插件接入真实拨号：未知插件名 → dial 直接失败（硬校验，不静默回退）"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#7.3"
+carrier = "v9-connectivity"
 
 [given]
 topology = "TcpListener（真机 127.0.0.1:0，仅用于提供可拨地址；不接受连接也行）；client 调 dial_with_obfs(obfs=Some(\"no-such-plugin\"))"

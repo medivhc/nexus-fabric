@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteri
 
 # 冻结锚点：fixtures/code-intel/src/transport.rs:9:8 = `Egress::send` 声明处
 # （1-based 行/列）。夹具行号属契约，改动必须重走契约阶段。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"

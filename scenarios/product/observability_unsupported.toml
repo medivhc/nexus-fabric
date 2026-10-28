@@ -3,6 +3,7 @@ id = "product.observability-unsupported"
 title = "§9 可观察性：领域未就绪命令显式拒绝（禁止静默降级）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "v9-connectivity"
 
 [given]
 domain_state = "connectivity trace not ready"

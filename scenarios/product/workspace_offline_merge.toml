@@ -3,6 +3,7 @@ id = "product.workspace-offline-merge"
 title = "Workspace 多端离线提交不丢失并三方合并"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#workspace"
+carrier = "n1-fabric"
 
 [given]
 description = "双端离线分叉后 HeadSet 为 2；重连三方合并事件有序出现；合并后本地提交零丢失（v2：CommitId 为内容哈希，不再使用 C{seq} 序列号）"

@@ -4,6 +4,7 @@ title = "正式提供方初始化、只读检查及真实daemon恢复"
 evidence_strength = "E4"
 platform = "linux"
 requirement = "PRODUCT.md#178-n3-11"
+carrier = "external"
 [given]
 [when]
 command = "python3 engineering/verifiers/n3_provider_init.py"

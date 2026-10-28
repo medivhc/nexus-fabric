@@ -31,7 +31,7 @@
 - `nexus-compute`
 - `nexus-platform`
 - `nexus-projection`（统一数据面：TUN/分类器/多路径/Boost）
-- `nexus-connectivity`（统一数据面：CAKE-like QoS）
+- `nexus-qos`（跨栈共享叶：CAKE-like QoS 调度与令牌桶；`cake` / `bucket`）
 - `nexus-dns`（统一数据面：UnifiedDns）
 - `nexus-path`（统一数据面：PathManager/EWMA 选路，Boost 联动）
 - `signal-hook`（R4：Unix SIGTERM/SIGINT 优雅关闭；MIT/Apache-2.0；`default-features = false`）
@@ -42,8 +42,11 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
-- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
-  当前残留接缝：②`OutboundAdapter`（待 P2）/ ③CAKE（待 P3，新增 `nexus-qos` 后下沉），
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）：
+  接缝 ①（NAT 词汇）/ ②（出站交接词汇）/ ③（CAKE）/ ④（LinkMarker）
+  **均已清零**，本 crate 无任何直接依赖边与源码引用，且**无反向依赖例外**
+  （不设临时放行、不设 allow 条目）；跨栈共享词汇见
+  `nexus-domain` / `nexus-proxy-config` / `nexus-qos` / `nexus-session`。
   见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants

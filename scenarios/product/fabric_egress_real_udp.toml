@@ -3,6 +3,7 @@ id = "product.fabric-egress-real-udp"
 title = "真实 UDP 出口：egress 节点经真实 socket 转发，回包反向 NAT 返回"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6.4"
+carrier = "n1-fabric"
 
 [given]
 topology = "two Projections (A + B) with MockTun, mock peer link; B has RealUdpEgress with real OS socket; local UDP echo server on 127.0.0.1"

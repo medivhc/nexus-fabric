@@ -3,6 +3,7 @@ id = "platform.workspace-fuse-projection"
 title = "Linux FUSE 投影：挂载 → 内核读写 → 提交 → Head 前进"
 evidence_strength = "E4"
 requirement = "v9#22"
+carrier = "n1-fabric"
 
 [given]
 platform = "linux"

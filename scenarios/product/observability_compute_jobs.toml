@@ -3,6 +3,7 @@ id = "product.observability-compute-jobs"
 title = "§9 可观察性：nexus CLI thin-client 下 compute jobs 无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "v9-connectivity"
 
 [given]
 domain_state = "compute sessions ready (submitted via in-memory transport)"

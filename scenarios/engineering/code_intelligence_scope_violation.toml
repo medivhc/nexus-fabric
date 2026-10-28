@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resou
 
 # 目标文件真实存在，但不在声明的 --workspace 内：必须 QUERY_INVALID，
 # 而不是悄悄按仓库根去查（那会让 --workspace 变成装饰性参数）。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (不启动 language server)"

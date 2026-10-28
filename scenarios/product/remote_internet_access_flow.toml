@@ -3,6 +3,7 @@ id = "product.remote-internet-access-flow"
 title = "Node A 经远程闭环访问 Node B 的 InternetAccess 出口（HTTP 请求/响应帧）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 node_a = "requester"

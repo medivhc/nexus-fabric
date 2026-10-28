@@ -3,6 +3,7 @@ id = "product.proxy-http-mixed-inbound"
 title = "HTTP/混合代理入站：同端口首字节分流 HTTP 代理（绝对 GET + CONNECT 隧道）与 SOCKS5 共存"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "mixed (same TCP port: 0x05 -> SOCKS5, otherwise -> HTTP proxy)"

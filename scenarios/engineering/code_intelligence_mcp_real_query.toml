@@ -6,6 +6,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#4-agent-facing-api"
 
 # 作用域限定在夹具 workspace（3 个源文件、独立 cargo workspace root），
 # 因此冷启动面与命中集合都是确定的；换成仓库根 workspace 会让这条场景变成网速竞赛。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

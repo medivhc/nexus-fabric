@@ -3,6 +3,7 @@ id = "product.fib-manager"
 title = "FIB 管理器：LSDB 指纹触发重算、代际管理"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-fib-manager"
+carrier = "v9-connectivity"
 
 [given]
 api = "FibManager::new/maybe_recompute/fib/generation/select"

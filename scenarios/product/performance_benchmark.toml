@@ -3,6 +3,7 @@ id = "product.performance-benchmark"
 title = "加密数据面性能基准：AEAD 帧路径 + 隧道数据面吞吐/延迟（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-perf-benchmark"
+carrier = "v9-connectivity"
 
 [given]
 payload_bytes = 1024

@@ -3,6 +3,7 @@ id = "product.outbound-reload-restore"
 title = "A10/R2-F12：proxy.yaml 被拒后原样恢复，outbound 状态面清标记（stale/file_rejected）"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#统一数据面装配"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example outbound_reload_restore --json）：

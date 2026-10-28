@@ -7,6 +7,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resou
 # 比 code_intelligence_diagnostics_advisory 更严：verdict 必须是 PASS（不是
 # one_of[PASS,FAIL] 那种永为真的断言），并机器化验证"写请求拒绝计数为 0"——
 # 未识别请求计数已与之分离，因此该字段为 0 才真正说明 provider 没被诱导写。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"

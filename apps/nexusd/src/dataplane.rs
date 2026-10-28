@@ -17,7 +17,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use nexus_connectivity::cake::{CakeConfig, CakeScheduler, EnqueueDecision, FiveTuple};
 use nexus_dns::{DnsQuery, DnsType, DnsUnifiedConfig, UnifiedDns};
 use nexus_domain::SessionId;
 use nexus_flow_session::{
@@ -43,6 +42,7 @@ use nexus_projection::transparent::{
     TcpConnection, TransparentDecision, TransparentOutput, TransparentTcpInput, TransparentUdpInput,
 };
 use nexus_proxy_config::FlowSessionsMode;
+use nexus_qos::cake::{CakeConfig, CakeScheduler, EnqueueDecision, FiveTuple};
 
 mod chain_wiring;
 

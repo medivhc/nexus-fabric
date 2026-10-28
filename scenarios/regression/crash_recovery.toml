@@ -2,6 +2,7 @@ schema_version = 1
 id = "regression.crash-recovery"
 title = "强杀后冷启动先 Reconciliation 再接受新工作"
 evidence_strength = "E4"
+carrier = "n1-fabric"
 
 [given]
 persisted_session = "Active+Unfinished"

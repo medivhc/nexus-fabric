@@ -3,6 +3,7 @@ id = "product.health-check-real"
 title = "健康检查真实定时器：loopback 探测起停驱动 Healthy→Unhealthy→Healthy"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-health-check-real"
+carrier = "v9-connectivity"
 
 [given]
 probe_interval_ms = 80

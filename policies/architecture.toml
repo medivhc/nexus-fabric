@@ -40,7 +40,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-connectivity"
-allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement"]
+allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement", "nexus-proxy-config", "nexus-qos"]
 portable = false
 layer = "delivery"
 
@@ -53,6 +53,12 @@ layer = "portable-core"
 [[crate]]
 name = "nexus-proxy-config"
 allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-qos"
+allowed_internal_dependencies = []
 portable = true
 layer = "portable-core"
 
@@ -190,43 +196,43 @@ layer = "platform-adapter"
 
 [[crate]]
 name = "nexus-outbound-shadowsocks"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-vmess"
-allowed_internal_dependencies = ["nexus-connectivity"]
+allowed_internal_dependencies = ["nexus-proxy-config"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-trojan"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-anytls"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-vless"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-hysteria2"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-fabric", "nexus-plugin"]
+allowed_internal_dependencies = ["nexus-proxy-config", "nexus-fabric", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
 [[crate]]
 name = "nexus-harness"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-dns", "nexus-domain", "nexus-platform", "nexus-projection"]
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-dns", "nexus-domain", "nexus-platform", "nexus-projection", "nexus-qos", "nexus-turn"]
 portable = false
 layer = "engineering"
 
@@ -322,3 +328,32 @@ variants = ["Network", "Service", "Workspace", "Compute", "Device"]
 # 允许的特化点（穷举；当前为空 = 四 crate 零豁免，P1-5 已删除此前指向
 # nexus-domain 的 5 条死 allow）。新增需评审＋更新本 policy，且条目必须同时
 # 给出 file / line / contains / reason（P1-6），缺字段即 gate FAIL。
+
+# ---------------------------------------------------------------------------
+# Q6 依赖边门禁：冻结演进面（run dual-stack-convergence §2.6.2）
+#
+# `frozen_crates` 是冻结演进、只修缺陷/安全/崩溃一致性的 v9 CLI 运行时 crate
+# （`nexus-connectivity`，划界见 ARCHITECTURE.md §6 与
+# docs/adr/0001-dual-stack-boundary.md）。它们的**直接依赖方集合**是收敛成果，
+# 由 harness gate 强制：实际直接依赖方（全部工作区包，含 app/engineering 宿主，
+# normal 依赖）必须**集合相等**于 `allowed_dependents ∪ {allow.crate}` —— 多一个
+# 是回归（新栈又反向依赖旧栈），少一个同样 FAIL（policy 与实际脱节）。
+#
+# 例外条目必须同时给出非空 `reason` 与合法、未过期的 `review_by`
+# （YYYY-MM-DD，以运行当日为准；缺失/非法/过期一律 FAIL，不是 WARN）。
+#
+# 机器检查：harness gate `architecture-policy`（full）与 `architecture-delta`
+# （fast）共用同一实现，两档都拦；策略见 §2.6.1（`actual − allowed` 非空即 FAIL）。
+# ---------------------------------------------------------------------------
+[dual_stack]
+# 冻结演进的 v9 运行时 crate（当前仅一个）。
+frozen_crates = ["nexus-connectivity"]
+# 收敛后的直接依赖方闭集（集合相等判据；P1/P1'/P2/P3 全绿后才写目标值）。
+allowed_dependents = ["nexus", "nexus-harness", "nexus-proxy"]
+
+# 例外条目：必须同时给 reason 与 review_by；过期即 FAIL。当前无例外
+# （P2 的 R2 v1.4 追认已完成，故走目标值路径，不写 allow）。
+# [[dual_stack.allow]]
+# crate = "<dependent>"
+# reason = "<为什么暂时保留这条边 + 关联 Red Evidence/issue>"
+# review_by = "YYYY-MM-DD"

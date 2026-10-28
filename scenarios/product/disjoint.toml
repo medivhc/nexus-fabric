@@ -3,6 +3,7 @@ id = "product.disjoint"
 title = "Disjoint 不交路径：Suurballe 求 2 条边不交最短路"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-disjoint"
+carrier = "v9-connectivity"
 
 [given]
 topology = "A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms), B-C(5ms)"

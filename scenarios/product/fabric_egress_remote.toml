@@ -3,6 +3,7 @@ id = "product.fabric-egress-remote"
 title = "统一路由跨节点出口：TUN 包走 Egress{peer} 经对端 NAT，回包经 fabric 返回"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6.4"
+carrier = "n1-fabric"
 
 [given]
 topology = "two Projections (A + B) with MockTun, mock peer link (example binary)"

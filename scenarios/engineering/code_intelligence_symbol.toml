@@ -3,6 +3,7 @@ id = "engineering.code-intelligence-symbol"
 title = "nexus-harness code symbol 经 rust-analyzer 在夹具 workspace 内解析 trait 符号（提案 §4/§16.1）"
 evidence_strength = "E4"
 requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#4-agent-facing-api"
+carrier = "engineering"
 
 [given]
 repository = "initialized"

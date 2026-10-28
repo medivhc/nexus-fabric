@@ -3,6 +3,7 @@ id = "product.compression"
 title = "数据压缩：算法选择、自适应门控与压缩统计"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-compression"
+carrier = "v9-connectivity"
 
 [given]
 algorithm = "gzip"

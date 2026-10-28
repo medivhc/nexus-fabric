@@ -3,6 +3,7 @@ id = "product.psk-handshake-admission"
 title = "PSK 网络准入：同 PSK 建连 -> 异 PSK/单边无 PSK 建连失败"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-psk-admission"
+carrier = "v9-connectivity"
 
 [given]
 key_derivation = "X25519 triple-DH + HKDF-SHA256, salt = nexus-link-encryption-v2 || psk"

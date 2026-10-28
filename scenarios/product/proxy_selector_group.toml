@@ -3,6 +3,7 @@ id = "product.proxy-selector-group"
 title = "selector 策略组手动切换 direct/relay 候选并断言选中 tag"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 group_kind = "selector"

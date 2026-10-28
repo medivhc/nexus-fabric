@@ -3,6 +3,7 @@ id = "product.connectivity-failure-rollback"
 title = "Connectivity 建连失败时按逆序幂等回滚到 Disposed"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#session"
+carrier = "v9-connectivity"
 
 [given]
 resource = "internet-access"

@@ -3,6 +3,7 @@ id = "product.tun-production-chain"
 title = "TUN 生产链：规则分流 + Proxy/Direct 真转发（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example tun_production_chain --json）：MockTun 注入流量，真实驱动

@@ -3,6 +3,7 @@ id = "product.subnet-daemon"
 title = "nexus 托管 subnet：up → status 读回 → leave 生命周期闭环（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-subnet-daemon"
+carrier = "v9-connectivity"
 
 [given]
 # 可执行 E4（example subnet_daemon --json，进程内 spawn nexus 子进程）：

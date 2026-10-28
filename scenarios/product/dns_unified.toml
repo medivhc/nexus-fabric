@@ -3,6 +3,7 @@ id = "product.dns-unified"
 title = "统一 DNS：mesh > fake-ip > 上游分类与 Fake-IP 生命周期"
 evidence_strength = "E4"
 requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
 
 [given]
 # Mesh 侧：peer 主机名 -> 虚拟网 IP

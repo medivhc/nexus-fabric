@@ -5,7 +5,7 @@
 
 ## Responsibility
 
-实现 `nexus_connectivity::OutboundAdapter` 的 **VLESS** 出站实现：
+实现 `nexus_proxy_config::outbound_seam::OutboundAdapter` 的 **VLESS** 出站实现：
 在一条已建立的字节流上完成 VLESS 请求/响应头握手，支持基础 VLESS 与
 XTLS-Vision padding 封装。
 
@@ -57,11 +57,12 @@ XTLS-Vision padding 封装。
 ## Outputs
 
 - `OutboundAdapter::handoff` → `OutboundHandoff { kind = "vless", tag, locator }`；
+  错误类型为 `OutboundHandoffError`（当前无生产者，见 proxy-config MODULE）；
 - 请求/响应头、Vision 帧、UDP 数据报字节流；结构化错误。
 
 ## Allowed Dependencies
 
-- `nexus-connectivity`（OutboundAdapter 接缝）；
+- `nexus-proxy-config`（出站身份/交接词汇 `outbound_seam::OutboundAdapter`）；
 - 标准库（`std::io`、`std::net`、`std::time`）；无第三方依赖。
 
 ## Forbidden Dependencies
@@ -70,8 +71,9 @@ XTLS-Vision padding 封装。
 - tokio / 异步运行时（与仓库 loopback blocking+thread 模式一致）；
 - 任何 wasm 不可移植但未隔离的依赖。
 - `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
-  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
-  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
+  接缝 ② 已于 2026-10-28（P2）清除：出站身份/交接词汇定义于 `nexus-proxy-config`，
+  本 crate 对 `nexus-connectivity` 的直接边为 0
+  （见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`）。
 
 ## Invariants
 

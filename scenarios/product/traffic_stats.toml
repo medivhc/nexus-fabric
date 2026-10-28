@@ -3,6 +3,7 @@ id = "product.traffic-stats"
 title = "流量统计汇总：按节点记账与全量快照导出"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-traffic-stats"
+carrier = "v9-connectivity"
 
 [given]
 node_a_rx_records = [[100, 200], [50, 50]]

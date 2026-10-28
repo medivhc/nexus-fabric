@@ -3,6 +3,7 @@ id = "product.routing-strategy"
 title = "[routing] strategy 配置装配：策略枚举 + PathComputer 委托"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-routing-strategy"
+carrier = "v9-connectivity"
 
 [given]
 config = "[routing] strategy = shortest|ecmp (default shortest); unknown -> CONFIG_ERROR"

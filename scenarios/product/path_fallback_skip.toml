@@ -3,6 +3,7 @@ id = "product.path-fallback-skip"
 title = "Fallback 诚实跳过：无代理/TURN 配置时链退化为纯直连，跳过计数可观测"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#3.5"
+carrier = "n1-fabric"
 
 [given]
 topology = "任意 loopback 可用的环境（无真机依赖）；TCP echo 服务在 127.0.0.1（example 内建）"

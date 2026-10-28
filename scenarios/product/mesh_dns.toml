@@ -3,6 +3,7 @@ id = "product.mesh-dns"
 title = "Mesh 网络内域名注册与跨节点解析闭环"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-mesh-dns"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

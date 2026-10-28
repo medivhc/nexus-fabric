@@ -3,6 +3,7 @@ id = "product.qos-cake"
 title = "CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 整形 + 流回收）"
 evidence_strength = "E4"
 requirement = "docs/DAEMON_ARCHITECTURE.md#11"
+carrier = "shared-leaf"
 
 [given]
 quantum = 1514
@@ -55,25 +56,3 @@ equals = 1
 [[expect]]
 field = "reap.flows_remaining"
 equals = 0
-
-# (e) daemon.toml [qos] 解析映射（apps/nexusd）
-[[expect]]
-field = "config.enabled"
-equals = true
-
-[[expect]]
-field = "config.mesh_upload_mbps"
-equals = 100
-
-[[expect]]
-field = "config.proxy_upload_mbps"
-equals = 50
-
-[[expect]]
-field = "config.quantum"
-equals = 1514
-
-#     注：equals 仅支持标量，端口列表编码为逗号分隔字符串
-[[expect]]
-field = "config.high_priority_ports"
-equals = "22,53,3389"

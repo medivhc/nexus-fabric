@@ -28,6 +28,152 @@ pub enum ExpectKind {
     Absent,
 }
 
+/// 场景的执行载体所属栈（契约 §2 / 冻结件 §4.2 闭集 5 值）。
+///
+/// 非 `Option`：`load_file` 成功即已解析并校验过声明值与派生值一致，
+/// 因此下游（证据头、索引）不需要再处理"未声明"分支。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Carrier {
+    V9Connectivity,
+    N1Fabric,
+    SharedLeaf,
+    Engineering,
+    External,
+}
+
+impl Carrier {
+    pub const ALL: [Carrier; 5] = [
+        Carrier::V9Connectivity,
+        Carrier::N1Fabric,
+        Carrier::SharedLeaf,
+        Carrier::Engineering,
+        Carrier::External,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Carrier::V9Connectivity => "v9-connectivity",
+            Carrier::N1Fabric => "n1-fabric",
+            Carrier::SharedLeaf => "shared-leaf",
+            Carrier::Engineering => "engineering",
+            Carrier::External => "external",
+        }
+    }
+
+    /// 闭集解析（大小写敏感、逐字匹配）。非法值返回 `None`，由调用方报错。
+    pub fn parse(s: &str) -> Option<Carrier> {
+        Carrier::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
+/// 从 `[when].command` 文本派生 carrier（冻结件 §4.2 十条规则，按序命中即止）。
+///
+/// `None` = 不命中任何规则（合成夹具容忍；仓库级 totality 由
+/// `scenario index --check` 强制）。
+pub fn carrier_for_command(command: &str) -> Option<Carrier> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let first = *tokens.first()?;
+    let package = package_token(&tokens);
+    let run_sub = harness_run_subcommand(&tokens, package);
+    const V9_RUN: [&str; 7] = [
+        "virtual-subnet-tunnel",
+        "virtual-subnet-mesh",
+        "multihop-routing",
+        "mesh-dns",
+        "firewall-rules",
+        "bandwidth-qos",
+        "auto-reconnect",
+    ];
+    const N1_RUN: [&str; 3] = ["dns-unified", "multipath", "nat-hole-punching"];
+
+    // ① harness `run bootstrap-join`（结构化判定：不是任意文本子串）。
+    if run_sub == Some("bootstrap-join") {
+        return Some(Carrier::V9Connectivity);
+    }
+    // ② `-p nexus`（**token 精确匹配**，非前缀）或 CLI 裸命令。
+    if package == Some("nexus") || matches!(first, "proxy" | "virtual") {
+        return Some(Carrier::V9Connectivity);
+    }
+    // ③ harness run ∈ v9 内联子命令集。
+    if run_sub.is_some_and(|s| V9_RUN.contains(&s)) {
+        return Some(Carrier::V9Connectivity);
+    }
+    // ④ `-p nexusd`。
+    if package == Some("nexusd") {
+        return Some(Carrier::N1Fabric);
+    }
+    // ⑤ `-p nexus-<name>`（<name> ≠ harness）。
+    if package.is_some_and(|p| p.starts_with("nexus-") && p != "nexus-harness") {
+        return Some(Carrier::N1Fabric);
+    }
+    // ⑥ harness run ∈ n1 内联子命令集。
+    if run_sub.is_some_and(|s| N1_RUN.contains(&s)) {
+        return Some(Carrier::N1Fabric);
+    }
+    // ⑦ harness run qos-cake（两栈共享叶）。
+    if run_sub == Some("qos-cake") {
+        return Some(Carrier::SharedLeaf);
+    }
+    // ⑧ `-p nexus-harness`。
+    if package == Some("nexus-harness") {
+        return Some(Carrier::Engineering);
+    }
+    // ⑨ 首 token 是 harness 自身。
+    if first_basename(&tokens) == Some("nexus-harness") {
+        return Some(Carrier::Engineering);
+    }
+    // ⑩ 脚本载体：解释器首 token 或仓库内 `scripts/**.sh` 路径。
+    if matches!(first, "python3" | "python" | "sh" | "bash") || is_scripts_sh(first) {
+        return Some(Carrier::External);
+    }
+    None
+}
+
+/// `-p` / `--package` 的**下一个 token**（包名），不是字符串前缀匹配。
+fn package_token<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    tokens
+        .windows(2)
+        .find(|w| matches!(w[0], "-p" | "--package"))
+        .map(|w| w[1])
+}
+
+fn first_basename<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    tokens
+        .first()
+        .and_then(|t| Path::new(*t).file_name()?.to_str())
+}
+
+/// harness `run <sub>` 子命令名。识别两种调用形态：
+/// `nexus-harness run <sub>` 与 `cargo … -p nexus-harness … -- run <sub>`。
+fn harness_run_subcommand<'a>(tokens: &[&'a str], package: Option<&str>) -> Option<&'a str> {
+    if first_basename(tokens) == Some("nexus-harness") {
+        return match tokens.get(1) {
+            Some(&"run") => tokens.get(2).copied(),
+            _ => None,
+        };
+    }
+    if tokens.first() == Some(&"cargo") && package == Some("nexus-harness") {
+        if let Some(pos) = tokens.iter().position(|t| *t == "--") {
+            if tokens.get(pos + 1) == Some(&"run") {
+                return tokens.get(pos + 2).copied();
+            }
+        }
+    }
+    None
+}
+
+fn is_scripts_sh(token: &str) -> bool {
+    (token.starts_with("scripts/") || token.contains("/scripts/")) && token.ends_with(".sh")
+}
+
+fn legal_carriers() -> String {
+    Carrier::ALL
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone)]
 pub struct Scenario {
     pub id: String,
@@ -50,11 +196,15 @@ pub struct Scenario {
     /// None = 未声明或非字符串；分层由 `evidence_strength()` 推导/校验，
     /// 加载不因该字段缺失或非法而失败（契约 §4.5：不静默丢弃场景）。
     pub evidence_strength: Option<String>,
+    /// 顶层 `carrier`（契约 §2）：执行载体所属栈，闭集 5 值。
+    /// `load_file` 成功即保证已声明且与派生值一致。
+    pub carrier: Carrier,
 }
 
 #[derive(Clone)]
 pub struct ScenarioResult {
     pub id: String,
+    pub carrier: Carrier,
     pub verdict: String,
     pub detail: String,
     pub duration_ms: u64,
@@ -875,6 +1025,45 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
         .and_then(|w| w.get("command"))
         .and_then(toml::Value::as_str)
         .map(str::to_string);
+    // 顶层 carrier（契约 §2）：必填、闭集 5 值，且与命令派生值一致。
+    // 缺失/非法/不一致 → Err（fail-closed，由 load_all_reporting 汇总成门 FAIL）。
+    let carrier = match v.get("carrier") {
+        None => {
+            return Err(format!(
+                "缺顶层 carrier 字段: {}（合法值: {}）",
+                path.display(),
+                legal_carriers()
+            ));
+        }
+        Some(toml::Value::String(s)) => Carrier::parse(s).ok_or_else(|| {
+            format!(
+                "非法 carrier 值 {:?}: {}（合法值: {}）",
+                s,
+                path.display(),
+                legal_carriers()
+            )
+        })?,
+        Some(other) => {
+            return Err(format!(
+                "carrier 非字符串（{:?}）: {}（合法值: {}）",
+                other,
+                path.display(),
+                legal_carriers()
+            ));
+        }
+    };
+    if let Some(cmd) = command.as_deref() {
+        if let Some(derived) = carrier_for_command(cmd) {
+            if derived != carrier {
+                return Err(format!(
+                    "carrier 与派生值不一致: {} 声明 {}，命令派生 {}（command: {cmd}）",
+                    path.display(),
+                    carrier.as_str(),
+                    derived.as_str()
+                ));
+            }
+        }
+    }
     let expects = v
         .get("expect")
         .and_then(toml::Value::as_array)
@@ -909,6 +1098,7 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
         command,
         expects,
         evidence_strength,
+        carrier,
     })
 }
 
@@ -1001,8 +1191,18 @@ fn toml_value_to_json(v: &toml::Value) -> Value {
 }
 
 /// Load all scenario files under scenarios/<subdir>/.
+///
+/// 兼容入口：丢弃加载错误（既有调用点签名不变）。需要 fail-closed 判定
+/// （场景门 / 索引）的调用方必须用 `load_all_reporting`。
 pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
+    load_all_reporting(scenarios_dir, subdirs).0
+}
+
+/// Load scenarios and **return** per-file load errors instead of only logging
+/// them. 契约 §4 规则 5 的「不静默丢弃」：调用方据此 fail-closed。
+pub fn load_all_reporting(scenarios_dir: &Path, subdirs: &[&str]) -> (Vec<Scenario>, Vec<String>) {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     for sub in subdirs {
         let dir = scenarios_dir.join(sub);
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1017,13 +1217,17 @@ pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
         for f in files {
             match load_file(&f, sub) {
                 Ok(s) => out.push(s),
-                // 契约校验失败的场景不静默丢弃：记录日志后跳过，
-                // 由 verify --full 的 product-scenarios gate 汇总为 FAIL。
-                Err(e) => eprintln!("[scenario] 跳过 {}: {e}", f.display()),
+                // 契约校验失败的场景不静默丢弃：记录日志 + 回传错误，
+                // 由场景门 / 索引 gate 汇总为 FAIL（fail-closed）。
+                Err(e) => {
+                    let msg = format!("{}: {e}", f.display());
+                    eprintln!("[scenario] 跳过 {msg}");
+                    errors.push(msg);
+                }
             }
         }
     }
-    out
+    (out, errors)
 }
 
 /// 单个 expect 失败的结构化信息（供失败签名使用）。
@@ -1726,7 +1930,20 @@ pub fn run_gate(
 ) -> (Vec<ScenarioResult>, Gate) {
     use std::time::Instant;
     let started = Instant::now();
-    let scenarios = load_all(&config.scenarios_dir, subdirs);
+    let (scenarios, load_errors) = load_all_reporting(&config.scenarios_dir, subdirs);
+    // fail-closed：任何场景加载失败都先于「空集早退」判 FAIL。否则
+    // carrier 写错/漏写的场景会从集合里消失而 gate 仍可能 PASS
+    // （AC-13 机械不可判定）。
+    if !load_errors.is_empty() {
+        let detail = format!(
+            "{} scenario file(s) failed to load:\n{}",
+            load_errors.len(),
+            load_errors.join("\n")
+        );
+        let mut gate = Gate::fail(gate_name, &detail);
+        gate.duration_ms = started.elapsed().as_millis() as u64;
+        return (Vec::new(), gate);
+    }
     if scenarios.is_empty() {
         return (
             Vec::new(),
@@ -1751,6 +1968,7 @@ pub fn run_gate(
         }
         results.push(ScenarioResult {
             id: s.id.clone(),
+            carrier: s.carrier,
             verdict: rep.verdict,
             detail: rep.detail,
             duration_ms: rep.duration_ms,
@@ -1764,11 +1982,12 @@ pub fn run_gate(
         .zip(results.iter())
         .map(|(s, r)| {
             format!(
-                "{}: {} (requires={}, evidence={}; {})",
+                "{}: {} (requires={}, evidence={}, carrier={}; {})",
                 r.id,
                 r.verdict,
                 scenario_requires(s),
                 evidence_strength(s),
+                r.carrier.as_str(),
                 r.detail
             )
         })
@@ -1800,6 +2019,7 @@ mod tests {
             command: None,
             expects,
             evidence_strength: None,
+            carrier: Carrier::Engineering,
         }
     }
 
@@ -1925,7 +2145,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmpdir");
         std::fs::write(
             dir.join("s.toml"),
-            "schema_version = 1\nid = \"t.absent\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"a.b\"\nabsent = true\n",
+            "schema_version = 1\nid = \"t.absent\"\ncarrier = \"engineering\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"a.b\"\nabsent = true\n",
         )
         .expect("write toml");
         let loaded = load_file(&dir.join("s.toml"), "product").unwrap();
@@ -2086,7 +2306,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmpdir");
         std::fs::write(
             dir.join("s.toml"),
-            "schema_version = 1\nid = \"t.v1\"\n[when]\ncommand = \"true\"\n",
+            "schema_version = 1\nid = \"t.v1\"\ncarrier = \"engineering\"\n[when]\ncommand = \"true\"\n",
         )
         .expect("write toml");
         let scenarios = load_all(&dir, &[""]);
@@ -2102,7 +2322,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmpdir");
         std::fs::write(
             dir.join("s.toml"),
-            "schema_version = 1\nid = \"t.fixture\"\n[given]\nfixture = [\"echo one\", \"echo two\"]\n[when]\ncommand = \"echo hi\"\n",
+            "schema_version = 1\nid = \"t.fixture\"\ncarrier = \"engineering\"\n[given]\nfixture = [\"echo one\", \"echo two\"]\n[when]\ncommand = \"echo hi\"\n",
         )
         .expect("write toml");
         let scenarios = load_all(&dir, &[""]);
@@ -2121,7 +2341,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmpdir");
         std::fs::write(
             dir.join("s.toml"),
-            "schema_version = 1\nid = \"t.nofixture\"\n[given]\n[when]\ncommand = \"echo hi\"\n",
+            "schema_version = 1\nid = \"t.nofixture\"\ncarrier = \"engineering\"\n[given]\n[when]\ncommand = \"echo hi\"\n",
         )
         .expect("write toml");
         let scenarios = load_all(&dir, &[""]);
@@ -2151,7 +2371,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmpdir");
         std::fs::write(
             dir.join("s.toml"),
-            "schema_version = 1\nid = \"t.fixture2\"\n[given]\nfixture = [\"echo ok\", 42]\n[when]\ncommand = \"echo hi\"\n",
+            "schema_version = 1\nid = \"t.fixture2\"\ncarrier = \"engineering\"\n[given]\nfixture = [\"echo ok\", 42]\n[when]\ncommand = \"echo hi\"\n",
         )
         .expect("write toml");
         let scenarios = load_all(&dir, &[""]);
@@ -2250,7 +2470,7 @@ mod tests {
     fn evidence_strength_parsed_from_toml() {
         let (dir, scenarios) = synthetic_scenario(
             "ev",
-            "schema_version = 1\nid = \"t.ev\"\nevidence_strength = \"E4\"\n[given]\nfixture = [\"true\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+            "schema_version = 1\nid = \"t.ev\"\nevidence_strength = \"E4\"\ncarrier = \"engineering\"\n[given]\nfixture = [\"true\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(scenarios.len(), 1);
@@ -2280,7 +2500,7 @@ mod tests {
         std::fs::write(
             dir.join("a.toml"),
             format!(
-                "schema_version = 1\nid = \"t.a\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                "schema_version = 1\nid = \"t.a\"\ncarrier = \"external\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
                 toml_escape(&cmd)
             ),
         )
@@ -2289,7 +2509,7 @@ mod tests {
         std::fs::write(
             dir.join("b.toml"),
             format!(
-                "schema_version = 1\nid = \"t.b\"\nrequires_root = true\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                "schema_version = 1\nid = \"t.b\"\nrequires_root = true\ncarrier = \"external\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
                 toml_escape(&cmd)
             ),
         )
@@ -2336,7 +2556,7 @@ mod tests {
         std::fs::create_dir_all(&sub).expect("tmpdir");
         std::fs::write(
             sub.join("m.toml"),
-            "schema_version = 1\nid = \"t.meta\"\ntitle = \"元信息测试\"\nrequires_root = true\n[when]\ncommand = \"echo hi\"\n",
+            "schema_version = 1\nid = \"t.meta\"\ntitle = \"元信息测试\"\nrequires_root = true\ncarrier = \"engineering\"\n[when]\ncommand = \"echo hi\"\n",
         )
         .expect("write toml");
         let scenarios = load_all(&dir, &["product"]);
@@ -2398,7 +2618,7 @@ mod tests {
         std::fs::write(
             dir.join(format!("{id}.toml")),
             format!(
-                "schema_version = 1\nid = \"t.{id}\"\n[when]\ncommand = \"{}\"\n{expects}",
+                "schema_version = 1\nid = \"t.{id}\"\ncarrier = \"external\"\n[when]\ncommand = \"{}\"\n{expects}",
                 toml_escape(&cmd)
             ),
         )
@@ -2431,7 +2651,7 @@ mod tests {
     fn run_single_fixture_failure_signature() {
         let (dir, scenarios) = synthetic_scenario(
             "fx",
-            "schema_version = 1\nid = \"t.fx\"\n[given]\nfixture = [\"false\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+            "schema_version = 1\nid = \"t.fx\"\ncarrier = \"engineering\"\n[given]\nfixture = [\"false\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
         let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2445,7 +2665,7 @@ mod tests {
     fn run_single_static_contract_is_unknown() {
         let (dir, scenarios) = synthetic_scenario(
             "st",
-            "schema_version = 1\nid = \"t.st\"\ntitle = \"静态契约\"\n[when]\n",
+            "schema_version = 1\nid = \"t.st\"\ntitle = \"静态契约\"\ncarrier = \"engineering\"\n[when]\n",
         );
         let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2458,7 +2678,7 @@ mod tests {
     fn run_single_platform_mismatch_is_unknown() {
         let (dir, scenarios) = synthetic_scenario(
             "pl",
-            "schema_version = 1\nid = \"t.pl\"\n[given]\nplatform = \"definitely-not-this-os\"\n[when]\ncommand = \"echo hi\"\n",
+            "schema_version = 1\nid = \"t.pl\"\ncarrier = \"engineering\"\n[given]\nplatform = \"definitely-not-this-os\"\n[when]\ncommand = \"echo hi\"\n",
         );
         let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2490,7 +2710,7 @@ mod tests {
     fn run_single_parse_failure_signature() {
         let (dir, scenarios) = synthetic_scenario(
             "np",
-            "schema_version = 1\nid = \"t.parse\"\n[when]\ncommand = \"echo not-json\"\n",
+            "schema_version = 1\nid = \"t.parse\"\ncarrier = \"engineering\"\n[when]\ncommand = \"echo not-json\"\n",
         );
         let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2510,7 +2730,7 @@ mod tests {
     fn run_single_spawn_failed_signature() {
         let (dir, scenarios) = synthetic_scenario(
             "sf",
-            "schema_version = 1\nid = \"t.spawn\"\n[when]\ncommand = \"nexus-harness-no-such-binary-zzz\"\n",
+            "schema_version = 1\nid = \"t.spawn\"\ncarrier = \"engineering\"\n[when]\ncommand = \"nexus-harness-no-such-binary-zzz\"\n",
         );
         let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2546,7 +2766,7 @@ mod tests {
             // `\U` 是 TOML 非法 unicode 转义，六个场景会全部解析失败被跳过。
             let cmd = format!("sh {}", script.display());
             let toml_body = format!(
-                "schema_version = 1\nid = \"t.par{i}\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                "schema_version = 1\nid = \"t.par{i}\"\ncarrier = \"external\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
                 toml_escape(&cmd)
             );
             std::fs::write(dir.join(format!("s{i}.toml")), toml_body).expect("write toml");
@@ -2644,7 +2864,7 @@ mod tests {
         let script = dir.join("slow-fixture.sh");
         std::fs::write(&script, "#!/bin/sh\nsleep 5\n").expect("write script");
         let body = format!(
-            "schema_version = 1\nid = \"t.fxto\"\n[given]\nfixture = [\"sh {}\"]\n[when]\ncommand = \"echo {{\\\"verdict\\\":\\\"PASS\\\"}}\"\n",
+            "schema_version = 1\nid = \"t.fxto\"\ncarrier = \"engineering\"\n[given]\nfixture = [\"sh {}\"]\n[when]\ncommand = \"echo {{\\\"verdict\\\":\\\"PASS\\\"}}\"\n",
             toml_escape(&script.to_string_lossy())
         );
         std::fs::write(dir.join("fxto.toml"), body).expect("write toml");
@@ -2831,12 +3051,13 @@ mod tests {
             }
         }
         // fixes-5 合并注记：master 287 + fixes-5 新增 product.proxy-trojan-fallback-rejected 场景 1 = 288。
-        assert_eq!(parseable, 288, "288 cargo-run [when].command");
+        // P3 合并注记：+ product.qos-cake-enabled-path（cargo run -p nexusd --example）= 289。
+        assert_eq!(parseable, 289, "289 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 266, "all declared targets resolve to Direct");
+        assert_eq!(direct, 267, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -2875,10 +3096,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            210,
-            "206 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            211,
+            "207 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 206);
+        assert_eq!(examples.len(), 207);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(
@@ -2918,7 +3139,7 @@ mod tests {
             std::fs::write(
                 dir.join(format!("{id}.toml")),
                 format!(
-                    "schema_version = 1\nid = \"t.{id}\"\n[when]\ncommand = \"cargo run --quiet -p pkg --example {example} -- {{\\\"verdict\\\":\\\"PASS\\\"}}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n"
+                    "schema_version = 1\nid = \"t.{id}\"\ncarrier = \"engineering\"\n[when]\ncommand = \"cargo run --quiet -p pkg --example {example} -- {{\\\"verdict\\\":\\\"PASS\\\"}}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n"
                 ),
             )
             .unwrap();
@@ -3043,5 +3264,261 @@ mod tests {
         let b = unique_artifact_path(&canonical, "nexus-path", "example", "basic", &[], false);
         assert_ne!(a, b, "same-name examples must not share an executable path");
         assert_eq!(a.parent(), canonical.parent());
+    }
+
+    // ---- carrier（契约 §2/§4.2） -------------------------------------------
+
+    #[test]
+    fn carrier_parse_rejects_unknown() {
+        for c in Carrier::ALL {
+            assert_eq!(Carrier::parse(c.as_str()), Some(c));
+        }
+        for bad in [
+            "",
+            "V9-Connectivity",
+            "v9_connectivity",
+            "n1",
+            "shared",
+            "mock-packet-carrier",
+            "engineering ",
+        ] {
+            assert_eq!(Carrier::parse(bad), None, "illegal carrier {bad:?}");
+        }
+    }
+
+    #[test]
+    fn carrier_for_command_rule_table() {
+        // ① bootstrap-join（两种 harness 调用形态）
+        assert_eq!(
+            carrier_for_command("cargo run --quiet -p nexus-harness -- run bootstrap-join --json"),
+            Some(Carrier::V9Connectivity)
+        );
+        assert_eq!(
+            carrier_for_command("nexus-harness run bootstrap-join --json"),
+            Some(Carrier::V9Connectivity)
+        );
+        // ② `-p nexus` 必须 token 精确——前缀陷阱逐个否掉。
+        assert_eq!(
+            carrier_for_command("cargo run --quiet -p nexus --example auto_discovery -- --json"),
+            Some(Carrier::V9Connectivity)
+        );
+        assert_eq!(
+            carrier_for_command("cargo run --quiet -p nexusd --example tun -- --json"),
+            Some(Carrier::N1Fabric),
+            "-p nexusd 不能被 -p nexus 前缀吞掉"
+        );
+        assert_eq!(
+            carrier_for_command("cargo run --quiet -p nexus-harness -- status --json"),
+            Some(Carrier::Engineering)
+        );
+        // ③ v9 内联子命令
+        assert_eq!(
+            carrier_for_command("nexus-harness run firewall-rules --json"),
+            Some(Carrier::V9Connectivity)
+        );
+        // ⑤ `-p nexus-<name>`（≠ harness）
+        assert_eq!(
+            carrier_for_command("cargo test --quiet -p nexus-connectivity filter"),
+            Some(Carrier::N1Fabric)
+        );
+        // ⑥ n1 内联子命令
+        assert_eq!(
+            carrier_for_command("nexus-harness run multipath --json"),
+            Some(Carrier::N1Fabric)
+        );
+        // ⑦ shared-leaf
+        assert_eq!(
+            carrier_for_command("nexus-harness run qos-cake --json"),
+            Some(Carrier::SharedLeaf)
+        );
+        // ⑨ 首 token harness 自身
+        assert_eq!(
+            carrier_for_command("nexus-harness status --json"),
+            Some(Carrier::Engineering)
+        );
+        // ⑩ external：解释器 / 仓库脚本
+        assert_eq!(
+            carrier_for_command("python3 engineering/verifiers/n3_snapshot_staging.py"),
+            Some(Carrier::External)
+        );
+        assert_eq!(
+            carrier_for_command("scripts/e4/tun_outbound_ref_flow.sh shadowsocks"),
+            Some(Carrier::External)
+        );
+        assert_eq!(carrier_for_command("bash run.sh"), Some(Carrier::External));
+    }
+
+    #[test]
+    fn carrier_for_command_order_sensitive_cases() {
+        // C2-② 的 11 例：先命中 v9/n1/shared，后命中 engineering。
+        assert_eq!(
+            carrier_for_command("cargo run --quiet -p nexus-harness -- run bootstrap-join --json"),
+            Some(Carrier::V9Connectivity)
+        );
+        for sub in [
+            "virtual-subnet-tunnel",
+            "virtual-subnet-mesh",
+            "multihop-routing",
+            "mesh-dns",
+            "firewall-rules",
+            "bandwidth-qos",
+            "auto-reconnect",
+        ] {
+            let cmd = format!("nexus-harness run {sub} --json");
+            assert_eq!(
+                carrier_for_command(&cmd),
+                Some(Carrier::V9Connectivity),
+                "{cmd}"
+            );
+        }
+        for sub in ["dns-unified", "multipath"] {
+            let cmd = format!("nexus-harness run {sub} --json");
+            assert_eq!(carrier_for_command(&cmd), Some(Carrier::N1Fabric), "{cmd}");
+        }
+        assert_eq!(
+            carrier_for_command("nexus-harness run qos-cake --json"),
+            Some(Carrier::SharedLeaf)
+        );
+    }
+
+    #[test]
+    fn carrier_for_command_unclassified_returns_none() {
+        for cmd in [
+            "echo hi",
+            "true",
+            "",
+            "cargo run --quiet -p pkg --example x",
+        ] {
+            assert_eq!(carrier_for_command(cmd), None, "{cmd:?}");
+        }
+    }
+
+    fn carrier_toml(id: &str, carrier_line: &str) -> String {
+        format!("schema_version = 1\nid = \"{id}\"\n{carrier_line}[when]\ncommand = \"echo hi\"\n")
+    }
+
+    #[test]
+    fn load_rejects_missing_or_invalid_carrier() {
+        let dir = std::env::temp_dir().join(format!("harness-carrier-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("missing.toml"),
+            "schema_version = 1\nid = \"t.missing\"\n[when]\ncommand = \"echo hi\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("invalid.toml"),
+            carrier_toml("t.invalid", "carrier = \"nonsense\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("notstring.toml"),
+            carrier_toml("t.notstring", "carrier = 42\n"),
+        )
+        .unwrap();
+        let (scenarios, errors) = load_all_reporting(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(scenarios.is_empty());
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("缺顶层 carrier")));
+        assert!(errors.iter().any(|e| e.contains("非法 carrier")));
+        assert!(errors.iter().any(|e| e.contains("carrier 非字符串")));
+    }
+
+    #[test]
+    fn load_rejects_declared_derivation_mismatch() {
+        let dir = std::env::temp_dir().join(format!("harness-carrier-mis-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("s.toml"),
+            "schema_version = 1\nid = \"t.mis\"\ncarrier = \"v9-connectivity\"\n[when]\ncommand = \"cargo run --quiet -p nexusd --example tun -- --json\"\n",
+        )
+        .unwrap();
+        let (scenarios, errors) = load_all_reporting(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(scenarios.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("与派生值不一致"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn load_accepts_declared_when_underivable() {
+        // 派生 None（合成命令）→ 声明值不被否决（仓库级 totality 由 index --check 强制）。
+        let (dir, scenarios) = synthetic_scenario(
+            "underivable",
+            "schema_version = 1\nid = \"t.underivable\"\ncarrier = \"external\"\n[when]\ncommand = \"echo hi\"\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].carrier, Carrier::External);
+    }
+
+    fn carrier_gate_config(dir: &std::path::Path) -> Config {
+        Config {
+            policies_dir: dir.join("policies"),
+            scenarios_dir: dir.to_path_buf(),
+            evidence_dir: dir.join("evidence"),
+            crates_dir: dir.join("crates"),
+            engineering_dir: dir.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
+        }
+    }
+
+    #[test]
+    fn load_all_reports_errors_instead_of_silent_skip() {
+        let dir = std::env::temp_dir().join(format!("harness-load-rep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("good.toml"),
+            carrier_toml("t.good", "carrier = \"engineering\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bad.toml"),
+            "schema_version = 1\nid = \"t.bad\"\n[when]\ncommand = \"echo hi\"\n",
+        )
+        .unwrap();
+        let (scenarios, errors) = load_all_reporting(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].id, "t.good");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bad.toml"));
+    }
+
+    #[test]
+    fn run_gate_fails_on_load_error() {
+        // 全部场景都坏：必须是 FAIL，而不是 "no scenario files declared" PASS。
+        let dir = std::env::temp_dir().join(format!("harness-gate-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("bad.toml"),
+            "schema_version = 1\nid = \"t.bad\"\ncarrier = \"v9-connectivity\"\n[when]\ncommand = \"cargo run --quiet -p nexusd --example tun -- --json\"\n",
+        )
+        .unwrap();
+        let config = carrier_gate_config(&dir);
+        let (results, gate) = run_gate(
+            &config,
+            "product-scenarios",
+            &[""],
+            None,
+            &ScenarioTimeouts::legacy(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(gate.verdict, "FAIL", "{}", gate.detail);
+        assert!(
+            !gate.detail.contains("no scenario files declared"),
+            "{}",
+            gate.detail
+        );
+        assert!(gate.detail.contains("failed to load"), "{}", gate.detail);
+        assert!(results.is_empty());
     }
 }

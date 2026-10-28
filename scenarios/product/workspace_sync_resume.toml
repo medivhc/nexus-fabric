@@ -3,6 +3,7 @@ id = "product.workspace-sync-resume"
 title = "大对象 sync 中断续传：kill -9 后重跑续传完成"
 evidence_strength = "E4"
 requirement = "v9 §17/§18 + C2-D5（OBJECT-DATA 去 hex 改二进制分块 OBJECT-CHUNK/OBJECT-END）+ C2-D6（非原子、幂等、可续；fetch 每批 persist）"
+carrier = "n1-fabric"
 
 [given]
 description = "A 有一个 >1MB 的大对象；B 发起 sync；传输中途（约 50% chunks 后）模拟 kill -9 中断（丢弃传输态）；B 重跑 sync"

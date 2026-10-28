@@ -3,6 +3,7 @@ id = "product.remote-presence-dynamic-flow"
 title = "Node B 发布动态 Presence，Node A 经动态发现解析后完成远程闭环"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 requester = "node-a"

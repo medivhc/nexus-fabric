@@ -3,6 +3,7 @@ id = "product.proxy-fwd-trojan-plaintext-rejected"
 title = "Trojan 无显式 TLS 声明：daemon 启动硬失败（exit 1 + cause=PLAINTEXT_TROJAN_UNSUPPORTED）"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example proxy_fwd_trojan_plaintext_rejected --json，daemon 级）：

@@ -3,6 +3,7 @@ id = "product.log-level"
 title = "日志级别控制：全局/模块级级别、动态调整与覆盖"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-log-level"
+carrier = "v9-connectivity"
 
 [when]
 command = "cargo run --quiet -p nexus --example log_level -- --json"

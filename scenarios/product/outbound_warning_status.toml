@@ -3,6 +3,7 @@ id = "product.outbound-warning-status"
 title = "出站 interop 警示（daemon/stats/status 载体）：SS partial 在启动日志、LocalAPI stats 与 nexus status 一致"
 evidence_strength = "E3"
 requirement = "apps/nexusd/MODULE.md#出站-interop-标注五载体步骤-3spec-v14-5253542026-10-26"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example outbound_warning_status --json）：

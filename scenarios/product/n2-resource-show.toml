@@ -3,6 +3,7 @@ id = "product.n2-resource-show"
 title = "nexus resource show <name>：资源详情（含双层授权字段与可用状态）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#16-n2-resource-access"
+carrier = "v9-connectivity"
 
 [given]
 # P0-0 契约冻结（2026-10-03）：`nexus resource show` 在 P0-2/P0-4 实现，

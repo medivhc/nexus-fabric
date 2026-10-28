@@ -3,6 +3,7 @@ id = "product.dijkstra-fib"
 title = "去中心化选路：LSDB → TopoView → Dijkstra 最短路 → FIB（dst → Vec<NextHop>）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-dijkstra-fib"
+carrier = "v9-connectivity"
 
 [given]
 topology = "4 nodes: A-B(10ms), B-D(10ms), A-C(50ms), C-D(10ms), B-C(10ms); links advertised in LSA neighbors"
