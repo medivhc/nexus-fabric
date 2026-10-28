@@ -11,6 +11,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteri
 # 依据：outgoingCalls 按源码出现顺序返回，两宿主实测一致（Windows RA 1.95.0 / Linux RA 1.94.1，
 # results[0]=dispatch_dyn、results[1]=Result::Ok）。若某次 RA 改了顺序，本场景会变红——
 # 那是真回归信号，不是脆弱性；届时应按 requirement-change 流程重冻结，而不是删断言。
+carrier = "engineering"
 [given]
 repository = "initialized"
 network = "none (本地 language server 子进程)"
