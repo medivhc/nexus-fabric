@@ -87,7 +87,7 @@ impl TargetSet {
             Cell::TcpThroughput => cfg.workload.throughput_bytes,
             Cell::LongLived => cfg.workload.long_lived_heartbeats as usize,
             Cell::BadCredential | Cell::BadConfig => 16,
-            Cell::UdpEcho | Cell::QpackDiag | Cell::PaddingDiag => 16,
+            Cell::UdpEcho | Cell::UdpEchoCrate | Cell::QpackDiag | Cell::PaddingDiag => 16,
         };
         let sink_close_after = if cfg.cell == Cell::TcpThroughput {
             2 + 2 * cfg.workload.throughput_repeats as usize

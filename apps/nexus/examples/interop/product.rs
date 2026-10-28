@@ -521,7 +521,11 @@ fn run_workload(
                 }
             }
         }
-        Cell::Reconnect | Cell::UdpEcho | Cell::QpackDiag | Cell::PaddingDiag => {
+        Cell::Reconnect
+        | Cell::UdpEcho
+        | Cell::UdpEchoCrate
+        | Cell::QpackDiag
+        | Cell::PaddingDiag => {
             return Err(format!("cell {cell} is not a product tunnel workload"));
         }
     };

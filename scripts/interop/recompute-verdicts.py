@@ -230,9 +230,16 @@ def load_rows(run_dir, matrix):
             "1.13.16",
             "26.10.21",
         ):
-            raise RecomputeError(
-                f"{ev['evidence_id']}: unexpected ref version {ev['reference'].get('version')}"
+            # `NOT_IMPLEMENTED` 格在出站未接线时根本不会触达参照端（fail-closed 丢弃），
+            # 其证据里 ref version = `none` 是事实而非漂移；其余状态仍强制钉版参照端。
+            ref_none_ok = (
+                ev.get("reference", {}).get("version") == "none"
+                and ev.get("verdict") == "NotImplemented"
             )
+            if not ref_none_ok:
+                raise RecomputeError(
+                    f"{ev['evidence_id']}: unexpected ref version {ev['reference'].get('version')}"
+                )
         if cell == "TcpThroughput" and status == "PASS":
             samples = ev.get("metrics", {}).get("throughput_samples_bps", [])
             if len(samples) != 3 or ev.get("metrics", {}).get("throughput_median_bps", 0) <= 0:
@@ -425,6 +432,26 @@ def render_matrix(
     )
     window = f"{times[0]} .. {times[-1]}" if times else "n/a"
     archive = sorted((run_dir / "archive").glob("*.tar.zst"))
+    # Q10（spec §9.1/§9.2）：UdpEcho 是产品级 required 格，UdpEchoCrate 是 crate 级 diag 格。
+    # 产品级 UDP 的叙述必须由证据本身派生，不得在无产品级证据时提前宣称可用。
+    product_udp_rows = [
+        r
+        for r in rows
+        if r["cell"] == "UdpEcho"
+        and r["present"]
+        and r["evidence"].get("carrier") == "ProductSocks5"
+    ]
+    product_udp_ok = [r["protocol"] for r in product_udp_rows if r["status"] == "PASS"]
+    product_udp_gap = [r["protocol"] for r in product_udp_rows if r["status"] != "PASS"]
+    if product_udp_rows:
+        udp_carrier_clause = (
+            "`UdpEcho` 为产品级（`ProductSocks5`/`ProductPath`），`UdpEchoCrate` 为 crate 级诊断格"
+            "（`CrateDirect`/`ProtocolWire`）；VLESS Vision 部分格为 crate 直调。"
+        )
+    else:
+        udp_carrier_clause = (
+            "`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。"
+        )
     lines = []
     lines.append("# 出站协议互操作证据总表（MATRIX）")
     lines.append("")
@@ -465,8 +492,8 @@ def render_matrix(
     lines.append("")
     lines.append(
         f"- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）"
-        f"共 {len(matrix['cells'])} 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision "
-        "部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。"
+        f"共 {len(matrix['cells'])} 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；"
+        + udp_carrier_clause
     )
     lines.append(
         "- **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、"
@@ -474,7 +501,7 @@ def render_matrix(
     )
     lines.append(
         "- **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把"
-        "「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。"
+        "「产品级 UDP 能力缺口」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。"
     )
     # 结论 1/3 必须由本次复算的 verdict 派生，禁止硬编码与结果无关的结论句。
     verdict_names = {
@@ -507,10 +534,22 @@ def render_matrix(
         usable = "当前无任何协议可宣称可用。"
     lines.append(f"- **结论 1**：本次复算：{counts}；{usable}")
     if run_meta:
-        lines.append(
-            "- **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE "
-            "五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。"
-        )
+        if product_udp_rows:
+            udp_claim = (
+                "`USABLE` 指协议级互操作：TCP 产品路径 + 产品级 UDP（`UdpEcho` 行）。"
+                + (f"产品 SOCKS5 UDP ASSOCIATE 已有产品级证据支撑：{'、'.join(product_udp_ok)}；" if product_udp_ok else "")
+                + (
+                    f"其余协议产品级 UDP 仍为 `NOT_IMPLEMENTED` 或未通过（{'、'.join(product_udp_gap)}），见「产品级 UDP」节。"
+                    if product_udp_gap
+                    else "五协议产品级 UDP 均已取证。"
+                )
+            )
+        else:
+            udp_claim = (
+                "`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，"
+                "`UdpEcho` 为 crate 级证据、不代表产品入口可用。"
+            )
+        lines.append(f"- **结论 1 限定**：{udp_claim}")
     if run_meta:
         lines.append(
             "- **结论 2**："
@@ -853,8 +892,11 @@ def render_matrix(
                 qualifiers.append("诊断格，不参与 verdict")
             if proto == "Vless" and r["variant"] == "VlessVision":
                 qualifiers.append("crate 级，产品 splice 未实现")
-            if run_meta and proto in ("Vless", "Anytls") and r["cell"] == "UdpEcho":
-                qualifiers.append("crate 级，产品入口不可用")
+            if run_meta and r["cell"] == "UdpEcho":
+                if ev.get("carrier") == "CrateDirect":
+                    qualifiers.append("crate 级，产品入口不可用")
+                else:
+                    qualifiers.append("产品级（ProductSocks5）")
             if r["cell"] in FAILURE_CELLS and r["status"] == "PASS":
                 override = narrative.get("failure_cell_qualifier")
                 if override and proto in override:
@@ -882,16 +924,28 @@ def render_matrix(
         lines.append("")
     lines.append("## 产品级 UDP（不参与协议 verdict）")
     lines.append("")
-    lines.append(
-        "产品 SOCKS5 入口 `crates/nexus-ingress/src/lib.rs:232-241` 拒绝 BND/UDP ASSOCIATE；"
-        "Trojan/SS 出站也没有 UDP 帧路径。因此产品级 UDP 按能力缺口记录，"
-        "不进入五协议 verdict；crate 级 UDP 结论见各协议 `UdpEcho` 行。"
-    )
+    if product_udp_rows:
+        detail = ""
+        if product_udp_ok:
+            detail += f"已可用（产品级 `UdpEcho` PASS）：{'、'.join(product_udp_ok)}；"
+        if product_udp_gap:
+            detail += (
+                f"仍为 `NOT_IMPLEMENTED`/未通过：{'、'.join(product_udp_gap)}"
+                "（出站无 UDP 帧路径，按 fail-closed 丢弃，不直连）；"
+            )
+        lines.append(
+            "产品 SOCKS5 UDP ASSOCIATE 入口与出站帧路径按协议分别取证：`UdpEcho` 为产品级 required 格，"
+            "`UdpEchoCrate` 为 crate 级诊断格（不参与 verdict）。" + detail
+        )
+    else:
+        lines.append(
+            "产品 SOCKS5 UDP ASSOCIATE 入口与出站帧路径的证据见各协议 `UdpEcho`（产品级 required）与 "
+            "`UdpEchoCrate`（crate 级诊断）两行；本表不据此对产品级 UDP 可用性下结论。"
+        )
     lines.append("")
     lines.append(
-        "**区分**：本项指产品 SOCKS5 UDP relay 入口/出站帧路径缺失，"
-        "不等于所有 UDP/QUIC 路径不可用——Hy2 出站到代理服务器仍走 QUIC/UDP 传输，"
-        "其失败点是认证响应编解码（`E_NEXUS_CODEC`），不是 UDP 传输本身。"
+        "**区分**：本项指产品 SOCKS5 UDP relay 入口/出站帧路径，"
+        "不等于所有 UDP/QUIC 路径不可用——Hy2 出站到代理服务器仍走 QUIC/UDP 传输。"
     )
     lines.append("")
     lines.append("## 产品能力缺口")
@@ -902,7 +956,14 @@ def render_matrix(
         for item in gaps_override:
             lines.append(f"- {item}")
     else:
-        lines.append("- 产品级 UDP：未实现（上节）。")
+        if product_udp_gap:
+            lines.append(
+                f"- 产品级 UDP：{'、'.join(product_udp_gap)} 未实现（上节）。"
+            )
+        elif product_udp_rows:
+            lines.append("- 产品级 UDP：五协议均已取证（上节）。")
+        else:
+            lines.append("- 产品级 UDP：未实现（上节）。")
         lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
         lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
         lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")

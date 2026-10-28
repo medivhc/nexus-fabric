@@ -29,7 +29,8 @@ def entry_key(entry):
 
 
 def write_cell(run_dir, entry, status, cls, payload_hashes=True, pcap=True,
-               carrier=None, scope=None, notes=None, metrics=None, synthetic=False):
+               carrier=None, scope=None, notes=None, metrics=None, synthetic=False,
+               reference=None):
     proto = entry["protocol"]
     variant = entry["variant"]
     cell = entry["cell"]
@@ -63,6 +64,14 @@ def write_cell(run_dir, entry, status, cls, payload_hashes=True, pcap=True,
     }
     if cls:
         ev["error"] = {"class": cls, "message": "test", "first_failure_artifact": None}
+    if reference is not None:
+        ev["reference"] = {
+            "implementation": "none",
+            "version": "none",
+            "binary_sha256": "",
+            "config_sha256": "",
+            **reference,
+        }
     if cell == "TcpThroughput" and status == "PASS" and metrics is None:
         ev["metrics"] = {"throughput_samples_bps": [1, 2, 3], "throughput_median_bps": 2}
     if cell in ("Handshake", "TcpSmall") and status == "PASS" and payload_hashes:
@@ -246,6 +255,38 @@ class RecomputeTests(unittest.TestCase):
             with self.assertRaises(recompute.RecomputeError):
                 self.build(Path(tmp))
 
+    def test_ref_version_pin_exempts_unimplemented_only(self):
+        # `NOT_IMPLEMENTED` 格不触达参照端 → ref version `none` 合法；
+        # 其余状态的 `none` 仍是硬错误（不放松钉版参照端门禁）。
+        with tempfile.TemporaryDirectory() as tmp:
+            make_run(
+                Path(tmp),
+                "Trojan",
+                {
+                    ("Default", "UdpEcho"): {
+                        "status": "NOT_IMPLEMENTED",
+                        "cls": "E_NEXUS_NOT_IMPLEMENTED",
+                        "reference": {"implementation": "none", "version": "none"},
+                    }
+                },
+            )
+            payload, _ = recompute.build(Path(tmp), str(MATRIX_PATH), allow_partial=False)
+            self.assertEqual(payload["protocols"]["Trojan"]["verdict"], "PARTIAL")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            make_run(
+                Path(tmp),
+                "Trojan",
+                {
+                    ("Default", "UdpEcho"): {
+                        "status": "PASS",
+                        "reference": {"implementation": "none", "version": "none"},
+                    }
+                },
+            )
+            with self.assertRaises(recompute.RecomputeError):
+                recompute.build(Path(tmp), str(MATRIX_PATH), allow_partial=False)
+
     def test_failure_cell_without_pcap_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             make_run(
@@ -389,14 +430,20 @@ class RecomputeTests(unittest.TestCase):
                 run_meta=meta, run_meta_path=str(meta_path),
             )
             self.assertIn("**结论 1 限定**", text)
-            self.assertIn("`USABLE` 指 TCP 产品路径", text)
+            self.assertIn("`USABLE` 指协议级互操作", text)
             self.assertIn("**测试广度**", text)
             self.assertIn("REALITY、ws/grpc", text)
             udp_line = next(
                 line for line in text.splitlines()
                 if line.startswith("| Default/UdpEcho |") and "MISSING" not in line
             )
-            self.assertIn("crate 级，产品入口不可用", udp_line)
+            self.assertIn("产品级（ProductSocks5）", udp_line)
+            self.assertNotIn("crate 级，产品入口不可用", udp_line)
+            crate_line = next(
+                line for line in text.splitlines()
+                if line.startswith("| Default/UdpEchoCrate |") and "MISSING" not in line
+            )
+            self.assertIn("诊断格，不参与 verdict", crate_line)
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -411,7 +458,39 @@ class RecomputeTests(unittest.TestCase):
                 line for line in text.splitlines()
                 if line.startswith("| Default/UdpEcho |") and "MISSING" not in line
             )
-            self.assertIn("crate 级，产品入口不可用", udp_line)
+            self.assertIn("产品级（ProductSocks5）", udp_line)
+
+    def test_product_udp_section_is_evidence_driven(self):
+        # spec §9.2/Q10：产品级 UDP 叙述只能由产品级 UdpEcho 证据派生；
+        # 不得再出现硬编码的旧 ingress 行号引用，也不得在无产品级证据时宣称可用。
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(tmp, "Vless", {})
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            section = text.split("## 产品级 UDP", 1)[1].split("## 产品能力缺口", 1)[0]
+            self.assertIn("已可用", section)
+            self.assertIn("Vless", section)
+            self.assertNotIn("crates/nexus-ingress/src/lib.rs:232-241", text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(
+                tmp,
+                "Vless",
+                {("Default", "UdpEcho"): {"carrier": "CrateDirect", "scope": "ProtocolWire"}},
+            )
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            section = text.split("## 产品级 UDP", 1)[1].split("## 产品能力缺口", 1)[0]
+            self.assertNotIn("已可用", section)
+            self.assertIn("本表不据此对产品级 UDP 可用性下结论", section)
 
     def test_fix_section_and_appendix_use_run_meta_and_actual_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

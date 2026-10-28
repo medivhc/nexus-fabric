@@ -178,21 +178,25 @@ impl Outcome {
     }
 }
 
-/// 合成格（不发连接，D-10）。
+/// 合成格（不发连接，D-10；Q10：只对 crate 级 diag / 不可表达负向格生效）。
 #[must_use]
 pub fn is_synthetic(cfg: &InteropProbeConfig) -> bool {
     matches!(
         (cfg.protocol, cfg.cell),
-        (Protocol::Trojan | Protocol::Shadowsocks, Cell::UdpEcho)
+        (Protocol::Trojan | Protocol::Shadowsocks, Cell::UdpEchoCrate)
             | (Protocol::Trojan, Cell::BadConfig)
     )
 }
 
 /// 载波/作用域派生（§6.3 唯一映射：配置面不含 carrier 字段）。
+///
+/// Q10（spec §9.1/§9.2）：
+/// - `UdpEcho` → `ProductSocks5`/`ProductPath`（required，产品入口 + 出站全链路）；
+/// - `UdpEchoCrate` → `CrateDirect`/`ProtocolWire`（diag，保留 crate 级证据）；
+/// - QPACK 诊断格与 VLESS Vision 格仍为 crate 直调。
 #[must_use]
 pub fn carrier_for(cfg: &InteropProbeConfig) -> (Carrier, Scope) {
-    if is_synthetic(cfg)
-        || cfg.cell == Cell::UdpEcho
+    if cfg.cell == Cell::UdpEchoCrate
         || cfg.cell == Cell::QpackDiag
         || cfg.variant == Variant::VlessVision
     {
