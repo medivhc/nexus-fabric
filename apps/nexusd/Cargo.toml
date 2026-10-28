@@ -29,7 +29,7 @@ nexus-outbound-anytls = { path = "../../crates/nexus-outbound-anytls" }
 nexus-outbound-vless = { path = "../../crates/nexus-outbound-vless" }
 nexus-outbound-hysteria2 = { path = "../../crates/nexus-outbound-hysteria2" }
 nexus-projection = { path = "../../crates/nexus-projection" }
-nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+nexus-qos = { path = "../../crates/nexus-qos" }
 nexus-dns = { path = "../../crates/nexus-dns" }
 nexus-path = { path = "../../crates/nexus-path" }
 nexus-nat-traversal = { path = "../../crates/nexus-nat-traversal" }
