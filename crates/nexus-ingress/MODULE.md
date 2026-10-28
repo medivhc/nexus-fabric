@@ -65,15 +65,30 @@
     `from_virtual_packet_interface` 构造 `FlowContext`。
 - 已实现（SOCKS5 有状态握手状态机，sing-box 吸收）：
   - `Socks5Handshake`：`new()` / `state()` / `feed(&mut self, bytes) -> Socks5Step` /
-    `take_data()`（Established 后的数据面字节）；
+    `command()` / `take_data()`（Established 后的数据面字节）；
   - `Socks5State`：Greeting / MethodSelected / UserPassAuth / Established / Failed；
   - `Socks5Step { state, response, flow, needs_more }`：需发送的响应字节 +
     握手完成时的 `FlowContext`（origin=Socks5, destination="host:port"）；
   - `Socks5Error`：BadVersion / BadMethodCount / NoAcceptableMethod / BadAuthVersion /
     AuthFailed / BadRequestVersion / UnsupportedCommand / UnsupportedAddressType /
     InvalidAddress（结构化，非文本日志）。
-  - 支持 CONNECT（ATYP IPv4/域名/IPv6）；BIND/UDP ASSOCIATE 显式返回
-    command-not-supported。
+  - 支持 CONNECT（ATYP IPv4/域名/IPv6）与 UDP ASSOCIATE（CMD=0x03）；BIND/未知命令
+    显式返回 command-not-supported（REP=0x07）。
+- 已实现（SOCKS5 UDP ASSOCIATE 协议面，纯函数零 I/O，portable）：
+  - `Socks5Address { Ipv4, Domain, Ipv6 }`：ATYP 三型 + `port()` /
+    `to_destination_string()` / `is_unspecified()`；用数组/String 表示，
+    不依赖 `std::net` socket。
+  - `Socks5Command { Connect, UdpAssociate { client_endpoint } }`：
+    握手 `Established` 后经 `Socks5Handshake::command()` 读取（`Socks5Step` 字段不变）。
+  - `encode_udp_associate_reply(&Socks5Address)` / `encode_command_reply(rep, &Socks5Address)`：
+    构造 BND 应答。**硬约定**：UDP ASSOCIATE 时 `Socks5Step.response` 为空
+    （状态机不知道实际 bind 地址），调用方必须先 bind UDP socket，再用
+    `encode_udp_associate_reply` 发送真实 BND。
+  - `Socks5UdpDatagram { fragment, address, payload }` + `decode_udp_datagram` /
+    `encode_udp_datagram`：RSV=0 校验、ATYP 三型、单包上限 65507；FRAG != 0 只保留
+    字段由上层策略丢弃（本模块不做重组）。
+  - `Socks5UdpError`：TooShort / BadReserved / UnsupportedAddressType /
+    InvalidAddress / DatagramTooLarge（结构化）。
 
 ## Verification
 
