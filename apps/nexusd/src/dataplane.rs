@@ -415,6 +415,9 @@ pub struct Dataplane {
     chunk_stats: Arc<crate::nat_chunk_stats::ChunkStats>,
     /// Inbound direct chunks produced by the receiver thread.
     nat_inbound_rx: Option<std::sync::mpsc::Receiver<crate::nat_chunk_recv::NatInboundChunk>>,
+    /// AC-H-1 `[P]`: the one-time `[nat-consumer] handle not attached` notice
+    /// has been emitted (spec §13.2).
+    nat_not_attached_logged: AtomicBool,
 }
 
 /// 流会话可见状态（spec §9.16 / §11.3）。
@@ -569,6 +572,7 @@ impl Dataplane {
             direct_gate: None,
             chunk_stats: Arc::new(crate::nat_chunk_stats::ChunkStats::default()),
             nat_inbound_rx: None,
+            nat_not_attached_logged: AtomicBool::new(false),
         })
     }
 
@@ -2450,6 +2454,13 @@ impl Dataplane {
     fn send_mesh_data_frame(&mut self, dst: IpAddr, frame: &[u8]) -> bool {
         use crate::nat_chunk_stats::FallbackReason;
 
+        // AC-H-1 `[P]` / spec §13.2: with no attached provider (no
+        // `[network.turn]`, or NAT has not started yet) the degraded mode is
+        // announced exactly once; every chunk then falls back to N1.
+        if self.nat_path.as_ref().and_then(|slot| slot.get()).is_none() {
+            crate::nat_consumer::note_handle_not_attached(&self.nat_not_attached_logged);
+        }
+
         let stats = Arc::clone(&self.chunk_stats);
 
         let peer = match dst {
@@ -4114,6 +4125,30 @@ mod tests {
         // 显式注入无配置默认引擎（新装配不再静默回落到它）。
         dp.set_default_simple_engine().expect("default engine");
         (dp, mock)
+    }
+
+    /// AC-H-1 `[P]`: driving Mesh TCP DATA with no attached NAT provider logs
+    /// the spec §13.2 degraded notice exactly once (and keeps falling back).
+    #[test]
+    fn no_nat_provider_logs_not_attached_once() {
+        let (mut dp, _mock) = test_dataplane();
+        let peer = nexus_fabric::PeerId([0x44; 32]);
+        let routes = vec![nexus_network::n1::pump::Ipv4Route {
+            subnet: nexus_network::n1::pump::Ipv4Net::parse("10.200.0.0/24").expect("subnet"),
+            peer: nexus_network::n1::N1PeerId(peer.0),
+        }];
+        dp.set_mesh_peer_resolver(Arc::new(
+            crate::mesh_peer_map::StaticMeshPeerMap::from_routes(&routes),
+        ));
+        assert!(!dp.nat_not_attached_logged.load(Ordering::Relaxed));
+
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5));
+        let frame = b"\x00\x00\x00\x00\x00hi";
+        let _ = dp.send_mesh_data_frame(dst, frame);
+        assert!(dp.nat_not_attached_logged.load(Ordering::Relaxed));
+        // A second chunk must not emit again (the flag is already latched).
+        let _ = dp.send_mesh_data_frame(dst, frame);
+        assert!(dp.nat_not_attached_logged.load(Ordering::Relaxed));
     }
 
     /// 装配回归：未注入引擎的 Dataplane 必须 fail-closed（Drop），

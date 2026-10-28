@@ -97,6 +97,22 @@ fn warn_poisoned_once() {
     }
 }
 
+/// Spec §13.2 degraded-mode notice for a chunk consumed without an attached
+/// NAT provider handle (no `[network.turn]`, or NAT has not started yet).
+pub(crate) const HANDLE_NOT_ATTACHED_LOG: &str =
+    "[nat-consumer] handle not attached (degraded; all chunks fallback)";
+
+/// Emit [`HANDLE_NOT_ATTACHED_LOG`] at most once per dataplane instance
+/// (AC-H-1 `[P]`: driving Mesh TCP DATA with no `[network.turn]` logs the
+/// line exactly once). Returns `true` on the first call.
+pub(crate) fn note_handle_not_attached(flag: &AtomicBool) -> bool {
+    if flag.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    eprintln!("{HANDLE_NOT_ATTACHED_LOG}");
+    true
+}
+
 impl NatPathProvider for crate::nat_switch::NatSwitching {
     fn active_conn(&self, peer_hex: &str) -> Option<NatActiveConn> {
         // Direct first: `active_direct_conn` returns `Some` only when the
@@ -180,5 +196,19 @@ mod tests {
     fn peer_hex_is_lowercase_64_hex() {
         let peer = FabricPeerId([0xabu8; 32]);
         assert_eq!(peer_hex(&peer), "ab".repeat(32));
+    }
+
+    #[test]
+    fn handle_not_attached_notice_is_once_only() {
+        assert_eq!(
+            HANDLE_NOT_ATTACHED_LOG,
+            "[nat-consumer] handle not attached (degraded; all chunks fallback)"
+        );
+        let flag = AtomicBool::new(false);
+        assert!(note_handle_not_attached(&flag), "first call must emit");
+        assert!(
+            !note_handle_not_attached(&flag),
+            "second call must be silent"
+        );
     }
 }
