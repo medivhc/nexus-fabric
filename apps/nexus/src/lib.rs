@@ -33,6 +33,10 @@ mod udp_session_vless;
 #[allow(dead_code)] // C4 接线前无生产调用方（plan §3.2 C2 阶段）。
 mod udp_session_anytls;
 
+/// UDP 关联管理器（spec §5；C3 只做纯逻辑，C4 接 `proxy_serve_once`）。
+#[allow(dead_code)] // C4 接线前无生产调用方（plan §3.2 C3 阶段）。
+mod udp_association;
+
 /// Linux durable Artifact receiver shared by the CLI and daemon composition roots.
 #[cfg(target_os = "linux")]
 pub mod artifact_download;
