@@ -12,7 +12,7 @@ nexus-fabric = { path = "../nexus-fabric" }
 nexus-ingress = { path = "../nexus-ingress" }
 nexus-nat-wireup = { path = "../nexus-nat-wireup" }
 nexus-path = { path = "../nexus-path" }
-smoltcp = { version = "0.12", default-features = false, features = ["std", "proto-ipv4", "socket-tcp", "medium-ip"] }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "proto-ipv4", "proto-ipv6", "socket-tcp", "medium-ip"] }
 tun-rs = { version = "2.8", default-features = false }
 
 [dev-dependencies]
