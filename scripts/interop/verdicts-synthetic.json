@@ -64,7 +64,7 @@
     },
     "PRODUCT_UDP_NOT_IMPLEMENTED": {
       "severity": "warn",
-      "text": "产品级 UDP 未接线；UDP 流量将被丢弃。"
+      "text": "产品级 UDP 按表面区分：nexusd/TUN 表面未实现，UDP 将被丢弃；nexus proxy 的 SOCKS5 入口已实现 VLESS/AnyTLS 的 UDP 转发，其余协议仍未实现、将被丢弃。"
     },
     "TROJAN_FALLBACK_FAIL_OPEN": {
       "severity": "security",
@@ -92,7 +92,7 @@
     },
     "PROTOCOL_NOT_WIRED": {
       "severity": "warn",
-      "text": "该协议在当前版本尚未接线；不能作为生产出口。"
+      "text": "该协议在 nexusd/TUN 表面尚未接线，不能作为 TUN 出口；产品 SOCKS5 表面仅 Hysteria2 已接线 TCP（其 UDP 未实现），其余未接线协议在产品表面同样不能作为生产出口。"
     },
     "VERDICT_MISSING": {
       "severity": "warn",
