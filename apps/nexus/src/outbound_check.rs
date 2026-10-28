@@ -8,6 +8,9 @@
 //! 与 daemon 的关系：校验语义以 nexusd `proxy_fwd::adapter::build_dialer` 为事实
 //! 标准；这里只做**不需要网络**的子集（locator 只查语法、SNI 只查可构造性），
 //! 因此不会出现“config check 通过但 daemon 因 DNS 失败”以外的分歧。
+//! 唯一例外是 **wired 集合按表面区分**：本命令服务产品 SOCKS5 表面，wired 判定走
+//! [`is_wired_product_surface`]（共享集合 + Hysteria2）；nexusd/TUN 表面仍以
+//! [`outbound_manifest::is_wired`] 为唯一定义（N9）。
 //! 警示文案全部来自 [`crate::outbound_manifest`]（include_str! 的 verdicts.json）。
 
 use std::collections::BTreeMap;
@@ -79,8 +82,26 @@ fn valid_locator(locator: &str) -> bool {
     !host.is_empty() && port.parse::<u16>().map(|p| p > 0).unwrap_or(false)
 }
 
+/// CLI 产品表面的 wired 判定（`nexus config check` 专用的私有派生）。
+///
+/// 产品 SOCKS5 表面（`nexus proxy`）真实服务 Hy2 TCP，故 CLI 校验表面把 Hysteria2
+/// 视为 wired；TUN 表面的 Hy2 仍未接线。`outbound_manifest::is_wired` /
+/// `outbound_manifest::select_index` 仍是 nexusd/TUN 表面的**唯一定义**（N9）；
+/// 本判定只存在于 `nexus config check` 的校验层、nexusd 不可见，也不得被反向引用。
+fn is_wired_product_surface(kind: OutboundKind) -> bool {
+    outbound_manifest::is_wired(kind) || kind == OutboundKind::Hysteria2
+}
+
+/// 与 `outbound_manifest::select_index` 同形（文件顺序第一个 proxy 且产品表面
+/// wired 的下标）；谓词换成 [`is_wired_product_surface`]。无则 `None`。
+fn select_index_product_surface(outbounds: &[OutboundConfig]) -> Option<usize> {
+    outbounds.iter().position(|outbound| {
+        outbound_manifest::is_proxy_kind(outbound.kind) && is_wired_product_surface(outbound.kind)
+    })
+}
+
 fn static_errors(outbound: &OutboundConfig) -> Vec<CheckError> {
-    if !outbound_manifest::is_wired(outbound.kind) {
+    if !is_wired_product_surface(outbound.kind) {
         return Vec::new();
     }
     let mut errors = Vec::new();
@@ -364,12 +385,12 @@ pub fn check(config_dir: &Path, file: Option<&str>) -> CheckOutcome {
         stdout_warnings.push(file_warning("DUPLICATE_OUTBOUND_TAG"));
     }
 
-    let selected = outbound_manifest::select_index(&config.outbounds);
+    let selected = select_index_product_surface(&config.outbounds);
     let mut outbounds = Vec::new();
     let mut stderr_lines = Vec::new();
     let mut selected_errors = 0usize;
     for (index, outbound) in config.outbounds.iter().enumerate() {
-        let wired = outbound_manifest::is_wired(outbound.kind);
+        let wired = is_wired_product_surface(outbound.kind);
         let is_selected = selected == Some(index);
         let label = outbound_manifest::outbound_label(outbound);
         let item_errors = static_errors(outbound);
@@ -585,6 +606,102 @@ mod tests {
                 .iter()
                 .any(|e| e["code"] == "NO_USABLE_OUTBOUND")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2（fixes-6 裁决）：产品 SOCKS5 表面（`nexus proxy`）真实服务 Hy2 TCP，故
+    /// hy2-only 配置在 `config check` 必须 static_valid / exit 0 / selected。
+    /// 这里的 `wired=true` 是**产品表面**口径；nexusd/TUN 表面 Hy2 仍未接线，
+    /// 共享 `is_wired` 语义由 `outbound_manifest` 独占、本命令不反向污染。
+    #[test]
+    fn hy2_only_config_is_static_valid_and_selected_on_product_surface() {
+        let dir = temp_dir("hy2-only");
+        write_yaml(
+            &dir,
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: hy2-a\noutbounds:\n  - tag: hy2-a\n    kind: hysteria2\n    locator: 127.0.0.1:443\n    password: secret\n",
+        );
+        let outcome = check(&dir, None);
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.json);
+        assert_eq!(outcome.json["static_valid"], true);
+        assert_eq!(outcome.json["verdict"], "PASS");
+        assert!(
+            !outcome.json["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["code"] == "NO_USABLE_OUTBOUND"),
+            "{}",
+            outcome.json
+        );
+        assert_eq!(outcome.json["outbounds"][0]["wired"], true);
+        assert_eq!(outcome.json["outbounds"][0]["selected"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：静态校验现在对 Hy2 生效（此前被 `is_wired` 门整体跳过，Hy2 出站拿到的是
+    /// 空错误集）。解析器对「字面缺失 / 空串」locator 已在 config 层硬拒
+    /// （`PROXY_YAML_INVALID`），因此能走到 `static_errors` 的“locator 缺失”形态是
+    /// 仅空白值——`non_empty` 与 `valid_locator` 对它的判定同“缺失”。
+    #[test]
+    fn hy2_without_effective_locator_is_missing_locator() {
+        let dir = temp_dir("hy2-no-locator");
+        write_yaml(
+            &dir,
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: hy2-a\noutbounds:\n  - tag: hy2-a\n    kind: hysteria2\n    locator: \"   \"\n    password: secret\n",
+        );
+        let outcome = check(&dir, None);
+        assert_eq!(outcome.exit_code, 1, "{}", outcome.json);
+        assert_eq!(outcome.json["static_valid"], false);
+        let codes: Vec<&str> = outcome.json["outbounds"][0]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["code"].as_str())
+            .collect();
+        assert!(codes.contains(&"MISSING_LOCATOR"), "{codes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：未过度放宽——vmess 在两个表面都未接线，仍须 `NO_USABLE_OUTBOUND` / exit 1。
+    #[test]
+    fn vmess_only_is_still_no_usable_outbound() {
+        let dir = temp_dir("vmess-only");
+        write_yaml(
+            &dir,
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: vm-a\noutbounds:\n  - tag: vm-a\n    kind: vmess\n    locator: 127.0.0.1:443\n",
+        );
+        let outcome = check(&dir, None);
+        assert_eq!(outcome.exit_code, 1, "{}", outcome.json);
+        assert_eq!(outcome.json["static_valid"], false);
+        assert!(
+            outcome.json["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["code"] == "NO_USABLE_OUTBOUND"),
+            "{}",
+            outcome.json
+        );
+        assert_eq!(outcome.json["outbounds"][0]["wired"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：混合配置下产品表面选中项 = 文件顺序第一个产品表面 wired（hy2），
+    /// 与 `select_index` 同形只换谓词。
+    #[test]
+    fn hy2_wins_selection_over_vmess_in_mixed_config() {
+        let dir = temp_dir("hy2-vmess");
+        write_yaml(
+            &dir,
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: hy2-a\noutbounds:\n  - tag: hy2-a\n    kind: hysteria2\n    locator: 127.0.0.1:443\n    password: secret\n  - tag: vm-a\n    kind: vmess\n    locator: 127.0.0.1:443\n",
+        );
+        let outcome = check(&dir, None);
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.json);
+        assert_eq!(outcome.json["outbounds"][0]["kind"], "hysteria2");
+        assert_eq!(outcome.json["outbounds"][0]["selected"], true);
+        assert_eq!(outcome.json["outbounds"][0]["wired"], true);
+        assert_eq!(outcome.json["outbounds"][1]["selected"], false);
+        assert_eq!(outcome.json["outbounds"][1]["wired"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

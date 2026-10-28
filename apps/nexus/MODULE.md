@@ -69,6 +69,10 @@
   `dns_resolution: skipped (performed only at daemon engine construction)`；
   `static_valid = errors.is_empty() && selected.is_some() && selected_errors == 0`；
   `DUPLICATE_OUTBOUND_TAG` 只 warning 不改 exit code。
+  - 校验层的 `wired` / `selected` 采用**产品表面判定**（本模块私有派生
+    `is_wired_product_surface` = 共享 `is_wired` 集合 + `Hysteria2`，因 `nexus proxy`
+    的 SOCKS5 入口真实服务其 TCP）；nexusd/TUN 表面仍以 `is_wired` / `select_index`
+    为唯一定义（N9），运行期行为不变。
   - 领域未就绪命令（connectivity trace 等）返回
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
   - CLI 前端（apps/nexus/src/main.rs + control_service.rs + localapi_client.rs）：thin-client，
