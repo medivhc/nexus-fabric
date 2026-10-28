@@ -6,6 +6,8 @@ pub mod assembly;
 pub mod config;
 pub mod dataplane;
 pub mod discovery_runtime;
+/// DNS-time proxy classification from the `proxy.yaml` domain subset.
+pub mod dns_classify;
 /// DNS service snapshot (`/dns/status`); wired in C11.
 pub mod dns_status;
 /// 热路径日志限频（per `(tag, cause)`；PRODUCT hot-path 契约）。
