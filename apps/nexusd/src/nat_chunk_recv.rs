@@ -16,6 +16,17 @@ use nexus_nat_wireup::{PunchPeerStatus, PunchState};
 
 use crate::nat_consumer::NatPathProvider;
 
+/// Chunk payload prefix: distinguishes the TUN STREAM frame from other users of
+/// the `WORKSPACE_SYNC` (0x03) stream type. Never appears on the N1 fallback.
+pub const CHUNK_KIND_TUN_STREAM: u8 = 0x01;
+
+/// One accepted direct chunk, already stripped of the KIND byte.
+#[derive(Debug)]
+pub struct NatInboundChunk {
+    pub peer: FabricPeerId,
+    pub stream_frame: Vec<u8>,
+}
+
 /// Receiver-side accept gate (frozen by Q8=A; do not change without a
 /// requirement change).
 pub const DIRECT_ACCEPT_QUIET_MS: u64 = 30000;
@@ -23,6 +34,12 @@ pub const DIRECT_ACCEPT_QUIET_MS: u64 = 30000;
 pub const DIRECT_SEND_GUARD_MS: u64 = 32000;
 /// How often the gate re-reads peer statuses.
 pub const DIRECT_GATE_REFRESH_MS: u64 = 500;
+/// Receiver supervisor poll interval.
+pub const NAT_RECV_POLL_MS: u64 = 500;
+/// Per-frame read/drain budget.
+pub const NAT_CHUNK_READ_TIMEOUT_MS: u64 = 5000;
+/// Inbound chunk queue depth between the receiver thread and the dataplane.
+pub const NAT_INBOUND_QUEUE_CAP: usize = 1024;
 
 /// Receiver-side rejection/lifecycle reasons (D-A only; no seq/reorder/ack
 /// variants).
