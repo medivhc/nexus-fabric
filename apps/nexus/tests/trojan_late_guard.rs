@@ -214,4 +214,55 @@ fn held_status_prefix_is_delivered_once_the_client_speaks() {
         got, HTTP_200,
         "held prefix must be delivered in order; session: {result:?}"
     );
+    assert!(result.is_ok(), "session must succeed: {result:?}");
+}
+
+/// Right-password node that sends `HT` after the window and then only reads
+/// until the connection ends.
+fn spawn_prefix_then_wait_node() -> (u16, thread::JoinHandle<()>) {
+    let identity = generate_loopback_identity().expect("identity");
+    let cfg = Arc::new(server_config(&identity).expect("server config"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind node");
+    let port = listener.local_addr().expect("node addr").port();
+    let handle = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("node accept");
+        tcp.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut srv = rustls::ServerConnection::new(cfg).expect("tls server");
+        let mut tls = rustls::Stream::new(&mut srv, &mut tcp);
+        let header = read_header(&mut tls);
+        parse_request(NODE_PASSWORD, &header).expect("password accepted");
+        thread::sleep(Duration::from_millis(150));
+        tls.write_all(&HTTP_200[..2]).expect("status prefix");
+        let _ = tls.flush();
+        let mut buf = [0u8; 64];
+        while matches!(tls.read(&mut buf), Ok(n) if n > 0) {}
+    });
+    (port, handle)
+}
+
+/// A client FIN is not client payload: the guard stays on and a held prefix
+/// is never delivered.
+#[test]
+fn held_prefix_is_not_flushed_by_a_client_half_close() {
+    let (node_port, node) = spawn_prefix_then_wait_node();
+    let cfg = config(node_port, NODE_PASSWORD);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    let session = thread::spawn(move || proxy_serve_once(&listener, &cfg));
+
+    let (rep, mut client) = socks5_connect(proxy_addr, 9);
+    assert_eq!(rep, 0x00);
+    thread::sleep(Duration::from_millis(300));
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    let mut got = Vec::new();
+    let _ = client.read_to_end(&mut got);
+    node.join().expect("node");
+    let _ = session.join().expect("session thread");
+    assert!(
+        got.is_empty(),
+        "a held prefix must not reach a client that never sent payload: {got:?}"
+    );
 }
