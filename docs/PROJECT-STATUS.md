@@ -5,8 +5,11 @@ owner: coordinator
 last-verified: 2026-10-06
 verified-against: b9ae124
 note: 沙盒本地 HEAD (222e49c) 滞后；b9ae124 系真机核实的 github master 最新状态，本地无法独立验证
-status: current
+status: historical
 ---
+
+> 注：本文为 2026-10-06 时点快照；协议互操作与项目状态的现行结论见
+> `docs/protocols/interop/MATRIX.md` 与 Nexus Feature 看板。
 
 # Nexus 项目状态（2026-10-06）
 

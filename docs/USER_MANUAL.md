@@ -355,7 +355,7 @@ cargo build --workspace
 
 
 
-* **能力**：规则路由代理内核 ——Clash 风格配置解析（订阅节点解析）、规则匹配（DOMAIN / GEOSITE / GEOIP / IP-CIDR / MATCH / 端口）、规则集与 rule-providers（含在线 URL 拉取）、分组策略（selector /url-test/load-balance /relay）。真实数据面：`nexus proxy --addr <ip:port> [--config <path>]` 提供真实 SOCKS5 监听，逐会话完成握手 → 规则路由 → Session → 真实出站 → 双向字节中继。
+* **能力**：规则路由代理内核 ——Clash 风格配置解析（订阅节点解析）、规则匹配（DOMAIN / GEOSITE / GEOIP / IP-CIDR / MATCH / 端口）、规则集与 rule-providers（含在线 URL 拉取）、分组策略（selector /url-test/load-balance /relay）。真实数据面：`nexus proxy [--config <path>]` 提供真实 SOCKS5 监听（当前固定监听 `127.0.0.1:1080`；`--addr` 对 `proxy` 子命令暂不生效，见本节末「`--addr` 的临时口径」），逐会话完成握手 → 规则路由 → Session → 真实出站 → 双向字节中继。
 
 * **出站适配器**：Shadowsocks（真实 TCP 会话）、VMess（线格式）、Trojan（TLS + 认证 + Standard/Singbox 头格式 + SNI/ALPN/skip-verify 参数）。适配器经 `OutboundAdapter` trait 注入（MODULE.md 冻结契约）。
 

@@ -89,3 +89,4 @@
 | `fixes-7` | Hy2 T2 pump（P4b） | `fixes-3` |
 | `fixes-5` | Trojan fallback 完整语义（P6） | `protocol-config-surface-labeling` / 产品架构决策 |
 | `fixes-6` | 产品级 UDP（P7） | 产品决策 |
+| `nexus-proxy-addr-parsing-fix` | `nexus proxy --addr` 解析缺陷（S 级；依据 product-review r1 P10 实测；状态=已立项 stub，见 pipeline runs） | 无 |
