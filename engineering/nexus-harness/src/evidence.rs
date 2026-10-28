@@ -881,6 +881,7 @@ mod tests {
         let gates = vec![Gate::ok("whitespace", "ok")];
         let scenarios = vec![ScenarioResult {
             id: "s.one".to_string(),
+            carrier: crate::scenario::Carrier::Engineering,
             verdict: "PASS".to_string(),
             detail: "ok".to_string(),
             duration_ms: 5,

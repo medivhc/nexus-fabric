@@ -42,7 +42,23 @@ fn list() -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let scenarios = scenario::load_all(&config.scenarios_dir, SCAN_SUBDIRS);
+    let (scenarios, load_errors) =
+        scenario::load_all_reporting(&config.scenarios_dir, SCAN_SUBDIRS);
+    if !load_errors.is_empty() {
+        // fail-closed：加载失败不能退化成「少几个场景的 PASS 列表」。
+        return (
+            "BLOCKED".to_string(),
+            format!(
+                "{} scenario file(s) failed to load:\n{}",
+                load_errors.len(),
+                load_errors.join("\n")
+            ),
+            vec![
+                ("command".to_string(), json!("scenario list")),
+                ("scenarios".to_string(), json!([])),
+            ],
+        );
+    }
     let arr: Vec<Value> = scenarios
         .iter()
         .map(|s| {
@@ -51,6 +67,7 @@ fn list() -> Outcome {
                 "subdir": s.subdir,
                 "summary": s.title,
                 "requires": scenario::scenario_requires(s),
+                "carrier": s.carrier.as_str(),
             })
         })
         .collect();
