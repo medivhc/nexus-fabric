@@ -115,10 +115,12 @@
     解码 base64 订阅、逐行解析节点 URI，产出 `outbounds: Vec<OutboundConfig>` 与
     `rejected: Vec<RejectedEntry>`（未知协议行及原因）；
   - `parse(yaml: &str) -> Result<ProxyConfig, ConfigError>`。
-  - 出站互操作标注（PRODUCT §11.21）：`outbound_warnings(cfg: &ProxyConfig) -> Vec<ConfigWarning>`；
-    `ConfigWarning { code, field, tag, kind, interop_verdict, reason }`。纯函数、零 I/O；
-    仅 `kind ∈ {trojan, hysteria2}` 各产生一条 `OUTBOUND_INTEROP_BROKEN`，按 `outbounds`
-    声明顺序；不改变 `parse` 的成功/失败结果（警告不是 `ConfigError`）。
+  - 出站互操作分级标注（PRODUCT §11.21）：`outbound_warnings(cfg: &ProxyConfig) -> Vec<ConfigWarning>`；
+    `ConfigWarning { code, field, tag, kind, interop_verdict, tcp, udp, fallback_warning, reason }`。
+    纯函数、零 I/O；仅 `kind ∈ {trojan, shadowsocks}`（MATRIX `PARTIAL`）各产生一条
+    `OUTBOUND_INTEROP_PARTIAL`（`tcp = "usable"`、`udp = "not_implemented"`，仅 trojan
+    `fallback_warning = true`），按 `outbounds` 声明顺序；不改变 `parse` 的成功/失败结果
+    （警告不是 `ConfigError`）。
 
 ## Verification
 

@@ -3773,7 +3773,7 @@ outbounds:
     }
 
     #[test]
-    fn broken_outbounds_warned_in_declaration_order() {
+    fn partial_outbounds_warned_in_declaration_order() {
         let cfg = parse(MIXED).expect("labeling never blocks parsing");
         let w = outbound_warnings(&cfg);
         let got: Vec<_> = w
@@ -3784,19 +3784,19 @@ outbounds:
             got,
             [
                 ("t", "trojan", "outbounds[1].kind"),
-                ("h", "hysteria2", "outbounds[3].kind")
+                ("s", "shadowsocks", "outbounds[4].kind")
             ]
         );
         assert!(
             w.iter()
-                .all(|w| w.code == "OUTBOUND_INTEROP_BROKEN" && w.interop_verdict == "BROKEN")
+                .all(|w| w.code == "OUTBOUND_INTEROP_PARTIAL" && w.interop_verdict == "PARTIAL")
         );
     }
 
     // Exhaustive on purpose: a new OutboundKind fails to compile here until its
     // §11.21 labeling is decided.
     #[test]
-    fn only_trojan_and_hysteria2_are_labeled() {
+    fn only_trojan_and_shadowsocks_are_labeled() {
         let all = [
             OutboundKind::Direct,
             OutboundKind::Relay,
@@ -3810,10 +3810,10 @@ outbounds:
         ];
         for kind in all {
             let expected = match kind {
-                OutboundKind::Trojan | OutboundKind::Hysteria2 => 1,
+                OutboundKind::Trojan | OutboundKind::Shadowsocks => 1,
                 OutboundKind::Direct
                 | OutboundKind::Relay
-                | OutboundKind::Shadowsocks
+                | OutboundKind::Hysteria2
                 | OutboundKind::Vmess
                 | OutboundKind::Socks5
                 | OutboundKind::Anytls
@@ -3851,17 +3851,28 @@ outbounds:
     }
 
     #[test]
-    fn reasons_name_the_failure() {
+    fn reasons_name_the_gaps() {
         let w = outbound_warnings(&config_with(&[
             OutboundKind::Trojan,
-            OutboundKind::Hysteria2,
+            OutboundKind::Shadowsocks,
         ]));
+        assert_eq!(w.len(), 2, "{w:?}");
         let trojan = w[0].reason.to_lowercase();
         assert!(
-            trojan.contains("fallback") && trojan.contains("fail-open"),
-            "trojan reason must name the fallback fail-open: {}",
+            trojan.contains("udp") && trojan.contains("fallback"),
+            "trojan reason must name the UDP gap and the fallback residual: {}",
             w[0].reason
         );
-        assert!(!w[1].reason.trim().is_empty(), "hysteria2 reason empty");
+        let ss = w[1].reason.to_lowercase();
+        assert!(
+            ss.contains("udp"),
+            "shadowsocks reason must name the UDP gap: {}",
+            w[1].reason
+        );
+        assert!(
+            !ss.contains("fallback"),
+            "shadowsocks carries no fallback warning: {}",
+            w[1].reason
+        );
     }
 }

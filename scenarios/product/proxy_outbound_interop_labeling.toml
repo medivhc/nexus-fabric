@@ -1,18 +1,21 @@
 schema_version = 1
 id = "product.proxy-outbound-interop-labeling"
-title = "出站协议互操作标注：BROKEN 协议（trojan/hysteria2）在 nexus proxy READY 行给出结构化警告，不阻断"
+title = "出站协议互操作分级标注：PARTIAL 协议（trojan/shadowsocks）在 nexus proxy READY 行给出结构化警告，不阻断"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-outbound-interop-labeling"
 
 [given]
-config = "outbounds: trojan_node(trojan) / hy2_node(hysteria2) / vless_node(vless) / direct；规则 MATCH -> direct"
+config = "outbounds: trojan_node(trojan) / ss_node(shadowsocks) / hy2_node(hysteria2) / vless_node(vless) / direct；规则 MATCH -> direct"
 process = "真实 nexus proxy 子进程（cargo run -p nexus --bin nexus -- proxy --addr 127.0.0.1:0 --config <tmp>）"
 network = "none (只读取 READY 行，不发起会话；读取后终止子进程)"
 
-# 可执行 E4（PRODUCT §11.21）：标注集合 = MATRIX verdict BROKEN 的 trojan / hysteria2。
-# 断言：READY 行照常输出（不阻断）；warnings 中 trojan_node / hy2_node 各一条
-# OUTBOUND_INTEROP_BROKEN（interop_verdict=BROKEN）；VERIFIED 的 vless_node 无标注；共 2 条。
-# 旧实现 READY 行无 warnings 字段 -> verdict FAIL（Red Evidence）。
+# 可执行 E4（PRODUCT §11.21，requirement-change 2026-10-28 分级标注）：
+# 标注集合 = MATRIX verdict PARTIAL 的 trojan / shadowsocks。
+# 断言：READY 行照常输出（不阻断）；warnings 中 trojan_node / ss_node 各一条
+# OUTBOUND_INTEROP_PARTIAL（interop_verdict=PARTIAL，tcp=usable，udp=not_implemented，
+# 仅 trojan fallback_warning=true）；VERIFIED 的 hy2_node / vless_node 无标注；共 2 条。
+# 「warnings 字段始终存在」：无 PARTIAL 出站与启动时无法解析的配置都必须给出空数组。
+# 初版实现（trojan / hysteria2 各一条 OUTBOUND_INTEROP_BROKEN）-> verdict FAIL（Red Evidence）。
 [when]
 command = "cargo run --quiet -p nexus --example proxy_outbound_interop_labeling -- --json"
 
@@ -33,35 +36,12 @@ field = "warnings.count"
 equals = 2
 
 [[expect]]
-field = "warnings.trojan_node.code"
-equals = "OUTBOUND_INTEROP_BROKEN"
-
-[[expect]]
-field = "warnings.trojan_node.interop_verdict"
-equals = "BROKEN"
-
-[[expect]]
-field = "warnings.trojan_node.reason_mentions_fallback"
-equals = true
-
-[[expect]]
-field = "warnings.hy2_node.code"
-equals = "OUTBOUND_INTEROP_BROKEN"
-
-[[expect]]
-field = "warnings.hy2_node.interop_verdict"
-equals = "BROKEN"
-
-[[expect]]
-field = "warnings.vless_node.present"
-equals = false
-
-# 追加期望（test-review r1 CHANGES_REQUESTED 后补齐，既有期望未改动）：
-# §11.21 字段/顺序、trojan 原因须点明 fail-open、hysteria2 原因非空；
-# 「warnings 字段始终存在」：无 BROKEN 出站与启动时无法解析的配置都必须给出空数组。
-[[expect]]
 field = "warnings.order"
-equals = "trojan_node,hy2_node"
+equals = "trojan_node,ss_node"
+
+[[expect]]
+field = "warnings.trojan_node.code"
+equals = "OUTBOUND_INTEROP_PARTIAL"
 
 [[expect]]
 field = "warnings.trojan_node.kind"
@@ -72,20 +52,68 @@ field = "warnings.trojan_node.field"
 equals = "outbounds[0].kind"
 
 [[expect]]
-field = "warnings.trojan_node.reason_mentions_fail_open"
+field = "warnings.trojan_node.interop_verdict"
+equals = "PARTIAL"
+
+[[expect]]
+field = "warnings.trojan_node.tcp"
+equals = "usable"
+
+[[expect]]
+field = "warnings.trojan_node.udp"
+equals = "not_implemented"
+
+[[expect]]
+field = "warnings.trojan_node.fallback_warning"
 equals = true
 
 [[expect]]
-field = "warnings.hy2_node.kind"
-equals = "hysteria2"
+field = "warnings.trojan_node.reason_mentions_udp"
+equals = true
 
 [[expect]]
-field = "warnings.hy2_node.field"
+field = "warnings.trojan_node.reason_mentions_fallback"
+equals = true
+
+[[expect]]
+field = "warnings.ss_node.code"
+equals = "OUTBOUND_INTEROP_PARTIAL"
+
+[[expect]]
+field = "warnings.ss_node.kind"
+equals = "shadowsocks"
+
+[[expect]]
+field = "warnings.ss_node.field"
 equals = "outbounds[1].kind"
 
 [[expect]]
-field = "warnings.hy2_node.reason_non_empty"
+field = "warnings.ss_node.interop_verdict"
+equals = "PARTIAL"
+
+[[expect]]
+field = "warnings.ss_node.tcp"
+equals = "usable"
+
+[[expect]]
+field = "warnings.ss_node.udp"
+equals = "not_implemented"
+
+[[expect]]
+field = "warnings.ss_node.fallback_warning"
+equals = false
+
+[[expect]]
+field = "warnings.ss_node.reason_mentions_udp"
 equals = true
+
+[[expect]]
+field = "warnings.hy2_node.present"
+equals = false
+
+[[expect]]
+field = "warnings.vless_node.present"
+equals = false
 
 [[expect]]
 field = "clean.ready_verdict"

@@ -1256,27 +1256,33 @@ SOCKS5 入站（Socks5Handshake，§11.4 不变）
   本地节点）+ 原始 SOCKS5 客户端经 proxy 访问 echo；断言 VLESS 节点收到连接、
   请求头目标送达、payload 经隧道往返、`routing.outbound_kind=vless`。
 
-### 11.21 出站协议互操作标注（outbound interop labeling，2026-10-26） {#11-outbound-interop-labeling}
+### 11.21 出站协议互操作标注（outbound interop labeling，2026-10-26；分级 2026-10-28） {#11-outbound-interop-labeling}
 
-`docs/protocols/interop/MATRIX.md` 判定 Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`，
-但二者在配置面可直接选用且无任何标注；Trojan 在密码错误或服务端 fallback 时会把
-fallback 响应当作隧道数据交给应用（fail-open）。`NEXT-STEPS.md` P0b 已裁决：配置面
-对这两个协议给出「未验证/不可用」标注。本节冻结该标注的可观察语义。
+`docs/protocols/interop/MATRIX.md` 判定 Trojan、Shadowsocks 为 `PARTIAL / TCP_ONLY /
+USABLE_WITH_GAPS`：产品级 UDP 未实现；Trojan 另有 SOCKS5 success **之后**才到达的
+fallback 残余（fixes-5 只关闭了 success 之前的主路径）。二者在配置面可直接选用且无任何
+标注。`NEXT-STEPS.md` P0b 已裁决分级标注：Trojan「TCP 可用 / UDP 未实现 / 含 fallback
+警示」，Shadowsocks「TCP 可用 / UDP 未实现」——**不是**「未验证/不可用」。本节冻结该
+标注的可观察语义。（requirement-change 2026-10-28：初版按当时 MATRIX 的 `BROKEN` 标注
+trojan / hysteria2；Hysteria2 已翻转 `VERIFIED`、Trojan 改判 `PARTIAL`，改为本分级标注。）
 
-- **标注集合**：仅 `kind ∈ { trojan, hysteria2 }`（MATRIX verdict `BROKEN`）。
-  `vless` / `anytls`（`VERIFIED`）、`shadowsocks`（`PARTIAL`）及 MATRIX 未覆盖的
-  `direct` / `relay` / `socks5` / `vmess` 不产生标注。标注集合随 MATRIX verdict 变化
-  必须走 requirement-change 同步修改本节与 E4 场景，不得静默增删。
+- **标注集合**：仅 `kind ∈ { trojan, shadowsocks }`（MATRIX verdict `PARTIAL`）。
+  `vless` / `anytls` / `hysteria2`（`VERIFIED`）及 MATRIX 未覆盖的 `direct` / `relay` /
+  `socks5` / `vmess` 不产生标注。标注集合或分级随 MATRIX verdict 变化必须走
+  requirement-change 同步修改本节与 E4 场景，不得静默增删。
 - **结构化警告**：每个被标注的出站产生一条警告，按 `outbounds` 声明顺序排列：
 
   ```text
   {
-    code:            "OUTBOUND_INTEROP_BROKEN",
-    field:           "outbounds[<index>].kind",
-    tag:             <outbound tag>,
-    kind:            "trojan" | "hysteria2",
-    interop_verdict: "BROKEN",
-    reason:          <人类可读原因；trojan 必须点明 fallback fail-open>
+    code:             "OUTBOUND_INTEROP_PARTIAL",
+    field:            "outbounds[<index>].kind",
+    tag:              <outbound tag>,
+    kind:             "trojan" | "shadowsocks",
+    interop_verdict:  "PARTIAL",
+    tcp:              "usable",
+    udp:              "not_implemented",
+    fallback_warning: true（trojan）| false（shadowsocks）,
+    reason:           <人类可读原因；须点明 UDP 未实现，trojan 还须点明 fallback 残余>
   }
   ```
 
@@ -1285,12 +1291,14 @@ fallback 响应当作隧道数据交给应用（fail-open）。`NEXT-STEPS.md` P
 - **可观察（CLI）**：`nexus proxy` 启动输出的 `READY` JSON 行新增 `warnings` 数组
   （无标注时为空数组 `[]`，字段始终存在）。启动时配置无法解析的，`warnings` 为 `[]`，
   其余行为（逐会话解析并结构化 FAIL）不变。
-- **不覆盖**：nexusd 配置目录热加载路径的标注呈现、UI 呈现、Trojan fallback 的
-  fail-closed 修复（MATRIX P6 / `fixes-5`）。
+- **不覆盖**：nexusd 配置目录热加载路径的标注呈现、UI 呈现、Trojan success 之后 fallback
+  残余的修复（另行处理）、产品级 UDP 本身（MATRIX P7）。
 - **E4 场景**：`scenarios/product/proxy_outbound_interop_labeling.toml`——以含
-  trojan / hysteria2 / vless / direct 出站的配置启动真实 `nexus proxy` 进程，读取
-  `READY` 行；断言 trojan 与 hysteria2 各一条 `OUTBOUND_INTEROP_BROKEN`、vless 无标注、
-  警告共 2 条。旧实现 `READY` 行无 `warnings` 字段 → FAIL（Red Evidence）。
+  trojan / shadowsocks / hysteria2 / vless / direct 出站的配置启动真实 `nexus proxy` 进程，
+  读取 `READY` 行；断言 trojan 与 shadowsocks 各一条 `OUTBOUND_INTEROP_PARTIAL`（`tcp`
+  `usable`、`udp` `not_implemented`，仅 trojan `fallback_warning`）、hysteria2 与 vless
+  无标注、警告共 2 条。初版实现（trojan / hysteria2 各一条 `OUTBOUND_INTEROP_BROKEN`）
+  → FAIL（Red Evidence）。
 
 
 ## 12. 虚拟子网组网（Virtual Subnet Networking） {#12-virtual-subnet-networking}

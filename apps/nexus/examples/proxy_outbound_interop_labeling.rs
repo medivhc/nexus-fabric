@@ -4,9 +4,11 @@
 //! cargo run --quiet -p nexus --example proxy_outbound_interop_labeling -- --json
 //! ```
 //!
-//! 以含 trojan / hysteria2 / vless / direct 出站的配置启动真实 `nexus proxy` 子进程，
-//! 只读取其 `READY` 行（不发起会话），随后终止子进程。断言 MATRIX verdict 为 BROKEN 的
-//! trojan / hysteria2 各有一条 `OUTBOUND_INTEROP_BROKEN` 警告，VERIFIED 的 vless 无标注。
+//! 以含 trojan / shadowsocks / hysteria2 / vless / direct 出站的配置启动真实
+//! `nexus proxy` 子进程，只读取其 `READY` 行（不发起会话），随后终止子进程。断言
+//! MATRIX verdict 为 PARTIAL 的 trojan / shadowsocks 各有一条分级的
+//! `OUTBOUND_INTEROP_PARTIAL` 警告（TCP 可用 / UDP 未实现；仅 trojan 含 fallback 警示），
+//! VERIFIED 的 hysteria2 / vless 无标注。
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +33,11 @@ outbounds:
     kind: trojan
     locator: 127.0.0.1:9
     password: labeling-only
+  - tag: ss_node
+    kind: shadowsocks
+    locator: 127.0.0.1:9
+    method: chacha20-ietf-poly1305
+    password: labeling-only
   - tag: hy2_node
     kind: hysteria2
     locator: 127.0.0.1:9
@@ -44,7 +51,7 @@ outbounds:
     locator: \"\"
 ";
 
-// 无 BROKEN 出站：warnings 必须是空数组（字段仍存在）。
+// 无 PARTIAL 出站（只有 VERIFIED 与 direct）：warnings 必须是空数组（字段仍存在）。
 const CONFIG_CLEAN: &str = "\
 schema_version: 1
 rules:
@@ -55,6 +62,10 @@ rules:
       - kind: select_outbound
         tag: direct
 outbounds:
+  - tag: hy2_node
+    kind: hysteria2
+    locator: 127.0.0.1:9
+    password: labeling-only
   - tag: vless_node
     kind: vless
     locator: 127.0.0.1:9
@@ -110,6 +121,11 @@ fn read_ready_line(config_path: &std::path::Path) -> Result<String, String> {
 }
 
 fn warning_view(warnings: &[Value], tag: &str) -> Value {
+    let mentions = |w: &Value, word: &str| {
+        w["reason"]
+            .as_str()
+            .is_some_and(|r| r.to_lowercase().contains(word))
+    };
     match warnings.iter().find(|w| w["tag"] == tag) {
         Some(w) => json!({
             "present": true,
@@ -117,13 +133,11 @@ fn warning_view(warnings: &[Value], tag: &str) -> Value {
             "kind": w["kind"],
             "field": w["field"],
             "interop_verdict": w["interop_verdict"],
-            "reason_mentions_fallback": w["reason"]
-                .as_str()
-                .is_some_and(|r| r.to_lowercase().contains("fallback")),
-            "reason_mentions_fail_open": w["reason"]
-                .as_str()
-                .is_some_and(|r| r.to_lowercase().contains("fail-open")),
-            "reason_non_empty": w["reason"].as_str().is_some_and(|r| !r.trim().is_empty()),
+            "tcp": w["tcp"],
+            "udp": w["udp"],
+            "fallback_warning": w["fallback_warning"],
+            "reason_mentions_udp": mentions(w, "udp"),
+            "reason_mentions_fallback": mentions(w, "fallback"),
         }),
         None => json!({"present": false}),
     }
@@ -164,6 +178,7 @@ fn main() {
         (Ok(ready), Ok(clean_ready), Ok(invalid_ready)) => {
             let warnings = ready["warnings"].as_array().cloned().unwrap_or_default();
             let trojan = warning_view(&warnings, "trojan_node");
+            let ss = warning_view(&warnings, "ss_node");
             let hy2 = warning_view(&warnings, "hy2_node");
             let vless = warning_view(&warnings, "vless_node");
             let order = warnings
@@ -178,23 +193,29 @@ fn main() {
                     && v["warnings_field_present"] == true
                     && v["warnings_count"] == 0
             };
-            let broken = |v: &Value| {
-                v["code"] == "OUTBOUND_INTEROP_BROKEN" && v["interop_verdict"] == "BROKEN"
+            // TCP 可用 / UDP 未实现 / 原因点明 UDP：两个 PARTIAL 协议共有的分级。
+            let partial = |v: &Value| {
+                v["code"] == "OUTBOUND_INTEROP_PARTIAL"
+                    && v["interop_verdict"] == "PARTIAL"
+                    && v["tcp"] == "usable"
+                    && v["udp"] == "not_implemented"
+                    && v["reason_mentions_udp"] == true
             };
             let pass = ready["verdict"] == "READY"
                 && ready.get("warnings").is_some_and(Value::is_array)
                 && warnings.len() == 2
-                && broken(&trojan)
+                && partial(&trojan)
                 && trojan["kind"] == "trojan"
                 && trojan["field"] == "outbounds[0].kind"
+                && trojan["fallback_warning"] == true
                 && trojan["reason_mentions_fallback"] == true
-                && trojan["reason_mentions_fail_open"] == true
-                && broken(&hy2)
-                && hy2["kind"] == "hysteria2"
-                && hy2["field"] == "outbounds[1].kind"
-                && hy2["reason_non_empty"] == true
+                && partial(&ss)
+                && ss["kind"] == "shadowsocks"
+                && ss["field"] == "outbounds[1].kind"
+                && ss["fallback_warning"] == false
+                && hy2["present"] == false
                 && vless["present"] == false
-                && order == "trojan_node,hy2_node"
+                && order == "trojan_node,ss_node"
                 && empty_ok(&clean)
                 && empty_ok(&invalid);
             json!({
@@ -207,6 +228,7 @@ fn main() {
                     "count": warnings.len(),
                     "order": order,
                     "trojan_node": trojan,
+                    "ss_node": ss,
                     "hy2_node": hy2,
                     "vless_node": vless,
                 },
