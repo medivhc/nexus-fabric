@@ -105,7 +105,11 @@ fn static_errors(outbound: &OutboundConfig) -> Vec<CheckError> {
         return Vec::new();
     }
     let mut errors = Vec::new();
-    if outbound_manifest::has_unsupported_obfs(outbound) {
+    // obfs 禁令只对共享 wired 集合成立（这些协议没有 obfs 实现）；Hy2 的 Salamander
+    // 已实现，不在禁令内——禁令按 TUN/共享口径判定，与本函数的产品表面门刻意不同。
+    if outbound_manifest::is_wired(outbound.kind)
+        && outbound_manifest::has_unsupported_obfs(outbound)
+    {
         errors.push(CheckError::new(
             "UNSUPPORTED_OBFS",
             "obfs",
@@ -630,6 +634,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|e| e["code"] == "NO_USABLE_OUTBOUND"),
+            "{}",
+            outcome.json
+        );
+        assert_eq!(outcome.json["outbounds"][0]["wired"], true);
+        assert_eq!(outcome.json["outbounds"][0]["selected"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A2（P2 定点）：Hy2 的 `obfs: salamander` 已实现（fixes-4 验证），不得被共享
+    /// `has_unsupported_obfs` 误报 `UNSUPPORTED_OBFS`；obfs 禁令仍只对共享 `is_wired`
+    /// 集合成立。Hy2 的混淆密码字段是 `obfs_password`（不是 `obfs_key`）。
+    #[test]
+    fn hy2_with_salamander_obfs_is_not_unsupported_obfs() {
+        let dir = temp_dir("hy2-salamander");
+        write_yaml(
+            &dir,
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: hy2-a\noutbounds:\n  - tag: hy2-a\n    kind: hysteria2\n    locator: 127.0.0.1:443\n    password: secret\n    obfs: salamander\n    obfs_password: s3cr3t\n",
+        );
+        let outcome = check(&dir, None);
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.json);
+        assert_eq!(outcome.json["static_valid"], true);
+        let outbound_errors = outcome.json["outbounds"][0]["errors"].as_array().unwrap();
+        assert!(outbound_errors.is_empty(), "{}", outcome.json);
+        assert!(
+            !outbound_errors
+                .iter()
+                .any(|e| e["code"] == "UNSUPPORTED_OBFS"),
             "{}",
             outcome.json
         );
