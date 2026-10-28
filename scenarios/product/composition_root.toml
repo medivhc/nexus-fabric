@@ -21,7 +21,7 @@ carrier = "n1-fabric"
 #   不失败）；
 # - n1_assemble_bad：非法 network.toml → assemble_n1 返回 Err（降级路径）；
 # - hot_reload_classify：network.toml 内容变更 → NeedsRestart；
-#   dns.toml 内容变更 → Hot。
+#   dns.toml 内容变更 → NeedsRestart（Q8；DNS 服务持有 socket/缓存）。
 
 [when]
 command = "cargo run --quiet -p nexusd --example composition_root_wiring -- --json"
@@ -71,5 +71,5 @@ field = "wiring.hot_network_is_restart"
 equals = true
 
 [[expect]]
-field = "wiring.hot_dns_is_hot"
+field = "wiring.hot_dns_is_restart"
 equals = true

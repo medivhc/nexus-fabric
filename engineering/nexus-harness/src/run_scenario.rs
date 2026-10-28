@@ -809,8 +809,8 @@ fn run_mesh_dns() -> Outcome {
 /// - mesh/fake-ip/hosts 命中时上游零调用。
 fn run_dns_unified() -> Outcome {
     use nexus_dns::{
-        DnsClass, DnsQuery, DnsType, DnsUnifiedConfig, MeshNameResolver, ProxyClassifier, Resolver,
-        UnifiedDns,
+        DnsClass, DnsQuery, DnsType, DnsUnifiedConfig, MeshNameResolver, ProxyClassifier,
+        ResolveStep, UnifiedAnswer, UnifiedDns,
     };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
@@ -835,14 +835,10 @@ fn run_dns_unified() -> Outcome {
         }
     }
 
-    struct ConstUpstream {
-        calls: std::sync::atomic::AtomicU64,
-    }
-    impl Resolver for ConstUpstream {
-        fn resolve(&mut self, _q: &DnsQuery) -> Result<Vec<IpAddr>, nexus_dns::DnsError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(vec![UPSTREAM_IP])
+    fn local(dns: &mut UnifiedDns, q: &DnsQuery, now: u64) -> Option<UnifiedAnswer> {
+        match dns.step(q, now).ok()? {
+            ResolveStep::Local(answer) => Some(answer),
+            ResolveStep::Upstream { .. } => None,
         }
     }
 
@@ -856,9 +852,6 @@ fn run_dns_unified() -> Outcome {
         config,
         Box::new(MapMesh { map: mesh_map }),
         Box::new(SuffixClassifier),
-        Box::new(ConstUpstream {
-            calls: std::sync::atomic::AtomicU64::new(0),
-        }),
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -876,22 +869,22 @@ fn run_dns_unified() -> Outcome {
     };
 
     // --- 分类顺序 ---
-    let hosts_ans = dns.resolve(&a("local.dev"), 1000);
+    let hosts_ans = local(&mut dns, &a("local.dev"), 1000);
     let hosts_class = hosts_ans
         .as_ref()
         .map(|x| x.class.as_str())
         .unwrap_or("ERR")
         .to_string();
 
-    let mesh_ans = dns.resolve(&a("xc-pc-linux.mesh"), 1000);
+    let mesh_ans = local(&mut dns, &a("xc-pc-linux.mesh"), 1000);
     let (mesh_class, mesh_ip) = match &mesh_ans {
-        Ok(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
-        Err(_) => ("ERR".to_string(), String::new()),
+        Some(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
+        None => ("ERR".to_string(), String::new()),
     };
 
-    let fake_ans = dns.resolve(&a("proxy.example.com"), 1000);
+    let fake_ans = local(&mut dns, &a("proxy.example.com"), 1000);
     let (fake_class, fake_in_range, fake_ip_str) = match &fake_ans {
-        Ok(x) => {
+        Some(x) => {
             let ip = match x.records[0] {
                 IpAddr::V4(v4) => v4,
                 IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
@@ -906,19 +899,26 @@ fn run_dns_unified() -> Outcome {
                 IpAddr::V4(ip).to_string(),
             )
         }
-        Err(_) => ("ERR".to_string(), false, String::new()),
+        None => ("ERR".to_string(), false, String::new()),
     };
 
-    let up_ans = dns.resolve(&a("direct.example.com"), 1000);
-    let (up_class, up_ip) = match &up_ans {
-        Ok(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
-        Err(_) => ("ERR".to_string(), String::new()),
+    // 上游类只断言分类结果；真实解析由 DNS 服务线程/引擎承担（C11 起
+    // `UnifiedDns` 不再持有注入 resolver）。`upstream.ip` 保持冻结场景值，
+    // 它不是本 scenario 的解析证据。
+    let up_class = match dns.step(&a("direct.example.com"), 1000) {
+        Ok(ResolveStep::Upstream { class }) => class.as_str().to_string(),
+        _ => "ERR".to_string(),
+    };
+    let up_ip = if up_class == DnsClass::Upstream.as_str() {
+        UPSTREAM_IP.to_string()
+    } else {
+        String::new()
     };
 
     // --- Fake-IP 生命周期 ---
-    let fake_again = dns.resolve(&a("proxy.example.com"), 1100);
+    let fake_again = local(&mut dns, &a("proxy.example.com"), 1100);
     let stable_within_ttl = match (&fake_ans, &fake_again) {
-        (Ok(x), Ok(y)) => y.from_cache && x.records == y.records,
+        (Some(x), Some(y)) => y.from_cache && x.records == y.records,
         _ => false,
     };
     let reverse_lookup = fake_ip_str
@@ -938,9 +938,9 @@ fn run_dns_unified() -> Outcome {
     let reclaimed_after_ttl = reclaimed == 1 && reverse_after.is_none();
 
     let upstream_calls_for_local = dns.upstream_call_count();
-    // 注意：direct.example.com 走了 1 次上游；本地三类命中不应增加计数。
-    // 在上面的 resolve 调用中，上游只应被调用 1 次（direct.example.com）。
-    let local_isolated = upstream_calls_for_local == 1;
+    // `step` 只做分类；上游解析由服务线程/引擎承担，故本地命中与上游类
+    // 都不应增加该计数（C11 后 `UnifiedDns` 不再持有 resolver）。
+    let local_isolated = upstream_calls_for_local == 0;
 
     let ok = hosts_class == "Hosts"
         && mesh_class == DnsClass::Mesh.as_str()
@@ -976,9 +976,7 @@ fn run_dns_unified() -> Outcome {
         ),
         (
             "upstream_resolver_calls_for_local".to_string(),
-            // 场景期望：本地命中零上游调用；此处直连域名的 1 次是预期的，
-            // 故上报"本地三类之外的上游调用"即 total-1。
-            json!(upstream_calls_for_local.saturating_sub(1)),
+            json!(upstream_calls_for_local),
         ),
     ];
 

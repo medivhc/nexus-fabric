@@ -387,8 +387,9 @@ fn assemble_dataplane(
     tun: Box<dyn nexus_projection::TunDevice>,
     config: nexusd::dataplane::DataplaneConfig,
     rule_engine: Option<ErasedRuleEngine>,
+    dns: Option<nexusd::dns_service::DnsServiceHandle>,
 ) -> Result<nexusd::dataplane::Dataplane, String> {
-    let mut dp = nexusd::dataplane::Dataplane::new(tun, config)?;
+    let mut dp = nexusd::dataplane::Dataplane::new(tun, config, dns)?;
     match rule_engine {
         Some(engine) => {
             dp.set_rule_engine(engine);
@@ -582,7 +583,37 @@ fn run_dataplane(
         Box::new(nexusd::dataplane::InertTun)
     };
 
-    let mut dp = match assemble_dataplane(tun, config, rule_engine) {
+    // C11 / D-impl-9：DNS 服务在 TUN 创建成功后启动；owner 线程与句柄由本函数持有。
+    let dns_status = Arc::new(nexusd::dns_status::DnsStatus::new(
+        nexusd::dns_status::DnsStatusSnapshot::disabled(),
+    ));
+    nexusd::dns_status::publish(Arc::clone(&dns_status));
+    let dns_service = if config.dns_enabled {
+        let Some(dns_config) = config.dns_config.clone() else {
+            eprintln!("[nexusd] dns ERROR event=dns_config_invalid reason=missing-dns-config");
+            return;
+        };
+        match nexusd::dns_service::DnsService::start(
+            dns_config,
+            proxy_yaml.as_deref(),
+            Arc::clone(&dns_status),
+        ) {
+            Ok(handle) => {
+                eprintln!(
+                    "[nexusd] dns level=info event=dns_service state=running entry=tun+tproxy"
+                );
+                Some(handle)
+            }
+            Err(e) => {
+                eprintln!("[nexusd] dns ERROR event=dns_config_invalid reason={e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut dp = match assemble_dataplane(tun, config, rule_engine, dns_service) {
         Ok(dp) => dp,
         Err(e) => {
             eprintln!("[nexusd] dataplane: init failed ({e}); dataplane disabled");
@@ -783,8 +814,9 @@ fn run_dataplane(
             last_tproxy_publish = std::time::Instant::now();
         }
     }
-    // §13.4 清理顺序：停收包 → 透明前端 → 捕获规则 → OS 装配。
+    // §13.4 清理顺序：停收包 → 透明前端 → DNS 服务 → 捕获规则 → OS 装配。
     dp.shutdown_transparent();
+    dp.shutdown_dns();
     #[cfg(target_os = "linux")]
     if let Some(mut frontend) = tproxy_frontend.take() {
         frontend.shutdown();
@@ -1847,8 +1879,6 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         } else {
             "resource-level"
         });
-    nexusd::dataplane::publish_runtime_basics(takeover_mode, "ipv4");
-
     // 2. 组装 DataplaneConfig（R2/R3；dns.toml 解析失败 → exit 1）。
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
         Ok(c) => c,
@@ -1857,6 +1887,13 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // T4b：发布 takeover/ingress + IPv6 能力表（N-8：地址族由能力表派生，
+    // 不再硬编码 "ipv4" 而与 ipv6_paths 自相矛盾）。
+    let ipv6_paths =
+        nexusd::dataplane::Ipv6Paths::from_capabilities(!dataplane_config.mesh_cidrs6.is_empty());
+    nexusd::dataplane::publish_runtime_basics(takeover_mode, ipv6_paths);
+    eprintln!("[nexusd] IPv6 capability table: {}", ipv6_paths.summary());
 
     // 3. R1：装配 N1 网桥 + 单一 discovery hub（失败 → 降级，dataplane 照常跑）。
     //
@@ -2941,10 +2978,37 @@ fn handle_localapi_request(
             }
             Ok(body)
         }
-        "/localapi/v0/dns/status" => nexus::observability::dns_status()
-            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
-        "/localapi/v0/dns/cache" => nexus::observability::dns_cache()
-            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/dns/status" => {
+            let snapshot = nexusd::dns_status::snapshot()
+                .unwrap_or_else(nexusd::dns_status::DnsStatusSnapshot::disabled);
+            let mut body = snapshot.to_json();
+            body["verdict"] = json!("PASS");
+            Ok(body)
+        }
+        "/localapi/v0/dns/cache" => {
+            let entries = nexusd::dns_status::cache_entries();
+            let mut cache = Vec::new();
+            let mut negative_cache = Vec::new();
+            for entry in entries {
+                let value = json!({
+                    "name": entry.name,
+                    "qtype": entry.qtype,
+                    "expires_at_ms": entry.expires_at_ms,
+                    "rcode": entry.rcode,
+                });
+                if entry.negative {
+                    negative_cache.push(value);
+                } else {
+                    cache.push(value);
+                }
+            }
+            Ok(json!({
+                "verdict": "PASS",
+                "enabled": nexusd::dns_status::snapshot().map(|s| s.enabled).unwrap_or(false),
+                "cache": cache,
+                "negative_cache": negative_cache,
+            }))
+        }
         "/localapi/v0/session/watch" => nexus::observability::session_watch(qp("session"))
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         // D1（P1-1）：daemon 内唯一 SessionManager 的会话读口。
@@ -3231,6 +3295,7 @@ outbounds:
             Box::new(SharedTun(Arc::clone(&mock))),
             DataplaneConfig::default(),
             engine,
+            None,
         )
         .expect("assemble dataplane");
         let pkt = craft_udp([10, 200, 1, 2], [203, 0, 113, 7], 32_890, 8080);

@@ -431,7 +431,7 @@ mod tests {
         let repo = Repo::discover().expect("must run inside the nexus repository");
         let config = Config::load(&repo).expect("config must load");
         let detail = check(&repo, &config).expect("index must match scenarios");
-        assert!(detail.contains("339 rows"), "{detail}");
+        assert!(detail.contains("347 rows"), "{detail}");
         assert!(detail.contains("5 carriers"), "{detail}");
     }
 

@@ -2,10 +2,20 @@
 //!
 //! Binary (`main.rs`) 为 Composition Root；可测试逻辑下沉到此。
 
+#![recursion_limit = "256"]
+
 pub mod assembly;
 pub mod config;
 pub mod dataplane;
 pub mod discovery_runtime;
+/// DNS-time proxy classification from the `proxy.yaml` domain subset.
+pub mod dns_classify;
+/// DNS service thread: single owner + bounded queues (wired in C11).
+pub mod dns_service;
+/// DNS service snapshot (`/dns/status`); wired in C11.
+pub mod dns_status;
+/// Non-blocking upstream DNS engine (pending table/retry/failover/cache).
+pub mod dns_upstream;
 /// 热路径日志限频（per `(tag, cause)`；PRODUCT hot-path 契约）。
 mod log_throttle;
 pub mod nat_gather;

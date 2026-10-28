@@ -6,6 +6,7 @@
 //!
 //! std-only + smoltcp; no Tokio.
 
+use crate::ip::{parse_ip_packet, tcp_udp_checksum_v6};
 use crate::process::{FlowLabels, PlatformAttributor, ProcessAttributor, Proto, QosConfig};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -14,7 +15,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -23,6 +24,11 @@ use std::time::{Duration, SystemTime};
 /// smoltcp interface address (packets are rewritten to this dst before
 /// being fed to the stack; the real destination lives in the stream table).
 pub const SMOLTCP_IFACE_IP: [u8; 4] = [10, 254, 0, 1];
+
+/// smoltcp interface address for the IPv6 stack (`fd00::1`, C20).
+pub const SMOLTCP_IFACE_IP6: [u8; 16] = [
+    0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+];
 
 /// Max concurrent terminated TCP connections (S22).
 pub const MAX_TCP_CONNS: usize = 1024;
@@ -61,14 +67,17 @@ const CANCELLED_TTL: Duration = Duration::from_secs(60);
 pub(crate) enum SynTarget {
     /// IPv4 地址 + 端口。
     V4(std::net::SocketAddrV4),
+    /// IPv6 地址 + 端口（C20 新增 addr-type `0x02`）。
+    V6(std::net::SocketAddrV6),
     /// 域名 + 端口（egress 侧解析；originator 永不本地解析）。
     Domain(String, u16),
 }
 
 /// 编码 SYN 载荷（S25 typed 形式，originator 自 3d 起统一使用）。
 ///
-/// 首字节 addr-type：`0x01` 后跟 4 字节 IPv4；`0x03` 后跟 1 字节域名长度 +
-/// 域名；最后 2 字节 port（u16be）。host 为 IP 字面量时用 `0x01` 形式。
+/// 首字节 addr-type：`0x01` 后跟 4 字节 IPv4；`0x02` 后跟 16 字节 IPv6；
+/// `0x03` 后跟 1 字节域名长度 + 域名；最后 2 字节 port（u16be）。
+/// host 为 IP 字面量时用 `0x01`/`0x02` 形式。
 ///
 /// F1：2 字符域名会产生恰好 6 字节的 typed 载荷，而 `decode_syn_payload`
 /// 按冻结的线兼容规则把 6 字节无条件读作 3b-5 旧格式（IPv4+port）——根本
@@ -80,6 +89,13 @@ pub fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let mut out = Vec::with_capacity(7);
         out.push(0x01);
+        out.extend_from_slice(&ip.octets());
+        out.extend_from_slice(&port.to_be_bytes());
+        return out;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        let mut out = Vec::with_capacity(19);
+        out.push(0x02);
         out.extend_from_slice(&ip.octets());
         out.extend_from_slice(&port.to_be_bytes());
         return out;
@@ -150,6 +166,23 @@ pub(crate) fn decode_syn_payload(payload: &[u8]) -> Option<(SynTarget, usize)> {
             }
             let port = u16::from_be_bytes([rest[len], rest[len + 1]]);
             Some((SynTarget::Domain(name.to_string(), port), 1 + 1 + len + 2))
+        }
+        0x02 => {
+            if rest.len() < 18 {
+                return None;
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&rest[..16]);
+            let port = u16::from_be_bytes([rest[16], rest[17]]);
+            Some((
+                SynTarget::V6(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::from(ip),
+                    port,
+                    0,
+                    0,
+                )),
+                19,
+            ))
         }
         _ => None,
     }
@@ -266,83 +299,117 @@ pub fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
 }
 
 /// Parsed TCP header: (src_ip, dst_ip, src_port, dst_port, flags, payload_offset).
-pub type TcpParsed = ([u8; 4], [u8; 4], u16, u16, u8, usize);
+pub type TcpParsed = (IpAddr, IpAddr, u16, u16, u8, usize);
 
-/// Minimal IPv4/TCP header parse.
+/// Minimal IPv4/IPv6 TCP header parse.
+///
+/// v6 uses the shared fixed-header + extension-header chain walker
+/// (`crate::ip::parse_ip_packet`), so the returned payload offset already
+/// accounts for any Hop-by-Hop/Routing/Destination-Options/Fragment headers.
+/// Non-first fragments and unparseable extension chains yield `None`.
 pub fn parse_tcp(packet: &[u8]) -> Option<TcpParsed> {
-    if packet.len() < 40 || packet[0] >> 4 != 4 || packet[9] != 6 {
+    let view = parse_ip_packet(packet).ok()?;
+    if view.protocol != 6 {
         return None;
     }
-    let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    if packet.len() < ihl + 20 {
+    let tcp = view.payload;
+    if tcp.len() < 20 {
         return None;
     }
-    let tcp = &packet[ihl..];
     let data_off = ((tcp[12] >> 4) as usize) * 4;
-    if tcp.len() < data_off {
+    if data_off < 20 || tcp.len() < data_off {
         return None;
     }
-    let mut src = [0u8; 4];
-    let mut dst = [0u8; 4];
-    src.copy_from_slice(&packet[12..16]);
-    dst.copy_from_slice(&packet[16..20]);
     Some((
-        src,
-        dst,
+        view.src,
+        view.dst,
         u16::from_be_bytes([tcp[0], tcp[1]]),
         u16::from_be_bytes([tcp[2], tcp[3]]),
         tcp[13],
-        ihl + data_off,
+        view.l4_offset + data_off,
     ))
 }
 
-/// Rewrite the IPv4 destination and fix IP + TCP checksums.
-pub fn rewrite_dst(packet: &[u8], new_dst: [u8; 4]) -> Option<Vec<u8>> {
-    let mut p = packet.to_vec();
-    if p.len() < 20 || p[0] >> 4 != 4 {
+/// Rewrite the IP destination and fix IP + TCP checksums.
+///
+/// v4: IP header checksum + TCP pseudo-header recompute.
+/// v6: no IP header checksum; TCP pseudo-header recompute (extension-header
+/// aware L4 offset from `parse_ip_packet`).
+pub fn rewrite_dst(packet: &[u8], new_dst: IpAddr) -> Option<Vec<u8>> {
+    let view = parse_ip_packet(packet).ok()?;
+    if view.protocol != 6 {
         return None;
     }
-    let ihl = ((p[0] & 0x0F) as usize) * 4;
-    p[16..20].copy_from_slice(&new_dst);
-    p[10] = 0;
-    p[11] = 0;
-    let c = ip_checksum(&p[..ihl]);
-    p[10..12].copy_from_slice(&c.to_be_bytes());
-    if p[9] == 6 && p.len() >= ihl + 20 {
-        // TCP checksum covers the pseudo-header; zero it first.
-        p[ihl + 16] = 0;
-        p[ihl + 17] = 0;
-        let mut src = [0u8; 4];
-        src.copy_from_slice(&p[12..16]);
-        let tc = tcp_checksum(src, new_dst, &p[ihl..]);
-        p[ihl + 16..ihl + 18].copy_from_slice(&tc.to_be_bytes());
+    if std::mem::discriminant(&view.dst) != std::mem::discriminant(&new_dst) {
+        return None;
+    }
+    let l4 = view.l4_offset;
+    if packet.len() < l4 + 20 {
+        return None;
+    }
+    let mut p = packet.to_vec();
+    match (view.src, new_dst) {
+        (IpAddr::V4(src), IpAddr::V4(new_dst)) => {
+            p[16..20].copy_from_slice(&new_dst.octets());
+            p[10] = 0;
+            p[11] = 0;
+            let c = ip_checksum(&p[..l4]);
+            p[10..12].copy_from_slice(&c.to_be_bytes());
+            p[l4 + 16] = 0;
+            p[l4 + 17] = 0;
+            let tc = tcp_checksum(src.octets(), new_dst.octets(), &p[l4..]);
+            p[l4 + 16..l4 + 18].copy_from_slice(&tc.to_be_bytes());
+        }
+        (IpAddr::V6(src), IpAddr::V6(new_dst)) => {
+            p[24..40].copy_from_slice(&new_dst.octets());
+            p[l4 + 16] = 0;
+            p[l4 + 17] = 0;
+            let tc = tcp_udp_checksum_v6(src, new_dst, 6, &p[l4..]);
+            p[l4 + 16..l4 + 18].copy_from_slice(&tc.to_be_bytes());
+        }
+        _ => return None,
     }
     Some(p)
 }
 
-/// Rewrite the IPv4 source and fix IP + TCP checksums (GAP-5).
+/// Rewrite the IP source and fix IP + TCP checksums (GAP-5).
 ///
 /// Used by `TcpTerminator::fixup_tun_packet` to restore the original
-/// destination as source for real-TUN outbound packets.
-pub fn rewrite_src(packet: &[u8], new_src: [u8; 4]) -> Option<Vec<u8>> {
-    let mut p = packet.to_vec();
-    if p.len() < 20 || p[0] >> 4 != 4 {
+/// destination as source for real-TUN outbound packets. v6 has no IP
+/// header checksum; the TCP pseudo-header is recomputed.
+pub fn rewrite_src(packet: &[u8], new_src: IpAddr) -> Option<Vec<u8>> {
+    let view = parse_ip_packet(packet).ok()?;
+    if view.protocol != 6 {
         return None;
     }
-    let ihl = ((p[0] & 0x0F) as usize) * 4;
-    p[12..16].copy_from_slice(&new_src);
-    p[10] = 0;
-    p[11] = 0;
-    let c = ip_checksum(&p[..ihl]);
-    p[10..12].copy_from_slice(&c.to_be_bytes());
-    if p[9] == 6 && p.len() >= ihl + 20 {
-        // TCP checksum covers the pseudo-header; zero it first.
-        p[ihl + 16] = 0;
-        p[ihl + 17] = 0;
-        let mut dst = [0u8; 4];
-        dst.copy_from_slice(&p[16..20]);
-        let tc = tcp_checksum(new_src, dst, &p[ihl..]);
-        p[ihl + 16..ihl + 18].copy_from_slice(&tc.to_be_bytes());
+    if std::mem::discriminant(&view.src) != std::mem::discriminant(&new_src) {
+        return None;
+    }
+    let l4 = view.l4_offset;
+    if packet.len() < l4 + 20 {
+        return None;
+    }
+    let mut p = packet.to_vec();
+    match (new_src, view.dst) {
+        (IpAddr::V4(new_src), IpAddr::V4(dst)) => {
+            p[12..16].copy_from_slice(&new_src.octets());
+            p[10] = 0;
+            p[11] = 0;
+            let c = ip_checksum(&p[..l4]);
+            p[10..12].copy_from_slice(&c.to_be_bytes());
+            p[l4 + 16] = 0;
+            p[l4 + 17] = 0;
+            let tc = tcp_checksum(new_src.octets(), dst.octets(), &p[l4..]);
+            p[l4 + 16..l4 + 18].copy_from_slice(&tc.to_be_bytes());
+        }
+        (IpAddr::V6(new_src), IpAddr::V6(dst)) => {
+            p[8..24].copy_from_slice(&new_src.octets());
+            p[l4 + 16] = 0;
+            p[l4 + 17] = 0;
+            let tc = tcp_udp_checksum_v6(new_src, dst, 6, &p[l4..]);
+            p[l4 + 16..l4 + 18].copy_from_slice(&tc.to_be_bytes());
+        }
+        _ => return None,
     }
     Some(p)
 }
@@ -414,9 +481,9 @@ impl Device for QueueDevice {
 /// App-visible four-tuple (original addresses, before dst rewrite).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FourTuple {
-    pub src_ip: [u8; 4],
+    pub src_ip: IpAddr,
     pub src_port: u16,
-    pub dst_ip: [u8; 4],
+    pub dst_ip: IpAddr,
     pub dst_port: u16,
 }
 
@@ -432,7 +499,7 @@ struct TermConn {
     stream_id: u32,
     sock: SocketHandle,
     peer: String,
-    orig_dst: SocketAddrV4,
+    orig_dst: SocketAddr,
     state: TermState,
     /// Whether the SYN frame was already emitted over fabric.
     syn_sent: bool,
@@ -451,7 +518,7 @@ pub enum TcpEvent {
     /// New connection established: send a SYN frame (with real dst) first.
     Syn {
         stream_id: u32,
-        dst: SocketAddrV4,
+        dst: SocketAddr,
         peer: String,
     },
     /// Application bytes from the local socket: send as DATA frame.
@@ -596,6 +663,12 @@ impl TcpTerminator {
                 ),
                 24,
             ));
+            // C20: dual-stack termination — the v6 rewritten dst must be a
+            // local address or smoltcp drops the packet before the socket.
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv6(Ipv6Addr::from(SMOLTCP_IFACE_IP6)),
+                128,
+            ));
         });
         iface.poll(Instant::now(), &mut self.device, &mut self.sockets);
     }
@@ -634,22 +707,16 @@ impl TcpTerminator {
             }
             let handle = self.sockets.add(sock);
             // S26: attribute once at flow setup; cached on the TermConn.
-            let src_v4 = SocketAddrV4::new(Ipv4Addr::from(src_ip), src_port);
-            let dst_v4 = SocketAddrV4::new(Ipv4Addr::from(dst_ip), dst_port);
-            let labels = FlowLabels::attribute(
-                &*self.attributor,
-                &self.qos,
-                SocketAddr::V4(src_v4),
-                SocketAddr::V4(dst_v4),
-                Proto::Tcp,
-            );
+            let src = SocketAddr::new(src_ip, src_port);
+            let dst = SocketAddr::new(dst_ip, dst_port);
+            let labels = FlowLabels::attribute(&*self.attributor, &self.qos, src, dst, Proto::Tcp);
             self.conns.insert(
                 key,
                 TermConn {
                     stream_id,
                     sock: handle,
                     peer: peer.to_string(),
-                    orig_dst: dst_v4,
+                    orig_dst: dst,
                     state: TermState::SynReceived(SystemTime::now()),
                     syn_sent: false,
                     close_sent: false,
@@ -661,7 +728,11 @@ impl TcpTerminator {
         }
 
         // Rewrite dst to the smoltcp interface address and feed the stack.
-        if let Some(rw) = rewrite_dst(packet, SMOLTCP_IFACE_IP) {
+        let iface_ip = match dst_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(SMOLTCP_IFACE_IP)),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(SMOLTCP_IFACE_IP6)),
+        };
+        if let Some(rw) = rewrite_dst(packet, iface_ip) {
             self.device.rx.push_back(rw);
         }
         self.poll_iface();
@@ -805,7 +876,11 @@ impl TcpTerminator {
     /// 包不匹配已知连接 → 返回 `None`（调用方计数丢弃）。
     pub fn fixup_tun_packet(&self, pkt: &[u8]) -> Option<Vec<u8>> {
         let (src_ip, dst_ip, src_port, dst_port, _flags, _off) = parse_tcp(pkt)?;
-        if src_ip != SMOLTCP_IFACE_IP {
+        let iface_src = match src_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(SMOLTCP_IFACE_IP)),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(SMOLTCP_IFACE_IP6)),
+        };
+        if src_ip != iface_src {
             return None;
         }
         // 按客户端 (dst_ip, dst_port) + 服务端端口 (src_port) 查找。
@@ -1129,6 +1204,12 @@ impl TcpRelay {
                 let stream = match worker_target {
                     SynTarget::V4(a) => {
                         let sa = SocketAddr::V4(a);
+                        TcpStream::connect_timeout(&sa, RELAY_CONNECT_TIMEOUT)
+                            .ok()
+                            .and_then(|s| s.set_nonblocking(true).ok().map(|_| s))
+                    }
+                    SynTarget::V6(a) => {
+                        let sa = SocketAddr::V6(a);
                         TcpStream::connect_timeout(&sa, RELAY_CONNECT_TIMEOUT)
                             .ok()
                             .and_then(|s| s.set_nonblocking(true).ok().map(|_| s))
@@ -1462,6 +1543,164 @@ mod tests {
         pkt
     }
 
+    /// Build a minimal IPv6/TCP packet with correct checksums.
+    #[allow(clippy::too_many_arguments)]
+    fn craft_tcp6(
+        src_ip: std::net::Ipv6Addr,
+        dst_ip: std::net::Ipv6Addr,
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + 20 + payload.len()];
+        pkt[0] = 0x60;
+        let plen = (20 + payload.len()) as u16;
+        pkt[4..6].copy_from_slice(&plen.to_be_bytes());
+        pkt[6] = 6;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&src_ip.octets());
+        pkt[24..40].copy_from_slice(&dst_ip.octets());
+        let t = &mut pkt[40..60];
+        t[0..2].copy_from_slice(&src_port.to_be_bytes());
+        t[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[8..12].copy_from_slice(&ack.to_be_bytes());
+        t[12] = 0x50;
+        t[13] = flags;
+        t[14..16].copy_from_slice(&8192u16.to_be_bytes());
+        pkt[60..].copy_from_slice(payload);
+        let tc = tcp_udp_checksum_v6(src_ip, dst_ip, 6, &pkt[40..]);
+        pkt[56..58].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn c20_v6_syn_yields_syn_ack_and_bidirectional_data() {
+        let client: std::net::Ipv6Addr = "2001:db8::100".parse().unwrap();
+        let server: std::net::Ipv6Addr = "fd00:144::6".parse().unwrap();
+        let iface6 = std::net::Ipv6Addr::from(SMOLTCP_IFACE_IP6);
+        let mut term = TcpTerminator::new();
+
+        // SYN -> SYN-ACK sourced from fd00::1 with a self-verifying checksum.
+        let syn = craft_tcp6(client, server, 40000, 80, 1000, 0, 0x02, &[]);
+        let tun = term.handle_uplink(&syn, "peer-B");
+        assert_eq!(tun.len(), 1, "expected v6 SYN-ACK");
+        let (src, dst, sp, dp, flags, tcp_off) = parse_tcp(&tun[0]).expect("v6 parse");
+        assert_eq!(src, IpAddr::V6(iface6));
+        assert_eq!(dst, IpAddr::V6(client));
+        assert_eq!((sp, dp), (80, 40000));
+        assert_eq!(flags & 0x12, 0x12, "SYN+ACK");
+        assert!(tcp_off >= 60, "v6 fixed 40 + TCP header (>=20)");
+        assert_eq!(
+            tcp_udp_checksum_v6(iface6, client, 6, &tun[0][40..]),
+            0,
+            "v6 TCP checksum self-verifies"
+        );
+
+        // Complete the handshake (ACK), then the Syn event appears on poll.
+        let srv_seq = u32::from_be_bytes([tun[0][44], tun[0][45], tun[0][46], tun[0][47]]);
+        let ack = craft_tcp6(client, server, 40000, 80, 1001, srv_seq + 1, 0x10, &[]);
+        let _ = term.handle_uplink(&ack, "peer-B");
+        let events = term.poll();
+        let (stream_id, dst_ev) = events
+            .iter()
+            .find_map(|e| match e {
+                TcpEvent::Syn { stream_id, dst, .. } => Some((*stream_id, *dst)),
+                _ => None,
+            })
+            .expect("v6 Syn event");
+        assert_eq!(dst_ev, SocketAddr::new(IpAddr::V6(server), 80));
+
+        // Client -> app bytes.
+        let data = craft_tcp6(client, server, 40000, 80, 1001, srv_seq + 1, 0x18, b"hello");
+        let _ = term.handle_uplink(&data, "peer-B");
+        let events = term.poll();
+        let up: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                TcpEvent::Data { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(up, b"hello", "uplink bytes reach the fabric side");
+
+        // App -> client bytes.
+        let down_pkts = term.handle_fabric_data(stream_id, b"world");
+        let down = down_pkts
+            .iter()
+            .find_map(|p| {
+                let (_, _, _, _, _, off) = parse_tcp(p)?;
+                let payload = &p[off..];
+                (!payload.is_empty()).then(|| payload.to_vec())
+            })
+            .unwrap_or_default();
+        assert_eq!(down, b"world", "downlink bytes reach the TUN side");
+    }
+
+    #[test]
+    fn c20_v6_parse_tcp_walks_extension_headers() {
+        let src: std::net::Ipv6Addr = "2001:db8::100".parse().unwrap();
+        let dst: std::net::Ipv6Addr = "fd00:144::6".parse().unwrap();
+        let base = craft_tcp6(src, dst, 40000, 80, 7, 0, 0x02, &[]);
+        // Insert an 8-byte Hop-by-Hop header (next=TCP, hdr-ext-len=0).
+        let mut pkt = Vec::with_capacity(base.len() + 8);
+        pkt.extend_from_slice(&base[..40]);
+        pkt.push(6); // next header = TCP
+        pkt.push(0); // ext len = 0 => 8 bytes
+        pkt.extend_from_slice(&[0u8; 6]);
+        pkt.extend_from_slice(&base[40..]);
+        pkt[6] = 0; // fixed header next header = Hop-by-Hop
+        let plen = (pkt.len() - 40) as u16;
+        pkt[4..6].copy_from_slice(&plen.to_be_bytes());
+        // Recompute TCP checksum over the shifted segment.
+        let tcp_seg = &mut pkt[48..];
+        tcp_seg[16] = 0;
+        tcp_seg[17] = 0;
+        let tc = tcp_udp_checksum_v6(src, dst, 6, tcp_seg);
+        pkt[64..66].copy_from_slice(&tc.to_be_bytes());
+
+        let (_, _, sp, dp, flags, off) = parse_tcp(&pkt).expect("ext-header v6 parse");
+        assert_eq!((sp, dp), (40000, 80));
+        assert_eq!(flags, 0x02);
+        assert_eq!(off, 68, "40 fixed + 8 ext + 20 TCP");
+    }
+
+    #[test]
+    fn c20_syn_target_v6_roundtrip_and_legacy_compat() {
+        let enc = encode_syn_payload("fd00:144::6", 80);
+        assert_eq!(enc[0], 0x02);
+        assert_eq!(enc.len(), 19);
+        let target = "[fd00:144::6]:80".parse::<SocketAddr>().unwrap();
+        let expected = match target {
+            SocketAddr::V6(v6) => SynTarget::V6(v6),
+            SocketAddr::V4(_) => unreachable!(),
+        };
+        assert_eq!(decode_syn_payload(&enc), Some((expected.clone(), 19)));
+
+        // Legacy rules must not regress: 0x01 IPv4, 0x03 domain, 6-byte v4.
+        let v4 = encode_syn_payload("1.2.3.4", 80);
+        assert_eq!(v4[0], 0x01);
+        assert_eq!(
+            decode_syn_payload(&v4),
+            Some((SynTarget::V4("1.2.3.4:80".parse().unwrap()), 7))
+        );
+        let dom = encode_syn_payload("example.com", 443);
+        assert_eq!(dom[0], 0x03);
+        assert_eq!(
+            decode_syn_payload(&dom),
+            Some((SynTarget::Domain("example.com".to_string(), 443), dom.len()))
+        );
+        let legacy = [1u8, 2, 3, 4, 0, 80];
+        assert_eq!(
+            decode_syn_payload(&legacy),
+            Some((SynTarget::V4("1.2.3.4:80".parse().unwrap()), 6))
+        );
+    }
+
     #[test]
     fn terminator_completes_handshake() {
         // S21: SYN -> SYN-ACK; ACK -> Established; Syn event emitted.
@@ -1509,7 +1748,7 @@ mod tests {
             events.len()
         );
         let (sid, dst, peer) = syn_ev.unwrap();
-        assert_eq!(dst.ip().octets(), [1, 2, 3, 4]);
+        assert_eq!(dst.ip(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(dst.port(), 8080);
         assert_eq!(peer, "peer-B");
         assert_eq!(term.stats().handshake_done, 1);
@@ -1778,7 +2017,7 @@ mod tests {
     #[test]
     fn rewrite_dst_fixes_checksums() {
         let pkt = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40000, 8080, 1000, 0, 0x02, &[]);
-        let rw = rewrite_dst(&pkt, SMOLTCP_IFACE_IP).unwrap();
+        let rw = rewrite_dst(&pkt, IpAddr::V4(Ipv4Addr::from(SMOLTCP_IFACE_IP))).unwrap();
         assert_eq!(&rw[16..20], &SMOLTCP_IFACE_IP);
         assert_eq!(ip_checksum(&rw[..20]), 0);
         // TCP checksum over new pseudo-header verifies to 0.

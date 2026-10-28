@@ -1,0 +1,60 @@
+schema_version = 1
+id = "product.dns-fake-ip-aaaa-nodata"
+title = "AC8a：fake-ip 开启时代理类 AAAA 恒 NODATA（不消耗地址）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
+
+[given]
+# 三个名字覆盖 domain / domain_suffix / geosite-unevaluable→proxied。
+# 每个 AAAA → rcode 0 + ancount 0 + fake_ip.allocated 不变；同名 A 仍 fake-ip。
+# 额外覆盖 AC8 group1/4/5/6（浏览器 AAAA、ip_preference、HTTPS qtype、fake-ip 关闭）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example dns_production_e4 -- --json --suite aaaa"
+
+[[expect]]
+field = "ac8a.nodata"
+equals = true
+
+[[expect]]
+field = "ac8a.allocated_unchanged_for_aaaa"
+equals = true
+
+[[expect]]
+field = "ac8a.a_still_fakeip"
+equals = true
+
+[[expect]]
+field = "ac8a.allocated"
+equals = 3
+
+[[expect]]
+field = "ac8.group1"
+equals = true
+
+[[expect]]
+field = "ac8.group4"
+equals = true
+
+[[expect]]
+field = "ac8.group5"
+equals = true
+
+[[expect]]
+field = "ac8.group6"
+equals = true
+
+# AC8 组 6 v6-datapath：以真实 AAAA 答案（2001:db8::2）为目的注入 v6/UDP，
+# 同一生产 Dataplane 上计 1 次 Proxy 分类 + 1 次阻断（增量口径）。
+[[expect]]
+field = "ac8.group6_v6_datapath.classified_proxy"
+equals = 1
+
+[[expect]]
+field = "ac8.group6_v6_datapath.proxy_dropped"
+equals = 1
+
+[[expect]]
+field = "verdict"
+equals = "PASS"

@@ -1,0 +1,250 @@
+schema_version = 1
+id = "product.ipv6-dataplane"
+title = "IPv6 数据面 slice 1：0x86DD 计数/分类/Mesh 原始转发/能力表（AC6/AC7/AC10/AC16）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#6"
+carrier = "n1-fabric"
+
+[given]
+# `ipv6_dataplane_e4 --json` 从生产装配链出发：
+# ConfigDir::new → config::load → assembly::build_dataplane_config
+# → Dataplane::new(SharedTun(MockTun), cfg, None)。
+# 每个 section 在独立子进程里跑，父进程按 section 捕获 stderr，
+# 使 AC7/AC10 的日志限流断言可判定（每 (event, 判别字段) 行数 ≤1）。
+#
+# AC6：network.toml 配 [[vpi.routes6]] subnet="fd00:144::/64"；
+#      注入 v6/UDP dst=fd00:144::6（校验和完整、总长 ≤1200）→ Mesh → N1 原始转发。
+#      反例（无 v6 路由）由 fake N1Sender 的 send_to_mesh 失败表达：
+#      "删 routes6" 会同时删掉 mesh CIDR，包将改走 v6 bypass（见 ac6_no_routes6）。
+# AC7：fc00::5 → Direct；2001:db8::20 → Proxy（burst 10 包）；ff02::1 → 多播只计数。
+# AC10：6 类包 ×10 = 60 包（正常 UDP/正常 TCP/ICMPv6/ESP/分片首片+非首片/截断），
+#       通用 dropped 不增。
+# AC16：ipv6_paths 组合（有/无 routes6）与 /dataplane/stats 暴露。
+
+[when]
+command = "cargo run --quiet -p nexusd --example ipv6_dataplane_e4 -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# ===== AC6：v6 Mesh UDP 原始转发 =====
+[[expect]]
+field = "sections.ac6.ipv6.packets"
+equals = 1
+
+[[expect]]
+field = "sections.ac6.ipv6.udp"
+equals = 1
+
+[[expect]]
+field = "sections.ac6.ipv6.classified_mesh"
+equals = 1
+
+[[expect]]
+field = "sections.ac6.ipv6.mesh_forwarded"
+equals = 1
+
+[[expect]]
+field = "sections.ac6.dropped"
+equals = 0
+
+[[expect]]
+field = "sections.ac6.sender.frames"
+equals = 1
+
+[[expect]]
+field = "sections.ac6.sender.dst"
+equals = "fd00:144::6"
+
+[[expect]]
+field = "sections.ac6.sender.bytes_match"
+equals = true
+
+# AC6 反例：有 CIDR、N1 桥无 v6 路由 → mesh_no_route 且 mesh_dropped_no_n1 同步 +1。
+[[expect]]
+field = "sections.ac6_no_route.ipv6.classified_mesh"
+equals = 1
+
+[[expect]]
+field = "sections.ac6_no_route.ipv6.mesh_no_route"
+equals = 1
+
+[[expect]]
+field = "sections.ac6_no_route.ipv6.mesh_forwarded"
+equals = 0
+
+[[expect]]
+field = "sections.ac6_no_route.mesh_dropped_no_n1"
+equals = 1
+
+[[expect]]
+field = "sections.ac6_no_route.dropped"
+equals = 0
+
+# AC6 补充：删掉 routes6 → 同一目的不再分类为 Mesh（ULA 落 bypass → Direct）。
+[[expect]]
+field = "sections.ac6_no_routes6.ipv6.classified_mesh"
+equals = 0
+
+[[expect]]
+field = "sections.ac6_no_routes6.ipv6.classified_direct"
+equals = 1
+
+[[expect]]
+field = "sections.ac6_no_routes6.ipv6.mesh_no_route"
+equals = 0
+
+[[expect]]
+field = "sections.ac6_no_routes6.paths.mesh"
+equals = "unsupported"
+
+# ===== AC7：Direct / Proxy 阻断 / 多播 =====
+[[expect]]
+field = "sections.ac7.ipv6.packets"
+equals = 12
+
+[[expect]]
+field = "sections.ac7.ipv6.classified_direct"
+equals = 1
+
+[[expect]]
+field = "sections.ac7.direct_forwarded_delta"
+equals = 1
+
+[[expect]]
+field = "sections.ac7.ipv6.classified_proxy"
+equals = 10
+
+[[expect]]
+field = "sections.ac7.ipv6.proxy_dropped"
+equals = 10
+
+[[expect]]
+field = "sections.ac7.ipv6.multicast"
+equals = 1
+
+[[expect]]
+field = "sections.ac7.dropped"
+equals = 0
+
+[[expect]]
+field = "sections.ac7.paths.proxy_udp"
+equals = "blocked"
+
+# 限流（burst 计数法，N=10）：10 个同 dst 代理包只产生 1 行
+# `ipv6_proxy_unsupported`，且计数不随限流丢失（proxy_dropped=10 见上）。
+[[expect]]
+field = "sections.ac7.log.by_event.ipv6_proxy_unsupported"
+equals = 1
+
+[[expect]]
+field = "sections.ac7.log.max_per_event_key"
+equals = 1
+
+# ===== AC10：0x86DD 无静默丢弃（6 类 × 10 = 60）=====
+[[expect]]
+field = "sections.ac10.ipv6.packets"
+equals = 60
+
+[[expect]]
+field = "sections.ac10.ipv6.udp"
+equals = 15
+
+[[expect]]
+field = "sections.ac10.ipv6.tcp"
+equals = 10
+
+[[expect]]
+field = "sections.ac10.ipv6.classified_mesh"
+equals = 20
+
+[[expect]]
+field = "sections.ac10.ipv6.classified_direct"
+equals = 0
+
+[[expect]]
+field = "sections.ac10.ipv6.classified_proxy"
+equals = 30
+
+[[expect]]
+field = "sections.ac10.ipv6.mesh_forwarded"
+equals = 20
+
+[[expect]]
+field = "sections.ac10.ipv6.mesh_no_route"
+equals = 0
+
+[[expect]]
+field = "sections.ac10.ipv6.proxy_dropped"
+equals = 30
+
+[[expect]]
+field = "sections.ac10.ipv6.multicast"
+equals = 0
+
+[[expect]]
+field = "sections.ac10.ipv6.dropped_truncated"
+equals = 10
+
+[[expect]]
+field = "sections.ac10.ipv6.dropped_extension"
+equals = 0
+
+[[expect]]
+field = "sections.ac10.ipv6.fragments"
+equals = 10
+
+[[expect]]
+field = "sections.ac10.dropped"
+equals = 0
+
+# 每 (event, 判别字段) 的日志行数 ≤1。
+[[expect]]
+field = "sections.ac10.log.max_per_event_key"
+equals = 1
+
+[[expect]]
+field = "sections.ac10.log.by_event.ipv6_ext_unsupported"
+equals = 1
+
+# ===== AC16：能力表 =====
+[[expect]]
+field = "sections.ac16.without_routes6.mesh"
+equals = "unsupported"
+
+[[expect]]
+field = "sections.ac16.with_routes6.mesh"
+equals = "supported"
+
+[[expect]]
+field = "sections.ac16.with_routes6.direct"
+equals = "supported"
+
+[[expect]]
+field = "sections.ac16.with_routes6.proxy_tcp"
+equals = "supported"
+
+[[expect]]
+field = "sections.ac16.with_routes6.proxy_udp"
+equals = "blocked"
+
+[[expect]]
+field = "sections.ac16.with_routes6.tun_address"
+equals = "unassigned"
+
+[[expect]]
+field = "sections.ac16.with_routes6.nat"
+equals = "unsupported"
+
+[[expect]]
+field = "sections.ac16.stats.ipv6_paths.mesh"
+equals = "supported"
+
+[[expect]]
+field = "sections.ac16.stats.ipv6_paths.proxy_udp"
+equals = "blocked"
+
+[[expect]]
+field = "sections.ac16.stats.ingress_ip_family"
+equals = "dual-stack"

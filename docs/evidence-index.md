@@ -52,6 +52,7 @@
 | product.bandwidth-qos | v9-connectivity | nexus-harness run | PRODUCT.md#12-bandwidth-qos | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.boost-v1 | n1-fabric | cargo -p nexus-projection | docs/DAEMON_ARCHITECTURE.md#12 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.bootstrap-join | v9-connectivity | cargo -p nexus-harness | PRODUCT.md#bootstrap-join | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.cac1-proxy-v6-echo | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.certificate-manager | v9-connectivity | cargo -p nexus | PRODUCT.md#12-certificate-manager | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.cli-compute-jobs | v9-connectivity | cargo -p nexus | PRODUCT.md#9-observability | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.cli-connectivity-candidates | v9-connectivity | cargo -p nexus | PRODUCT.md#9-observability | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
@@ -94,10 +95,15 @@
 | product.discovery-mdns | v9-connectivity | cargo -p nexus | DESIGN.md#8.2 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.discovery-static | v9-connectivity | cargo -p nexus | DESIGN.md#8.2 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.disjoint | v9-connectivity | cargo -p nexus | PRODUCT.md#12-disjoint | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.dns-degradation | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.dns-exit-binding | v9-connectivity | cargo -p nexus | PRODUCT.md#network | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.dns-fake-ip-aaaa-nodata | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
+| product.dns-fake-ip-roundtrip | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.dns-ipcidr-rule | v9-connectivity | cargo -p nexus | PRODUCT.md#11-proxy-kernel | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.dns-mesh-names | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.dns-rule-server-selection | v9-connectivity | cargo -p nexus | PRODUCT.md#11-dns | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.dns-unified | n1-fabric | nexus-harness run | DAEMON_ARCHITECTURE.md#10 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.dns-upstream-real | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.ecmp | v9-connectivity | cargo -p nexus | PRODUCT.md#12-ecmp | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.fabric-conn-basic | n1-fabric | cargo -p nexus-fabric | docs/foundation/DESIGN.md#3 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.fabric-conn-roam | n1-fabric | cargo -p nexus-fabric | docs/foundation/DESIGN.md#3 | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
@@ -137,6 +143,8 @@
 | product.hole-punch-multi | v9-connectivity | cargo -p nexus | PRODUCT.md#12-holepunch-multi | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.identity-auto-exchange | v9-connectivity | cargo -p nexus | PRODUCT.md#12-identity-auto-exchange | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.internet-access-flow | v9-connectivity | cargo -p nexus | PRODUCT.md#network | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.ipv6-dataplane | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#6 | unrecorded |
+| product.ipv6-tcp-termination | n1-fabric | cargo -p nexusd | DAEMON_ARCHITECTURE.md#10 | unrecorded |
 | product.k-shortest | v9-connectivity | cargo -p nexus | PRODUCT.md#12-k-shortest | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.link-encryption | v9-connectivity | cargo -p nexus | PRODUCT.md#remote | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.log-level | v9-connectivity | cargo -p nexus | PRODUCT.md#12-log-level | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |

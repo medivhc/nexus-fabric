@@ -97,6 +97,126 @@ fn mask(prefix: u8) -> u32 {
     }
 }
 
+/// 双栈 CIDR 块（v4 + v6 统一类型，R3 WP-V6-A）。
+///
+/// 与 [`Cidr`] 并存：`Cidr` 是 v4 专用历史类型（`SimpleRuleEngine`/`egress`
+/// 仍用），本类型服务 `PacketClassifier` / `DataplaneConfig` 的双栈匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpCidr {
+    /// IPv4 网段（network 已按 prefix 掩掉主机位）。
+    V4 {
+        /// 网络地址（主机位已清零）。
+        network: u32,
+        /// 前缀长度（0..=32）。
+        prefix: u8,
+    },
+    /// IPv6 网段（network 已按 prefix 掩掉主机位）。
+    V6 {
+        /// 网络地址（主机位已清零）。
+        network: u128,
+        /// 前缀长度（0..=128）。
+        prefix: u8,
+    },
+}
+
+impl IpCidr {
+    /// 构造 IPv4 网段；`prefix > 32` → `None`（主机位被掩掉）。
+    #[must_use]
+    pub fn new_v4(addr: u32, prefix: u8) -> Option<Self> {
+        if prefix > 32 {
+            return None;
+        }
+        Some(Self::V4 {
+            network: addr & mask(prefix),
+            prefix,
+        })
+    }
+
+    /// 构造 IPv6 网段；`prefix > 128` → `None`（主机位被掩掉）。
+    #[must_use]
+    pub fn new_v6(addr: u128, prefix: u8) -> Option<Self> {
+        if prefix > 128 {
+            return None;
+        }
+        Some(Self::V6 {
+            network: addr & mask6(prefix),
+            prefix,
+        })
+    }
+
+    /// `ip` 是否落在本网段内（族不同 → false）。
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (Self::V4 { network, prefix }, IpAddr::V4(ip)) => {
+                (u32::from(ip) & mask(*prefix)) == *network
+            }
+            (Self::V6 { network, prefix }, IpAddr::V6(ip)) => {
+                (u128::from(ip) & mask6(*prefix)) == *network
+            }
+            _ => false,
+        }
+    }
+
+    /// 是否 IPv4 网段。
+    #[must_use]
+    pub fn is_v4(&self) -> bool {
+        matches!(self, Self::V4 { .. })
+    }
+
+    /// 前缀长度（v4 0..=32，v6 0..=128）。
+    #[must_use]
+    pub fn prefix(&self) -> u8 {
+        match self {
+            Self::V4 { prefix, .. } | Self::V6 { prefix, .. } => *prefix,
+        }
+    }
+}
+
+impl std::fmt::Display for IpCidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V4 { network, prefix } => {
+                write!(f, "{}/{}", std::net::Ipv4Addr::from(*network), prefix)
+            }
+            Self::V6 { network, prefix } => {
+                write!(f, "{}/{}", std::net::Ipv6Addr::from(*network), prefix)
+            }
+        }
+    }
+}
+
+/// 解析 `"10.0.0.0/8"` / `"fd00:144::/64"`（两族同形，主机位被掩掉）。
+impl FromStr for IpCidr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (ip_part, prefix_part) = s
+            .split_once('/')
+            .ok_or_else(|| format!("missing '/' in {s:?}"))?;
+        let prefix: u8 = prefix_part
+            .parse()
+            .map_err(|_| format!("bad prefix in {s:?}"))?;
+        let addr: IpAddr = ip_part
+            .parse()
+            .map_err(|_| format!("bad IP address in {s:?}"))?;
+        match addr {
+            IpAddr::V4(v4) => IpCidr::new_v4(u32::from(v4), prefix)
+                .ok_or_else(|| format!("prefix out of range in {s:?}")),
+            IpAddr::V6(v6) => IpCidr::new_v6(u128::from(v6), prefix)
+                .ok_or_else(|| format!("prefix out of range in {s:?}")),
+        }
+    }
+}
+
+fn mask6(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
 /// Format a u32 as dotted-decimal IPv4.
 pub fn format_ipv4(ip: u32) -> String {
     format!(
@@ -309,6 +429,68 @@ mod tests {
         assert!(!single.contains(0x01020305));
         assert!("10.0.0.0/33".parse::<Cidr>().is_err());
         assert!("not-a-cidr".parse::<Cidr>().is_err());
+    }
+
+    #[test]
+    fn ip_cidr_v4_parse_and_contains() {
+        let c: IpCidr = "10.0.0.0/8".parse().unwrap();
+        assert!(c.is_v4());
+        assert_eq!(c.prefix(), 8);
+        assert!(c.contains("10.1.2.3".parse::<IpAddr>().unwrap()));
+        assert!(!c.contains("11.1.2.3".parse::<IpAddr>().unwrap()));
+        // 非规范输入（主机位非零）→ 掩掉后仍匹配该网段。
+        let loose: IpCidr = "10.9.9.9/8".parse().unwrap();
+        assert_eq!(loose, "10.0.0.0/8".parse::<IpCidr>().unwrap());
+        assert!(loose.contains("10.255.255.255".parse::<IpAddr>().unwrap()));
+        // /32 单机。
+        let single: IpCidr = "1.2.3.4/32".parse().unwrap();
+        assert!(single.contains("1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert!(!single.contains("1.2.3.5".parse::<IpAddr>().unwrap()));
+        // /0 全匹配。
+        let all: IpCidr = "0.0.0.0/0".parse().unwrap();
+        assert!(all.contains("1.2.3.4".parse::<IpAddr>().unwrap()));
+        // 前缀越界 / 非法输入。
+        assert!("10.0.0.0/33".parse::<IpCidr>().is_err());
+        assert!("not-a-cidr".parse::<IpCidr>().is_err());
+        assert!("10.0.0.0".parse::<IpCidr>().is_err());
+        // 族不同 → false。
+        assert!(!c.contains("::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn ip_cidr_v6_prefixes() {
+        // /0：全匹配 v6，不匹配 v4。
+        let all: IpCidr = "::/0".parse().unwrap();
+        assert!(all.contains("2001:db8::20".parse::<IpAddr>().unwrap()));
+        assert!(!all.contains("1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert_eq!(all.prefix(), 0);
+
+        // /64：标准 mesh 网段。
+        let mesh: IpCidr = "fd00:144::/64".parse().unwrap();
+        assert!(mesh.contains("fd00:144::6".parse::<IpAddr>().unwrap()));
+        assert!(!mesh.contains("fd00:145::6".parse::<IpAddr>().unwrap()));
+
+        // /128：单地址。
+        let single: IpCidr = "::1/128".parse().unwrap();
+        assert!(single.contains("::1".parse::<IpAddr>().unwrap()));
+        assert!(!single.contains("::2".parse::<IpAddr>().unwrap()));
+
+        // fc00::/7：ULA（fd00::/8 也在内）。
+        let ula: IpCidr = "fc00::/7".parse().unwrap();
+        assert!(ula.contains("fc00::5".parse::<IpAddr>().unwrap()));
+        assert!(ula.contains("fd00:144::6".parse::<IpAddr>().unwrap()));
+        assert!(!ula.contains("fe80::1".parse::<IpAddr>().unwrap()));
+
+        // 非规范输入（主机位非零）→ 掩掉。
+        let loose: IpCidr = "fd00:144::abcd/64".parse().unwrap();
+        assert_eq!(loose, "fd00:144::/64".parse::<IpCidr>().unwrap());
+        assert_eq!(loose.to_string(), "fd00:144::/64");
+
+        // 前缀越界。
+        assert!("fd00::/129".parse::<IpCidr>().is_err());
+        assert!(IpCidr::new_v6(0, 129).is_none());
+        assert!(IpCidr::new_v4(0, 33).is_none());
+        assert!(IpCidr::new_v4(0x0A00_0000, 8).unwrap().is_v4());
     }
 
     #[test]

@@ -360,7 +360,7 @@ fn run_case(password: &str, probe_field: Option<bool>, flows: u16, echo: SocketA
             proxy_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config)
+        let mut dp = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None)
             .map_err(|e| format!("dataplane init: {e}"))?;
         let rule_engine = nexus_proxy::domain_engine::DomainRuleEngine::from_yaml(&proxy_yaml)
             .map_err(|e| format!("rule engine: {e}"))?;

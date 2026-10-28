@@ -262,7 +262,7 @@ fn run() -> serde_json::Value {
         proxy_configured: true,
         ..Default::default()
     };
-    let mut dp = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config) {
+    let mut dp = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None) {
         Ok(dp) => dp,
         Err(error) => return fail(format!("dataplane init: {error}")),
     };
