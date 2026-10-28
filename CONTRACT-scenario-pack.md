@@ -30,6 +30,7 @@
   - 其余 → `"sandbox"`。
 - 无 `[when].command` 的静态契约场景同样列出（agent 可见但不可执行；
   `scenario run` 对其返回 `BLOCKED`）。
+- `carrier` 为新增字段（执行载体所属栈，闭集 5 值），既有字段的语义不变。
 
 ### 2. `nexus-harness scenario run <name> --json`
 

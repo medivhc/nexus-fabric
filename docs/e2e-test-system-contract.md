@@ -32,6 +32,7 @@
 | `[when].command` | string | 否 | 被测命令；缺省→静态契约（UNKNOWN） |
 | `[[expect]]` | array | 否 | 断言：`equals` / `one_of` / `non_empty`；缺省→仅命令 smoke |
 | `requirement` | string | 否 | 文档标注（指向 PRODUCT.md 锚点），**parser 不解析**，仅供人类阅读 |
+| `carrier` | string | 是 | 执行载体所属栈，**闭集 5 值**：`v9-connectivity` / `n1-fabric` / `shared-leaf` / `engineering` / `external`。加载期校验：缺失、非字符串、非闭集值，或与 `[when].command` 的派生载体不一致 → 拒绝加载（见 §4 规则 6） |
 
 ## 3. 分层证据模型
 
@@ -50,6 +51,7 @@
 3. `verify --full` 的 `product-scenarios` gate 并行跑全部 product/engineering/platform 场景。
 4. 未实现的 gate 记 UNKNOWN，不静默跳过。
 5. 场景文件必须声明 `schema_version = 1`（缺省或非 1 时 `load_all` 拒绝加载并打印诊断，不静默丢弃）。
+6. `carrier` 缺失、非法或与命令派生值不一致 → 场景加载失败；场景门与 `scenario list` 一律 fail-closed（`run_gate` FAIL、`list` BLOCKED），**不静默跳过该场景**。只有部分场景坏掉时门禁同样是 FAIL，不会因为「少跑几个」而 PASS。
 
 ## 4b. 判定值枚举（verdicts）
 
@@ -110,8 +112,9 @@
 
 | 命令 | 用途 | 判定值 |
 |------|------|--------|
-| `scenario list` | 列出全部场景（输出字段：`name`/`subdir`/`summary`/`requires`，`scenario_cmd.rs:51`） | PASS |
+| `scenario list` | 列出全部场景（输出字段：`name`/`subdir`/`summary`/`requires`/`carrier`，`scenario_cmd.rs:51`） | PASS |
 | `scenario run <id>` | 单场景执行，输出失败签名 | PASS/FAIL/UNKNOWN/BLOCKED |
+| `scenario index [--write\|--check]` | 生成/校验仓库内证据索引 `docs/evidence-index.md`（场景 ↔ carrier；`--check` 与 `architecture_gate` 共用 `evidence_index::check`） | PASS/FAIL |
 
 ## 6. 示例（可直接使用）
 
