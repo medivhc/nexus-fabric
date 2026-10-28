@@ -2831,12 +2831,13 @@ mod tests {
             }
         }
         // fixes-5 合并注记：master 287 + fixes-5 新增 product.proxy-trojan-fallback-rejected 场景 1 = 288。
-        assert_eq!(parseable, 288, "288 cargo-run [when].command");
+        // P3 合并注记：+ product.qos-cake-enabled-path（cargo run -p nexusd --example）= 289。
+        assert_eq!(parseable, 289, "289 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 266, "all declared targets resolve to Direct");
+        assert_eq!(direct, 267, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -2875,10 +2876,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            210,
-            "206 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            211,
+            "207 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 206);
+        assert_eq!(examples.len(), 207);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(
