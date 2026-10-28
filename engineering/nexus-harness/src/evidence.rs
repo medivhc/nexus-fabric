@@ -1058,7 +1058,7 @@ mod tests {
             &base.scenarios_dir,
             &["product", "engineering", "platform", "regression"],
         );
-        assert_eq!(loaded.len(), 338, "repository scenario count");
+        assert_eq!(loaded.len(), 345, "repository scenario count");
         let scenarios: Vec<ScenarioResult> = loaded
             .iter()
             .map(|s| carrier_result(&s.id, s.carrier))

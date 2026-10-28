@@ -3060,7 +3060,7 @@ mod tests {
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 273, "all declared targets resolve to Direct");
+        assert_eq!(direct, 274, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -3099,8 +3099,8 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            213,
-            "209 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            214,
+            "210 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
         assert_eq!(examples.len(), 209);
         assert_eq!(bins.len(), 4);
