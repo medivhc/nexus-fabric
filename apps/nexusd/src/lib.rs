@@ -18,6 +18,7 @@ pub mod dns_status;
 pub mod dns_upstream;
 /// 热路径日志限频（per `(tag, cause)`；PRODUCT hot-path 契约）。
 mod log_throttle;
+pub mod nat_consumer;
 pub mod nat_gather;
 pub mod nat_relay;
 pub mod nat_status;
