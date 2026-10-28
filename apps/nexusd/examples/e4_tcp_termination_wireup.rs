@@ -12,7 +12,7 @@
 //! 清理：TUN 设备随进程退出自动删除；路由需手动确认（见输出）。
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use nexusd::dataplane::{Dataplane, DataplaneConfig};
 use serde_json::json;
 
 /// 捕获的 STREAM 帧（目标地址，原始包）。
-type CapturedFrames = Vec<(Ipv4Addr, Vec<u8>)>;
+type CapturedFrames = Vec<(IpAddr, Vec<u8>)>;
 
 /// 捕获 N1Sender：记录 STREAM 帧（E4 验证 S4/S5/S6）。
 struct CaptureSender {
@@ -30,7 +30,7 @@ struct CaptureSender {
 }
 
 impl nexus_network::n1::bridge::N1Sender for CaptureSender {
-    fn send_to_mesh(&self, dst: Ipv4Addr, packet: &[u8]) -> Result<(), nexus_network::n1::N1Error> {
+    fn send_to_mesh(&self, dst: IpAddr, packet: &[u8]) -> Result<(), nexus_network::n1::N1Error> {
         self.frames.lock().unwrap().push((dst, packet.to_vec()));
         Ok(())
     }

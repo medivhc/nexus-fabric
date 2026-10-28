@@ -21,7 +21,7 @@ use serde_json::json;
 struct AcceptAllN1Sender;
 
 impl N1Sender for AcceptAllN1Sender {
-    fn send_to_mesh(&self, _dst: Ipv4Addr, _packet: &[u8]) -> Result<(), N1Error> {
+    fn send_to_mesh(&self, _dst: IpAddr, _packet: &[u8]) -> Result<(), N1Error> {
         Ok(())
     }
 }

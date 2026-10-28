@@ -175,7 +175,7 @@ fn run() -> serde_json::Value {
     impl nexus_network::n1::bridge::N1Sender for MockN1Sender {
         fn send_to_mesh(
             &self,
-            _dst: std::net::Ipv4Addr,
+            _dst: std::net::IpAddr,
             _packet: &[u8],
         ) -> Result<(), nexus_network::n1::N1Error> {
             Ok(())

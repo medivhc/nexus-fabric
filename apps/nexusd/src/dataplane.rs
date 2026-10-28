@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -1474,7 +1474,7 @@ impl Dataplane {
             Classification::Mesh { .. } => {
                 if self.config.n1_configured {
                     // W1：N1 真发（发送器已注入时）；失败则计数 mesh_dropped_no_n1。
-                    let sent = match (&self.n1_sender, ipv4_dst_of(&packet)) {
+                    let sent = match (&self.n1_sender, ip_dst_of(&packet)) {
                         (Some(sender), Some(dst)) => sender.send_to_mesh(dst, &packet).is_ok(),
                         _ => false,
                     };
@@ -1774,7 +1774,7 @@ impl Dataplane {
         match classification {
             Classification::Mesh { .. } => {
                 if self.config.n1_configured {
-                    let sent = match (&self.n1_sender, ipv4_dst_of(packet)) {
+                    let sent = match (&self.n1_sender, ip_dst_of(packet)) {
                         (Some(sender), Some(dst)) => sender.send_to_mesh(dst, packet).is_ok(),
                         _ => false,
                     };
@@ -1878,7 +1878,7 @@ impl Dataplane {
                 // S5-Mesh：STREAM DATA 帧经 N1 发送。
                 let frame = encode_stream_frame(stream_id, 0x00, bytes);
                 let n = bytes.len() as u64;
-                if self.send_mesh_tcp_frame(*info.dst.ip(), &frame) {
+                if self.send_mesh_tcp_frame((*info.dst.ip()).into(), &frame) {
                     self.with_stats(|s| s.mesh_tcp_bytes += n);
                 }
             }
@@ -2118,7 +2118,7 @@ impl Dataplane {
     fn handle_tcp_terminated(&mut self, packet: &[u8], classification: &Classification) {
         let peer = match classification {
             Classification::Mesh { path: Some(p), .. } => p.to_string(),
-            Classification::Mesh { path: None, .. } => ipv4_dst_of(packet)
+            Classification::Mesh { path: None, .. } => ip_dst_of(packet)
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
             Classification::Proxy { .. } => "proxy".to_string(),
@@ -2218,7 +2218,7 @@ impl Dataplane {
                         // S4-Mesh：STREAM SYN 帧经 N1 发送（按原始目的路由）。
                         let payload = encode_syn_payload(&dst.ip().to_string(), dst.port());
                         let frame = encode_stream_frame(stream_id, STREAM_SYN, &payload);
-                        self.send_mesh_tcp_frame(*dst.ip(), &frame);
+                        self.send_mesh_tcp_frame((*dst.ip()).into(), &frame);
                     }
                 }
                 TcpEvent::Data {
@@ -2254,7 +2254,7 @@ impl Dataplane {
                             // S6-Mesh：STREAM FIN/RST 帧经 N1 发送。
                             let flag = if reset { STREAM_RST } else { STREAM_FIN };
                             let frame = encode_stream_frame(stream_id, flag, &[]);
-                            self.send_mesh_tcp_frame(*info.dst.ip(), &frame);
+                            self.send_mesh_tcp_frame((*info.dst.ip()).into(), &frame);
                         }
                         // S6-Proxy：S4 已计流数，无额外动作。
                     }
@@ -2270,7 +2270,7 @@ impl Dataplane {
     ///
     /// 成功 → `mesh_tcp_frames += 1`；失败（无 sender/无路由/发送错）→
     /// `mesh_dropped_no_n1 += 1`（W1 语义复用）。
-    fn send_mesh_tcp_frame(&mut self, dst: Ipv4Addr, frame: &[u8]) -> bool {
+    fn send_mesh_tcp_frame(&mut self, dst: IpAddr, frame: &[u8]) -> bool {
         let sent = match &self.n1_sender {
             Some(sender) => sender.send_to_mesh(dst, frame).is_ok(),
             None => false,
@@ -2384,14 +2384,19 @@ fn parse_cidr(s: &str) -> Result<Cidr, String> {
     Cidr::new(bits, prefix).ok_or_else(|| format!("invalid CIDR {s}"))
 }
 
-/// 从 IPv4 包提取目的地址。
-fn ipv4_dst_of(packet: &[u8]) -> Option<Ipv4Addr> {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return None;
+/// 从 IP 包提取目的地址（v4/v6；v6 只读固定头，扩展头不参与 N1 目的路由）。
+fn ip_dst_of(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first().map(|b| b >> 4) {
+        Some(4) if packet.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
+            packet[16], packet[17], packet[18], packet[19],
+        ))),
+        Some(6) if packet.len() >= 40 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[24..40]);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
     }
-    Some(Ipv4Addr::new(
-        packet[16], packet[17], packet[18], packet[19],
-    ))
 }
 
 /// 判断是否为 TCP 包（IPv4 + proto 6；S1 终结范围判定）。
@@ -3193,12 +3198,12 @@ mod tests {
     }
 
     /// N1Sender 捕获的帧：(目的 IP, STREAM 帧字节)。
-    type CapturedFrames = Arc<Mutex<Vec<(Ipv4Addr, Vec<u8>)>>>;
+    type CapturedFrames = Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>>;
 
     impl N1Sender for TestN1Sender {
         fn send_to_mesh(
             &self,
-            dst: Ipv4Addr,
+            dst: IpAddr,
             packet: &[u8],
         ) -> Result<(), nexus_network::n1::N1Error> {
             self.frames.lock().unwrap().push((dst, packet.to_vec()));
@@ -3406,7 +3411,7 @@ mod tests {
         let captured = frames.lock().unwrap();
         assert_eq!(captured.len(), 1, "S4: one STREAM SYN frame sent");
         let (dst, frame) = &captured[0];
-        assert_eq!(*dst, Ipv4Addr::new(10, 200, 0, 5));
+        assert_eq!(*dst, IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5)));
         let (sid, flags, _payload) = decode_stream_frame(frame).expect("decode");
         assert_eq!(flags, STREAM_SYN, "S4: SYN flag");
         assert_eq!(dp.stats().mesh_tcp_frames, 1);

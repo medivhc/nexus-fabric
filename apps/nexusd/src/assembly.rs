@@ -126,6 +126,7 @@ pub fn assemble_n1_with_discovery(
     let bridge = Arc::new(N1MeshBridge::new(
         Arc::clone(&sessions),
         config.vpi.routes.clone(),
+        config.vpi.routes6.clone(),
     ));
     eprintln!(
         "[nexusd] N1 bridge assembled: {} routes",

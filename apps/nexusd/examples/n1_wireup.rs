@@ -24,7 +24,7 @@ use serde_json::json;
 /// Mock N1 发送器：记录收到的包；可配置路由表与失败模式。
 struct MockN1Sender {
     /// 记录 (dst, packet)。
-    sent: Mutex<Vec<(Ipv4Addr, Vec<u8>)>>,
+    sent: Mutex<Vec<(IpAddr, Vec<u8>)>>,
     /// 有路由的网段（如 "10.99.0.0/16"）。
     routed_cidr: (u32, u8),
     /// 为 true 时 send 返回 Err（模拟无连接）。
@@ -48,7 +48,10 @@ impl MockN1Sender {
         }
     }
 
-    fn contains(&self, ip: Ipv4Addr) -> bool {
+    fn contains(&self, ip: IpAddr) -> bool {
+        let IpAddr::V4(ip) = ip else {
+            return false;
+        };
         let (net, prefix) = self.routed_cidr;
         let mask = if prefix == 0 {
             0
@@ -68,7 +71,7 @@ impl MockN1Sender {
 }
 
 impl N1Sender for MockN1Sender {
-    fn send_to_mesh(&self, dst: Ipv4Addr, packet: &[u8]) -> Result<(), N1Error> {
+    fn send_to_mesh(&self, dst: IpAddr, packet: &[u8]) -> Result<(), N1Error> {
         if !self.contains(dst) {
             return Err(N1Error::PeerUnknown);
         }
