@@ -13077,80 +13077,208 @@ mod hysteria2_dataplane_tests {
         port
     }
 
+    /// How the local app side saw the relay end.
+    #[derive(Debug, PartialEq)]
+    enum PeerEnd {
+        Closed,
+        Payload(Vec<u8>),
+        StillOpen,
+    }
+
+    /// Runs `hysteria2_pump_stream` (fast-open) for a stream to `dest` on its
+    /// own thread, with `peer` as the local app. Panics if the pump is still
+    /// running after `watchdog`. The relayed socket stays open until the peer
+    /// returns, so any close the peer observes was made by the pump itself.
+    fn run_fast_open_relay<T: Send + 'static>(
+        port: u16,
+        dest: &str,
+        watchdog: std::time::Duration,
+        peer: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
+    ) -> ((usize, usize), std::time::Duration, T) {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use std::time::Instant;
+
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(port)).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        assert!(target.fast_open, "these tests cover the fast-open path");
+        let mut hy2 = Hysteria2Client::connect(&target).unwrap();
+        let stream = hy2.open_tcp(dest).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = std::thread::spawn(move || peer(std::net::TcpStream::connect(addr).unwrap()));
+        let (mut relayed, _) = listener.accept().unwrap();
+        relayed.set_nonblocking(true).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let counts = hysteria2_pump_stream(&mut hy2, stream, true, &mut relayed);
+            let _ = tx.send((counts, started.elapsed(), relayed, hy2));
+        });
+        let (counts, elapsed, relayed, mut hy2) = rx
+            .recv_timeout(watchdog)
+            .unwrap_or_else(|e| panic!("relay to {dest} still running after {watchdog:?}: {e}"));
+        let seen = app.join().unwrap();
+        drop(relayed);
+        hy2.close();
+        (counts, elapsed, seen)
+    }
+
+    /// App side that writes `upload` once and then waits (up to `give_up`)
+    /// for the relay to end, collecting whatever arrives.
+    fn write_then_wait(
+        upload: &'static [u8],
+        give_up: std::time::Duration,
+    ) -> impl FnOnce(std::net::TcpStream) -> PeerEnd + Send + 'static {
+        move |mut s| {
+            use std::io::{Read, Write};
+            s.set_read_timeout(Some(give_up)).unwrap();
+            let _ = s.write_all(upload);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return PeerEnd::StillOpen;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if got.is_empty() {
+                PeerEnd::Closed
+            } else {
+                PeerEnd::Payload(got)
+            }
+        }
+    }
+
     /// Real servers answer the fast-open TCPRequest one RTT (plus their
     /// upstream dial) after the stream opens. A fixed 50 ms first-read guard
     /// aborted every connection to a server more than ~25 ms away
     /// (reproduced: RTT 120 ms -> abort at 54 ms, 0 bytes).
     #[test]
     fn hysteria2_relay_survives_a_slow_tcp_response() {
-        use nexus_outbound_hysteria2::Hysteria2Client;
         use nexus_outbound_hysteria2::test_server::TestServer;
         use std::io::{Read, Write};
         use std::time::Duration;
 
         let server = TestServer::spawn("secret123", true).unwrap();
         let port = spawn_delay_relay(server.addr, Duration::from_millis(60));
-        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(port)).unwrap();
-        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
-        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
-        let mut hy2 = Hysteria2Client::connect(&target).unwrap();
-        let stream = hy2.open_tcp("example.com:80").unwrap();
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = std::thread::spawn(move || {
-            let mut s = std::net::TcpStream::connect(addr).unwrap();
-            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            s.write_all(b"hello-over-latency").unwrap();
-            let mut got = Vec::new();
-            let mut buf = [0u8; 64];
-            while got.len() < 18 {
-                match s.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => got.extend_from_slice(&buf[..n]),
+        let (counts, _, got) =
+            run_fast_open_relay(port, "example.com:80", Duration::from_secs(20), |mut s| {
+                s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                s.write_all(b"hello-over-latency").unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 64];
+                while got.len() < 18 {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
                 }
-            }
-            got
-        });
-        let (mut relayed, _) = listener.accept().unwrap();
-        relayed.set_nonblocking(true).unwrap();
-        let (up, down) = hysteria2_pump_stream(&mut hy2, stream, true, &mut relayed);
-        drop(relayed);
-        assert_eq!(app.join().unwrap(), b"hello-over-latency");
-        assert_eq!((up, down), (18, 18));
-        hy2.close();
+                got
+            });
+        assert_eq!(got, b"hello-over-latency");
+        assert_eq!(counts, (18, 18));
     }
 
+    /// A response that arrives seconds late is still a response: upload written
+    /// before it must not be lost, and the echo must come back afterwards.
+    #[test]
+    fn hysteria2_late_tcp_response_still_relays_the_earlier_upload() {
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let (counts, elapsed, got) = run_fast_open_relay(
+            server.addr.port(),
+            "late.test:1",
+            Duration::from_secs(20),
+            |mut s| {
+                s.set_read_timeout(Some(Duration::from_secs(12))).unwrap();
+                s.write_all(b"sent-before-response").unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 64];
+                while got.len() < 20 {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                got
+            },
+        );
+        assert_eq!(
+            got, b"sent-before-response",
+            "echo after a 3 s late response"
+        );
+        assert_eq!(counts, (20, 20));
+        assert!(
+            elapsed >= Duration::from_millis(2900),
+            "the echo cannot precede the late response, relay ended after {elapsed:?}"
+        );
+    }
+
+    /// While the response is outstanding the upload keeps flowing to the
+    /// server; only the 10 s response deadline (counted from the start of the
+    /// relay, not reset by upload progress) ends a relay whose server never
+    /// answers, and nothing is ever sent downstream.
     #[test]
     fn hysteria2_missing_tcp_response_aborts_after_the_response_deadline() {
-        use nexus_outbound_hysteria2::Hysteria2Client;
         use nexus_outbound_hysteria2::test_server::TestServer;
-        use std::io::Read;
-        use std::net::TcpListener;
+        use std::io::{Read, Write};
         use std::time::{Duration, Instant};
 
         let server = TestServer::spawn("secret123", true).unwrap();
-        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(server.addr.port())).unwrap();
-        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
-        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
-
-        let mut client = Hysteria2Client::connect(&target).unwrap();
-        // 第一条 stream 占住 server 的 TCP 处理循环（它读而不发数据），
-        // 第二条 stream 的 TCPResponse 因而永远不会到达。
-        let _first = client.open_tcp("first.example:80").unwrap();
-        let second = client.open_tcp("second.example:80").unwrap();
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut peer = std::net::TcpStream::connect(addr).unwrap();
-        let mut down_client = listener.accept().unwrap().0;
-        down_client.set_nonblocking(true).unwrap();
-
-        let started = Instant::now();
-        let counts = hysteria2_pump_stream(&mut client, second, true, &mut down_client);
-        let elapsed = started.elapsed();
-
-        assert_eq!(counts, (0, 0), "no response: nothing is forwarded");
+        let (counts, elapsed, (written, end)) = run_fast_open_relay(
+            server.addr.port(),
+            "hold.test:1",
+            Duration::from_secs(25),
+            |mut s| {
+                // One byte every 500 ms until the relay closes the app side.
+                s.set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let give_up = Instant::now() + Duration::from_secs(25);
+                let mut written = 0usize;
+                let mut buf = [0u8; 64];
+                while Instant::now() < give_up {
+                    if s.write_all(b"u").is_ok() {
+                        written += 1;
+                    }
+                    match s.read(&mut buf) {
+                        Ok(0) => return (written, PeerEnd::Closed),
+                        Ok(n) => return (written, PeerEnd::Payload(buf[..n].to_vec())),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => return (written, PeerEnd::Closed),
+                    }
+                }
+                (written, PeerEnd::StillOpen)
+            },
+        );
+        let (up, down) = counts;
+        assert_eq!(down, 0, "no response: nothing may be sent downstream");
+        assert!(
+            up > 0 && up <= written,
+            "upload must keep flowing while the response is pending (up={up}, written={written})"
+        );
+        assert!(
+            server.received_bytes() > 0,
+            "the server must have received the pending-phase upload"
+        );
         assert!(
             elapsed >= Duration::from_secs(9),
             "a slow response must not be cut short (10 s window), aborted after {elapsed:?}"
@@ -13159,12 +13287,41 @@ mod hysteria2_dataplane_tests {
             elapsed < Duration::from_secs(20),
             "a missing response must still end the relay, took {elapsed:?}"
         );
-        drop(down_client);
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut buf = [0u8; 16];
-        let n = peer.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "downstream must be closed without payload");
-        drop(client);
+        assert_eq!(end, PeerEnd::Closed, "the relay must close the app side");
+    }
+
+    #[test]
+    fn hysteria2_rejected_fast_open_ends_promptly_without_payload() {
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let (counts, elapsed, end) = run_fast_open_relay(
+            server.addr.port(),
+            "reject.test:1",
+            Duration::from_secs(10),
+            write_then_wait(b"x", Duration::from_secs(5)),
+        );
+        assert_eq!(counts.1, 0);
+        assert_eq!(end, PeerEnd::Closed);
+        assert!(elapsed < Duration::from_secs(1), "reject took {elapsed:?}");
+    }
+
+    #[test]
+    fn hysteria2_fin_before_tcp_response_ends_promptly_without_payload() {
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let (counts, elapsed, end) = run_fast_open_relay(
+            server.addr.port(),
+            "fin.test:1",
+            Duration::from_secs(10),
+            write_then_wait(b"x", Duration::from_secs(5)),
+        );
+        assert_eq!(counts.1, 0);
+        assert_eq!(end, PeerEnd::Closed);
+        assert!(elapsed < Duration::from_secs(1), "FIN took {elapsed:?}");
     }
 }
 

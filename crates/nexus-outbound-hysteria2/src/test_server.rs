@@ -13,7 +13,8 @@
 //!    crate 内测试另有四个按目标地址选择的 TCP 行为：`banner.test:1`
 //!    （TCPResponse 与 `banner` 同批写出后 FIN）、`close.test:1`（TCPResponse +
 //!    `last words` 后立即关闭连接）、`fin.test:1`（不回 TCPResponse 直接 FIN）、
-//!    `reject.test:1`（拒绝，消息 `denied`）。
+//!    `reject.test:1`（拒绝，消息 `denied`）、`hold.test:1`（读走上行并计入
+//!    `received_bytes`、永不回 TCPResponse）、`late.test:1`（3 s 后才回 TCPResponse，之后回显）。
 //!
 //! 不实现：完整 HTTP/3（无 QPACK 动态表、无 server SETTINGS）、拥塞协商的
 //! 实际限速、分片重组（测试只发不分片的包）。
@@ -275,9 +276,36 @@ fn run_server(
                     let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
                     driver.finish_stream(handle, &mut conn, id);
                 }
-                Ok(_target) => {
+                Ok(target) if target == "hold.test:1" => {
+                    // 从不回 TCPResponse：持续读走上行直到对端 FIN/出错。
+                    while let Ok(n) = driver.read_some(
+                        handle,
+                        &mut conn,
+                        id,
+                        &mut buf,
+                        Instant::now() + Duration::from_secs(30),
+                    ) {
+                        if n == 0 {
+                            break;
+                        }
+                        received_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    driver.finish_stream(handle, &mut conn, id);
+                }
+                Ok(target) => {
+                    if target == "late.test:1" {
+                        // 晚 3 s 才回 TCPResponse（期间照常收包），之后按 mode 回显。
+                        let late = Instant::now() + Duration::from_secs(3);
+                        let _ = driver.drive_until(handle, &mut conn, late, |_| false);
+                    }
                     let resp = TcpResponse::encode(true, "", &[]);
-                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    let _ = driver.write_all(
+                        handle,
+                        &mut conn,
+                        id,
+                        &resp,
+                        Instant::now() + Duration::from_secs(10),
+                    );
                     // Echo 回显 / Sink 只读丢弃，直到对端 FIN。
                     loop {
                         match driver.read_some(

@@ -39,9 +39,9 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
   端点事件路由、stream 读写原语（`write_all` / `read_exact` / `read_some` /
   `read_varint`）、DATAGRAM 收发；client 与测试用 server 共用；
 - 测试用最小 server（`test_server.rs`，**仅测试**）：rcgen 自签证书、
-  密码校验、`:status: 233` 响应、TCP 回显、UDP 回显；另有按目标地址选择的
-  TCP 测试模式：`SINK_TARGET`（吸收长度前缀的上行并回实收字节数）与 crate
-  内的 banner / 关闭前数据 / 无响应 FIN / 拒绝四种；
+  密码校验、`:status: 233` 响应、TCP 回显、UDP 回显；`EchoMode::Sink`（只读
+  丢弃上行）；另有按目标地址选择的 TCP 测试模式：banner / 关闭前数据 / 无响应
+  FIN / 拒绝 / 永不响应（`hold.test:1`）/ 晚 3 s 响应（`late.test:1`）；
 - 结构化错误 `Hysteria2Error`（不以日志文本代替类型；`Display`/ `Debug`
   绝不回显密码；`Hysteria2Target` 的 `Debug` 对密码脱敏）。
 
@@ -121,9 +121,12 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 ## Invariants
 
 - fast-open 首读超时非致命：`TCPResponse` 跨超时按字节累积（读超时保留已读
-  部分），中继在等待期间继续转发上行；只有服务端拒绝、非法帧、响应前 FIN、
-  停滞预算或 10 s 响应期限（与非 fast-open `open_tcp` 的等待上限一致）结束连接。
-  固定的短窗口不得作为中止条件：真实服务端的响应至少晚一个 RTT。
+  部分）。`apps/nexus` 的 `hysteria2_pump_stream` 在等待期间照常转发上行（不得
+  先阻塞等响应再放行上行），下行字节只在响应剥离之后转发。等待以 10 s 响应期限
+  为界：从中继开始计的绝对期限（与非 fast-open `open_tcp` 的等待上限一致），上行
+  进展不重置它；到期仍无响应则干净中止。除既有结束条件（client EOF、QUIC 关闭/
+  reset、下游写失败、停滞预算）外，等待期间只有服务端拒绝、非法帧、响应前 FIN
+  与该期限结束连接。固定的短窗口不得作为中止条件：真实服务端的响应至少晚一个 RTT。
 - fast-open：`open_tcp` 返回后，读侧仍必须先且仅剥离一次 `TCPResponse`
   （由 `stream_read` 或 `await_tcp_response` 消费标记）；剥离后不得把后续
   载荷字节当响应解析。`await_tcp_response` 幂等：标记已消费时直接 `Ok(())`。
@@ -139,9 +142,10 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 - `cargo test -p nexus hysteria2_dataplane_tests`：`EchoMode::Sink` 的 12 MiB
   上传-only 中继在 30 s 内完成（精确字节数、零下行载荷、server 实收字节数）；
   fast-open 首个 `TCPResponse` 晚到（真实网络 RTT，测试注入单向 60 ms）不中止，
-  连接正常中继；`TCPResponse` 在 10 s 响应期限内始终未到才干净中止（不转发
-  任何字节、下游关闭、有界返回）（requirement-change 2026-10-27，取代 fixes-7
-  的固定 50 ms 首读守卫）。
+  连接正常中继；3 s 后才到的响应之前写入的上行在响应后被回显；服务端永不响应时
+  等待期间上行照常转发（`up_bytes > 0`），10 s 期限到期干净中止（零下行字节、
+  下游关闭、有界返回）；拒绝 / 响应前 FIN 1 s 内中止（requirement-change
+  2026-10-27，取代 fixes-7 的固定 50 ms 首读守卫）。
 
 ## Allowed Dependencies
 
