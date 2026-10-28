@@ -1698,4 +1698,16 @@ mod tests {
             UpstreamInitError::TooManyServers
         );
     }
+
+    /// AC15: `BadServer` is directly reachable through a port-0 server
+    /// (defensive; `dns.toml` already rejects port 0 before this point).
+    #[test]
+    fn init_rejects_port_zero_server_as_bad_server() {
+        let cfg = default_cfg(vec![addr(0)]);
+        let fake = Arc::new(Mutex::new(FakeTransport::default()));
+        assert_eq!(
+            UpstreamEngine::with_transport(cfg, Box::new(SharedFake(fake))).expect_err("port 0"),
+            UpstreamInitError::BadServer(addr(0))
+        );
+    }
 }
