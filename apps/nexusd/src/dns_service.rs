@@ -10,7 +10,7 @@
 //! in-flight queries for at most [`JOIN_TIMEOUT`], then marks the status
 //! `failed` and exits.
 
-pub use crate::dns_upstream::DnsReply;
+pub use crate::dns_upstream::{DnsReply, ReplySink};
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -55,6 +55,8 @@ pub struct DnsRequest {
     pub server: SocketAddr,
     /// Raw DNS query.
     pub wire: Vec<u8>,
+    /// Where the reply must be written (TUN or TPROXY).
+    pub sink: ReplySink,
 }
 
 /// Submission failure (`§5.4`).
@@ -184,13 +186,8 @@ impl DnsService {
 
         let mesh = StaticMeshResolver::new(config.mesh_hosts.clone())
             .map_err(|e| invalid(format!("dns.mesh.hosts: {e}")))?;
-        let unified = UnifiedDns::new(
-            config.unified.clone(),
-            Box::new(mesh),
-            classifier,
-            Box::new(NoUpstream),
-        )
-        .map_err(|e| invalid(format!("dns unified: {e}")))?;
+        let unified = UnifiedDns::new(config.unified.clone(), Box::new(mesh), classifier)
+            .map_err(|e| invalid(format!("dns unified: {e}")))?;
         let engine = UpstreamEngine::new(config.upstream.clone())
             .map_err(|e| invalid(format!("dns upstream: {e}")))?;
 
@@ -242,6 +239,8 @@ impl DnsService {
 
         let (req_tx, req_rx) = sync_channel::<DnsRequest>(DNS_REQUEST_QUEUE);
         let (reply_tx, reply_rx) = sync_channel::<DnsReply>(DNS_REPLY_QUEUE);
+        let cache_view = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::dns_status::publish_cache(Arc::clone(&cache_view));
 
         let worker_status = Arc::clone(&status);
         let thread = std::thread::Builder::new()
@@ -255,6 +254,7 @@ impl DnsService {
                     worker_status,
                     snapshot,
                     unevaluable_hits,
+                    cache_view,
                 );
             })
             .map_err(|e| {
@@ -271,16 +271,6 @@ impl DnsService {
             status,
             thread: Some(thread),
         })
-    }
-}
-
-struct NoUpstream;
-
-impl nexus_dns::Resolver for NoUpstream {
-    fn resolve(&mut self, _query: &DnsQuery) -> Result<Vec<IpAddr>, DnsError> {
-        Err(DnsError::ResolutionFailed(
-            "dns service owns upstream I/O".to_string(),
-        ))
     }
 }
 
@@ -330,9 +320,11 @@ fn run_worker(
     status: Arc<DnsStatus>,
     mut snapshot: DnsStatusSnapshot,
     unevaluable_hits: Arc<AtomicU64>,
+    cache_view: Arc<std::sync::Mutex<Vec<crate::dns_upstream::CacheEntryView>>>,
 ) {
     let start = Instant::now();
     let mut last_reclaim = 0;
+    let mut last_cache_publish = 0u64;
     let mut local = LocalCounters::default();
     let mut reply_buf = Vec::new();
 
@@ -384,6 +376,13 @@ fn run_worker(
         if now_secs >= last_reclaim + RECLAIM_INTERVAL_SECS {
             unified.reclaim_expired(now_secs);
             last_reclaim = now_secs;
+        }
+        if now_secs != last_cache_publish {
+            let entries = engine.cache_snapshot();
+            if let Ok(mut guard) = cache_view.lock() {
+                *guard = entries;
+            }
+            last_cache_publish = now_secs;
         }
 
         refresh_status(&mut snapshot, &engine, &unified, &local, &unevaluable_hits);
@@ -490,6 +489,7 @@ fn handle_request(
                     wire,
                     class: DnsClass::Upstream,
                     rcode: 1,
+                    sink: request.sink.clone(),
                 });
             }
             return;
@@ -518,12 +518,19 @@ fn handle_request(
                         wire,
                         class: answer.class,
                         rcode: 0,
+                        sink: request.sink.clone(),
                     });
                 }
             }
             Ok(ResolveStep::Upstream { class }) => {
                 unified.note_upstream_answer();
-                match engine.submit(request.client, request.server, question, Instant::now()) {
+                match engine.submit_with_sink(
+                    request.client,
+                    request.server,
+                    question,
+                    Instant::now(),
+                    request.sink.clone(),
+                ) {
                     Ok(()) => {}
                     Err(_) => {
                         send_error(reply_tx, &request, class, DnsRcode::ServFail);
@@ -547,7 +554,13 @@ fn handle_request(
     let class = unified.classify(&question.name);
     if class == DnsClass::Upstream {
         unified.note_upstream_answer();
-        match engine.submit(request.client, request.server, question, Instant::now()) {
+        match engine.submit_with_sink(
+            request.client,
+            request.server,
+            question,
+            Instant::now(),
+            request.sink.clone(),
+        ) {
             Ok(()) => {}
             Err(_) => send_error(reply_tx, &request, class, DnsRcode::ServFail),
         }
@@ -558,6 +571,7 @@ fn handle_request(
             wire,
             class,
             rcode: 0,
+            sink: request.sink.clone(),
         });
     }
 }
@@ -586,6 +600,7 @@ fn send_error(
             wire,
             class,
             rcode: u16::from(rcode.code()),
+            sink: request.sink.clone(),
         });
     }
 }
@@ -624,7 +639,6 @@ mod tests {
 
     fn config_with_hosts(hosts: Vec<(String, IpAddr)>) -> DnsFileConfig {
         let mut unified = DnsUnifiedConfig::default();
-        unified.upstream = vec!["127.0.0.1:5399".to_string()];
         unified.hosts = hosts;
         DnsFileConfig {
             unified,
@@ -659,6 +673,7 @@ mod tests {
             client: "127.0.0.1:40000".parse().expect("client"),
             server: "127.0.0.1:53".parse().expect("server"),
             wire,
+            sink: ReplySink::Tun,
         }
     }
 

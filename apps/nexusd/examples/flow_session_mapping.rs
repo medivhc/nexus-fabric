@@ -193,7 +193,7 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp = Dataplane::new(Box::new(SharedTun(tun_clone)), config).expect("new");
+    let mut dp = Dataplane::new(Box::new(SharedTun(tun_clone)), config, None).expect("new");
     // 注入 mock N1 → establish 成功（会话可进 Active）。
     dp.set_n1_sender(std::sync::Arc::new(MockN1Sender));
     inject_production_chain(&mut dp);
@@ -324,7 +324,7 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp3 = Dataplane::new(Box::new(SharedTun3(tun3_clone)), config3).expect("new3");
+    let mut dp3 = Dataplane::new(Box::new(SharedTun3(tun3_clone)), config3, None).expect("new3");
     inject_production_chain(&mut dp3);
     dp3.enable_flow_sessions_with_establisher(Box::new(BlockingEstablisher));
     let udp_pkt = build_udp(uk.src_ip, uk.dst_ip, uk.src_port, uk.dst_port, b"udp-data");
@@ -366,7 +366,7 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp2 = Dataplane::new(Box::new(SharedTun2(tun2_clone)), config2).expect("new2");
+    let mut dp2 = Dataplane::new(Box::new(SharedTun2(tun2_clone)), config2, None).expect("new2");
     inject_production_chain(&mut dp2);
     dp2.enable_flow_sessions();
     tun2.lock().unwrap().inject(syn.clone());

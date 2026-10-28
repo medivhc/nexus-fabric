@@ -335,6 +335,28 @@ pub fn snapshot() -> Option<DnsStatusSnapshot> {
     PUBLISHED.get().map(|s| s.snapshot())
 }
 
+/// Process-wide cache view for `/dns/cache` (owner thread refreshes it).
+static PUBLISHED_CACHE: OnceLock<
+    std::sync::Arc<std::sync::Mutex<Vec<crate::dns_upstream::CacheEntryView>>>,
+> = OnceLock::new();
+
+/// Publish the cache handle. First publisher wins (D-impl-9).
+pub fn publish_cache(
+    cache: std::sync::Arc<std::sync::Mutex<Vec<crate::dns_upstream::CacheEntryView>>>,
+) {
+    let _ = PUBLISHED_CACHE.set(cache);
+}
+
+/// Read the published cache entries (empty when no service was published).
+#[must_use]
+pub fn cache_entries() -> Vec<crate::dns_upstream::CacheEntryView> {
+    PUBLISHED_CACHE
+        .get()
+        .and_then(|h| h.lock().ok())
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -296,7 +296,8 @@ outbounds:
 
 fn make_dataplane(config: DataplaneConfig) -> (Dataplane, Arc<Mutex<MockTun>>) {
     let mock = Arc::new(Mutex::new(MockTun::new("mock0")));
-    let dp = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config).expect("dataplane");
+    let dp =
+        Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None).expect("dataplane");
     (dp, mock)
 }
 

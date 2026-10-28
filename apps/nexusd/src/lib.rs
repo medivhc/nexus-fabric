@@ -2,6 +2,8 @@
 //!
 //! Binary (`main.rs`) 为 Composition Root；可测试逻辑下沉到此。
 
+#![recursion_limit = "256"]
+
 pub mod assembly;
 pub mod config;
 pub mod dataplane;

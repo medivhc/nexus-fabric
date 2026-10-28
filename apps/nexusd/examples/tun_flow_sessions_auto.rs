@@ -99,6 +99,7 @@ fn make_dataplane() -> (Dataplane, Arc<Mutex<MockTun>>) {
     let dp = Dataplane::new(
         Box::new(SharedTun(Arc::clone(&mock))),
         DataplaneConfig::default(),
+        None,
     )
     .expect("dataplane");
     (dp, mock)

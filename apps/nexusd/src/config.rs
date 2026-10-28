@@ -1251,89 +1251,6 @@ fn parse_port_list(v: &toml::Value) -> Result<Vec<u16>, String> {
     ))
 }
 
-/// 解析 `dns.toml` 为 `DnsUnifiedConfig`（R3）。
-///
-/// 字段从 `[dns]` 小节读取；小节缺失时读根级键；全缺失时取默认值。
-/// 字段：
-/// - `upstream`：字符串数组（默认空）；
-/// - `fake_ip_enabled`：bool（默认 true）；
-/// - `fake_ip_range`：CIDR 字符串（默认 `198.18.0.0/15`）；
-/// - `mesh_suffix`：字符串（默认 `"mesh"`）；
-/// - `fake_ip_ttl_secs`：整数秒（默认 300）；
-/// - `hosts`：表，域名 → IP 字符串。
-///
-/// # Errors
-/// - TOML 语法错误；
-/// - `fake_ip_range` 非法 CIDR；
-/// - `hosts` 中 IP 非法。
-///
-/// 调用方按 §13.6 处理：解析失败 → daemon 启动失败 exit 1。
-pub fn parse_dns_toml(text: &str) -> Result<nexus_dns::DnsUnifiedConfig, String> {
-    use nexus_dns::{DEFAULT_FAKE_IP_RANGE, DEFAULT_MESH_SUFFIX, DnsUnifiedConfig};
-
-    let v: toml::Value = toml::from_str(text).map_err(|e| format!("{}: {e}", DNS_TOML))?;
-    // [dns] 小节优先，否则读根级。
-    let t = v.get("dns").unwrap_or(&v);
-
-    let upstream: Vec<String> = t
-        .get("upstream")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|i| i.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let fake_ip_enabled = t
-        .get("fake_ip_enabled")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(true);
-
-    let fake_ip_range = t
-        .get("fake_ip_range")
-        .and_then(|x| x.as_str())
-        .unwrap_or(DEFAULT_FAKE_IP_RANGE);
-    let (fake_ip_network, fake_ip_prefix) =
-        parse_cidr_v4(fake_ip_range).map_err(|e| format!("{DNS_TOML}: bad fake_ip_range: {e}"))?;
-
-    let mesh_suffix = t
-        .get("mesh_suffix")
-        .and_then(|x| x.as_str())
-        .unwrap_or(DEFAULT_MESH_SUFFIX)
-        .to_string();
-
-    let fake_ip_ttl_secs = t
-        .get("fake_ip_ttl_secs")
-        .and_then(|x| x.as_integer())
-        .and_then(|i| u64::try_from(i).ok())
-        .unwrap_or(300);
-
-    let mut hosts = Vec::new();
-    if let Some(table) = t.get("hosts").and_then(|x| x.as_table()) {
-        for (name, ip_v) in table {
-            let ip_s = ip_v
-                .as_str()
-                .ok_or_else(|| format!("{DNS_TOML}: hosts.{name} must be an IP string"))?;
-            let ip: std::net::IpAddr = ip_s
-                .parse()
-                .map_err(|_| format!("{DNS_TOML}: hosts.{name} bad IP '{ip_s}'"))?;
-            hosts.push((name.clone(), ip));
-        }
-    }
-
-    Ok(DnsUnifiedConfig {
-        upstream,
-        fake_ip_enabled,
-        fake_ip_network,
-        fake_ip_prefix,
-        mesh_suffix,
-        fake_ip_ttl_secs,
-        hosts,
-        ip_preference: nexus_dns::IpPreference::PreferV4,
-    })
-}
-
 /// 解析 IPv4 CIDR（`"A.B.C.D/N"`）→ `(网络地址 u32, 前缀长度)`。
 fn parse_cidr_v4(s: &str) -> Result<(u32, u8), String> {
     let (addr_s, prefix_s) = s
@@ -1730,12 +1647,13 @@ impl MeshNetworks {
 /// `has_usable_outbound` must be derived from
 /// `nexus::outbound_manifest::select_index` (F1 / §6.2), never re-implemented.
 ///
-/// The old loose [`parse_dns_toml`] stays in place until C11 replaces it.
+/// The strict parser replaced the loose one in C11; the three-argument shape
+/// is required because mesh ownership and `unmatched=proxied` need context.
 ///
 /// # Errors
 ///
 /// Any of the nine [`DnsConfigError`] variants.
-pub fn parse_dns_config(
+pub fn parse_dns_toml(
     text: &str,
     network_toml: Option<&str>,
     has_usable_outbound: bool,
@@ -1778,7 +1696,6 @@ pub fn parse_dns_config(
     if upstream_items.is_empty() {
         return Err(DnsConfigError::EmptyUpstream);
     }
-    let mut raw_upstream = Vec::with_capacity(upstream_items.len());
     let mut servers: Vec<std::net::SocketAddr> = Vec::new();
     for item in upstream_items {
         let raw = item
@@ -1787,7 +1704,6 @@ pub fn parse_dns_config(
         let addr = parse_upstream_addr(raw)?;
         if !servers.contains(&addr) {
             servers.push(addr);
-            raw_upstream.push(raw.trim().to_string());
         }
     }
     if servers.len() > 8 {
@@ -1963,7 +1879,6 @@ pub fn parse_dns_config(
 
     Ok(DnsFileConfig {
         unified: DnsUnifiedConfig {
-            upstream: raw_upstream,
             fake_ip_enabled,
             fake_ip_network,
             fake_ip_prefix,
@@ -2086,6 +2001,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if inbound_signatures(old.proxy_yaml.as_deref())
         != inbound_signatures(new.proxy_yaml.as_deref())
     {
+        return ChangeKind::NeedsRestart;
+    }
+    // R5 / Q8（C13）：dns.toml 内容变更 → NeedsRestart（DNS 服务持有 socket 与缓存）。
+    if old.dns_toml != new.dns_toml {
         return ChangeKind::NeedsRestart;
     }
     // 任一文件的增删 → 需重启（子系统启停）
@@ -2586,34 +2505,47 @@ mod tests {
     }
 
     #[test]
-    fn dns_toml_empty_uses_defaults() {
-        let cfg = parse_dns_toml("").unwrap();
-        assert_eq!(cfg.mesh_suffix.as_str(), "mesh");
-        assert!(cfg.upstream.is_empty());
-        assert!(cfg.hosts.is_empty());
+    fn dns_toml_empty_is_rejected() {
+        // C11: the strict schema requires [dns].upstream.
+        assert!(parse_dns_toml("", None, false).is_err());
     }
 
     #[test]
     fn dns_toml_section_and_root_level() {
         // [dns] 节。
-        let cfg = parse_dns_toml("[dns]\nmesh_suffix = \"lan\"\n").unwrap();
-        assert_eq!(cfg.mesh_suffix.as_str(), "lan");
-        // 根级字段。
-        let cfg = parse_dns_toml("upstream = [\"9.9.9.9\"]\n").unwrap();
-        assert_eq!(cfg.upstream, vec!["9.9.9.9"]);
+        let cfg = parse_dns_toml(
+            "[dns]\nupstream = [\"9.9.9.9\"]\nmesh_suffix = \"lan\"\n",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.unified.mesh_suffix.as_str(), "lan");
+        // 根级字段不再被接受（strict schema）。
+        assert!(parse_dns_toml("upstream = [\"9.9.9.9\"]\n", None, false).is_err());
     }
 
     #[test]
     fn dns_toml_hosts_parsed() {
-        let cfg = parse_dns_toml("[dns.hosts]\nprinter = \"192.168.1.50\"\n").unwrap();
-        assert_eq!(cfg.hosts.len(), 1);
+        let cfg = parse_dns_toml(
+            "[dns]\nupstream = [\"9.9.9.9\"]\n[dns.hosts]\nprinter = \"192.168.1.50\"\n",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.unified.hosts.len(), 1);
     }
 
     #[test]
     fn dns_toml_bad_rejected() {
-        assert!(parse_dns_toml("not toml [[[").is_err());
-        assert!(parse_dns_toml("[dns]\nfake_ip_range = \"999.1.1.0/24\"\n").is_err());
-        assert!(parse_dns_toml("[dns.hosts]\nbad = \"not-an-ip\"\n").is_err());
+        assert!(parse_dns_toml("not toml [[[", None, false).is_err());
+        assert!(
+            parse_dns_toml(
+                "[dns]\nupstream = [\"9.9.9.9\"]\nfake_ip_range = \"999.1.1.0/24\"\n",
+                None,
+                false
+            )
+            .is_err()
+        );
     }
 
     // ---------- [network.turn] 小节（NAT switching daemon activation，AC2） ----------
@@ -3391,7 +3323,7 @@ mod dns_config_tests {
     const BASE: &str = "[dns]\nupstream = [\"1.1.1.1\"]\n";
 
     fn parse(text: &str) -> Result<DnsFileConfig, DnsConfigError> {
-        parse_dns_config(text, None, false)
+        parse_dns_toml(text, None, false)
     }
 
     fn ok(text: &str) -> DnsFileConfig {
@@ -3475,7 +3407,7 @@ max_inflight = 16
 "xc.mesh" = "10.144.144.6"
 "ll.mesh" = "fe80::1"
 "#;
-        let c = parse_dns_config(text, Some(MESH_NET), true).expect("full schema parses");
+        let c = parse_dns_toml(text, Some(MESH_NET), true).expect("full schema parses");
         // Deduplicated in declaration order (8.8.8.8 appears once).
         assert_eq!(
             c.upstream.servers,
@@ -3484,10 +3416,6 @@ max_inflight = 16
                 addr("1.1.1.1:5353"),
                 addr("[2001:db8::53]:53")
             ]
-        );
-        assert_eq!(
-            c.unified.upstream,
-            vec!["8.8.8.8", "1.1.1.1:5353", "[2001:db8::53]:53"]
         );
         assert!(!c.unified.fake_ip_enabled);
         assert_eq!(c.unified.fake_ip_prefix, 16);
@@ -3583,7 +3511,7 @@ max_inflight = 16
         ));
         // MeshAddrInvalid: loopback (SU-3 #1) and multicast.
         assert!(matches!(
-            parse_dns_config(
+            parse_dns_toml(
                 "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"loop.mesh\" = \"127.0.0.1\"\n",
                 Some(MESH_NET),
                 false
@@ -3591,7 +3519,7 @@ max_inflight = 16
             Err(DnsConfigError::MeshAddrInvalid(_))
         ));
         assert!(matches!(
-            parse_dns_config(
+            parse_dns_toml(
                 "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"mc.mesh\" = \"ff02::1\"\n",
                 Some(MESH_NET),
                 false
@@ -3600,7 +3528,7 @@ max_inflight = 16
         ));
         // MeshWithoutRoutes: mesh hosts without network.toml.
         assert_eq!(
-            parse_dns_config(
+            parse_dns_toml(
                 "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.mesh\" = \"10.144.144.6\"\n",
                 None,
                 false
@@ -3609,7 +3537,7 @@ max_inflight = 16
         );
         // ProxyPolicyConflict.
         assert_eq!(
-            parse_dns_config(
+            parse_dns_toml(
                 "[dns]\nupstream = [\"1.1.1.1\"]\nunmatched = \"proxied\"\n",
                 None,
                 false
@@ -3681,20 +3609,20 @@ max_inflight = 16
                 "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"loop.mesh\" = \"{value}\"\n"
             );
             assert!(matches!(
-                parse_dns_config(&text, Some(MESH_NET), false),
+                parse_dns_toml(&text, Some(MESH_NET), false),
                 Err(DnsConfigError::MeshAddrInvalid(_))
             ));
         }
         // 2. fe80:: link-local is accepted when routes6 covers it.
         let text = "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"ll.mesh\" = \"fe80::1\"\n";
         let net = "[vpi]\naddress6 = \"fd00::1\"\n[[vpi.routes6]]\nsubnet = \"fe80::/64\"\npeer = \"00\"\n";
-        let c = parse_dns_config(text, Some(net), false).expect("link-local mesh accepted");
+        let c = parse_dns_toml(text, Some(net), false).expect("link-local mesh accepted");
         assert_eq!(
             c.mesh_hosts,
             vec![("ll.mesh".to_string(), "fe80::1".parse().unwrap())]
         );
         // 3. [vpi].address6 without [[vpi.routes6]] is accepted (§4.6.2 SU-3).
-        let c = parse_dns_config(BASE, Some("[vpi]\naddress6 = \"fd00::1\"\n"), false)
+        let c = parse_dns_toml(BASE, Some("[vpi]\naddress6 = \"fd00::1\"\n"), false)
             .expect("address6 alone is allowed");
         assert!(c.mesh_hosts.is_empty());
     }
@@ -3705,16 +3633,16 @@ max_inflight = 16
         let outside =
             "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.mesh\" = \"10.9.9.9\"\n";
         assert!(matches!(
-            parse_dns_config(outside, Some(net), false),
+            parse_dns_toml(outside, Some(net), false),
             Err(DnsConfigError::MeshAddrInvalid(_))
         ));
         let inside =
             "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.mesh\" = \"10.144.144.6\"\n";
-        assert!(parse_dns_config(inside, Some(net), false).is_ok());
+        assert!(parse_dns_toml(inside, Some(net), false).is_ok());
         // A v6 mesh host without routes6 is MeshWithoutRoutes even if address6 exists.
         let v6 = "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"v6.mesh\" = \"fd00::9\"\n";
         assert_eq!(
-            parse_dns_config(v6, Some("[vpi]\naddress6 = \"fd00::1\"\n"), false),
+            parse_dns_toml(v6, Some("[vpi]\naddress6 = \"fd00::1\"\n"), false),
             Err(DnsConfigError::MeshWithoutRoutes)
         );
     }
@@ -3731,10 +3659,10 @@ max_inflight = 16
     fn unmatched_proxied_requires_a_usable_outbound() {
         let text = "[dns]\nupstream = [\"1.1.1.1\"]\nunmatched = \"proxied\"\n";
         assert_eq!(
-            parse_dns_config(text, None, false),
+            parse_dns_toml(text, None, false),
             Err(DnsConfigError::ProxyPolicyConflict)
         );
-        let c = parse_dns_config(text, None, true).expect("usable outbound satisfies proxied");
+        let c = parse_dns_toml(text, None, true).expect("usable outbound satisfies proxied");
         assert_eq!(c.proxy.unmatched, UnmatchedPolicy::Proxied);
     }
 

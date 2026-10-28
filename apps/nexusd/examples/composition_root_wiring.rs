@@ -74,11 +74,17 @@ fn run() -> serde_json::Value {
 
     // R3：dns.toml 解析。
     let dns = dp_config.dns_config.as_ref().expect("dns_config");
-    let dns_upstream_ok = dns.upstream == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
-    let dns_suffix_ok = dns.mesh_suffix == "mesh";
-    let dns_hosts_ok = dns.hosts.len() == 1
-        && dns.hosts[0].0 == "myhost"
-        && dns.hosts[0].1.to_string() == "10.200.0.5";
+    let dns_upstream_ok = dns
+        .upstream
+        .servers
+        .iter()
+        .map(|addr| addr.ip().to_string())
+        .collect::<Vec<_>>()
+        == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
+    let dns_suffix_ok = dns.unified.mesh_suffix == "mesh";
+    let dns_hosts_ok = dns.unified.hosts.len() == 1
+        && dns.unified.hosts[0].0 == "myhost"
+        && dns.unified.hosts[0].1.to_string() == "10.200.0.5";
     // R3：缺失 → None。
     let dns_missing_none = {
         let d2 = std::env::temp_dir().join("nexusd-composition-root-e4-nodns");
@@ -91,7 +97,12 @@ fn run() -> serde_json::Value {
         cfg2.dns_config.is_none()
     };
     // R3：非法 → Err。
-    let dns_bad_err = config::parse_dns_toml("[dns]\nfake_ip_range = \"not-a-cidr\"\n").is_err();
+    let dns_bad_err = config::parse_dns_toml(
+        "[dns]\nupstream = [\"9.9.9.9\"]\nfake_ip_range = \"not-a-cidr\"\n",
+        None,
+        false,
+    )
+    .is_err();
 
     // R1：N1 装配成功（dial 尽力而为，无真实对端时 warn 不失败）。
     let n1_ok = match assembly::assemble_n1(
@@ -138,9 +149,15 @@ fn run() -> serde_json::Value {
         "wiring": {
             "mesh_cidrs": dp_config.mesh_cidrs.join(","),
             "mesh_cidrs_hardcoded_absent": hardcoded_absent,
-            "dns_upstream": dns.upstream.join(","),
-            "dns_mesh_suffix": dns.mesh_suffix,
-            "dns_hosts_count": dns.hosts.len(),
+            "dns_upstream": dns
+                .upstream
+                .servers
+                .iter()
+                .map(|addr| addr.ip().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            "dns_mesh_suffix": dns.unified.mesh_suffix,
+            "dns_hosts_count": dns.unified.hosts.len(),
             "dns_missing_is_none": dns_missing_none,
             "dns_bad_is_err": dns_bad_err,
             "n1_assemble_ok": n1_ok,

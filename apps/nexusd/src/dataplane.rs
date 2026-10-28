@@ -11,13 +11,13 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 
-use nexus_dns::{DnsQuery, DnsType, DnsUnifiedConfig, UnifiedDns};
+use nexus_dns::wire::{self, DnsRcode};
 use nexus_domain::SessionId;
 use nexus_flow_session::{
     ChainDeps, ConnectivityEstablisher, FlowDecision, FlowKey, FlowSignal, IpProto, SessionManager,
@@ -110,6 +110,17 @@ pub struct DataplaneStats {
     pub direct_forwarded: u64,
     pub dropped: u64,
     pub dns_answered: u64,
+    /// DNS responses by RCODE (§4.10.2; `dns_answered` is their sum).
+    pub dns_noerror: u64,
+    pub dns_nodata: u64,
+    pub dns_nxdomain: u64,
+    pub dns_servfail: u64,
+    pub dns_refused: u64,
+    pub dns_formerr: u64,
+    pub dns_tcp_refused: u64,
+    pub dns_queue_full: u64,
+    pub dns_service_down: u64,
+    pub dns_reply_write_failed: u64,
     pub qos_dropped: u64,
     pub mesh_dropped_no_n1: u64,
     pub proxy_dropped_no_proxy: u64,
@@ -176,8 +187,8 @@ pub struct DataplaneConfig {
     pub bypass_cidrs: Vec<String>,
     /// 是否启用 DNS 拦截。
     pub dns_enabled: bool,
-    /// DNS 统一配置（dns.toml）。
-    pub dns_config: Option<DnsUnifiedConfig>,
+    /// DNS 统一配置（dns.toml；仅在 DNS 子系统启用时存在）。
+    pub dns_config: Option<crate::config::DnsFileConfig>,
     /// 是否启用 QoS。
     pub qos_enabled: bool,
     /// QoS 配置。
@@ -253,7 +264,7 @@ pub struct Dataplane {
     candidates: Vec<CandidatePath>,
     mesh_cidrs: Vec<Cidr>,
     bypass_cidrs: Vec<Cidr>,
-    dns: Option<UnifiedDns>,
+    dns: Option<crate::dns_service::DnsServiceHandle>,
     qos: Option<CakeScheduler>,
     /// N1 发送桥（W1/W3）；`None` 时 Mesh 包走 D2 计数路径。
     n1_sender: Option<std::sync::Arc<dyn N1Sender>>,
@@ -340,6 +351,8 @@ pub struct Dataplane {
     /// 该行位于每包路径（TCP 非 SYN / UDP），必须首次立即发射、其后 10 s 一行
     /// （PRODUCT hot-path 日志契约；review MAJOR-2/C4）。
     unavailable_log: crate::log_throttle::KeyedLogThrottle,
+    /// DNS 运维日志限频状态（`dns_tcp_query_refused` 等）。
+    dns_log: crate::log_throttle::KeyedLogThrottle,
     /// 透明前端管道（S42：TPROXY 生产装配）。
     transparent: Option<TransparentPipeline>,
     /// owner → listener 的 UDP 回包通道（`send_from` 在 listener 线程）。
@@ -373,11 +386,18 @@ impl Default for FlowSessionsState {
 impl Dataplane {
     /// 从配置构造数据面。
     ///
+    /// `dns` 是唯一 owner 的 DNS 服务句柄（C11）：`dns_enabled=true` 时必须
+    /// 传入，否则构造期硬失败（杜绝隐藏 Stub）。
+    ///
     /// # Errors
     /// - CIDR 解析失败 → `String` 错误；
     /// - QoS 配置非法 → `String` 错误；
-    /// - DNS 配置非法 → `String` 错误。
-    pub fn new(tun: Box<dyn TunDevice>, config: DataplaneConfig) -> Result<Self, String> {
+    /// - `dns_enabled=true` 但 `dns=None` → `String` 错误。
+    pub fn new(
+        tun: Box<dyn TunDevice>,
+        config: DataplaneConfig,
+        dns: Option<crate::dns_service::DnsServiceHandle>,
+    ) -> Result<Self, String> {
         // 解析 CIDR。
         let mesh_cidrs = config
             .mesh_cidrs
@@ -394,20 +414,10 @@ impl Dataplane {
         let manager = PathManager::new(PathConfig::default());
         let candidates: Vec<CandidatePath> = Vec::new();
 
-        // DNS（D3）。
-        let dns = if config.dns_enabled {
-            let dns_config = config.dns_config.clone().unwrap_or_default();
-            let dns = UnifiedDns::new(
-                dns_config,
-                Box::new(StubMeshResolver),
-                Box::new(StubProxyClassifier),
-                Box::new(StubUpstreamResolver),
-            )
-            .map_err(|e| format!("dns config invalid: {e}"))?;
-            Some(dns)
-        } else {
-            None
-        };
+        // DNS（D3/C11）：数据面不持有 resolver，只持有服务句柄。
+        if config.dns_enabled && dns.is_none() {
+            return Err("dns enabled but dns service not wired".to_string());
+        }
 
         // QoS（D4）。
         let qos = if config.qos_enabled {
@@ -480,6 +490,7 @@ impl Dataplane {
             tproxy_last_failure: None,
             proxy_egress_rst_pending: std::collections::HashSet::new(),
             unavailable_log: crate::log_throttle::KeyedLogThrottle::new(),
+            dns_log: crate::log_throttle::KeyedLogThrottle::new(),
             transparent: None,
             transparent_udp_reply_tx: None,
         })
@@ -513,10 +524,216 @@ impl Dataplane {
         self.decision_cache.stats()
     }
 
-    /// 写入一条 DNS 应答映射（SNI/应答写入路径）。
-    pub fn record_dns_answer(&mut self, domain: &str, ip: Ipv4Addr) {
+    /// 写入一条 DNS 应答映射（A/AAAA 共用；D-impl-8）。
+    pub fn record_dns_answer(&mut self, domain: &str, ip: IpAddr) {
         if let Ok(mut cache) = self.dns_cache.lock() {
-            cache.insert(domain, IpAddr::V4(ip), 300);
+            cache.insert(domain, ip, 300);
+        }
+    }
+
+    /// 是否已接入 DNS 服务（AC5 可观测）。
+    #[must_use]
+    pub fn dns_service_ready(&self) -> bool {
+        self.dns.is_some()
+    }
+
+    /// 排空 DNS 回包并回写 TUN / TPROXY 回程通道（每轮 `process_one` 开头）。
+    ///
+    /// 返回本轮处理的回包数（含写失败）。`WouldBlock` 轮次同样必须调用，
+    /// 否则上游应答只能等下一条入站包才写回（spec §4.1）。
+    pub fn drain_dns_replies(&mut self) -> usize {
+        let mut replies = Vec::new();
+        if let Some(handle) = self.dns.as_mut() {
+            loop {
+                match handle.rx.try_recv() {
+                    Ok(reply) => replies.push(reply),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        let drained = replies.len();
+        for reply in replies {
+            self.deliver_dns_reply(reply);
+        }
+        drained
+    }
+
+    /// 提交一条 TUN 侧 DNS 查询（包路径只做编解码 + `try_send`）。
+    fn submit_dns_tun(&mut self, packet: &[u8]) {
+        let Some(payload) = dns_udp_payload(packet) else {
+            self.with_stats(|s| s.dropped += 1);
+            return;
+        };
+        let client = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+            u16::from_be_bytes([packet[20], packet[21]]),
+        ));
+        let server = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+            u16::from_be_bytes([packet[22], packet[23]]),
+        ));
+        let request = crate::dns_service::DnsRequest {
+            client,
+            server,
+            wire: payload.to_vec(),
+            sink: crate::dns_service::ReplySink::Tun,
+        };
+        self.dispatch_dns_request(request);
+    }
+
+    /// 提交一条 TPROXY 侧 DNS 查询（Q-3 / D-impl-2）。
+    fn submit_dns_transparent(&mut self, datagram: &ReceivedDatagram) {
+        let request = crate::dns_service::DnsRequest {
+            client: SocketAddr::V4(datagram.peer),
+            server: SocketAddr::V4(datagram.orig_dst),
+            wire: datagram.payload.clone(),
+            sink: crate::dns_service::ReplySink::Transparent {
+                peer: datagram.peer,
+                orig_dst: datagram.orig_dst,
+            },
+        };
+        self.dispatch_dns_request(request);
+    }
+
+    fn dispatch_dns_request(&mut self, request: crate::dns_service::DnsRequest) {
+        let Some(handle) = self.dns.as_ref() else {
+            return;
+        };
+        let wire = request.wire.clone();
+        let client = request.client;
+        let server = request.server;
+        let sink = request.sink.clone();
+        match handle.submit(request) {
+            Ok(()) => {}
+            Err(crate::dns_service::DnsRequestError::QueueFull) => {
+                self.with_stats(|s| {
+                    s.dns_queue_full += 1;
+                    s.dns_servfail += 1;
+                });
+                self.deliver_local_servfail(server, client, sink, &wire, true);
+            }
+            Err(crate::dns_service::DnsRequestError::ServiceDown) => {
+                self.with_stats(|s| {
+                    s.dns_service_down += 1;
+                    s.dns_servfail += 1;
+                });
+                self.deliver_local_servfail(server, client, sink, &wire, false);
+            }
+        }
+    }
+
+    fn deliver_local_servfail(
+        &mut self,
+        server: SocketAddr,
+        client: SocketAddr,
+        sink: crate::dns_service::ReplySink,
+        query_wire: &[u8],
+        queue_full: bool,
+    ) {
+        // 计数已在 dispatch 侧按原因加过；这里只负责构造 + 写回。
+        let Ok(wire) = wire::build_error(query_wire, DnsRcode::ServFail) else {
+            return;
+        };
+        let reply = crate::dns_service::DnsReply {
+            client,
+            server,
+            wire,
+            class: nexus_dns::DnsClass::Upstream,
+            rcode: 2,
+            sink,
+        };
+        let written = self.write_dns_reply_packet(&reply);
+        if written {
+            // dns_servfail 已在投递原因处计数；dns_answered 与写回一致。
+            self.with_stats(|s| s.dns_answered += 1);
+        } else {
+            self.with_stats(|s| s.dns_reply_write_failed += 1);
+            let _ = queue_full;
+        }
+    }
+
+    /// 把一条 `DnsReply` 写回其 sink（TUN 或 TPROXY）。
+    fn deliver_dns_reply(&mut self, reply: crate::dns_service::DnsReply) {
+        let rcode = reply.rcode;
+        let (name, answers) = dns_response_meta(&reply.wire).unwrap_or_default();
+        if self.write_dns_reply_packet(&reply) {
+            self.with_stats(|s| {
+                s.dns_answered += 1;
+                match rcode {
+                    0 if answers.is_empty() => s.dns_nodata += 1,
+                    0 => s.dns_noerror += 1,
+                    1 => s.dns_formerr += 1,
+                    2 => s.dns_servfail += 1,
+                    3 => s.dns_nxdomain += 1,
+                    5 => s.dns_refused += 1,
+                    _ => {}
+                }
+            });
+            if !name.is_empty() {
+                for ip in answers {
+                    self.record_dns_answer(&name, ip);
+                }
+            }
+        } else {
+            self.with_stats(|s| s.dns_reply_write_failed += 1);
+        }
+    }
+
+    fn write_dns_reply_packet(&mut self, reply: &crate::dns_service::DnsReply) -> bool {
+        match &reply.sink {
+            crate::dns_service::ReplySink::Tun => {
+                let Some(packet) = build_dns_udp_reply(reply.server, reply.client, &reply.wire)
+                else {
+                    return false;
+                };
+                if self.tun.write(&packet).is_ok() {
+                    self.with_stats(|s| s.tun_written += 1);
+                    true
+                } else {
+                    false
+                }
+            }
+            crate::dns_service::ReplySink::Transparent { peer, orig_dst } => {
+                let Some(tx) = self.transparent_udp_reply_tx.as_ref() else {
+                    self.with_tproxy_counters(|c| c.udp_reply_failed += 1);
+                    return false;
+                };
+                tx.send(TransparentOutput::UdpReply {
+                    orig_dst: *orig_dst,
+                    peer: *peer,
+                    payload: reply.wire.clone(),
+                })
+                .is_ok()
+            }
+        }
+    }
+
+    /// 拒绝 TCP/53（fail-closed，让应用立刻失败而不是挂死）。
+    fn refuse_dns_tcp(&mut self, packet: &[u8], now_millis: u64) {
+        self.with_stats(|s| s.dns_tcp_refused += 1);
+        let now = self.epoch + std::time::Duration::from_millis(now_millis);
+        let decision = self.dns_log.decide(
+            "dns_tcp_query_refused",
+            "tcp",
+            now,
+            crate::log_throttle::OUTBOUND_UNAVAILABLE_LOG_INTERVAL,
+        );
+        if decision.emit {
+            eprintln!(
+                "[nexusd] dns WARN event=dns_tcp_query_refused proto=tcp suppressed={}",
+                decision.suppressed
+            );
+        }
+        if let Some(rst) = build_tcp_reset_for_query(packet) {
+            if self.tun.write(&rst).is_ok() {
+                self.with_stats(|s| {
+                    s.dns_answered += 1;
+                    s.tun_written += 1;
+                });
+            } else {
+                self.with_stats(|s| s.dns_reply_write_failed += 1);
+            }
         }
     }
 
@@ -1016,9 +1233,17 @@ impl Dataplane {
         self.transparent_udp_reply_tx = None;
     }
 
+    /// 关闭 DNS 服务：drop 请求发送端并 join（2 s 预算，不 hang）。
+    pub fn shutdown_dns(&mut self) {
+        if let Some(mut handle) = self.dns.take() {
+            let _ = handle.join(crate::dns_service::JOIN_TIMEOUT);
+        }
+    }
+
     /// 单个 tick：先 drain TPROXY channel（最多 256 条），驱动透明前端，
     /// 空闲也泵送一次 proxy 回程（P8b），再读 TUN 一包。
     pub fn tick(&mut self, now_millis: u64) -> io::Result<bool> {
+        let dns_drained = self.drain_dns_replies();
         let drained = self.drain_transparent_inbound(now_millis);
         let polled = self.poll_transparent(now_millis);
         // P8b（fix-review-r7 F1）：proxy 回程不能只在入站包到达时写回。
@@ -1027,7 +1252,9 @@ impl Dataplane {
         // 保证同 tick 内旧的回程先于本 tick 新包产生的回程写回。
         let proxy_pumped = self.poll_proxy_engine();
         match self.process_one_at(now_millis) {
-            Ok(processed) => Ok(processed || drained > 0 || polled > 0 || proxy_pumped),
+            Ok(processed) => {
+                Ok(processed || dns_drained > 0 || drained > 0 || polled > 0 || proxy_pumped)
+            }
             Err(e) => Err(e),
         }
     }
@@ -1136,26 +1363,11 @@ impl Dataplane {
     }
 
     fn handle_transparent_udp(&mut self, datagram: ReceivedDatagram, now_millis: u64) {
-        // UDP/53 与 TUN 共用本地 DNS 处理器（spec §5 G10 / §13.2 S2）。
+        // UDP/53：与 TUN 共用同一条 DNS 引擎/服务线程（Q-3 / D-impl-2）。
+        // 回程由 `DnsReply::sink=Transparent` 走 UdpReply 通道，异步到达。
         if datagram.orig_dst.port() == 53 && self.dns.is_some() {
-            let packet = synthetic_udp_packet(datagram.peer, datagram.orig_dst, &datagram.payload);
-            if let Some(response) = self.dns_response_for(&packet) {
-                if let Some(payload) = udp_payload_of(&response) {
-                    let sent = self.transparent_udp_reply_tx.as_ref().is_some_and(|tx| {
-                        tx.send(TransparentOutput::UdpReply {
-                            orig_dst: datagram.orig_dst,
-                            peer: datagram.peer,
-                            payload: payload.to_vec(),
-                        })
-                        .is_ok()
-                    });
-                    if sent {
-                        self.with_stats(|s| s.dns_answered += 1);
-                        return;
-                    }
-                    self.with_tproxy_counters(|c| c.udp_reply_failed += 1);
-                }
-            }
+            self.submit_dns_transparent(&datagram);
+            return;
         }
         let (decision, matched_rule, egress_hint, fresh) =
             self.transparent_decision(datagram.peer, datagram.orig_dst, 17, now_millis);
@@ -1389,6 +1601,7 @@ impl Dataplane {
 
     /// 兼容入口：driver 采集当前单调毫秒后调用 [`Self::tick`]。
     pub fn process_one(&mut self) -> io::Result<bool> {
+        self.drain_dns_replies();
         let now_millis = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.process_one_at(now_millis)
     }
@@ -1403,10 +1616,16 @@ impl Dataplane {
         };
         let packet = self.buf[..n].to_vec();
 
-        // D3：DNS 短路（UDP 目的端口 53）。
-        if self.dns.is_some() && is_dns_query(&packet) {
-            self.handle_dns(&packet);
-            return Ok(true);
+        // D3/C11：DNS 拦截（UDP/53 提交服务线程；TCP/53 无条件 RST）。
+        if self.dns.is_some() {
+            if is_dns_query(&packet) {
+                self.submit_dns_tun(&packet);
+                return Ok(true);
+            }
+            if is_dns_tcp_query(&packet) {
+                self.refuse_dns_tcp(&packet, now_millis);
+                return Ok(true);
+            }
         }
 
         // D2：分类。
@@ -2306,38 +2525,6 @@ impl Dataplane {
         self.tcp.stats()
     }
 
-    /// 处理 DNS 查询包：解析 → 构造响应 → 写回 TUN。
-    fn handle_dns(&mut self, packet: &[u8]) {
-        let Some(response) = self.dns_response_for(packet) else {
-            self.with_stats(|s| s.dropped += 1);
-            return;
-        };
-        if self.tun.write(&response).is_ok() {
-            self.with_stats(|s| {
-                s.dns_answered += 1;
-                s.tun_written += 1;
-            });
-        }
-    }
-
-    /// 解析 DNS 查询并构造应答包；TUN 与 TPROXY UDP/53 共用（spec §5 G10）。
-    fn dns_response_for(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
-        let dns = self.dns.as_mut()?;
-        let (query_name, query_id) = parse_dns_query(packet)?;
-        let query = DnsQuery {
-            name: query_name.clone(),
-            qtype: DnsType::A,
-        };
-        let answer = dns.resolve(&query, 0).ok()?;
-        let ip = answer.records.iter().find_map(|r| match r {
-            IpAddr::V4(v4) => Some(*v4),
-            IpAddr::V6(_) => None,
-        })?;
-        let response = build_dns_response(packet, query_id, &query_name, ip)?;
-        self.record_dns_answer(&query_name, ip);
-        Some(response)
-    }
-
     /// 获取统计快照（D6 可观测）。
     #[must_use]
     pub fn stats(&self) -> DataplaneStats {
@@ -2444,27 +2631,9 @@ fn synthetic_transport_packet(peer: SocketAddrV4, orig_dst: SocketAddrV4, proto:
     pkt
 }
 
-/// 构造透明 UDP 数据报的完整 IPv4/UDP 包（DNS 处理器输入）。
-fn synthetic_udp_packet(peer: SocketAddrV4, orig_dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
-    let udp_len = 8 + payload.len();
-    let total = 20 + udp_len;
-    let mut pkt = vec![0u8; total];
-    pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-    pkt[8] = 64;
-    pkt[9] = 17;
-    pkt[12..16].copy_from_slice(&peer.ip().octets());
-    pkt[16..20].copy_from_slice(&orig_dst.ip().octets());
-    pkt[20..22].copy_from_slice(&peer.port().to_be_bytes());
-    pkt[22..24].copy_from_slice(&orig_dst.port().to_be_bytes());
-    pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    pkt[28..].copy_from_slice(payload);
-    pkt
-}
-
-/// 取 IPv4/UDP 包的 UDP 载荷。
-fn udp_payload_of(packet: &[u8]) -> Option<&[u8]> {
-    if packet.len() < 28 || packet[9] != 17 {
+/// 取 IPv4/UDP 包的 UDP 载荷（TUN 侧 DNS 查询体）。
+fn dns_udp_payload(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 28 || packet[0] >> 4 != 4 || packet[9] != 17 {
         return None;
     }
     let ihl = usize::from(packet[0] & 0x0f) * 4;
@@ -2558,6 +2727,18 @@ fn is_dns_query(packet: &[u8]) -> bool {
     dport == 53
 }
 
+/// 判断是否为 TCP DNS 查询（IPv4 + TCP + 目的端口 53）。
+fn is_dns_tcp_query(packet: &[u8]) -> bool {
+    if packet.len() < 40 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return false;
+    }
+    let ihl = usize::from(packet[0] & 0x0F) * 4;
+    if ihl < 20 || packet.len() < ihl + 4 {
+        return false;
+    }
+    u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]) == 53
+}
+
 /// 从 IP 包提取 5 元组（用于 QoS）。
 fn five_tuple_of(packet: &[u8]) -> Option<FiveTuple> {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
@@ -2588,155 +2769,258 @@ fn five_tuple_of(packet: &[u8]) -> Option<FiveTuple> {
     })
 }
 
-/// 最小 DNS 查询解析：返回 (查询名, 事务 ID)。
+/// 构造 DNS 应答 IP/UDP 包（v4 与 v6；v6 写完整 UDP 校验和）。
 ///
-/// B2 修复：严格校验 QTYPE/QCLASS 存在，截断包返回 None（不 panic）。
-fn parse_dns_query(packet: &[u8]) -> Option<(String, u16)> {
-    if packet.len() < 28 {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    let udp_start = ihl;
-    let dns_start = udp_start + 8;
-    if packet.len() < dns_start + 12 {
-        return None;
-    }
-    let dns = &packet[dns_start..];
-    let txid = u16::from_be_bytes([dns[0], dns[1]]);
-    // 解析 QNAME（标签序列）。
-    let mut pos = 12;
-    let mut labels = Vec::new();
-    loop {
-        if pos >= dns.len() {
-            return None;
+/// `server` = 原查询目的（应答源），`client` = 原查询源（应答目的）。
+fn build_dns_udp_reply(server: SocketAddr, client: SocketAddr, dns_wire: &[u8]) -> Option<Vec<u8>> {
+    match (server, client) {
+        (SocketAddr::V4(server), SocketAddr::V4(client)) => {
+            build_dns_udp_reply_v4(server, client, dns_wire)
         }
-        let len = dns[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
+        (SocketAddr::V6(server), SocketAddr::V6(client)) => {
+            build_dns_udp_reply_v6(server, client, dns_wire)
         }
-        if len & 0xC0 != 0 {
-            return None; // 不支持压缩指针（查询包不应有）
-        }
-        pos += 1;
-        if pos + len > dns.len() {
-            return None;
-        }
-        let label = std::str::from_utf8(&dns[pos..pos + len]).ok()?;
-        labels.push(label.to_string());
-        pos += len;
+        _ => None,
     }
-    if labels.is_empty() {
-        return None;
-    }
-    // B2：校验 QTYPE(2) + QCLASS(2) 存在。
-    if pos + 4 > dns.len() {
-        return None;
-    }
-    Some((labels.join("."), txid))
 }
 
-/// 构造最小 DNS 响应包（IP 头 + UDP 头 + DNS 响应）。
-fn build_dns_response(
-    query_packet: &[u8],
-    txid: u16,
-    qname: &str,
-    answer_ip: Ipv4Addr,
+fn build_dns_udp_reply_v4(
+    server: SocketAddrV4,
+    client: SocketAddrV4,
+    dns_wire: &[u8],
 ) -> Option<Vec<u8>> {
-    if query_packet.len() < 28 {
+    let udp_len = 8 + dns_wire.len();
+    if udp_len > usize::from(u16::MAX) {
         return None;
     }
-    let ihl = ((query_packet[0] & 0x0F) as usize) * 4;
-    let udp_start = ihl;
-    let dns_start = udp_start + 8;
-
-    // 交换 IP 源/目。
-    let src_ip = Ipv4Addr::new(
-        query_packet[12],
-        query_packet[13],
-        query_packet[14],
-        query_packet[15],
-    );
-    let dst_ip = Ipv4Addr::new(
-        query_packet[16],
-        query_packet[17],
-        query_packet[18],
-        query_packet[19],
-    );
-    let src_port = u16::from_be_bytes([query_packet[udp_start], query_packet[udp_start + 1]]);
-    let _dst_port = u16::from_be_bytes([query_packet[udp_start + 2], query_packet[udp_start + 3]]);
-
-    // DNS 响应体。
-    let mut dns_resp = Vec::new();
-    dns_resp.extend_from_slice(&txid.to_be_bytes()); // ID
-    dns_resp.extend_from_slice(&[0x81, 0x80]); // Flags: QR=1, RD=1, RA=1
-    dns_resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-    dns_resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT=1
-    dns_resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
-    dns_resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-    // Question（复制原查询的 QNAME+QTYPE+QCLASS）。
-    // B2：边界校验，防止截断包导致切片越界 panic。
-    let qname_end = find_qname_end(&query_packet[dns_start..])?;
-    let q_section_len = qname_end + 4; // QNAME + QTYPE(2) + QCLASS(2)
-    if dns_start + q_section_len > query_packet.len() {
-        return None;
-    }
-    dns_resp.extend_from_slice(&query_packet[dns_start..dns_start + q_section_len]);
-    // Answer：NAME(指针), TYPE=A, CLASS=IN, TTL=300, RDLENGTH=4, RDATA=IP。
-    dns_resp.extend_from_slice(&[0xC0, 0x0C]); // 指向 QNAME 的压缩指针
-    dns_resp.extend_from_slice(&[0x00, 0x01]); // TYPE=A
-    dns_resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
-    dns_resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL=300
-    dns_resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
-    dns_resp.extend_from_slice(&answer_ip.octets());
-    let _ = qname;
-
-    // UDP 头。
-    let udp_len = 8 + dns_resp.len();
-    let mut udp_hdr = Vec::new();
-    udp_hdr.extend_from_slice(&53u16.to_be_bytes()); // 源端口 53
-    udp_hdr.extend_from_slice(&src_port.to_be_bytes()); // 目的端口（原源端口）
-    udp_hdr.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    udp_hdr.extend_from_slice(&[0x00, 0x00]); // 校验和（MVP 置零）
-
-    // IP 头。
     let total_len = 20 + udp_len;
+    if total_len > usize::from(u16::MAX) {
+        return None;
+    }
+    let mut udp = vec![0u8; udp_len];
+    udp[0..2].copy_from_slice(&server.port().to_be_bytes());
+    udp[2..4].copy_from_slice(&client.port().to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[8..].copy_from_slice(dns_wire);
+    let checksum = udp_checksum(IpAddr::V4(*server.ip()), IpAddr::V4(*client.ip()), &udp);
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+
     let mut ip_hdr = vec![0u8; 20];
-    ip_hdr[0] = 0x45; // 版本 4，IHL 5
-    ip_hdr[1] = 0x00; // DSCP
+    ip_hdr[0] = 0x45;
     ip_hdr[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    ip_hdr[4..6].copy_from_slice(&[0x00, 0x00]); // ID
-    ip_hdr[6..8].copy_from_slice(&[0x40, 0x00]); // Flags=DF
-    ip_hdr[8] = 64; // TTL
-    ip_hdr[9] = 17; // 协议 UDP
-    // 源 = 原目的（DNS 服务器），目的 = 原源（客户端）。
-    ip_hdr[12..16].copy_from_slice(&dst_ip.octets());
-    ip_hdr[16..20].copy_from_slice(&src_ip.octets());
-    // IP 校验和。
+    ip_hdr[6..8].copy_from_slice(&[0x40, 0x00]);
+    ip_hdr[8] = 64;
+    ip_hdr[9] = 17;
+    ip_hdr[12..16].copy_from_slice(&server.ip().octets());
+    ip_hdr[16..20].copy_from_slice(&client.ip().octets());
     let checksum = ip_checksum(&ip_hdr);
     ip_hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
 
     let mut packet = Vec::with_capacity(total_len);
     packet.extend_from_slice(&ip_hdr);
-    packet.extend_from_slice(&udp_hdr);
-    packet.extend_from_slice(&dns_resp);
+    packet.extend_from_slice(&udp);
     Some(packet)
 }
 
-/// 找到 DNS 查询包中 QNAME 的结束偏移（相对于 DNS 起始）。
-fn find_qname_end(dns: &[u8]) -> Option<usize> {
-    let mut pos = 12;
-    while pos < dns.len() {
-        let len = dns[pos] as usize;
+fn build_dns_udp_reply_v6(
+    server: SocketAddrV6,
+    client: SocketAddrV6,
+    dns_wire: &[u8],
+) -> Option<Vec<u8>> {
+    let udp_len = 8 + dns_wire.len();
+    if udp_len > usize::from(u16::MAX) {
+        return None;
+    }
+    let mut udp = vec![0u8; udp_len];
+    udp[0..2].copy_from_slice(&server.port().to_be_bytes());
+    udp[2..4].copy_from_slice(&client.port().to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[8..].copy_from_slice(dns_wire);
+    let checksum = udp_checksum(IpAddr::V6(*server.ip()), IpAddr::V6(*client.ip()), &udp);
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+
+    let mut ip_hdr = vec![0u8; 40];
+    ip_hdr[0] = 0x60;
+    ip_hdr[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    ip_hdr[6] = 17;
+    ip_hdr[7] = 64;
+    ip_hdr[8..24].copy_from_slice(&server.ip().octets());
+    ip_hdr[24..40].copy_from_slice(&client.ip().octets());
+
+    let mut packet = Vec::with_capacity(40 + udp_len);
+    packet.extend_from_slice(&ip_hdr);
+    packet.extend_from_slice(&udp);
+    Some(packet)
+}
+
+/// UDP 校验和（含 v4/v6 伪头）；返回 0 表示结果为零，按 RFC 768 写 0xFFFF。
+fn udp_checksum(src: IpAddr, dst: IpAddr, udp: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            sum = add_words(sum, &src.octets());
+            sum = add_words(sum, &dst.octets());
+            sum += 17;
+            sum += udp.len() as u32;
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            sum = add_words(sum, &src.octets());
+            sum = add_words(sum, &dst.octets());
+            sum += (udp.len() as u32) >> 16;
+            sum += (udp.len() as u32) & 0xFFFF;
+            sum += 17;
+        }
+        _ => return 0,
+    }
+    sum = add_words(sum, udp);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let folded = !(sum as u16);
+    if folded == 0 { 0xFFFF } else { folded }
+}
+
+fn add_words(mut sum: u32, data: &[u8]) -> u32 {
+    for chunk in data.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+        } else {
+            (chunk[0] as u32) << 8
+        };
+        sum += word;
+    }
+    sum
+}
+
+/// 从 DNS 响应 wire 提取 `(查询名, A/AAAA 答案)`，供决策缓存回填（D-impl-8）。
+///
+/// 只做足够解析：header + question 名 + answer 段的 A/AAAA。解析失败返回
+/// `None`（不影响回包）。
+fn dns_response_meta(wire: &[u8]) -> Option<(String, Vec<IpAddr>)> {
+    if wire.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([wire[4], wire[5]]);
+    let ancount = u16::from_be_bytes([wire[6], wire[7]]);
+    if qdcount != 1 {
+        return None;
+    }
+    let mut off = 12;
+    let name = read_dns_name(wire, &mut off)?;
+    off = off.checked_add(4)?; // QTYPE + QCLASS
+    if off > wire.len() {
+        return None;
+    }
+    let mut answers = Vec::new();
+    for _ in 0..ancount {
+        off = skip_dns_name(wire, off)?;
+        if off + 10 > wire.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([wire[off], wire[off + 1]]);
+        let rdlen = usize::from(u16::from_be_bytes([wire[off + 8], wire[off + 9]]));
+        let start = off + 10;
+        let end = start.checked_add(rdlen)?;
+        if end > wire.len() {
+            return None;
+        }
+        match (rtype, rdlen) {
+            (1, 4) => answers.push(IpAddr::V4(Ipv4Addr::new(
+                wire[start],
+                wire[start + 1],
+                wire[start + 2],
+                wire[start + 3],
+            ))),
+            (28, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&wire[start..end]);
+                answers.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        off = end;
+    }
+    Some((name, answers))
+}
+
+fn read_dns_name(wire: &[u8], off: &mut usize) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut pos = *off;
+    loop {
+        let len = *wire.get(pos)? as usize;
         if len == 0 {
-            return Some(pos + 1);
+            pos += 1;
+            break;
         }
         if len & 0xC0 != 0 {
             return None;
         }
-        pos += 1 + len;
+        pos += 1;
+        let label = wire.get(pos..pos + len)?;
+        labels.push(std::str::from_utf8(label).ok()?.to_ascii_lowercase());
+        pos += len;
     }
-    None
+    *off = pos;
+    Some(labels.join("."))
+}
+
+fn skip_dns_name(wire: &[u8], mut off: usize) -> Option<usize> {
+    loop {
+        let len = *wire.get(off)? as usize;
+        if len == 0 {
+            return Some(off + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return Some(off + 2);
+        }
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        off += 1 + len;
+    }
+}
+
+/// 构造 TCP/53 的 RST|ACK 应答（v4；`is_dns_tcp_query` 只匹配 v4）。
+fn build_tcp_reset_for_query(packet: &[u8]) -> Option<Vec<u8>> {
+    use nexus_projection::tcp::{ip_checksum, tcp_checksum};
+    if packet.len() < 40 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return None;
+    }
+    let ihl = usize::from(packet[0] & 0x0F) * 4;
+    if ihl < 20 || packet.len() < ihl + 14 {
+        return None;
+    }
+    let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let sport = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+    let dport = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+    let seq = u32::from_be_bytes([
+        packet[ihl + 4],
+        packet[ihl + 5],
+        packet[ihl + 6],
+        packet[ihl + 7],
+    ]);
+    let mut tcp = vec![0u8; 20];
+    tcp[0..2].copy_from_slice(&dport.to_be_bytes());
+    tcp[2..4].copy_from_slice(&sport.to_be_bytes());
+    tcp[4..8].copy_from_slice(&0u32.to_be_bytes()); // seq
+    tcp[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes()); // ack
+    tcp[12] = 0x50;
+    tcp[13] = 0x14; // RST|ACK
+    let tcp_sum = tcp_checksum(dst.octets(), src.octets(), &tcp);
+    tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
+
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&40u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 6;
+    ip[12..16].copy_from_slice(&dst.octets());
+    ip[16..20].copy_from_slice(&src.octets());
+    let ip_sum = ip_checksum(&ip);
+    ip[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    ip.extend_from_slice(&tcp);
+    Some(ip)
 }
 
 /// IP 头校验和。
@@ -3037,6 +3321,16 @@ pub fn dataplane_stats_json(
             "direct_dropped_unsupported": stats.direct_dropped_unsupported,
             "dropped": stats.dropped,
             "dns_answered": stats.dns_answered,
+            "dns_noerror": stats.dns_noerror,
+            "dns_nodata": stats.dns_nodata,
+            "dns_nxdomain": stats.dns_nxdomain,
+            "dns_servfail": stats.dns_servfail,
+            "dns_refused": stats.dns_refused,
+            "dns_formerr": stats.dns_formerr,
+            "dns_tcp_refused": stats.dns_tcp_refused,
+            "dns_queue_full": stats.dns_queue_full,
+            "dns_service_down": stats.dns_service_down,
+            "dns_reply_write_failed": stats.dns_reply_write_failed,
             "qos_dropped": stats.qos_dropped,
             "mesh_dropped_no_n1": stats.mesh_dropped_no_n1,
             "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
@@ -3071,32 +3365,8 @@ pub fn dataplane_stats_json(
     })
 }
 
-// ===== Stub 实现（MVP：E4 可测；真实解析器由子系统接入） =====
-
-struct StubUpstreamResolver;
-impl nexus_dns::Resolver for StubUpstreamResolver {
-    fn resolve(&mut self, _query: &DnsQuery) -> Result<Vec<IpAddr>, nexus_dns::DnsError> {
-        Err(nexus_dns::DnsError::ResolutionFailed(
-            "stub upstream not configured".to_string(),
-        ))
-    }
-}
-
 // ===== 全局 stats 句柄结束 =====
 
-struct StubMeshResolver;
-impl nexus_dns::MeshNameResolver for StubMeshResolver {
-    fn resolve_mesh(&self, _name: &str) -> Option<IpAddr> {
-        None
-    }
-}
-
-struct StubProxyClassifier;
-impl nexus_dns::ProxyClassifier for StubProxyClassifier {
-    fn is_proxied(&self, _domain: &str) -> bool {
-        true // MVP：默认走 proxy（触发 fake-IP）
-    }
-}
 /// 分类结果携带的规则出站 tag（Q3 `egress_hint`）。
 fn egress_hint(classification: &Classification) -> Option<&str> {
     match classification {
@@ -3281,7 +3551,7 @@ mod tests {
             n1_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         // 显式注入无配置默认引擎（新装配不再静默回落到它）。
         dp.set_default_simple_engine().expect("default engine");
         (dp, mock)
@@ -3295,6 +3565,7 @@ mod tests {
         let mut dp = Dataplane::new(
             Box::new(SharedTun { inner: mock }),
             DataplaneConfig::default(),
+            None,
         )
         .expect("dataplane new");
         let peer = SocketAddrV4::new(Ipv4Addr::new(10, 200, 2, 2), 40_000);
@@ -3363,7 +3634,7 @@ mod tests {
             n1_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         let frames = Arc::new(Mutex::new(Vec::new()));
         dp.set_n1_sender(Arc::new(TestN1Sender {
             frames: Arc::clone(&frames),
@@ -3563,7 +3834,7 @@ outbounds:
             proxy_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
             cidr: "0.0.0.0/0".parse().expect("cidr"),
             target: nexus_domain::RouteTarget::Egress {
@@ -3821,7 +4092,7 @@ outbounds:
         );
         dp.set_rule_engine(Box::new(engine));
 
-        dp.record_dns_answer("api.example.com", Ipv4Addr::new(203, 0, 113, 7));
+        dp.record_dns_answer("api.example.com", IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
         let pkt = craft_udp([192, 168, 1, 5], [203, 0, 113, 7], 40_000, 443, b"z");
         mock.lock().unwrap().inject(pkt.clone());
         assert!(dp.process_one().expect("packet"));
@@ -3858,7 +4129,7 @@ outbounds:
             bypass_cidrs: vec!["127.0.0.0/8".to_string()],
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         let dst = match server_addr {
             std::net::SocketAddr::V4(v4) => [
                 v4.ip().octets()[0],
@@ -4438,7 +4709,7 @@ proto=udp frontend=tproxy matched_rule=- egress_hint=- outbound=self session=-"
             proxy_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
             cidr: "10.200.3.3/32".parse().expect("cidr"),
             target: nexus_domain::RouteTarget::Egress {
@@ -4755,7 +5026,7 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
             proxy_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
             cidr: "10.200.3.3/32".parse().expect("cidr"),
             target: nexus_domain::RouteTarget::Egress {
@@ -5225,7 +5496,7 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
             proxy_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
         dp.set_proxy_engine(
             crate::proxy_fwd::ProxyEngine::new(Some(P6_PROXY_YAML))
                 .expect("proxy engine")
@@ -5533,5 +5804,122 @@ outbounds:
             .tproxy_last_failure()
             .expect("pipeline-None UDP drop must set last_failure_reason");
         assert!(reason.contains("udp_dropped_no_pipeline"), "{reason}");
+    }
+
+    fn dns_file_config_with_host() -> crate::config::DnsFileConfig {
+        use crate::config::{DnsProxyPolicy, UpstreamConfig};
+        use crate::dns_status::{UnevaluablePolicy, UnmatchedPolicy};
+        use nexus_dns::DnsUnifiedConfig;
+        let mut unified = DnsUnifiedConfig::default();
+        unified.hosts = vec![(
+            "local.example".to_string(),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        )];
+        crate::config::DnsFileConfig {
+            unified,
+            mesh_hosts: Vec::new(),
+            proxy: DnsProxyPolicy {
+                unmatched: UnmatchedPolicy::Auto,
+                unevaluable: UnevaluablePolicy::Proxied,
+            },
+            upstream: UpstreamConfig {
+                servers: vec!["127.0.0.1:9".parse().expect("upstream")],
+                attempt_timeout_ms: 50,
+                attempts_per_server: 1,
+                total_budget_ms: 50,
+                edns_udp_size: 0,
+                tcp_fallback: false,
+                tcp_timeout_ms: 100,
+                cache_max_entries: 0,
+                cache_max_ttl_secs: 1,
+                negative_ttl_secs: 0,
+                max_inflight: 1,
+            },
+        }
+    }
+
+    /// Q-3 / D-impl-2 / R-8：`handle_transparent_udp` → DNS 提交 →
+    /// `TransparentOutput::UdpReply` 全程（不经 TUN）。
+    #[test]
+    fn transparent_dns_query_replies_through_udp_reply_channel() {
+        use crate::dns_service::DnsService;
+        use crate::dns_status::{DnsStatus, DnsStatusSnapshot};
+        use nexus_dns::{DnsQuery, DnsType};
+
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let dns_config = dns_file_config_with_host();
+        let config = DataplaneConfig {
+            dns_enabled: true,
+            dns_config: Some(dns_config.clone()),
+            ..Default::default()
+        };
+        let status = Arc::new(DnsStatus::new(DnsStatusSnapshot::disabled()));
+        let handle = DnsService::start(dns_config, None, status).expect("dns service starts");
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let mut dp = Dataplane::new(
+            Box::new(SharedTun {
+                inner: Arc::clone(&mock),
+            }),
+            config,
+            Some(handle),
+        )
+        .expect("dataplane");
+        dp.transparent_udp_reply_tx = Some(reply_tx);
+
+        let query = nexus_dns::wire::build_query(
+            &DnsQuery {
+                name: "local.example".to_string(),
+                qtype: DnsType::A,
+            },
+            0x1234,
+            None,
+        );
+        dp.handle_transparent_udp(
+            ReceivedDatagram {
+                payload: query,
+                peer: SocketAddrV4::new(Ipv4Addr::new(10, 200, 1, 2), 40_000),
+                orig_dst: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53),
+                received_at_millis: 1,
+            },
+            1,
+        );
+
+        let mut output = None;
+        for _ in 0..400 {
+            dp.drain_dns_replies();
+            if let Ok(value) = reply_rx.try_recv() {
+                output = Some(value);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let output = output.expect("transparent DNS reply must reach UdpReply");
+        match output {
+            TransparentOutput::UdpReply {
+                orig_dst,
+                peer,
+                payload,
+            } => {
+                assert_eq!(orig_dst, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+                assert_eq!(
+                    peer,
+                    SocketAddrV4::new(Ipv4Addr::new(10, 200, 1, 2), 40_000)
+                );
+                let (name, answers) = dns_response_meta(&payload).expect("response parses");
+                assert_eq!(name, "local.example");
+                assert_eq!(answers, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+            }
+            other => panic!("expected UdpReply, got {other:?}"),
+        }
+        assert!(mock.lock().unwrap().read(&mut [0u8; 1]).is_err());
+        assert!(mock.lock().unwrap().read(&mut [0u8; 1]).is_err());
+        assert_eq!(dp.stats().dns_noerror, 1);
+        assert_eq!(dp.stats().dns_answered, 1);
+        let mapped = dp
+            .dns_cache_handle()
+            .lock()
+            .unwrap()
+            .lookup(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(mapped.as_deref(), Some("local.example"));
     }
 }

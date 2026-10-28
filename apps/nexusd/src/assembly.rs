@@ -318,16 +318,29 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
         .and_then(|e| e.as_bool())
         .unwrap_or(false);
 
-    // R3：dns.toml 解析。
-    let dns_config = match loaded.dns_toml.as_deref() {
-        Some(text) => Some(parse_dns_toml(text)?),
-        None => None,
+    // R3/C11：dns.toml 严格解析（三参数：mesh 网段归属 + 可用出站）。
+    // D-impl-6/SU-2：仅 TUN 启用时才解析；no-tun 下非法 dns.toml 不阻塞启动。
+    let dns_tun_enabled = loaded.daemon.tun.enabled;
+    let has_usable_outbound = match loaded.proxy_yaml.as_deref() {
+        Some(yaml) => crate::dns_classify::usable_outbound(yaml).map_err(|e| e.to_string())?,
+        None => false,
+    };
+    let dns_config = if dns_tun_enabled {
+        match loaded.dns_toml.as_deref() {
+            Some(text) => Some(
+                parse_dns_toml(text, loaded.network_toml.as_deref(), has_usable_outbound)
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        }
+    } else {
+        None
     };
 
     Ok(DataplaneConfig {
         mesh_cidrs,
         bypass_cidrs,
-        dns_enabled: loaded.dns_toml.is_some(),
+        dns_enabled: dns_tun_enabled && loaded.dns_toml.is_some(),
         dns_config,
         qos_enabled,
         qos_config,

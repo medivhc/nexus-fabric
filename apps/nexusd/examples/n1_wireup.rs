@@ -133,7 +133,7 @@ fn run() -> serde_json::Value {
         proxy_configured: true,
         ..Default::default()
     };
-    let mut dp = match Dataplane::new(Box::new(tun), config) {
+    let mut dp = match Dataplane::new(Box::new(tun), config, None) {
         Ok(dp) => dp,
         Err(e) => {
             return json!({

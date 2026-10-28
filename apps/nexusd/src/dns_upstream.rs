@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use nexus_dns::DnsClass;
@@ -24,6 +24,23 @@ use crate::config::UpstreamConfig;
 pub const DEGRADED_AFTER: u32 = 3;
 /// Hard server cap (§4.2.1).
 pub const MAX_SERVERS: usize = 8;
+
+/// Where a DNS reply must be written back (Q-3 / D-impl-2).
+///
+/// The frozen model only had the TUN sink; TPROXY UDP/53 is a second entry
+/// point whose reply channel is `TransparentOutput::UdpReply`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplySink {
+    /// Reply goes to the TUN as an IPv4/IPv6 UDP packet.
+    Tun,
+    /// Reply goes back through the TPROXY listener channel.
+    Transparent {
+        /// Client address of the intercepted datagram.
+        peer: SocketAddrV4,
+        /// Original destination of the intercepted datagram.
+        orig_dst: SocketAddrV4,
+    },
+}
 
 /// A DNS response ready for the dataplane to write back.
 #[derive(Debug, Clone)]
@@ -38,6 +55,8 @@ pub struct DnsReply {
     pub class: DnsClass,
     /// Response RCODE (0/1/2/3/5...).
     pub rcode: u16,
+    /// Reply channel (TUN or TPROXY).
+    pub sink: ReplySink,
 }
 
 /// One cache entry exposed to `/dns/cache` (§4.2.5).
@@ -250,6 +269,7 @@ struct Inflight {
     client: SocketAddr,
     server: SocketAddr,
     question: DnsQuestion,
+    sink: ReplySink,
     sock: u64,
     txid: u16,
     order: Vec<usize>,
@@ -345,6 +365,22 @@ impl UpstreamEngine {
         question: DnsQuestion,
         now: Instant,
     ) -> Result<(), UpstreamSubmitError> {
+        self.submit_with_sink(client, server, question, now, ReplySink::Tun)
+    }
+
+    /// Accept a query with an explicit reply sink (Q-3 / D-impl-2).
+    ///
+    /// # Errors
+    ///
+    /// `Overloaded` when `max_inflight` is reached.
+    pub fn submit_with_sink(
+        &mut self,
+        client: SocketAddr,
+        server: SocketAddr,
+        question: DnsQuestion,
+        now: Instant,
+        sink: ReplySink,
+    ) -> Result<(), UpstreamSubmitError> {
         let name = question.name.to_ascii_lowercase();
         let cacheable = matches!(question.qtype, 1 | 28);
 
@@ -362,6 +398,7 @@ impl UpstreamEngine {
                         wire,
                         class: DnsClass::Upstream,
                         rcode,
+                        sink,
                     });
                     return Ok(());
                 }
@@ -385,6 +422,7 @@ impl UpstreamEngine {
             client,
             server,
             question,
+            sink,
             sock: 0,
             txid,
             order,
@@ -402,8 +440,13 @@ impl UpstreamEngine {
         loop {
             let Some(&index) = inflight.order.get(inflight.order_pos) else {
                 self.last_error = Some("all-servers-failed".to_string());
-                let reply =
-                    self.error_reply(&inflight.question, client, server, DnsRcode::ServFail);
+                let reply = self.error_reply(
+                    &inflight.question,
+                    client,
+                    server,
+                    DnsRcode::ServFail,
+                    &inflight.sink,
+                );
                 self.ready.push(reply);
                 return Ok(());
             };
@@ -548,6 +591,7 @@ impl UpstreamEngine {
                 inflight.client,
                 inflight.server,
                 DnsRcode::ServFail,
+                &inflight.sink,
             );
             out.push(reply);
             self.transport.close_udp(inflight.sock);
@@ -623,6 +667,7 @@ impl UpstreamEngine {
                 inflight.client,
                 inflight.server,
                 DnsRcode::ServFail,
+                &inflight.sink,
             );
             out.push(reply);
         } else {
@@ -632,6 +677,7 @@ impl UpstreamEngine {
                 wire,
                 class: DnsClass::Upstream,
                 rcode,
+                sink: inflight.sink.clone(),
             });
         }
         self.transport.close_udp(inflight.sock);
@@ -709,6 +755,7 @@ impl UpstreamEngine {
                     inflight.client,
                     inflight.server,
                     DnsRcode::ServFail,
+                    &inflight.sink,
                 );
                 out.push(reply);
                 return None;
@@ -853,6 +900,7 @@ impl UpstreamEngine {
         client: SocketAddr,
         server: SocketAddr,
         rcode: DnsRcode,
+        sink: &ReplySink,
     ) -> DnsReply {
         let query = build_upstream_query(question, question.id, None);
         let wire = wire::build_error(&query, rcode).unwrap_or_default();
@@ -862,6 +910,7 @@ impl UpstreamEngine {
             wire,
             class: DnsClass::Upstream,
             rcode: u16::from(rcode.code()),
+            sink: sink.clone(),
         }
     }
 

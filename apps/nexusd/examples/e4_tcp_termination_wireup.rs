@@ -71,7 +71,7 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp = match Dataplane::new(tun, config) {
+    let mut dp = match Dataplane::new(tun, config, None) {
         Ok(dp) => dp,
         Err(e) => {
             return json!({"verdict": "FAIL", "error": format!("dataplane init failed: {e}")});
