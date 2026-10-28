@@ -6,7 +6,7 @@
 //! - dns_toml_missing：缺失 → None；非法 → Err（R3）；
 //! - n1_assemble_ok：合法配置 → bridge 构造成功，route_count == 1（R1）；
 //! - n1_assemble_bad：非法配置 → Err（R1 降级路径）；
-//! - hot_reload_classify：network.toml → NeedsRestart；dns.toml → Hot（R5）。
+//! - hot_reload_classify：network.toml → NeedsRestart；dns.toml → NeedsRestart（R5/Q8）。
 
 use serde_json::json;
 
@@ -128,7 +128,8 @@ fn run() -> serde_json::Value {
         config::classify_change(&loaded, &loaded_new) == ChangeKind::NeedsRestart;
     let mut loaded_new2 = loaded.clone();
     loaded_new2.dns_toml = Some("[dns]\nupstream = [\"9.9.9.9\"]\n".to_string());
-    let hot_dns_hot = config::classify_change(&loaded, &loaded_new2) == ChangeKind::Hot;
+    let hot_dns_is_restart =
+        config::classify_change(&loaded, &loaded_new2) == ChangeKind::NeedsRestart;
 
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -142,7 +143,7 @@ fn run() -> serde_json::Value {
         && n1_ok
         && n1_bad_err
         && hot_network_restart
-        && hot_dns_hot;
+        && hot_dns_is_restart;
 
     json!({
         "verdict": if pass { "PASS" } else { "FAIL" },
@@ -164,7 +165,7 @@ fn run() -> serde_json::Value {
             "n1_route_count": if n1_ok { 1 } else { 0 },
             "n1_assemble_bad_is_err": n1_bad_err,
             "hot_network_is_restart": hot_network_restart,
-            "hot_dns_is_hot": hot_dns_hot,
+            "hot_dns_is_restart": hot_dns_is_restart,
         }
     })
 }

@@ -1,0 +1,52 @@
+schema_version = 1
+id = "product.dns-fake-ip-roundtrip"
+title = "DNS 代理分类 + fake-ip 往返（AC4）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+
+[given]
+# proxy.yaml 3 条规则（domain/domain_suffix/match）；socks5 出站可用（select_index）。
+# fake-ip 池 198.18.0.0/15；direct.example 走真实上游。
+
+[when]
+command = "cargo run --quiet -p nexusd --example dns_production_e4 -- --json --suite fakeip"
+
+[[expect]]
+field = "ac4.fakeip.in_range"
+equals = true
+
+[[expect]]
+field = "ac4.fakeip.class"
+equals = "FakeIp"
+
+[[expect]]
+field = "ac4.fakeip.allocated"
+equals = 1
+
+[[expect]]
+field = "ac4.fakeip.stable"
+equals = true
+
+[[expect]]
+field = "ac4.direct_ip"
+equals = "93.184.216.36"
+
+[[expect]]
+field = "ac4.allocated_after_direct"
+equals = 1
+
+[[expect]]
+field = "ac4.fakeip.reverse_lookup"
+equals = "proxied.example"
+
+[[expect]]
+field = "ac4.proxy_policy.rules"
+equals = 3
+
+[[expect]]
+field = "ac4.classes.proxy_classifier"
+equals = true
+
+[[expect]]
+field = "verdict"
+equals = "PASS"

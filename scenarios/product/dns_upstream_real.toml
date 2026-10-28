@@ -1,0 +1,86 @@
+schema_version = 1
+id = "product.dns-upstream-real"
+title = "DNS 真实上游：dnsmasq 2.90 + 生产装配路径（AC1/AC2/AC5/AC12）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+
+[given]
+# `dns_production_e4 --suite upstream` 从生产装配链出发：
+# ConfigDir → config::load → assembly::build_dataplane_config
+# → DnsService::start（单 owner 线程）→ Dataplane::new(SharedTun, cfg, Some(handle))。
+# 真实 dnsmasq 2.90 子进程（动态端口，结束 kill+wait）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example dns_production_e4 -- --json --suite upstream"
+
+# AC1：真实上游交换（A/53/校验和）。
+[[expect]]
+field = "ac1.rcode"
+equals = 0
+
+[[expect]]
+field = "ac1.qtype"
+equals = 1
+
+[[expect]]
+field = "ac1.answer"
+equals = "93.184.216.34"
+
+[[expect]]
+field = "ac1.src_port"
+equals = 53
+
+[[expect]]
+field = "ac1.ip_checksum_ok"
+equals = true
+
+[[expect]]
+field = "ac1.udp_checksum_ok"
+equals = true
+
+[[expect]]
+field = "dataplane.dns_answered"
+equals = 1
+
+[[expect]]
+field = "dns.classes.upstream"
+equals = true
+
+# AC2：黑洞首服务器 → 故障转移 + 预算上界；同名第二次缓存命中；NXDOMAIN + 负缓存。
+[[expect]]
+field = "ac2.failovers"
+equals = 1
+
+[[expect]]
+field = "ac2.rcode"
+equals = 0
+
+[[expect]]
+field = "ac2.dnsmasq_unchanged"
+equals = true
+
+[[expect]]
+field = "ac2.nx_rcode"
+equals = 3
+
+[[expect]]
+field = "ac2.dns_nxdomain"
+equals = 1
+
+[[expect]]
+field = "ac2.negative_cached"
+equals = true
+
+# AC5（启用侧）：所有分类源为真、服务 running。
+[[expect]]
+field = "ac5.ok"
+equals = true
+
+# AC12：状态/缓存来自真实服务句柄，不是演示运行时。
+[[expect]]
+field = "ac12.ok"
+equals = true
+
+[[expect]]
+field = "verdict"
+equals = "PASS"

@@ -6,8 +6,8 @@ requirement = "PRODUCT.md#9-observability"
 carrier = "n1-fabric"
 
 [given]
-resolver = "memory-mock"
-snapshot_api = "DnsRuntime::cache_snapshot / negative_cache_snapshot"
+# 无 DnsService（daemon 未配置 dns.toml）→ /dns/cache 返回真实空缓存，
+# 不是 nexus 演示运行时的 DemoResolver 数据。
 
 [when]
 # CLI 统一重构（01e5114）后观察命令走 daemon LocalAPI；harness 不负责起 daemon，
@@ -19,9 +19,13 @@ field = "verdict"
 equals = "PASS"
 
 [[expect]]
+field = "enabled"
+equals = false
+
+[[expect]]
 field = "cache"
-non_empty = true
+equals = []
 
 [[expect]]
 field = "negative_cache"
-non_empty = true
+equals = []

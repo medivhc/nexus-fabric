@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.dns-mesh-names"
+title = "DNS Mesh 名源：dns.toml [dns.mesh.hosts] 静态表（AC3/AC8 group3）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+
+[given]
+# 生产装配路径 + 真实 dnsmasq；mesh 名本地回答，未知 mesh 名 NXDOMAIN 且不泄漏上游。
+
+[when]
+command = "cargo run --quiet -p nexusd --example dns_production_e4 -- --json --suite mesh"
+
+[[expect]]
+field = "ac3.answer"
+equals = "10.144.144.6"
+
+[[expect]]
+field = "ac3.class"
+equals = "Mesh"
+
+[[expect]]
+field = "ac3.upstream_delta"
+equals = 0
+
+[[expect]]
+field = "ac3.ghost_rcode"
+equals = 3
+
+[[expect]]
+field = "ac3.ghost_upstream_delta"
+equals = 0
+
+# AC8 group3：AAAA → fd00:144::9，同 A → NODATA。
+[[expect]]
+field = "ac8.group3_aaaa"
+equals = "fd00:144::9"
+
+[[expect]]
+field = "ac8.group3_a_nodata"
+equals = true
+
+[[expect]]
+field = "verdict"
+equals = "PASS"

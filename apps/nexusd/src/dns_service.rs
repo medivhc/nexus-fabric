@@ -324,7 +324,6 @@ fn run_worker(
 ) {
     let start = Instant::now();
     let mut last_reclaim = 0;
-    let mut last_cache_publish = 0u64;
     let mut local = LocalCounters::default();
     let mut reply_buf = Vec::new();
 
@@ -377,12 +376,11 @@ fn run_worker(
             unified.reclaim_expired(now_secs);
             last_reclaim = now_secs;
         }
-        if now_secs != last_cache_publish {
-            let entries = engine.cache_snapshot();
-            if let Ok(mut guard) = cache_view.lock() {
-                *guard = entries;
-            }
-            last_cache_publish = now_secs;
+        // `/dns/cache` reads a process-wide view; refresh on every tick so a
+        // just-completed query is visible to LocalAPI/E4 without a 1 s lag.
+        let entries = engine.cache_snapshot();
+        if let Ok(mut guard) = cache_view.lock() {
+            *guard = entries;
         }
 
         refresh_status(&mut snapshot, &engine, &unified, &local, &unevaluable_hits);
