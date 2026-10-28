@@ -3052,12 +3052,16 @@ mod tests {
         }
         // fixes-5 合并注记：master 287 + fixes-5 新增 product.proxy-trojan-fallback-rejected 场景 1 = 288。
         // P3 合并注记：+ product.qos-cake-enabled-path（cargo run -p nexusd --example）= 289。
-        assert_eq!(parseable, 289, "289 cargo-run [when].command");
+        // R3 合并注记：R3 C12 新增 5 个 dns_production_e4 场景 → 294；R3 C19 新增
+        // product.ipv6-dataplane（ipv6_dataplane_e4）→ 295；R3 C22 新增
+        // product.ipv6-tcp-termination（ipv6_tcp_termination_e4）→ 296；合并门 CAC-1 补跑新增
+        // product.cac1-proxy-v6-echo（同 example 的 --cac1 模式）→ 297（合并树实测重算）。
+        assert_eq!(parseable, 297, "297 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 267, "all declared targets resolve to Direct");
+        assert_eq!(direct, 275, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -3096,10 +3100,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            211,
-            "207 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            214,
+            "210 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 207);
+        assert_eq!(examples.len(), 210);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(

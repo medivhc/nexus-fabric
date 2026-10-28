@@ -19,7 +19,10 @@ P0 实现边界（`DnsRuntime`）：
 ## Non-Responsibilities
 
 不污染核心 Plan 固定字段；不直接修改平台系统 DNS；不感知 Connectivity/VPI；
-不实现真实 DNS 传输协议（UDP/TLS/HTTPS），真实传输由后续 `Resolver` 实现提供。
+不实现真实 DNS 传输协议（UDP/TLS/HTTPS）。“不实现真实传输”仍然成立：`wire`
+只做**报文编解码**（无 socket、无 `Instant`、无全局状态）；UDP/TCP socket、
+超时/重试/故障转移/并发上限全部在 `nexusd` 服务面（DnsService / 上游引擎）。
+本层也不决定 TLS/DoH 等上游形态，`Resolver` 由 Composition Root 注入。
 
 ## Inputs
 
@@ -81,7 +84,7 @@ enum DnsType { A, Aaaa }
 struct DnsQuery { name: String, qtype: DnsType }
 struct DnsRecord { name: String, rtype: DnsType, ttl_secs: u64, address: IpAddr }
 struct DnsAnswer { name: String, records: Vec<IpAddr>, from_cache: bool }
-enum DnsError { ResolutionFailed(String), LoopDetected(String), NegativeCached(String), InvalidQuery(String) }
+enum DnsError { ResolutionFailed(String), LoopDetected(String), NegativeCached(String), InvalidQuery(String), UnknownServer(String), NameNotFound(String) }
 
 trait Resolver {
     fn resolve(&mut self, query: &DnsQuery) -> Result<Vec<IpAddr>, DnsError>;
@@ -144,6 +147,44 @@ impl MultiServerDns {
 
 Public API 变更必须保持结构化、可版本化并有调用方验证。
 
+### R3 新增 Public API：`wire` / `mesh`（2026-10-28）
+
+```text
+// --- wire：DNS 报文编解码（纯函数，零 I/O、零 Instant、零全局状态）---
+enum DnsRcode { NoError, FormErr, ServFail, NxDomain, NotImp, Refused, Other(u8) }
+struct DnsQuestion { id: u16, name: String, qtype: u16, rd: bool, edns_udp_size: Option<u16> }
+struct WireRecord { rtype: u16, ttl_secs: u32, address: Option<IpAddr> }
+struct UpstreamReply { rcode: DnsRcode, truncated: bool, records: Vec<WireRecord>, min_ttl_secs: u32, wire: Vec<u8> }
+enum DnsWireError { Truncated, BadHeader, BadName, NoQuestion, BadQuestion, MismatchedQuestion, UnsupportedType(u16) }
+
+fn parse_question(packet: &[u8]) -> Result<DnsQuestion, DnsWireError>;
+fn build_query(q: &DnsQuery, id: u16, edns_udp_size: Option<u16>) -> Vec<u8>;
+fn parse_response(packet: &[u8], expected: &DnsQuestion) -> Result<UpstreamReply, DnsWireError>;
+fn build_answer(query: &[u8], records: &[WireRecord], rcode: DnsRcode) -> Result<Vec<u8>, DnsWireError>;
+fn build_error(query: &[u8], rcode: DnsRcode) -> Result<Vec<u8>, DnsWireError>;
+fn patch_id(packet: &mut [u8], id: u16) -> Result<(), DnsWireError>;
+
+// --- mesh：静态 Mesh 名表 ---
+struct StaticMeshResolver { /* BTreeMap<归一化名, IpAddr> */ }
+impl StaticMeshResolver {
+    fn new(entries: impl IntoIterator<Item = (String, IpAddr)>) -> Result<Self, DnsError>;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
+}
+impl MeshNameResolver for StaticMeshResolver { fn resolve_mesh(name: &str) -> Option<IpAddr>; }
+```
+
+- `wire` 是**纯编解码层**：12 字节规则、QDCOUNT=1、压缩指针拒绝、TC=1 早返回
+  `truncated=true`、上游 question 与请求不符 → `MismatchedQuestion`。socket、
+  并发、超时、重试、EDNS 协商策略都在 `nexusd`。
+- `build_query` 的冻结签名无 `Result`：非法名（空/超长/非法标签）返回**空
+  `Vec`**，调用方必须把空包视为构造失败。
+- `mesh` 只做精确匹配（不做后缀/通配）：构造期归一化（小写、去尾点、≤253、
+  拒绝空标签）与地址校验；`::1`/`127.0.0.1`/unspecified/multicast/broadcast
+  → `InvalidQuery`，link-local（`fe80::`/`169.254.0.0/16`）允许。
+  `a.mesh` 与 `b.a.mesh` 是不同名字。
+
+
 ### 冻结契约：DNS IP-CIDR 规则与按 server 缓存隔离（§11.5.1，scenarios/product/dns_ipcidr_rule.toml）
 
 - `enum DnsMatch { Domain(String), IpCidr { network: u32, prefix: u8 } }`；
@@ -172,7 +213,8 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
   消费以构造注入的上游 `Resolver`）、`fake_ip_enabled: bool`、
   `fake_ip_network: u32` + `fake_ip_prefix: u8`（默认 `198.18.0.0/15`，构造时
   掩码归一化）、`mesh_suffix: String`（默认 `"mesh"`）、
-  `fake_ip_ttl_secs: u64`、`hosts: Vec<(String, IpAddr)>`（自定义 hosts，最高优先级）。
+  `fake_ip_ttl_secs: u64`、`hosts: Vec<(String, IpAddr)>`（自定义 hosts，最高优先级）、
+  `ip_preference: IpPreference`（地址族偏好，默认 `PreferV4`；语义见下）。
 - `FakeIpPool`：fake-ip 分配池。`allocate(domain, now_secs) -> Ipv4Addr`；
   `lookup(ip) -> Option<String>` 反查域名；`reclaim_expired(now_secs)` 回收
   TTL 过期的映射；同一域名在 TTL 内重复分配返回同一 IP。
@@ -182,8 +224,10 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
   注入（通常包装 `nexus-proxy` 的 `RuleEngine`）。Deletion Test：若删除该
   trait，`nexus-dns` 将被迫直接依赖 `nexus-proxy`（违反 Forbidden
   Dependencies），故抽象成立。
-- `UnifiedDns`：`resolve(query, now_secs) -> Result<UnifiedAnswer, DnsError>`；
-  `classify(name) -> DnsClass`（`Hosts | Mesh | FakeIp | Upstream`）。
+- `UnifiedDns`：`step(query, now_secs) -> Result<ResolveStep, DnsError>`
+  （两阶段：本地可判定返回 `Local`，否则返回 `Upstream { class }`）；
+  `classify(name) -> DnsClass`（`Hosts | Mesh | FakeIp | Upstream`）；
+  `resolve(query, now_secs)` 保留为 `step` + 注入上游的**兼容薄封装**（C11 删除）。
 
 ### Invariants（S-unified）
 
@@ -208,20 +252,44 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
 ### Public API（新增）
 
 ```text
-struct DnsUnifiedConfig { upstream, fake_ip_enabled, fake_ip_network, fake_ip_prefix, mesh_suffix, fake_ip_ttl_secs, hosts }
+struct DnsUnifiedConfig { upstream, fake_ip_enabled, fake_ip_network, fake_ip_prefix, mesh_suffix, fake_ip_ttl_secs, hosts, ip_preference }
 struct FakeIpPool { new(network, prefix, ttl_secs), allocate(domain, now_secs), lookup(ip), reclaim_expired(now_secs), contains(ip), len(), capacity() }
 trait MeshNameResolver { resolve_mesh(name) -> Option<IpAddr> }
 trait ProxyClassifier { is_proxied(domain) -> bool }
 enum DnsClass { Hosts, Mesh, FakeIp, Upstream }  // as_str() 稳定表达
 struct UnifiedAnswer { name, class: DnsClass, records: Vec<IpAddr>, from_cache: bool }
-struct UnifiedDns { new(config, mesh, classifier, upstream), resolve(query, now_secs), classify(name),
+enum ResolveStep { Local(UnifiedAnswer), Upstream { class: DnsClass } }
+struct UnifiedDns { new(config, mesh, classifier, upstream), step(query, now_secs), resolve(query, now_secs), classify(name),
                     reverse_lookup(ip), reclaim_expired(now_secs),
-                    upstream_call_count(), fake_ip_count() }
+                    upstream_call_count(), note_upstream_answer(), fake_ip_count(), fake_ip_capacity() }
 ```
+
+### 两阶段 `step` / `NameNotFound` / `ip_preference`（R3，2026-10-28）
+
+- `step` 只做**本地可判定**部分，不调用上游；`Upstream { class }` 表示调用方
+  （`nexusd` 上游引擎）异步取回后再 `note_upstream_answer()` 计数并组装应答。
+  `resolve` 仅为过渡薄封装（内部 `step` + `resolve_upstream`），C11 生产接线时删除。
+- `DnsError::NameNotFound(name)`：`*.{mesh_suffix}` 命中但静态表无名 →
+  **NXDOMAIN**，且**不得**向上游泄露内部名（`upstream_call_count() == 0`）。
+  名字存在但无该族记录 → `Local` NODATA（不是错误）。
+- 族不符（A 查 v6 / AAAA 查 v4）→ `Local` NODATA；fake-ip 开启时代理类
+  AAAA 恒 NODATA 且**不消耗** fake-ip 地址（AC8a）。
+- `ip_preference`（D-impl-5）：`V4Only`/`V6Only` 只门控 **Upstream/Mesh/Hosts**
+  的查询 qtype（被拦截 → `Local` NODATA）；fake-ip 类的 A 不受影响。
+  `PreferV4`/`PreferV6` 在单 qtype 拦截路径上是 **no-op**（本层不做多记录排序，
+  不假装有排序效果）。
+- **非 A/AAAA qtype 的落点边界（协调员接受的落点上移，语义不变）**：
+  `DnsQuery.qtype` 冻结为 `DnsType { A, Aaaa }`，`step` 无法表达 HTTPS(65)/TXT/PTR
+  等类型。服务面在调用引擎前用 `wire::DnsQuestion::as_dns_type()` 判定：
+  Hosts/Mesh/FakeIp 名上的非 A/AAAA 查询 → NODATA；Upstream 类 → **原样 qtype
+  转发**（不缓存），由服务面 C9/C11 短路，`step` 不参与。该边界不放宽冻结签名。
+
 
 ### Verification（新增）
 
 ```text
+cargo test -p nexus-dns wire
+cargo test -p nexus-dns mesh
 cargo test -p nexus-dns unified
 scenarios/product/dns_unified.toml
 ```

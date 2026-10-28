@@ -91,7 +91,7 @@ fn run_phase(kind: &str) -> Result<Phase, String> {
         proxy_configured: true,
         ..Default::default()
     };
-    let mut dataplane = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config)
+    let mut dataplane = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None)
         .map_err(|error| format!("dataplane init: {error}"))?;
     let yaml_for_dp = proxy_yaml(kind);
     let engine = match ProxyEngine::new(Some(&yaml_for_dp)) {

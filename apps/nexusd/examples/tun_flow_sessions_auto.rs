@@ -99,6 +99,7 @@ fn make_dataplane() -> (Dataplane, Arc<Mutex<MockTun>>) {
     let dp = Dataplane::new(
         Box::new(SharedTun(Arc::clone(&mock))),
         DataplaneConfig::default(),
+        None,
     )
     .expect("dataplane");
     (dp, mock)
@@ -151,7 +152,7 @@ fn provider_flow() -> (String, Option<String>, usize, u64, u64, u64, String) {
     dp.process_one().expect("second flow");
     let other_calls = dp.flow_sessions_state().planner_calls;
 
-    let key = nexus_flow_session::FlowKey::parse_ipv4(&first).expect("flow key");
+    let key = nexus_flow_session::FlowKey::parse(&first).expect("flow key");
     let outbound = dp.flow_planned_provider(&key).unwrap_or_default();
     let engine = DomainRuleEngine::from_yaml(YAML_ONE_PROVIDER).expect("explain engine");
     let req = RouteRequest {

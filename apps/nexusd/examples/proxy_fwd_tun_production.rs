@@ -249,7 +249,7 @@ fn main() {
 fn run(echo_addr: SocketAddr, socks_addr: SocketAddr) -> serde_json::Value {
     // 阶段 1：真实 Dataplane + engine + MockTun。
     let mock = Arc::new(Mutex::new(MockTun::new("prod0")));
-    let mut dp = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config()) {
+    let mut dp = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config(), None) {
         Ok(dp) => dp,
         Err(e) => return fail(format!("dataplane init: {e}")),
     };
@@ -355,7 +355,7 @@ fn run(echo_addr: SocketAddr, socks_addr: SocketAddr) -> serde_json::Value {
     // 阶段 2（D2=C）：无 engine → SYN **当场**一个 RST，且**没有** SYN-ACK、
     // 不进终结器（tcp_handshakes 不增）。
     let mock2 = Arc::new(Mutex::new(MockTun::new("prod1")));
-    let mut dp2 = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock2))), config()) {
+    let mut dp2 = match Dataplane::new(Box::new(SharedTun(Arc::clone(&mock2))), config(), None) {
         Ok(dp) => dp,
         Err(e) => return fail(format!("dataplane2 init: {e}")),
     };

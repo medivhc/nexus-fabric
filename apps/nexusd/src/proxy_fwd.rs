@@ -413,7 +413,10 @@ impl ProxyEngine {
         if packet.len() < 20 {
             return Err(ProxyEngineError::UnsupportedProtocol { ip_proto: 0 });
         }
-        let proto = packet[9];
+        // C21：v4/v6 统一取 L4 协议号（v6 的 byte 9 是 payload-length 高字节，
+        // 不能像 v4 那样直接读）。
+        let proto = nexus_projection::ip::parse_ip_packet(packet)
+            .map_or_else(|_| packet[9], |view| view.protocol);
         if proto != 6 && proto != 17 {
             return Err(ProxyEngineError::UnsupportedProtocol { ip_proto: proto });
         }
@@ -522,16 +525,20 @@ impl ProxyEngine {
         let mut ready = Vec::with_capacity(pkts.len());
         let mut dropped = 0u64;
         for pkt in pkts {
-            let is_tcp = pkt.len() >= 20 && pkt[9] == 6;
+            // C21：v4/v6 统一判定 TCP（v6 的 byte 9 不是协议号）。
+            let is_tcp =
+                nexus_projection::ip::parse_ip_packet(&pkt).is_ok_and(|view| view.protocol == 6);
             if !is_tcp {
                 ready.push(pkt);
                 continue;
             }
+            let is_rst = nexus_projection::tcp::parse_tcp(&pkt)
+                .is_some_and(|(_, _, _, _, flags, _)| flags & 0x04 != 0);
             match self.terminator.fixup_tun_packet(&pkt) {
                 Some(fixed) => ready.push(fixed),
                 // 兜底 RST（`tcp_relay::craft_rst`）地址已正确，且 socket 可能已随
                 // RST 移除 → fixup 查不到连接；RST 直通，数据包仍按丢弃计数。
-                None if pkt.get(33).is_some_and(|flags| flags & 0x04 != 0) => ready.push(pkt),
+                None if is_rst => ready.push(pkt),
                 None => dropped += 1,
             }
         }

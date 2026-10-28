@@ -27,10 +27,10 @@
 //! heartbeat_timeout_ms = 3000
 //! ```
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::link::LinkConfig;
-use super::pump::{DATAGRAM_CAP, Ipv4Net, Ipv4Route};
+use super::pump::{DATAGRAM_CAP, Ipv4Net, Ipv4Route, Ipv6Net, Ipv6Route};
 use super::{N1Error, N1PeerId};
 
 /// 静态对端条目（M3 首期：`PeerId` + 已知 locator）。
@@ -49,10 +49,14 @@ pub struct N1VpiConfig {
     pub interface: String,
     /// 本节点 VPI 地址。
     pub address: Ipv4Addr,
+    /// 本节点 VPI IPv6 地址（可选；有 `routes6` 时必填）。
+    pub address6: Option<Ipv6Addr>,
     /// TUN MTU（必须 ≤ 1200，对齐 fabric datagram 上限）。
     pub mtu: u16,
-    /// 静态路由。
+    /// 静态路由（IPv4）。
     pub routes: Vec<Ipv4Route>,
+    /// 静态路由（IPv6）。
+    pub routes6: Vec<Ipv6Route>,
 }
 
 /// N1 完整配置。
@@ -145,6 +149,7 @@ enum Table {
     Peers,
     Vpi,
     VpiRoutes,
+    VpiRoutes6,
     Link,
     Boost,
 }
@@ -159,13 +164,20 @@ struct PartialRoute {
     peer: Option<N1PeerId>,
 }
 
+struct PartialRoute6 {
+    subnet: Option<Ipv6Net>,
+    peer: Option<N1PeerId>,
+}
+
 struct Parser {
     peer_id: Option<N1PeerId>,
     peers: Vec<PartialPeer>,
     vpi_interface: Option<String>,
     vpi_address: Option<Ipv4Addr>,
+    vpi_address6: Option<Ipv6Addr>,
     vpi_mtu: Option<u16>,
     routes: Vec<PartialRoute>,
+    routes6: Vec<PartialRoute6>,
     probe_interval_ms: Option<u64>,
     heartbeat_timeout_ms: Option<u64>,
     boost_enabled: Option<bool>,
@@ -181,8 +193,10 @@ impl Parser {
             peers: vec![],
             vpi_interface: None,
             vpi_address: None,
+            vpi_address6: None,
             vpi_mtu: None,
             routes: vec![],
+            routes6: vec![],
             probe_interval_ms: None,
             heartbeat_timeout_ms: None,
             boost_enabled: None,
@@ -214,13 +228,20 @@ impl Parser {
                         });
                         Table::VpiRoutes
                     }
+                    "vpi.routes6" => {
+                        this.routes6.push(PartialRoute6 {
+                            subnet: None,
+                            peer: None,
+                        });
+                        Table::VpiRoutes6
+                    }
                     "link" => Table::Link,
                     "boost" => Table::Boost,
                     _ => {
                         return Err(Self::err(
                             lineno,
                             &format!(
-                                "unknown table [{name}] (expected peers/vpi/vpi.routes/link/boost)"
+                                "unknown table [{name}] (expected peers/vpi/vpi.routes/vpi.routes6/link/boost)"
                             ),
                         ));
                     }
@@ -297,6 +318,13 @@ impl Parser {
                     self.vpi_address = Some(addr);
                     Ok(())
                 }
+                "address6" => {
+                    let addr: Ipv6Addr = unquote(lineno, val)?
+                        .parse()
+                        .map_err(|_| Self::err(lineno, "bad vpi.address6"))?;
+                    self.vpi_address6 = Some(addr);
+                    Ok(())
+                }
                 "mtu" => {
                     let mtu: u16 = val
                         .parse()
@@ -334,6 +362,31 @@ impl Parser {
                     _ => Err(Self::err(
                         lineno,
                         &format!("unknown [[vpi.routes]] key: {key}"),
+                    )),
+                }
+            }
+            Table::VpiRoutes6 => {
+                let r = self
+                    .routes6
+                    .last_mut()
+                    .ok_or_else(|| Self::err(lineno, "[[vpi.routes6]] entry missing"))?;
+                match key {
+                    "subnet" => {
+                        r.subnet = Some(
+                            Ipv6Net::parse(&unquote(lineno, val)?)
+                                .map_err(|e| Self::err(lineno, &format!("bad subnet: {e}")))?,
+                        );
+                        Ok(())
+                    }
+                    "peer" => {
+                        r.peer = Some(N1PeerId::from_hex(&unquote(lineno, val)?).map_err(|e| {
+                            Self::err(lineno, &format!("bad vpi.routes6.peer: {e}"))
+                        })?);
+                        Ok(())
+                    }
+                    _ => Err(Self::err(
+                        lineno,
+                        &format!("unknown [[vpi.routes6]] key: {key}"),
                     )),
                 }
             }
@@ -418,6 +471,32 @@ impl Parser {
                 })?,
             });
         }
+        let mut routes6 = vec![];
+        for (i, r) in self.routes6.into_iter().enumerate() {
+            let subnet = r.subnet.ok_or_else(|| {
+                N1Error::InvalidConfig(format!("[[vpi.routes6]][{i}]: missing subnet"))
+            })?;
+            if subnet.prefix_len() == 0 {
+                return Err(N1Error::InvalidConfig(format!(
+                    "[[vpi.routes6]][{i}]: prefix must be 1..=128"
+                )));
+            }
+            let peer = r.peer.ok_or_else(|| {
+                N1Error::InvalidConfig(format!("[[vpi.routes6]][{i}]: missing peer"))
+            })?;
+            if !peers.iter().any(|p| p.id == peer) {
+                return Err(N1Error::InvalidConfig(format!(
+                    "[[vpi.routes6]][{i}]: peer {} not declared in [[peers]]",
+                    peer.to_hex()
+                )));
+            }
+            routes6.push(Ipv6Route { subnet, peer });
+        }
+        if !routes6.is_empty() && self.vpi_address6.is_none() {
+            return Err(N1Error::InvalidConfig(
+                "missing required: vpi.address6 (required when [[vpi.routes6]] present)".into(),
+            ));
+        }
         Ok(N1Config {
             peer_id,
             peers,
@@ -428,8 +507,10 @@ impl Parser {
                 address: self.vpi_address.ok_or_else(|| {
                     N1Error::InvalidConfig("missing required: vpi.address".into())
                 })?,
+                address6: self.vpi_address6,
                 mtu: self.vpi_mtu.unwrap_or(1200),
                 routes,
+                routes6,
             },
             link: LinkConfig {
                 probe_interval: std::time::Duration::from_millis(
@@ -664,6 +745,8 @@ heartbeat_timeout_ms = 3000
         assert_eq!(c.vpi.mtu, 1200);
         assert_eq!(c.vpi.routes.len(), 1);
         assert_eq!(c.vpi.routes[0].subnet.to_string(), "10.144.0.0/24");
+        assert_eq!(c.vpi.address6, None);
+        assert!(c.vpi.routes6.is_empty());
         assert_eq!(
             c.link.probe_interval,
             std::time::Duration::from_millis(1000)
@@ -715,6 +798,111 @@ heartbeat_timeout_ms = 3000
     fn comment_inside_string_survives() {
         let toml = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\" # 注释\n[vpi] # 表注释\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
         assert!(N1Config::parse_toml(toml).is_ok());
+    }
+
+    // ---------- IPv6 address6 / routes6 ----------
+
+    const PEER: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// 构造带 `[[peers]]`（v6 locator）与可选 `address6` / `[[vpi.routes6]]`
+    /// 的配置文本。
+    fn v6_toml(address6: &str, routes6: &[(&str, &str)]) -> String {
+        let mut s = format!(
+            "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n\n[[peers]]\nid = \"{PEER}\"\naddrs = [\"[fd00::2]:9000\"]\n\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n"
+        );
+        if !address6.is_empty() {
+            s.push_str(&format!("address6 = \"{address6}\"\n"));
+        }
+        for (subnet, peer) in routes6 {
+            s.push_str(&format!(
+                "\n[[vpi.routes6]]\nsubnet = \"{subnet}\"\npeer = \"{peer}\"\n"
+            ));
+        }
+        s
+    }
+
+    #[test]
+    fn parses_v6_address_and_routes6() {
+        let toml = v6_toml("fd00::1", &[("fd00::/64", PEER), ("2001:db8::1/128", PEER)]);
+        let c = N1Config::parse_toml(&toml).unwrap();
+        assert_eq!(c.vpi.address6, Some("fd00::1".parse().unwrap()));
+        assert_eq!(c.vpi.routes6.len(), 2);
+        assert_eq!(c.vpi.routes6[0].subnet.to_string(), "fd00::/64");
+        assert_eq!(c.vpi.routes6[1].subnet.prefix_len(), 128);
+        assert_eq!(c.vpi.routes6[0].peer, N1PeerId::from_hex(PEER).unwrap());
+        // E4：`[[peers]].addrs` 已是 `SocketAddr`，v6 字面量无需改类型。
+        assert!(matches!(c.peers[0].addrs[0], SocketAddr::V6(_)));
+    }
+
+    #[test]
+    fn address6_without_routes6_is_allowed() {
+        let c = N1Config::parse_toml(&v6_toml("fe80::1", &[])).unwrap();
+        assert!(c.vpi.routes6.is_empty());
+        assert_eq!(c.vpi.address6, Some("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn routes6_require_address6() {
+        let e = N1Config::parse_toml(&v6_toml("", &[("fd00::/64", PEER)])).unwrap_err();
+        assert!(e.to_string().contains("vpi.address6"), "unexpected: {e}");
+    }
+
+    #[test]
+    fn routes6_prefix_must_be_1_to_128() {
+        for ok in ["fd00::/1", "fd00::/64", "fd00::/128"] {
+            let c = N1Config::parse_toml(&v6_toml("fd00::1", &[(ok, PEER)])).unwrap();
+            assert!(c.vpi.routes6[0].subnet.prefix_len() > 0, "{ok}");
+        }
+        let e = N1Config::parse_toml(&v6_toml("fd00::1", &[("::/0", PEER)])).unwrap_err();
+        assert!(e.to_string().contains("1..=128"), "unexpected: {e}");
+        let e = N1Config::parse_toml(&v6_toml("fd00::1", &[("fd00::/129", PEER)])).unwrap_err();
+        assert!(e.to_string().contains("subnet"), "unexpected: {e}");
+    }
+
+    #[test]
+    fn routes6_peer_must_be_declared() {
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let e = N1Config::parse_toml(&v6_toml("fd00::1", &[("fd00::/64", other)])).unwrap_err();
+        assert!(
+            e.to_string().contains("not declared in [[peers]]"),
+            "unexpected: {e}"
+        );
+    }
+
+    #[test]
+    fn routes6_link_local_accepted() {
+        // SU-3 ②：link-local 网段与地址在 N1 配置层合法（不是 loopback/组播）。
+        let c = N1Config::parse_toml(&v6_toml("fe80::1", &[("fe80::/64", PEER)])).unwrap();
+        assert_eq!(c.vpi.routes6[0].subnet.to_string(), "fe80::/64");
+        assert_eq!(c.vpi.address6, Some("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn routes6_rejects_bad_fields() {
+        // 缺 subnet。
+        let no_subnet = format!(
+            "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n\n[[peers]]\nid = \"{PEER}\"\naddrs = [\"[fd00::2]:9000\"]\n\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\naddress6 = \"fd00::1\"\n\n[[vpi.routes6]]\npeer = \"{PEER}\"\n"
+        );
+        let e = N1Config::parse_toml(&no_subnet).unwrap_err();
+        assert!(e.to_string().contains("missing subnet"), "unexpected: {e}");
+        // 缺 peer。
+        let no_peer = format!(
+            "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n\n[[peers]]\nid = \"{PEER}\"\naddrs = [\"[fd00::2]:9000\"]\n\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\naddress6 = \"fd00::1\"\n\n[[vpi.routes6]]\nsubnet = \"fd00::/64\"\n"
+        );
+        let e = N1Config::parse_toml(&no_peer).unwrap_err();
+        assert!(e.to_string().contains("missing peer"), "unexpected: {e}");
+        // 未知键。
+        let bad_key = format!(
+            "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\naddress6 = \"fd00::1\"\n\n[[vpi.routes6]]\nsubnet = \"fd00::/64\"\npeer = \"{PEER}\"\nnope = 1\n"
+        );
+        let e = N1Config::parse_toml(&bad_key).unwrap_err();
+        assert!(
+            e.to_string().contains("unknown [[vpi.routes6]] key"),
+            "unexpected: {e}"
+        );
+        // 非法 address6。
+        let bad_addr6 = v6_toml("10.0.0.99", &[]);
+        assert!(N1Config::parse_toml(&bad_addr6).is_err());
     }
 
     // ---------- Boost v1 (B1/B2) ----------

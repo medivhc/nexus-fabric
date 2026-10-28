@@ -89,7 +89,8 @@ Watcher 每 2 秒轮询（标准库实现，零新依赖；沙盒无网络时 `n
 
 | 变更类型 | 行为 | 说明 |
 |----------|------|------|
-| `proxy.yaml` / `dns.toml` 内容变更 | **热生效** | 规则、记录类纯数据，直接应用 |
+| `proxy.yaml` 内容变更 | **需重启** | outbound engine 只在启动构造 |
+| `dns.toml` 内容变更 | **需重启** | dns service owns sockets/cache |
 | `network.toml` 内容变更 | **热生效** | peer 列表等；端口类变更由 N1 侧自行决定 |
 | `daemon.toml` 的 `localapi_addr` 变更 | **需重启** | 记 warning，提示重启 daemon，不自动重启 |
 | 任一文件新增/删除 | **需重启** | 子系统启停需重新装配，记 warning |

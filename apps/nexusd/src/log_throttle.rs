@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 /// `event=outbound_unavailable` 的限频窗口（与 `udp_unsupported` 同为 10 s）。
 pub(crate) const OUTBOUND_UNAVAILABLE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// `event=ipv6_*` 的限频窗口（spec §4.10.3：每 `(event, reason)` 60 s 最多 1 条）。
+pub(crate) const IPV6_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// 单次限频决策。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ThrottleDecision {
