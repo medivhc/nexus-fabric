@@ -2123,7 +2123,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let peer_map: Arc<dyn nexusd::mesh_peer_map::MeshPeerResolver> = Arc::new(
         nexusd::mesh_peer_map::StaticMeshPeerMap::from_toml(loaded.network_toml.as_deref()),
     );
-    let (_nat_tx, nat_rx) = std::sync::mpsc::sync_channel::<nexusd::nat_chunk_recv::NatInboundChunk>(
+    let (nat_tx, nat_rx) = std::sync::mpsc::sync_channel::<nexusd::nat_chunk_recv::NatInboundChunk>(
         nexusd::nat_chunk_recv::NAT_INBOUND_QUEUE_CAP,
     );
     let dp_nat_slot = nat_slot.clone();
@@ -2170,6 +2170,19 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         eprintln!("[nexusd] tun disabled; dataplane not started (no-tun mode)");
         None
     };
+
+    // 4b. P0：direct chunk 接收端（supervisor + per-(peer,conn) acceptor）。
+    // slot 空时轮询等待；与 dataplane 的 slot 共享同一实例。
+    match nexusd::nat_chunk_recv::spawn_nat_chunk_receiver(
+        nat_slot.clone(),
+        Arc::clone(&direct_gate),
+        nat_tx,
+        Arc::clone(&chunk_stats),
+        Arc::clone(&shutdown),
+    ) {
+        Ok(_handle) => {}
+        Err(e) => eprintln!("[nat-consumer] WARN: chunk receiver spawn failed ({e})"),
+    }
 
     // 5. LocalAPI 线程（R4：可经 shutdown 标志停止）。
     let localapi_addr = loaded.daemon.localapi_addr.clone();

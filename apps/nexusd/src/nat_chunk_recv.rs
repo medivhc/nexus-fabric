@@ -8,13 +8,18 @@
 //! are derived from the *same* monotonic `PunchClock` that feeds
 //! `last_success_ms`, so the comparison is meaningful.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use nexus_fabric::PeerId as FabricPeerId;
+use nexus_fabric::{PeerId as FabricPeerId, StreamShared};
 use nexus_nat_traversal::PunchClock;
 use nexus_nat_wireup::{PunchPeerStatus, PunchState};
 
-use crate::nat_consumer::NatPathProvider;
+use crate::nat_chunk_stats::ChunkStats;
+use crate::nat_consumer::{NatActiveConn, NatHandleSlot, NatPathProvider};
 
 /// Chunk payload prefix: distinguishes the TUN STREAM frame from other users of
 /// the `WORKSPACE_SYNC` (0x03) stream type. Never appears on the N1 fallback.
@@ -25,6 +30,284 @@ pub const CHUNK_KIND_TUN_STREAM: u8 = 0x01;
 pub struct NatInboundChunk {
     pub peer: FabricPeerId,
     pub stream_frame: Vec<u8>,
+}
+
+/// Spawn the direct chunk receiver: a supervisor that tracks peer gate state
+/// and one acceptor thread per `(peer, direct conn)`.
+pub fn spawn_nat_chunk_receiver(
+    slot: NatHandleSlot,
+    gate: Arc<DirectGate>,
+    tx: SyncSender<NatInboundChunk>,
+    stats: Arc<ChunkStats>,
+    shutdown: Arc<AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("nexusd-nat-chunk-recv".to_string())
+        .spawn(move || {
+            let mut acceptors: HashMap<(FabricPeerId, u64), std::thread::JoinHandle<()>> =
+                HashMap::new();
+            let mut was_open: HashMap<FabricPeerId, bool> = HashMap::new();
+
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(provider) = slot.get() {
+                    let gates = gate.snapshot(provider.as_ref());
+                    for g in &gates {
+                        let name = crate::nat_consumer::peer_hex(&g.peer);
+                        let prev = was_open.insert(g.peer, g.sender_allowed);
+                        if g.sender_allowed && prev != Some(true) {
+                            eprintln!(
+                                "[nat-consumer] direct gate open peer={} waited_ms={}",
+                                hex16(&name),
+                                g.last_success_ms
+                            );
+                        } else if !g.sender_allowed && prev == Some(true) {
+                            let reason = if g.last_success_ms == 0 {
+                                "state_not_succeeded"
+                            } else {
+                                "not_direct"
+                            };
+                            eprintln!(
+                                "[nat-consumer] direct gate closed peer={} reason={reason}",
+                                hex16(&name)
+                            );
+                        }
+
+                        if !g.receiver_ready {
+                            continue;
+                        }
+                        let Some(NatActiveConn::Direct(conn)) = provider.active_conn(&name) else {
+                            continue;
+                        };
+                        let key = (g.peer, conn.id.0);
+                        if acceptors.contains_key(&key) {
+                            continue;
+                        }
+                        let acceptor = spawn_acceptor(
+                            Arc::clone(&provider),
+                            conn,
+                            g.peer,
+                            name.clone(),
+                            tx.clone(),
+                            Arc::clone(&stats),
+                            Arc::clone(&shutdown),
+                        );
+                        acceptors.insert(key, acceptor);
+                    }
+                }
+                acceptors.retain(|_, handle| !handle.is_finished());
+                std::thread::sleep(Duration::from_millis(NAT_RECV_POLL_MS));
+            }
+
+            for (_, handle) in acceptors.drain() {
+                let _ = handle.join();
+            }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_acceptor(
+    provider: Arc<dyn NatPathProvider>,
+    conn: Arc<nexus_fabric::ConnShared>,
+    peer: FabricPeerId,
+    name: String,
+    tx: SyncSender<NatInboundChunk>,
+    stats: Arc<ChunkStats>,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("nexusd-nat-acceptor".to_string())
+        .spawn(move || {
+            eprintln!(
+                "[nat-chunk] recv acceptor peer={} conn={} started (quiet_ms={DIRECT_ACCEPT_QUIET_MS})",
+                hex16(&name),
+                conn.id.0
+            );
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                match provider.active_conn(&name) {
+                    Some(NatActiveConn::Direct(c)) if c.id.0 == conn.id.0 => {}
+                    _ => break,
+                }
+                match nexus_nat_wireup::accept_stream_timeout(&conn, Duration::from_secs(1)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(_) => break,
+                    Ok(stream) => handle_stream(
+                        &peer, &name, &stream, &tx, &stats, &shutdown,
+                    ),
+                }
+            }
+            eprintln!(
+                "[nat-chunk] recv acceptor peer={} conn={} closed",
+                hex16(&name),
+                conn.id.0
+            );
+        })
+        .expect("spawn nat acceptor thread")
+}
+
+fn handle_stream(
+    peer: &FabricPeerId,
+    name: &str,
+    stream: &Arc<StreamShared>,
+    tx: &SyncSender<NatInboundChunk>,
+    stats: &ChunkStats,
+    shutdown: &AtomicBool,
+) {
+    let deadline = Instant::now() + Duration::from_millis(NAT_CHUNK_READ_TIMEOUT_MS);
+    let read = read_chunk_frame(stream, deadline);
+    let frame_ok = read.is_ok();
+    match read {
+        Ok((0x03, payload)) => match parse_chunk_payload(&payload) {
+            Ok(frame) => match tx.try_send(NatInboundChunk {
+                peer: *peer,
+                stream_frame: frame.to_vec(),
+            }) {
+                Ok(()) => {
+                    stats.record_recv(frame.len());
+                    eprintln!(
+                        "[nat-chunk] recv chunk peer={} bytes={} result=ok",
+                        hex16(name),
+                        frame.len()
+                    );
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    reject(stats, name, NatChunkRecvError::InjectionFull)
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    reject(stats, name, NatChunkRecvError::InjectionClosed)
+                }
+            },
+            Err(e) => reject(stats, name, e),
+        },
+        Ok((ty, _)) => reject(stats, name, NatChunkRecvError::TypeMismatch { got: ty }),
+        Err(e) => reject(stats, name, e),
+    }
+
+    // (a) The frame was read: keep reading this direction until EOF so quinn
+    // releases the receive half. A frame-read error already consumed the 5s
+    // budget, so it does not re-read.
+    if frame_ok {
+        if let Err(e) = drain_stream_to_eof(stream, deadline) {
+            reject(stats, name, e);
+        }
+    }
+    // (b) Always close our send half before dropping the stream — this is the
+    // other half of the MAX_STREAMS replenishment.
+    finish_send_half(stream);
+    if !shutdown.load(Ordering::Relaxed) {
+        eprintln!(
+            "[nat-chunk] stream closed peer={} (recv_eof; local_fin)",
+            hex16(name)
+        );
+    }
+}
+
+fn reject(stats: &ChunkStats, name: &str, e: NatChunkRecvError) {
+    stats.record_recv_rejected(e);
+    if e == NatChunkRecvError::AcceptClosed {
+        return;
+    }
+    eprintln!(
+        "[nat-chunk] recv chunk peer={} rejected reason={}",
+        hex16(name),
+        reason_token(e)
+    );
+}
+
+fn reason_token(e: NatChunkRecvError) -> &'static str {
+    match e {
+        NatChunkRecvError::TypeMismatch { .. } => "type_mismatch",
+        NatChunkRecvError::KindMismatch { .. } => "kind_mismatch",
+        NatChunkRecvError::BadLength { .. } => "bad_length",
+        NatChunkRecvError::FrameTooLarge { .. } => "too_large",
+        NatChunkRecvError::UnexpectedEof => "eof",
+        NatChunkRecvError::Timeout => "timeout",
+        NatChunkRecvError::AcceptClosed => "accept_closed",
+        NatChunkRecvError::InjectionClosed => "inject_closed",
+        NatChunkRecvError::InjectionFull => "inject_full",
+        NatChunkRecvError::Poisoned => "poisoned",
+    }
+}
+
+fn hex16(name: &str) -> &str {
+    &name[..name.len().min(16)]
+}
+
+/// Read one `type | u32 BE len | payload` frame.
+pub fn read_chunk_frame(
+    stream: &Arc<StreamShared>,
+    deadline: Instant,
+) -> Result<(u8, Vec<u8>), NatChunkRecvError> {
+    let mut header = [0u8; 5];
+    nexus_nat_wireup::channel::read_exact_deadline(stream, &mut header, deadline)
+        .map_err(map_io_recv_error)?;
+    let ty = header[0];
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len == 0 {
+        return Err(NatChunkRecvError::BadLength { len });
+    }
+    if len > nexus_nat_wireup::channel::MAX_FRAME {
+        return Err(NatChunkRecvError::FrameTooLarge { len });
+    }
+    let mut payload = vec![0u8; len];
+    nexus_nat_wireup::channel::read_exact_deadline(stream, &mut payload, deadline)
+        .map_err(map_io_recv_error)?;
+    Ok((ty, payload))
+}
+
+/// Strip the KIND byte; anything but `0x01` is rejected unambiguously.
+pub fn parse_chunk_payload(payload: &[u8]) -> Result<&[u8], NatChunkRecvError> {
+    let Some((&kind, rest)) = payload.split_first() else {
+        return Err(NatChunkRecvError::UnexpectedEof);
+    };
+    if kind != CHUNK_KIND_TUN_STREAM {
+        return Err(NatChunkRecvError::KindMismatch { got: kind });
+    }
+    if rest.is_empty() {
+        return Err(NatChunkRecvError::UnexpectedEof);
+    }
+    Ok(rest)
+}
+
+/// Keep reading the receive direction until EOF (`Ok(0)`). The peer FINs after
+/// `write_msg`, so EOF is expected; a timeout is counted, never blocks accept.
+pub fn drain_stream_to_eof(
+    stream: &Arc<StreamShared>,
+    deadline: Instant,
+) -> Result<(), NatChunkRecvError> {
+    let (_send, mut recv) = nexus_fabric::split_stream(Arc::clone(stream));
+    let mut buf = [0u8; 4096];
+    loop {
+        match recv.read_deadline(&mut buf, deadline) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(nexus_fabric::FabricError::Timeout) => return Err(NatChunkRecvError::Timeout),
+            Err(_) => return Err(NatChunkRecvError::UnexpectedEof),
+        }
+    }
+}
+
+/// Close our send half (same effect as `split_stream(..).0.finish()`); never
+/// panics on a poisoned lock.
+pub fn finish_send_half(stream: &Arc<StreamShared>) {
+    let (mut send, _recv) = nexus_fabric::split_stream(Arc::clone(stream));
+    let _ = send.finish();
+}
+
+/// Map transport read errors onto the frozen rejection taxonomy.
+#[must_use]
+pub fn map_io_recv_error(e: std::io::Error) -> NatChunkRecvError {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut => NatChunkRecvError::Timeout,
+        std::io::ErrorKind::UnexpectedEof => NatChunkRecvError::UnexpectedEof,
+        std::io::ErrorKind::InvalidData => NatChunkRecvError::BadLength { len: 0 },
+        _ => NatChunkRecvError::Poisoned,
+    }
 }
 
 /// Receiver-side accept gate (frozen by Q8=A; do not change without a
