@@ -3,7 +3,7 @@
   "generated_from_revision": "e1bb2770074b533bbe6ddba7dd37f5a1426d312f",
   "generated_at": "2026-10-26T01:32:24Z",
   "run_id": "protocol-interop-fixes-1",
-  "inputs_sha256": "916362ca6258d1ad3f02b79bd6152286ad368d84e90ebee888870a41e9939b49",
+  "inputs_sha256": "9f07c176da16ba6e1b1124c96959e71c9cba5ca0461f82e511ea1e4fb7eabb2c",
   "protocols": {
     "anytls": {
       "origin": "matrix",

@@ -586,6 +586,65 @@ class RecomputeTests(unittest.TestCase):
             # Verdict narrative stays default when only the qualifier is overridden.
             self.assertIn("Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断", text)
 
+    # ---- D-1: Hy2 三句话（叙事拼装，不改 verdict 派生） ---------------------
+
+    def test_hy2_three_sentence_narrative_is_evidence_driven(self):
+        # 产品评审 §4.2：Hy2 产品级 UdpEcho 未实现 + crate 级 UdpEchoCrate PASS
+        # → 结论 2 必须齐备三句话（TCP 结论不变 / 证据作用域变化 / crate 级 UDP 仍 PASS）。
+        overrides = {
+            ("Default", "UdpEcho"): {
+                "status": "NOT_IMPLEMENTED",
+                "cls": "E_NEXUS_NOT_IMPLEMENTED",
+            },
+            ("Default", "UdpEchoCrate"): {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            make_run(tmp, "Hysteria2", overrides)
+            path, meta = write_run_meta(tmp)
+            payload, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=False,
+                run_meta=meta, run_meta_path=str(path),
+            )
+            conclusion2 = next(
+                line for line in text.splitlines() if line.startswith("- **结论 2**：")
+            )
+            self.assertIn("Hy2 的 TCP 产品路径结论不变（逐格 PASS 仍在）", conclusion2)
+            self.assertIn("变化的是证据作用域", conclusion2)
+            self.assertIn("产品级 `UdpEcho` 未实现", conclusion2)
+            self.assertIn("crate 级 UDP 仍 PASS（`UdpEchoCrate`）", conclusion2)
+            self.assertIn("QUIC 出站传输不受影响", conclusion2)
+            # 叙事不改派生：verdict/scope/claim 仍由 E1 规则 6 机械得出。
+            self.assertEqual(payload["protocols"]["Hysteria2"]["verdict"], "PARTIAL")
+            self.assertEqual(
+                payload["protocols"]["Hysteria2"]["scope"], "PROTOCOL_SUBSET"
+            )
+            self.assertEqual(
+                payload["protocols"]["Hysteria2"]["claim"], "USABLE_WITH_GAPS"
+            )
+
+    def test_hy2_three_sentence_narrative_absent_without_crate_pass(self):
+        # 反例护栏：缺 crate 级 PASS 时不得追加三句话（防止把「crate 能用」说成无条件事实）。
+        overrides = {
+            ("Default", "UdpEcho"): {
+                "status": "NOT_IMPLEMENTED",
+                "cls": "E_NEXUS_NOT_IMPLEMENTED",
+            },
+            ("Default", "UdpEchoCrate"): {
+                "status": "NOT_IMPLEMENTED",
+                "cls": "E_NEXUS_NOT_IMPLEMENTED",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            make_run(tmp, "Hysteria2", overrides)
+            path, meta = write_run_meta(tmp)
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=False,
+                run_meta=meta, run_meta_path=str(path),
+            )
+            self.assertNotIn("Hysteria2 的口径需三句话讲清", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -127,8 +127,9 @@
     `nexus_ingress::encode_udp_associate_reply` 回真实 BND（绑定失败 → `REP=0x01`）。
   - **能力翻转点（全 run 唯一对外可见）**：VLESS → `Supported(VlessOverTcp)`（仅 `flow=None`）、
     AnyTLS → `Supported(AnytlsUot)` 首次被生产路径消费（`association` 旁 `udp.modes` 可见）；
-    Trojan / Shadowsocks → `Unsupported`（R-3：`NotWired`，crate 无 UDP 帧 API，与 TUN 侧
-    `TlsVariantNotSupported` 的理由不同）、Hysteria2 → `Unsupported`；
+    Trojan / Shadowsocks → `Unsupported`（R-3：`NotWired`，crate 无 UDP 帧 API；与 TUN 侧
+    `TlsVariantNotSupported` 的理由不同——两表面 reason 码不同源于调用栈不同：TUN 走 TLS
+    variant 判定、产品走 capability 表，不是两个独立缺陷）、Hysteria2 → `Unsupported`；
     Direct / Relay / Vmess / Socks5 出站 → 按 kind 先丢弃（Q11），**绝不直连**。
   - **fail-closed 计数与日志**：§6.3 逐行计数（`dropped_*`；产品侧同名字段
     `udp.unsupported_<proto>` / `udp.sent` / `udp.send_failed` 与 §7.3-3 对齐，不改 nexusd）；

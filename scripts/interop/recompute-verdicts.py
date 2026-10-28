@@ -443,6 +443,20 @@ def render_matrix(
     ]
     product_udp_ok = [r["protocol"] for r in product_udp_rows if r["status"] == "PASS"]
     product_udp_gap = [r["protocol"] for r in product_udp_rows if r["status"] != "PASS"]
+    # D-1（产品评审 §4.2）：Hy2 的「作用域变化 ≠ 能力回归」由证据派生，只拼叙事、
+    # 不参与 verdict/scope/claim/格状态。两个条件同时成立才追加，前序 run（无产品级
+    # UdpEcho 格）输出保持逐字节不变。
+    hy2_product_gap = any(
+        r["protocol"] == "Hysteria2" and r["status"] != "PASS"
+        for r in product_udp_rows
+    )
+    hy2_crate_ok = any(
+        r["cell"] == "UdpEchoCrate"
+        and r["protocol"] == "Hysteria2"
+        and r["present"]
+        and r["status"] == "PASS"
+        for r in rows
+    )
     if product_udp_rows:
         udp_carrier_clause = (
             "`UdpEcho` 为产品级（`ProductSocks5`/`ProductPath`），`UdpEchoCrate` 为 crate 级诊断格"
@@ -564,6 +578,14 @@ def render_matrix(
         lines.append(
             "- **结论 2**：阻断分属产品装配、跨协议传输、协议编解码、协议线格式与产品安全语义；"
             "`root_cause_class` 只是规则代表类，不是完整根因。"
+        )
+    if hy2_product_gap and hy2_crate_ok:
+        # 产品评审 §4.2 三句话：同一事实（产品级 UdpEcho 未实现）不得被读成能力回归。
+        lines[-1] += (
+            " Hysteria2 的口径需三句话讲清："
+            "(1) Hy2 的 TCP 产品路径结论不变（逐格 PASS 仍在）；"
+            "(2) 变化的是证据作用域：产品级 `UdpEcho` 未实现，按 spec E1 规则 6 记 `PARTIAL`；"
+            "(3) crate 级 UDP 仍 PASS（`UdpEchoCrate`），QUIC 出站传输不受影响。"
         )
     unverified = [
         p
