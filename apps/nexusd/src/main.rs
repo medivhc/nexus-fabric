@@ -1267,6 +1267,23 @@ struct NatSwitchRuntime {
 /// STUN 端口样本滚动历史上限（D2 判定最少需要 3 个；保留 8 个抗抖动）。
 const MAX_PORT_SAMPLES: usize = 8;
 
+/// Project a `TurnManager` onto the status row (spec §4.10.2/§4.10.4).
+fn turn_status_of(m: &nat_turn::TurnManager) -> nexusd::nat_status::TurnManagerStatus {
+    nexusd::nat_status::TurnManagerStatus {
+        health: m.health().as_str(),
+        bind_addr: m.bind_addr_text().map(str::to_string),
+        last_error: m.last_failure().map(|f| f.as_str()),
+    }
+}
+
+/// Publish the warm-backup row after every allocation/refresh attempt.
+fn publish_warm_backup(m: &nat_turn::TurnManager) {
+    nexusd::nat_status::update_turn_status(
+        nexusd::nat_status::TurnManagerKind::WarmBackup,
+        turn_status_of(m),
+    );
+}
+
 impl NatSwitchRuntime {
     /// 从 `[network.turn]` 配置创建并启动运行时。
     ///
@@ -1418,6 +1435,14 @@ impl NatSwitchRuntime {
                 sw.attach_relay_provider(
                     Arc::clone(&provider) as Arc<dyn nexusd::nat_relay::RelayConnProvider>
                 );
+                nexusd::nat_status::update_turn_status(
+                    nexusd::nat_status::TurnManagerKind::Provider,
+                    nexusd::nat_status::TurnManagerStatus {
+                        health: nexusd::nat_status::TURN_HEALTH_ALLOCATING,
+                        bind_addr: Some(section.bind_addr.clone()),
+                        last_error: None,
+                    },
+                );
                 Some(provider)
             }
             _ => None,
@@ -1499,6 +1524,7 @@ impl NatSwitchRuntime {
                 nat_gather::GatherError::Turn(e)
             ),
         }
+        publish_warm_backup(&self.turn);
 
         // 1b. The provider allocates and publishes **its own** relayed address.
         // The runtime's warm-backup allocation is never published (peers would
@@ -1519,7 +1545,13 @@ impl NatSwitchRuntime {
         let mut last_feed: Option<std::time::Instant> = None;
         let feed_interval = self.feed_interval;
         while !self.stop.load(Ordering::Relaxed) {
-            self.turn.refresh_if_needed();
+            let refresh = self.turn.refresh_if_needed();
+            if !matches!(
+                refresh,
+                nat_turn::RefreshOutcome::NotDue | nat_turn::RefreshOutcome::Inactive
+            ) {
+                publish_warm_backup(&self.turn);
+            }
             if let Some(provider) = &self.provider {
                 // `Lost` is fully handled inside the provider (slot cleared,
                 // sinks notified); the feed re-arms on the next book poll.
@@ -2254,6 +2286,22 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let punch_section = loaded.daemon.punch.clone();
     let identity_section = loaded.daemon.identity.clone();
     let turn_section = loaded.daemon.turn.clone();
+    // Initial TURN state row, before any worker exists (spec §4.10.4).
+    nexusd::nat_status::update_turn_status(
+        nexusd::nat_status::TurnManagerKind::WarmBackup,
+        match turn_section.as_ref() {
+            None => nexusd::nat_status::TurnManagerStatus {
+                health: nexusd::nat_status::TURN_HEALTH_UNCONFIGURED,
+                bind_addr: None,
+                last_error: None,
+            },
+            Some(section) => nexusd::nat_status::TurnManagerStatus {
+                health: nexusd::nat_status::TURN_HEALTH_ALLOCATING,
+                bind_addr: Some(section.bind_addr.clone()),
+                last_error: None,
+            },
+        },
+    );
     let nat_switch_handle = match turn_section.as_ref() {
         None => None,
         Some(section) => match (|| -> Result<Option<std::thread::JoinHandle<()>>, ExitCode> {
@@ -2321,6 +2369,22 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             Err(code) => return code,
         },
     };
+
+    // No worker started although TURN is configured (identity missing, driver
+    // bind failed, ...): the row is `not_started`, not `unconfigured`. The
+    // `is_some()` guard keeps the no-TURN case on `unconfigured`.
+    if let Some(section) = turn_section.as_ref() {
+        if nat_switch_handle.is_none() {
+            nexusd::nat_status::update_turn_status(
+                nexusd::nat_status::TurnManagerKind::WarmBackup,
+                nexusd::nat_status::TurnManagerStatus {
+                    health: nexusd::nat_status::TURN_HEALTH_NOT_STARTED,
+                    bind_addr: Some(section.bind_addr.clone()),
+                    last_error: None,
+                },
+            );
+        }
+    }
 
     // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();
