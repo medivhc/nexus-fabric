@@ -4479,6 +4479,36 @@ outbounds:
         assert_eq!(dp.stats().domain_miss, 1);
     }
 
+    /// D-impl-8 的 v6 侧：AAAA 答案回填后，目的为该 v6 的包不再计 domain_miss。
+    #[test]
+    fn d_impl_8_v6_dns_answer_feeds_domain_cache() {
+        use nexus_projection::ip::build_udp_packet;
+
+        let (mut dp, mock) = test_dataplane();
+        let cached: IpAddr = "fd00:144::9".parse().expect("v6 cached");
+        dp.record_dns_answer("v6.mesh", cached);
+
+        let hit = build_udp_packet(
+            "[2001:db8::100]:40000".parse().unwrap(),
+            "[fd00:144::9]:443".parse().unwrap(),
+            b"z",
+        )
+        .expect("v6 udp");
+        mock.lock().unwrap().inject(hit);
+        assert!(dp.process_one().expect("cached v6 packet"));
+        assert_eq!(dp.stats().domain_miss, 0, "v6 answer must feed the cache");
+
+        let miss = build_udp_packet(
+            "[2001:db8::100]:40001".parse().unwrap(),
+            "[fd00:144::a]:443".parse().unwrap(),
+            b"z",
+        )
+        .expect("v6 udp");
+        mock.lock().unwrap().inject(miss);
+        assert!(dp.process_one().expect("uncached v6 packet"));
+        assert_eq!(dp.stats().domain_miss, 1, "unknown v6 dst is a miss");
+    }
+
     /// S27：Direct UDP 真实往返 + ICMP 不支持计数。
     #[test]
     fn direct_forwarding_udp_and_unsupported() {
