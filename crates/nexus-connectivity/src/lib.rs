@@ -82,7 +82,9 @@ pub mod qos;
 
 // ---------- CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 整形，E4：product.qos-cake） ----------
 
-pub mod cake;
+// 定义已下沉跨栈共享叶 `nexus-qos`（2026-10-28，P3）；`pub use` 保持旧路径源码兼容，
+// 与接缝 ② 的 outbound_seam 处置同构。
+pub use nexus_qos::cake;
 
 // ---------- 自动断线重连（指数退避状态机，E4：product.auto-reconnect） ----------
 

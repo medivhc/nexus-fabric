@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_fabric::{Driver, PeerId as FabricPeerId};
 use nexus_nat_traversal::{
     DefaultPredictor, LocalCandidates, PortSample, Predictability, PunchConfig, PunchPredictor,

@@ -1581,15 +1581,14 @@ fn run_auto_reconnect() -> Outcome {
 }
 
 /// E4: CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 整形 + 流回收，
-/// `scenarios/product/qos_cake.toml`）。纯内存、假时钟确定性；演示五个检查点：
+/// `scenarios/product/qos_cake.toml`）。纯内存、假时钟确定性；演示四个检查点：
 /// (a) 同优先级 backlog 流按字节公平（A: 4x1500B vs B: 12x500B → 各 6000B）；
 /// (b) 严格优先级（High 3 包先于 Medium 3 包，签名 "HHHLLL"）；
 /// (c) 整形（burst 后阻塞、1s 恢复）；
-/// (d) 流回收（60s 空闲回收）；
-/// (e) daemon.toml [qos] 的 wire format 映射形状（真实解析器由 apps/nexusd 单测覆盖）。
+/// (d) 流回收（60s 空闲回收）。
 fn run_qos_cake() -> Outcome {
-    use nexus_connectivity::cake::{CakeConfig, CakeScheduler, FiveTuple, PROTO_TCP, PROTO_UDP};
-    use nexus_connectivity::qos::BandwidthLimit;
+    use nexus_qos::bucket::BandwidthLimit;
+    use nexus_qos::cake::{CakeConfig, CakeScheduler, FiveTuple, PROTO_TCP, PROTO_UDP};
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
@@ -1713,34 +1712,6 @@ fn run_qos_cake() -> Outcome {
     let reaped_count = reaper.reap(Duration::from_secs(61));
     let flows_remaining = reaper.flow_count();
 
-    // (e) daemon.toml [qos] wire format 映射形状。
-    let snippet = "[qos]\nenabled = true\nmesh_upload_mbps = 100\nproxy_upload_mbps = 50\nquantum = 1514\nhigh_priority_ports = \"22,53,3389\"\n";
-    let v: toml::Value = match toml::from_str(snippet) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                "FAIL".to_string(),
-                format!("qos-cake: parse qos snippet: {e}"),
-                Vec::new(),
-            );
-        }
-    };
-    let q = v.get("qos");
-    let cfg_enabled = q.and_then(|t| t.get("enabled")).and_then(|x| x.as_bool());
-    let cfg_mesh = q
-        .and_then(|t| t.get("mesh_upload_mbps"))
-        .and_then(|x| x.as_integer());
-    let cfg_proxy = q
-        .and_then(|t| t.get("proxy_upload_mbps"))
-        .and_then(|x| x.as_integer());
-    let cfg_quantum = q
-        .and_then(|t| t.get("quantum"))
-        .and_then(|x| x.as_integer());
-    let cfg_ports = q
-        .and_then(|t| t.get("high_priority_ports"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-
     let ok = a_bytes == 6000
         && b_bytes == 6000
         && total_packets == 16
@@ -1749,12 +1720,7 @@ fn run_qos_cake() -> Outcome {
         && blocked_when_tokens_empty
         && resumed_after_1s
         && reaped_count == 1
-        && flows_remaining == 0
-        && cfg_enabled == Some(true)
-        && cfg_mesh == Some(100)
-        && cfg_proxy == Some(50)
-        && cfg_quantum == Some(1514)
-        && cfg_ports == "22,53,3389";
+        && flows_remaining == 0;
 
     let extra = vec![
         (
@@ -1781,22 +1747,12 @@ fn run_qos_cake() -> Outcome {
                 "flows_remaining": flows_remaining,
             }),
         ),
-        (
-            "config".to_string(),
-            json!({
-                "enabled": cfg_enabled,
-                "mesh_upload_mbps": cfg_mesh,
-                "proxy_upload_mbps": cfg_proxy,
-                "quantum": cfg_quantum,
-                "high_priority_ports": cfg_ports,
-            }),
-        ),
     ];
 
     if ok {
         (
             "PASS".to_string(),
-            "qos-cake: DRR fairness + strict priority + shaping block/resume + 60s reap + [qos] mapping verified"
+            "qos-cake: DRR fairness + strict priority + shaping block/resume + 60s reap"
                 .to_string(),
             extra,
         )

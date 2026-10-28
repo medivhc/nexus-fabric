@@ -279,7 +279,7 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
 
     // QoS：从 daemon.toml [qos] 映射。
     let qos_enabled = loaded.daemon.qos.enabled;
-    let mut qos_config = nexus_connectivity::cake::CakeConfig::default();
+    let mut qos_config = nexus_qos::cake::CakeConfig::default();
     if qos_enabled {
         qos_config.quantum = loaded.daemon.qos.quantum;
         qos_config.high_priority_ports = loaded.daemon.qos.high_priority_ports.clone();
@@ -301,7 +301,7 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
                     rate_bps
                 );
             }
-            if let Ok(limit) = nexus_connectivity::qos::BandwidthLimit::new(rate_bps, rate_bps) {
+            if let Ok(limit) = nexus_qos::bucket::BandwidthLimit::new(rate_bps, rate_bps) {
                 qos_config.rate_limit = Some(limit);
             }
         }
@@ -633,7 +633,7 @@ mod tests {
         assert!(!cfg.qos_enabled);
         assert_eq!(
             cfg.qos_config.quantum,
-            nexus_connectivity::cake::CakeConfig::default().quantum
+            nexus_qos::cake::CakeConfig::default().quantum
         );
     }
 

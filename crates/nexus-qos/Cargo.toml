@@ -1,0 +1,12 @@
+[package]
+name = "nexus-qos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# 跨栈共享叶：只用 std（零第三方依赖、零 Nexus 内部依赖），见 MODULE.md Allowed Dependencies。

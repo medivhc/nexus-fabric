@@ -1233,6 +1233,7 @@ dependencies = [
  "nexus-measurement",
  "nexus-platform",
  "nexus-proxy-config",
+ "nexus-qos",
  "rand 0.8.8",
  "ring",
  "x25519-dalek",
@@ -1297,6 +1298,7 @@ dependencies = [
  "nexus-dns",
  "nexus-platform",
  "nexus-projection",
+ "nexus-qos",
  "nexus-turn",
  "serde_json",
  "sha2",
@@ -1557,6 +1559,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-qos"
+version = "0.1.0"
+
+[[package]]
 name = "nexus-registry"
 version = "0.1.0"
 dependencies = [
@@ -1659,7 +1665,6 @@ dependencies = [
  "libc",
  "nexus",
  "nexus-compute",
- "nexus-connectivity",
  "nexus-control-api",
  "nexus-discovery",
  "nexus-dns",
@@ -1686,6 +1691,7 @@ dependencies = [
  "nexus-proxy",
  "nexus-proxy-config",
  "nexus-proxy-transport",
+ "nexus-qos",
  "nexus-registry",
  "nexus-service",
  "nexus-session",

@@ -8,7 +8,7 @@
 //! - **DRR**：每流 `deficit` 计数器；每次访问 `deficit += quantum`，队首包
 //!   `len <= deficit` 则发送并 `deficit -= len`；单包大于 quantum 时 deficit
 //!   跨轮累积直到能发（保证大包最终能走，不饿死）；
-//! - **整形**：复用 `qos::TokenBucket` 做 per-egress 速率门控；令牌不足时**不**出队、
+//! - **整形**：复用 `bucket::TokenBucket` 做 per-egress 速率门控；令牌不足时**不**出队、
 //!   **不**扣 deficit、**不**跳过找小包，直接返回 `None`（调用方稍后重试）；
 //! - **流回收**：`reap(now)` 回收 `now - last_seen >= flow_timeout` 的流（默认 60s）；
 //! - **时钟**：调用方显式传入 `now: Duration`（`QosClock` 体系），单测用假时钟；
@@ -37,7 +37,7 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use super::qos::{BandwidthLimit, QosError, TokenBucket};
+use crate::bucket::{BandwidthLimit, QosError, TokenBucket};
 
 // ---------- 常量 ----------
 

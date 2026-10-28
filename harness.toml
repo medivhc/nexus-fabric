@@ -83,7 +83,8 @@ crates = [
   "nexus-measurement",
   "nexus-ingress",
   "nexus-proxy-config",
-  "nexus-proxy"
+  "nexus-proxy",
+  "nexus-qos"
 ]
 
 [hooks]

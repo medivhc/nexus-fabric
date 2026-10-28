@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.qos-cake-enabled-path"
+title = "QoS 启用路径（daemon.toml [qos] → 生产解析 → 生产装配 → 真实调度丢弃，E4）"
+evidence_strength = "E4"
+requirement = "docs/DAEMON_ARCHITECTURE.md#11.5"
+carrier = "n1-fabric"
+
+[given]
+config_dir = "temp dir with daemon.toml only ([qos] enabled, mesh 1 Mbps, quantum 1514, ports 22,53,3389)"
+parse_path = "nexusd::config::load → parse_qos_section（生产解析，不允许 harness 复刻）"
+assembly = "nexusd::assembly::build_dataplane_config → Dataplane::new（生产装配）"
+load = "1000 × IPv4/UDP 1400 B, dport 9999, 单流（burst 125000 B ≪ 1.4 MB）"
+
+[when]
+command = "cargo run --quiet -p nexusd --example qos_enabled_e4 -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "production.qos_enabled"
+equals = true
+
+[[expect]]
+field = "production.qos_bypassed"
+equals = false
+
+[[expect]]
+field = "production.qos_dropped_positive"
+equals = true
+
+[[expect]]
+field = "production.quantum"
+equals = 1514
+
+[[expect]]
+field = "production.high_priority_ports"
+equals = "22,53,3389"
+
+[[expect]]
+field = "production.mesh_upload_mbps"
+equals = 1
