@@ -13237,57 +13237,117 @@ mod hysteria2_dataplane_tests {
     fn hysteria2_missing_tcp_response_aborts_after_the_response_deadline() {
         use nexus_outbound_hysteria2::test_server::TestServer;
         use std::io::{Read, Write};
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         let server = TestServer::spawn("secret123", true).unwrap();
-        let (counts, elapsed, (written, end)) = run_fast_open_relay(
-            server.addr.port(),
-            "hold.test:1",
-            Duration::from_secs(25),
-            |mut s| {
-                // One byte every 500 ms until the relay closes the app side.
-                s.set_read_timeout(Some(Duration::from_millis(500)))
-                    .unwrap();
-                let give_up = Instant::now() + Duration::from_secs(25);
-                let mut written = 0usize;
-                let mut buf = [0u8; 64];
-                while Instant::now() < give_up {
-                    if s.write_all(b"u").is_ok() {
-                        written += 1;
+        let port = server.addr.port();
+        let (first_write, first_written) = mpsc::channel::<()>();
+        let (counts, elapsed, (written, end), early) = std::thread::scope(|scope| {
+            // ~1 s after the app's first write the server must already have
+            // upload: it is not held back until the response (or a timeout).
+            let server = &server;
+            let sampler = scope.spawn(move || {
+                first_written.recv_timeout(Duration::from_secs(10)).ok()?;
+                std::thread::sleep(Duration::from_secs(1));
+                Some(server.received_bytes())
+            });
+            let (counts, elapsed, peer) = run_fast_open_relay(
+                port,
+                "hold.test:1",
+                Duration::from_secs(25),
+                move |mut s| {
+                    // One byte every 500 ms until the relay closes the app side.
+                    s.set_read_timeout(Some(Duration::from_millis(500)))
+                        .unwrap();
+                    let give_up = Instant::now() + Duration::from_secs(25);
+                    let mut first_write = Some(first_write);
+                    let mut written = 0usize;
+                    let mut buf = [0u8; 64];
+                    while Instant::now() < give_up {
+                        if s.write_all(b"u").is_ok() {
+                            written += 1;
+                            if let Some(tx) = first_write.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        match s.read(&mut buf) {
+                            Ok(0) => return (written, PeerEnd::Closed),
+                            Ok(n) => return (written, PeerEnd::Payload(buf[..n].to_vec())),
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) => {}
+                            Err(_) => return (written, PeerEnd::Closed),
+                        }
                     }
-                    match s.read(&mut buf) {
-                        Ok(0) => return (written, PeerEnd::Closed),
-                        Ok(n) => return (written, PeerEnd::Payload(buf[..n].to_vec())),
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) => {}
-                        Err(_) => return (written, PeerEnd::Closed),
-                    }
-                }
-                (written, PeerEnd::StillOpen)
-            },
-        );
+                    (written, PeerEnd::StillOpen)
+                },
+            );
+            (counts, elapsed, peer, sampler.join().unwrap())
+        });
         let (up, down) = counts;
         assert_eq!(down, 0, "no response: nothing may be sent downstream");
         assert!(
-            up > 0 && up <= written,
-            "upload must keep flowing while the response is pending (up={up}, written={written})"
+            early.is_some_and(|n| n > 0),
+            "upload must reach the server while the response is pending (at ~1 s: {early:?})"
         );
         assert!(
-            server.received_bytes() > 0,
-            "the server must have received the pending-phase upload"
+            up > 0 && up <= written,
+            "upload must keep flowing while the response is pending (up={up}, written={written})"
         );
         assert!(
             elapsed >= Duration::from_secs(9),
             "a slow response must not be cut short (10 s window), aborted after {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(20),
-            "a missing response must still end the relay, took {elapsed:?}"
+            elapsed < Duration::from_secs(13),
+            "a missing response must end the relay at the 10 s deadline, took {elapsed:?}"
         );
         assert_eq!(end, PeerEnd::Closed, "the relay must close the app side");
+    }
+
+    /// Server-speaks-first targets (SMTP/SSH banners) leave the app silent: the
+    /// deadline still runs from the start of the relay, not from the first upload.
+    #[test]
+    fn hysteria2_missing_tcp_response_with_a_silent_app_still_hits_the_deadline() {
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let (counts, elapsed, end) = run_fast_open_relay(
+            server.addr.port(),
+            "hold.test:1",
+            Duration::from_secs(25),
+            write_then_wait(b"", Duration::from_secs(22)),
+        );
+        assert_eq!(counts, (0, 0));
+        assert!(
+            elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(13),
+            "deadline must run from relay start, relay ended after {elapsed:?}"
+        );
+        assert_eq!(end, PeerEnd::Closed, "the relay must close the app side");
+    }
+
+    #[test]
+    fn hysteria2_invalid_tcp_response_ends_promptly_without_payload() {
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let (counts, elapsed, end) = run_fast_open_relay(
+            server.addr.port(),
+            "bad.test:1",
+            Duration::from_secs(10),
+            write_then_wait(b"x", Duration::from_secs(5)),
+        );
+        assert_eq!(counts.1, 0);
+        assert_eq!(end, PeerEnd::Closed);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "invalid frame took {elapsed:?}"
+        );
     }
 
     #[test]

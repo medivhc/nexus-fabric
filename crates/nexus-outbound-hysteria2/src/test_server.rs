@@ -14,7 +14,8 @@
 //!    （TCPResponse 与 `banner` 同批写出后 FIN）、`close.test:1`（TCPResponse +
 //!    `last words` 后立即关闭连接）、`fin.test:1`（不回 TCPResponse 直接 FIN）、
 //!    `reject.test:1`（拒绝，消息 `denied`）、`hold.test:1`（读走上行并计入
-//!    `received_bytes`、永不回 TCPResponse）、`late.test:1`（3 s 后才回 TCPResponse，之后回显）。
+//!    `received_bytes`、永不回 TCPResponse）、`late.test:1`（3 s 后才回 TCPResponse，之后回显）、`bad.test:1`
+//!    （非法 TCPResponse 状态字节，之后不再发送）。
 //!
 //! 不实现：完整 HTTP/3（无 QPACK 动态表、无 server SETTINGS）、拥塞协商的
 //! 实际限速、分片重组（测试只发不分片的包）。
@@ -274,6 +275,22 @@ fn run_server(
                 Ok(target) if target == "reject.test:1" => {
                     let resp = TcpResponse::encode(false, "denied", &[]);
                     let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    driver.finish_stream(handle, &mut conn, id);
+                }
+                Ok(target) if target == "bad.test:1" => {
+                    // 非法 TCPResponse（状态字节 0x07），之后保持 stream 打开。
+                    let _ = driver.write_all(handle, &mut conn, id, &[0x07, 0, 0], stream_deadline);
+                    while let Ok(n) = driver.read_some(
+                        handle,
+                        &mut conn,
+                        id,
+                        &mut buf,
+                        Instant::now() + Duration::from_secs(30),
+                    ) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
                     driver.finish_stream(handle, &mut conn, id);
                 }
                 Ok(target) if target == "hold.test:1" => {

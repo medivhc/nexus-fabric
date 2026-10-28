@@ -41,7 +41,8 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 - 测试用最小 server（`test_server.rs`，**仅测试**）：rcgen 自签证书、
   密码校验、`:status: 233` 响应、TCP 回显、UDP 回显；`EchoMode::Sink`（只读
   丢弃上行）；另有按目标地址选择的 TCP 测试模式：banner / 关闭前数据 / 无响应
-  FIN / 拒绝 / 永不响应（`hold.test:1`）/ 晚 3 s 响应（`late.test:1`）；
+  FIN / 拒绝 / 永不响应（`hold.test:1`）/ 晚 3 s 响应（`late.test:1`）/ 非法响应帧
+  （`bad.test:1`）；
 - 结构化错误 `Hysteria2Error`（不以日志文本代替类型；`Display`/ `Debug`
   绝不回显密码；`Hysteria2Target` 的 `Debug` 对密码脱敏）。
 
@@ -144,8 +145,9 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
   上传-only 中继在 30 s 内完成（精确字节数、零下行载荷、server 实收字节数）；
   fast-open 首个 `TCPResponse` 晚到（真实网络 RTT，测试注入单向 60 ms）不中止，
   连接正常中继；3 s 后才到的响应之前写入的上行在响应后被回显；服务端永不响应时
-  等待期间上行照常转发（`up_bytes > 0`），10 s 期限到期干净中止（零下行字节、
-  下游关闭、有界返回）；拒绝 / 响应前 FIN 1 s 内中止（requirement-change
+  等待期间上行照常转发（首次写入约 1 s 后服务端已收到上行，`up_bytes > 0`），
+  10 s 期限到期干净中止（零下行字节、下游关闭、[9 s, 13 s) 内返回）；app 从不写入
+  时期限同样从中继开始计（[9 s, 13 s)）；拒绝 / 响应前 FIN / 非法响应帧 1 s 内中止（requirement-change
   2026-10-27，取代 fixes-7 的固定 50 ms 首读守卫）。
 
 ## Allowed Dependencies
