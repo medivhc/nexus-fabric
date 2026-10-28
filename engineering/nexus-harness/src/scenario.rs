@@ -3052,12 +3052,13 @@ mod tests {
         }
         // fixes-5 合并注记：master 287 + fixes-5 新增 product.proxy-trojan-fallback-rejected 场景 1 = 288。
         // P3 合并注记：+ product.qos-cake-enabled-path（cargo run -p nexusd --example）= 289。
-        assert_eq!(parseable, 289, "289 cargo-run [when].command");
+        // R3 合并注记：R3 C12 新增 5 个 dns_production_e4 场景 → 294（合并树实测重算）。
+        assert_eq!(parseable, 294, "294 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 267, "all declared targets resolve to Direct");
+        assert_eq!(direct, 272, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
