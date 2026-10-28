@@ -24,7 +24,8 @@ pub struct TproxyUdpConfig {
     pub recv_buffer_bytes: usize,
     /// 必须为 false（本 run IPv4-only）。
     pub ipv6: bool,
-    /// 同时保留的回包 socket 上限（每个 `orig_dst` 一个，LRU 淘汰；默认 256）。
+    /// 同时保留的回包 socket 上限（每个 `orig_dst` 一个，LRU 淘汰；默认 256；
+    /// 0 按 1 处理：回包总需要一个源地址为 `orig_dst` 的 socket）。
     pub max_reply_sockets: usize,
 }
 
@@ -417,6 +418,7 @@ fn map_socket_errno(operation: &'static str) -> TransparentIngressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn loopback(port: u16) -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
@@ -470,6 +472,8 @@ mod tests {
     }
 
     /// Binds a TPROXY UDP socket, or `None` without the privilege to do so.
+    /// A skip is printed; with `NEXUS_REQUIRE_PRIVILEGED_TESTS=1` it fails
+    /// instead, so a privileged run cited as evidence cannot pass vacuously.
     fn privileged_socket(max_reply_sockets: usize) -> Option<TproxyUdpSocket> {
         let config = TproxyUdpConfig {
             listen: loopback(0),
@@ -479,19 +483,80 @@ mod tests {
         match TproxyUdpSocket::bind(&config) {
             Ok(socket) => Some(socket),
             Err(
-                TransparentIngressError::PermissionDenied { .. }
-                | TransparentIngressError::CapabilityUnavailable { .. },
-            ) => None,
+                err @ (TransparentIngressError::PermissionDenied { .. }
+                | TransparentIngressError::CapabilityUnavailable { .. }),
+            ) => {
+                let test = std::thread::current().name().unwrap_or("?").to_string();
+                assert!(
+                    std::env::var("NEXUS_REQUIRE_PRIVILEGED_TESTS").as_deref() != Ok("1"),
+                    "{test}: privileged test cannot run: {err}"
+                );
+                // Written to the stderr handle, not eprintln!, so libtest's
+                // output capture does not hide the skip on a passing run.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "SKIP {test}: needs CAP_NET_ADMIN ({err})"
+                );
+                None
+            }
             Err(other) => panic!("unexpected bind error: {other}"),
         }
     }
 
-    fn free_loopback_port() -> SocketAddrV4 {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        match probe.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
+    /// TEST-NET-2 address: never local, so binding it needs `IP_TRANSPARENT`,
+    /// and nothing else on the machine holds it (no port-reuse race).
+    fn non_local(last: u8, port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, last), port)
+    }
+
+    /// Exclusive (no `SO_REUSEADDR`) transparent bind of `addr`: succeeds only
+    /// while no reply socket holds it. Returns the errno on failure.
+    fn exclusive_bind(addr: SocketAddrV4) -> Result<OwnedFd, i32> {
+        // SAFETY: socket(2) has no pointer arguments.
+        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: `raw` is a fresh fd owned only here.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        set_int_opt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IP,
+            IP_TRANSPARENT,
+            1,
+            "IP_TRANSPARENT",
+        )
+        .unwrap();
+        let sa = to_sockaddr_in(addr);
+        // SAFETY: `sa` is a fully initialized sockaddr_in; fd is valid.
+        let rc = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&sa as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(fd)
+        } else {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
         }
+    }
+
+    /// `SO_COOKIE` of the cached reply socket for `orig_dst` (unique per socket).
+    fn reply_cookie(socket: &TproxyUdpSocket, orig_dst: SocketAddrV4) -> Option<u64> {
+        let (_, fd) = socket.reply_sockets.iter().find(|(d, _)| *d == orig_dst)?;
+        let mut cookie: u64 = 0;
+        let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+        // SAFETY: valid fd; out-params sized for u64.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_COOKIE,
+                (&mut cookie as *mut u64).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(cookie)
     }
 
     fn client() -> (std::net::UdpSocket, SocketAddrV4) {
@@ -505,28 +570,78 @@ mod tests {
         (client, addr)
     }
 
+    fn recv_from_source(client: &std::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0u8; 64];
+        let (n, from) = client.recv_from(&mut buf).unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    fn assert_no_datagram(client: &std::net::UdpSocket) {
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            client.recv_from(&mut buf).is_err(),
+            "no reply may be sent from a different source"
+        );
+    }
+
+    fn assert_bind_failed(result: Result<usize, TransparentIngressError>, orig_dst: SocketAddrV4) {
+        match result {
+            Err(TransparentIngressError::BindFailed { addr, errno }) => {
+                assert_eq!(addr, orig_dst.to_string());
+                assert_eq!(errno, libc::EADDRINUSE);
+            }
+            other => panic!("expected BindFailed for {orig_dst}, got {other:?}"),
+        }
+    }
+
+    /// Bound to a non-local orig_dst, so this also needs `IP_TRANSPARENT`.
     #[test]
     fn tproxy_udp_reply_comes_from_orig_dst_ip_and_port() {
         let Some(mut socket) = privileged_socket(8) else {
             return;
         };
         let (client, peer) = client();
-        let orig_dst = free_loopback_port();
+        let orig_dst = non_local(11, 53);
         for payload in [&b"first"[..], b"second"] {
             socket.send_from(orig_dst, peer, payload).unwrap();
-            let mut buf = [0u8; 64];
-            let (n, from) = client.recv_from(&mut buf).unwrap();
-            assert_eq!(&buf[..n], payload);
+            let (got, from) = recv_from_source(&client);
+            assert_eq!(got, payload);
             assert_eq!(
                 from,
                 SocketAddr::V4(orig_dst),
                 "reply source must be orig_dst"
             );
         }
+        // Same IP, another port: a distinct orig_dst with its own reply socket.
+        let other_port = non_local(11, 5353);
+        socket.send_from(other_port, peer, b"third").unwrap();
+        assert_eq!(recv_from_source(&client).1, SocketAddr::V4(other_port));
         assert_eq!(
             socket.reply_socket_count(),
-            1,
+            2,
             "one reply socket per orig_dst"
+        );
+    }
+
+    #[test]
+    fn tproxy_udp_reply_socket_is_reused_not_reopened() {
+        let Some(mut socket) = privileged_socket(8) else {
+            return;
+        };
+        let (client, peer) = client();
+        let orig_dst = non_local(12, 9000);
+        socket.send_from(orig_dst, peer, b"a").unwrap();
+        recv_from_source(&client);
+        let first = reply_cookie(&socket, orig_dst).expect("reply socket cached");
+        socket.send_from(orig_dst, peer, b"b").unwrap();
+        recv_from_source(&client);
+        assert_eq!(
+            reply_cookie(&socket, orig_dst),
+            Some(first),
+            "the same reply socket must be reused"
         );
     }
 
@@ -537,15 +652,13 @@ mod tests {
         };
         let (client, peer) = client();
         let dsts = [
-            free_loopback_port(),
-            free_loopback_port(),
-            free_loopback_port(),
+            non_local(21, 9000),
+            non_local(22, 9000),
+            non_local(23, 9000),
         ];
-        let mut buf = [0u8; 16];
         for dst in [dsts[0], dsts[1], dsts[0], dsts[2]] {
             socket.send_from(dst, peer, b"x").unwrap();
-            let (_, from) = client.recv_from(&mut buf).unwrap();
-            assert_eq!(from, SocketAddr::V4(dst));
+            assert_eq!(recv_from_source(&client).1, SocketAddr::V4(dst));
         }
         // dsts[1] was least recently used when dsts[2] needed a slot.
         assert_eq!(socket.reply_socket_count(), 2);
@@ -555,25 +668,97 @@ mod tests {
     }
 
     #[test]
+    fn tproxy_udp_evicted_reply_socket_is_closed_and_readmitted() {
+        let Some(mut socket) = privileged_socket(1) else {
+            return;
+        };
+        let (client, peer) = client();
+        let (d0, d1) = (non_local(31, 9000), non_local(32, 9000));
+        socket.send_from(d0, peer, b"a").unwrap();
+        recv_from_source(&client);
+        socket.send_from(d1, peer, b"b").unwrap();
+        recv_from_source(&client);
+        drop(exclusive_bind(d0).expect("evicted reply socket must be closed"));
+        socket.send_from(d0, peer, b"c").unwrap();
+        assert_eq!(recv_from_source(&client).1, SocketAddr::V4(d0));
+    }
+
+    #[test]
+    fn tproxy_udp_zero_reply_socket_cap_counts_as_one() {
+        let Some(mut socket) = privileged_socket(0) else {
+            return;
+        };
+        let (client, peer) = client();
+        for dst in [non_local(41, 9000), non_local(42, 9000)] {
+            socket.send_from(dst, peer, b"z").unwrap();
+            assert_eq!(recv_from_source(&client).1, SocketAddr::V4(dst));
+            assert_eq!(socket.reply_socket_count(), 1);
+        }
+    }
+
+    /// dnsmasq-style services bind `0.0.0.0:P` with `SO_REUSEADDR`; the reply
+    /// socket sets it too, so both coexist.
+    #[test]
+    fn tproxy_udp_reply_coexists_with_reuseaddr_wildcard_socket() {
+        let Some(mut socket) = privileged_socket(8) else {
+            return;
+        };
+        let (client, peer) = client();
+        let svc = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        svc.set_reuse_address(true).unwrap();
+        svc.bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())
+            .unwrap();
+        let port = svc.local_addr().unwrap().as_socket_ipv4().unwrap().port();
+        let orig_dst = loopback(port);
+        socket.send_from(orig_dst, peer, b"x").unwrap();
+        assert_eq!(recv_from_source(&client).1, SocketAddr::V4(orig_dst));
+    }
+
+    #[test]
     fn tproxy_udp_reply_fails_instead_of_using_another_source_port() {
         let Some(mut socket) = privileged_socket(8) else {
             return;
         };
         let (client, peer) = client();
-        // A plain socket (no SO_REUSEADDR) owns this address exclusively.
-        let owner = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let SocketAddr::V4(busy) = owner.local_addr().unwrap() else {
-            unreachable!("bound to an IPv4 address")
-        };
-        assert!(socket.send_from(busy, peer, b"x").is_err());
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let mut buf = [0u8; 16];
-        assert!(
-            client.recv_from(&mut buf).is_err(),
-            "no reply may be sent from a different source"
-        );
+        // A plain wildcard socket (no SO_REUSEADDR) owns this port exclusively.
+        let owner = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let busy = loopback(owner.local_addr().unwrap().port());
+        assert_bind_failed(socket.send_from(busy, peer, b"x"), busy);
+        assert_no_datagram(&client);
         assert_eq!(socket.reply_socket_count(), 0);
+    }
+
+    #[test]
+    fn tproxy_udp_failed_reply_bind_keeps_cached_socket() {
+        let Some(mut socket) = privileged_socket(1) else {
+            return;
+        };
+        let (client, peer) = client();
+        let live = non_local(51, 4433);
+        socket.send_from(live, peer, b"a").unwrap();
+        recv_from_source(&client);
+        let owner = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let busy = loopback(owner.local_addr().unwrap().port());
+        assert_bind_failed(socket.send_from(busy, peer, b"x"), busy);
+        assert!(
+            socket.has_reply_socket(live),
+            "a failed bind must not evict a live reply socket"
+        );
+    }
+
+    #[test]
+    fn tproxy_udp_reply_sockets_close_with_frontend() {
+        let Some(mut socket) = privileged_socket(8) else {
+            return;
+        };
+        let (client, peer) = client();
+        let orig_dst = non_local(61, 9000);
+        socket.send_from(orig_dst, peer, b"x").unwrap();
+        recv_from_source(&client);
+        assert_eq!(exclusive_bind(orig_dst).err(), Some(libc::EADDRINUSE));
+        socket.shutdown().unwrap();
+        drop(exclusive_bind(orig_dst).expect("reply socket must close on shutdown"));
+        assert!(socket.send_from(orig_dst, peer, b"y").is_err());
+        assert_no_datagram(&client);
     }
 }

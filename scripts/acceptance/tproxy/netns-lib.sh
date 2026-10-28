@@ -451,9 +451,10 @@ stats_json() {
 
 # nexusd publishes tproxy counters at most once per second (apps/nexusd
 # main.rs), so one read right after traffic can still see the previous
-# snapshot. Poll `out` until every `<jq expr> <minimum>` pair holds or ~3 s
-# pass; the last poll stays in `out` for the assertions that follow, which
-# keep their thresholds.
+# snapshot. Poll `out` until every `<jq expr> <minimum>` pair holds, up to 12
+# polls 0.25 s apart (each poll is itself bounded by stats_json's 10 s
+# timeout); the last poll stays in `out` for the assertions that follow, which
+# keep their thresholds. A timeout is reported on stderr, not as a verdict.
 stats_wait() {
     local out="$1" i j ok actual
     shift
@@ -471,6 +472,7 @@ stats_wait() {
         [ "${ok}" = 1 ] && return 0
         sleep 0.25
     done
+    printf 'stats_wait: %s did not reach %s\n' "${out}" "${args[*]}" >&2
     return 0
 }
 

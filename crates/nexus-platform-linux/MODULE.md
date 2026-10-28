@@ -83,6 +83,18 @@ cargo check -p nexus-platform-linux
 cargo clippy -p nexus-platform-linux --all-targets -- -D warnings
 ```
 
+TPROXY UDP 回包（PRODUCT §11.18）的单测需要 `CAP_NET_ADMIN`：无权限时打印
+`SKIP <test>` 并返回（非特权 CI 不因此变红，但也不构成覆盖）。作为 Evidence 引用的
+运行必须带 `NEXUS_REQUIRE_PRIVILEGED_TESTS=1` 以特权执行，此时无权限即 FAIL：
+
+```text
+sudo -E env NEXUS_REQUIRE_PRIVILEGED_TESTS=1 cargo test -p nexus-platform-linux --lib tproxy_udp
+```
+
+产品级观察为 E5 `scripts/acceptance/tproxy/run.sh s2`：回包源为 `orig_dst`（IP 与端口）；
+router netns 独占持有某个 `orig_dst` 时该回包被丢弃（客户端收不到任何源的回包）并计
+`udp_reply_failed`。
+
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 
 ## Performance Budget
