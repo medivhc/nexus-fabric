@@ -3,6 +3,7 @@ id = "platform.win-procattr"
 title = "Windows 进程归因（iphlpapi 五元组 → 进程名）"
 evidence_strength = "E4"
 requirement = "crates/nexus-projection/MODULE.md#S26"
+carrier = "n1-fabric"
 
 [given]
 platform = "windows"

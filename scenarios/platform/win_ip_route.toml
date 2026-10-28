@@ -3,6 +3,7 @@ id = "platform.win-ip-route"
 title = "Windows IP 配置与路由管理（netsh/route 命令构造）"
 evidence_strength = "E4"
 requirement = "docs/WINDOWS_TUN_DESIGN.md#5"
+carrier = "n1-fabric"
 
 [given]
 platform = "windows"
