@@ -8,7 +8,7 @@
 //!
 //! 纯内存、零 tokio；不接真实 TUN（接入点预留）。
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use nexus_domain::{
     FlowContext, FlowOrigin, ResourceId, RouteRequest, RouteTarget, RuleEngine, RuleExplanation,
@@ -16,7 +16,8 @@ use nexus_domain::{
 use nexus_path::{CandidatePath, PathManager};
 
 use crate::boost::select_best;
-use crate::routing::{Cidr, parse_ipv4_dst, parse_packet_ports};
+use crate::ip::parse_ip_dst;
+use crate::routing::{Cidr, IpCidr, parse_ipv4_dst, parse_packet_ports};
 
 /// Fake-IP 池 CIDR（nexus-dns S-unified）：`198.18.0.0/15`。
 fn fake_ip_cidr() -> Cidr {
@@ -72,8 +73,8 @@ pub enum Classification {
 /// - `manager` / `candidates` 仅用于 S30 的只读 EWMA 选路；
 ///   不持有写权限（single writer 仍在 `nexus-path`）。
 pub struct PacketClassifier<'a> {
-    mesh_cidrs: Vec<Cidr>,
-    bypass_cidrs: Vec<Cidr>,
+    mesh_cidrs: Vec<IpCidr>,
+    bypass_cidrs: Vec<IpCidr>,
     manager: &'a PathManager,
     candidates: &'a [CandidatePath],
     degrade_threshold: f64,
@@ -89,8 +90,8 @@ impl<'a> PacketClassifier<'a> {
     /// - `manager`/`candidates`：EWMA 选路输入（只读）；
     /// - `degrade_threshold`：S30 劣化阈值（分数非归一化，调用方定）。
     pub fn new(
-        mesh_cidrs: Vec<Cidr>,
-        bypass_cidrs: Vec<Cidr>,
+        mesh_cidrs: Vec<IpCidr>,
+        bypass_cidrs: Vec<IpCidr>,
         rules: &'a dyn RuleEngine,
         fake_ip_enabled: bool,
         manager: &'a PathManager,
@@ -110,8 +111,10 @@ impl<'a> PacketClassifier<'a> {
 
     /// 分类一个 IP 包（S29 / spec §9.6）。
     ///
-    /// 顺序：mesh CIDR → fake-IP（启用时）→ bypass → 注入的规则引擎。
-    /// 非 IPv4 → `Drop { NotIpv4 }`；IPv4 头截断 → `Drop { Truncated }`。
+    /// 顺序（v4）：mesh CIDR → fake-IP（启用时）→ bypass → 注入的规则引擎。
+    /// v6：mesh CIDR → bypass → **直接 `Proxy{outbound:"proxy"}`**（D-impl-1：
+    /// 委托前短路，因为规则引擎无法解析 v6 目的）。
+    /// 非 v4/v6 → `Drop { NotIpv4 }`；固定头截断 → `Drop { Truncated }`。
     pub fn classify(&self, packet: &[u8], domain: Option<&str>) -> Classification {
         self.classify_explained(packet, domain).0
     }
@@ -121,19 +124,67 @@ impl<'a> PacketClassifier<'a> {
     /// 调用方（TUN 前端事件发射点，spec §11.2 `matched_rule=`）需要决策出处；
     /// mesh/bypass 快路径不经规则引擎 → `None`。规则引擎每次决策只调用一次
     /// （`explain` 一次返回目标与说明，不额外再跑 `decide`）。
+    ///
+    /// v6 决策永远不经规则引擎 → 说明恒为 `None`。
     pub fn classify_explained(
         &self,
         packet: &[u8],
         domain: Option<&str>,
     ) -> (Classification, Option<RuleExplanation>) {
-        if packet.is_empty() || packet[0] >> 4 != 4 {
-            return (
+        match packet.first().map(|b| b >> 4) {
+            Some(6) => self.classify_v6(packet),
+            Some(4) => self.classify_v4(packet, domain),
+            _ => (
                 Classification::Drop {
                     reason: DropReason::NotIpv4,
                 },
                 None,
-            );
+            ),
         }
+    }
+
+    /// v6 分支（D-impl-1）。
+    ///
+    /// `mesh_cidrs6` 命中 → [`Classification::Mesh`]（EWMA 选路与 v4 同）；
+    /// `bypass_cidrs6` 命中 → [`Classification::Direct`]；其余 →
+    /// [`Classification::Proxy`] 且出站 tag 固定为 `"proxy"`——**不委托规则引擎**
+    /// （`SimpleRuleEngine` 对 v6 目的返回 `Drop`，`DomainRuleEngine` 解析成空串；
+    /// 委托会让 AC7 的 `2001:db8::20 → Proxy` 变成静默丢弃）。
+    ///
+    /// 多播（`ff00::/8`）不在本层特判：数据面在分类前计 `ipv6.multicast` 并丢弃；
+    /// 若直接调用本函数，多播按普通目的地址落入 Proxy（契约写死并被单测钉住）。
+    fn classify_v6(&self, packet: &[u8]) -> (Classification, Option<RuleExplanation>) {
+        let dst = match parse_ip_dst(packet) {
+            Ok(dst) => dst,
+            Err(_) => {
+                return (
+                    Classification::Drop {
+                        reason: DropReason::Truncated,
+                    },
+                    None,
+                );
+            }
+        };
+        if self.mesh_cidrs.iter().any(|c| c.contains(dst)) {
+            return (self.classify_mesh(), None);
+        }
+        if self.bypass_cidrs.iter().any(|c| c.contains(dst)) {
+            return (Classification::Direct, None);
+        }
+        (
+            Classification::Proxy {
+                outbound: "proxy".to_string(),
+            },
+            None,
+        )
+    }
+
+    /// v4 分支（既有 S29 顺序不变）。
+    fn classify_v4(
+        &self,
+        packet: &[u8],
+        domain: Option<&str>,
+    ) -> (Classification, Option<RuleExplanation>) {
         let dst = match parse_ipv4_dst(packet) {
             Some(d) => d,
             None => {
@@ -146,7 +197,8 @@ impl<'a> PacketClassifier<'a> {
             }
         };
         // 1. mesh fast path（S10）：规则引擎不介入。
-        if self.mesh_cidrs.iter().any(|c| c.contains(dst)) {
+        let dst_ip = IpAddr::V4(std::net::Ipv4Addr::from(dst));
+        if self.mesh_cidrs.iter().any(|c| c.contains(dst_ip)) {
             return (self.classify_mesh(), None);
         }
         // 2. fake-IP：本 run 不启用；启用时仍需经规则引擎（不吞域名规则）。
@@ -154,7 +206,7 @@ impl<'a> PacketClassifier<'a> {
             return self.classify_rules(packet, domain);
         }
         // 3. bypass/白名单 → 直连。
-        if self.bypass_cidrs.iter().any(|c| c.contains(dst)) {
+        if self.bypass_cidrs.iter().any(|c| c.contains(dst_ip)) {
             return (Classification::Direct, None);
         }
         // 4. 其余 → 注入的规则引擎（TUN 与 TPROXY 共用同一实现）。
@@ -219,7 +271,8 @@ impl<'a> PacketClassifier<'a> {
     ///
     /// - `Drop` 返回 `None`（调用方计数丢弃）；
     /// - `origin` 恒为 `FlowOrigin::VirtualPacketInterface`；
-    /// - `destination` 为目的 IP 字符串；`domain` 透传（DNS 嗅探命中时由调用方填）；
+    /// - `destination` 为目的 IP 字符串（v6 用压缩文本形式，如 `2001:db8::20`）；
+    ///   `domain` 透传（DNS 嗅探命中时由调用方填）；
     /// - `resource` 按分类映射；`profile` 透传。
     pub fn to_flow_context(
         &self,
@@ -228,11 +281,10 @@ impl<'a> PacketClassifier<'a> {
         domain: Option<&str>,
         profile: &str,
     ) -> Option<FlowContext> {
-        let dst = parse_ipv4_dst(packet)?;
-        let dst_ip = Ipv4Addr::from(dst);
+        let dst = parse_ip_dst(packet).ok()?;
         let destination = domain
             .map(|d| d.to_string())
-            .unwrap_or_else(|| dst_ip.to_string());
+            .unwrap_or_else(|| dst.to_string());
         let (resource, egress_hint) = match classification {
             Classification::Mesh { .. } => (ResourceId("mesh".to_string()), None),
             Classification::Proxy { outbound } => {
@@ -263,6 +315,43 @@ mod tests {
         pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
         pkt[16..20].copy_from_slice(&dst);
         pkt
+    }
+
+    fn v6_packet(dst: &str) -> Vec<u8> {
+        let dst: std::net::Ipv6Addr = dst.parse().expect("v6 dst");
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 17; // UDP
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&"fd00::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        pkt[24..40].copy_from_slice(&dst.octets());
+        pkt[40..42].copy_from_slice(&9999u16.to_be_bytes());
+        pkt[42..44].copy_from_slice(&53u16.to_be_bytes());
+        pkt[44..46].copy_from_slice(&8u16.to_be_bytes());
+        pkt
+    }
+
+    /// 双栈分类器（v4 + v6 网段同时在场）。
+    fn dual_stack_classifier<'a>(
+        manager: &'a PathManager,
+        candidates: &'a [CandidatePath],
+    ) -> PacketClassifier<'a> {
+        PacketClassifier::new(
+            vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "fd00:144::/64".parse().unwrap(),
+            ],
+            vec![
+                "192.168.0.0/16".parse().unwrap(),
+                "fc00::/7".parse().unwrap(),
+            ],
+            test_rules(),
+            false,
+            manager,
+            candidates,
+            50.0,
+        )
     }
 
     fn test_rules() -> &'static crate::egress::SimpleRuleEngine {
@@ -425,12 +514,97 @@ mod tests {
                 reason: DropReason::NotIpv4
             }
         );
+        // 版式既非 4 也非 6（0x00/0x50…）→ NotIpv4。
         assert_eq!(
-            c.classify(&[0x60, 0, 0, 0], None),
+            c.classify(&[0x50, 0, 0, 0], None),
             Classification::Drop {
                 reason: DropReason::NotIpv4
             }
-        ); // IPv6
+        );
+        // 版本 6 但固定头截断 → Truncated（不再按 NotIpv4 丢弃）。
+        assert_eq!(
+            c.classify(&[0x60, 0, 0, 0], None),
+            Classification::Drop {
+                reason: DropReason::Truncated
+            }
+        );
+    }
+
+    /// C16 / AC7：`2001:db8::20` 走 D-impl-1 的短路 → `Proxy{"proxy"}`，
+    /// 且**不委托**规则引擎（委托会得到 `SimpleRuleEngine` 的 `Drop`）。
+    #[test]
+    fn c16_v6_proxy_short_circuits_before_rule_engine() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl RuleEngine for Counting {
+            fn decide(&self, _req: &RouteRequest<'_>) -> RouteTarget {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                RouteTarget::Drop
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rules = Counting(Arc::clone(&calls));
+        let m = PathManager::new(Default::default());
+        let c = PacketClassifier::new(
+            vec!["fd00:144::/64".parse().unwrap()],
+            vec!["fc00::/7".parse().unwrap()],
+            &rules,
+            false,
+            &m,
+            &[],
+            50.0,
+        );
+        let (classification, explanation) = c.classify_explained(&v6_packet("2001:db8::20"), None);
+        assert_eq!(
+            classification,
+            Classification::Proxy {
+                outbound: "proxy".to_string()
+            }
+        );
+        assert!(explanation.is_none(), "v6 never consults the rule engine");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// C16：v6 mesh 快路径（EWMA 全 unknown → `path: None`，不阻塞）。
+    #[test]
+    fn c16_v6_mesh_and_direct() {
+        let m = PathManager::new(Default::default());
+        let c = dual_stack_classifier(&m, &[]);
+        assert_eq!(
+            c.classify(&v6_packet("fd00:144::6"), None),
+            Classification::Mesh {
+                path: None,
+                degraded: false
+            }
+        );
+        // fc00::5 落在 bypass v6（fc00::/7）→ Direct。
+        assert_eq!(
+            c.classify(&v6_packet("fc00::5"), None),
+            Classification::Direct
+        );
+        // 多播：分类器不特判（数据面在分类前计 ipv6.multicast 并丢弃）；
+        // 直接调用时按普通目的地址落入 Proxy——契约写死。
+        assert_eq!(
+            c.classify(&v6_packet("ff02::1"), None),
+            Classification::Proxy {
+                outbound: "proxy".to_string()
+            }
+        );
+    }
+
+    /// C16：`to_flow_context` 对 v6 输出压缩文本形式的目的地址。
+    #[test]
+    fn c16_v6_flow_context_destination() {
+        let m = PathManager::new(Default::default());
+        let c = dual_stack_classifier(&m, &[]);
+        let pkt = v6_packet("2001:db8::20");
+        let cl = c.classify(&pkt, None);
+        let ctx = c.to_flow_context(&cl, &pkt, None, "default").unwrap();
+        assert_eq!(ctx.destination, "2001:db8::20");
+        assert_eq!(ctx.resource, ResourceId("proxy".to_string()));
+        assert_eq!(ctx.egress_hint.as_deref(), Some("proxy"));
     }
 
     #[test]

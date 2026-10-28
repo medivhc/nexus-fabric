@@ -31,7 +31,7 @@ use nexus_projection::classifier::DropReason;
 use nexus_projection::classifier::{Classification, PacketClassifier};
 use nexus_projection::dns::{DEFAULT_DNS_CACHE_ENTRIES, DnsCache};
 use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
-use nexus_projection::routing::{Cidr, parse_ipv4_dst};
+use nexus_projection::routing::{IpCidr, parse_ipv4_dst};
 use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
@@ -262,8 +262,8 @@ pub struct Dataplane {
     tun: Box<dyn TunDevice>,
     manager: PathManager,
     candidates: Vec<CandidatePath>,
-    mesh_cidrs: Vec<Cidr>,
-    bypass_cidrs: Vec<Cidr>,
+    mesh_cidrs: Vec<IpCidr>,
+    bypass_cidrs: Vec<IpCidr>,
     dns: Option<crate::dns_service::DnsServiceHandle>,
     qos: Option<CakeScheduler>,
     /// N1 发送桥（W1/W3）；`None` 时 Mesh 包走 D2 计数路径。
@@ -402,12 +402,12 @@ impl Dataplane {
         let mesh_cidrs = config
             .mesh_cidrs
             .iter()
-            .map(|s| parse_cidr(s))
+            .map(|s| parse_ip_cidr(s))
             .collect::<Result<Vec<_>, _>>()?;
         let bypass_cidrs = config
             .bypass_cidrs
             .iter()
-            .map(|s| parse_cidr(s))
+            .map(|s| parse_ip_cidr(s))
             .collect::<Result<Vec<_>, _>>()?;
 
         // PathManager（Boost 启用时用于 EWMA 选路；禁用时仍需一个实例供分类器）。
@@ -2555,20 +2555,10 @@ impl Dataplane {
     }
 }
 
-/// 解析 CIDR 字符串（如 "10.0.0.0/8"）为 `Cidr`。
-fn parse_cidr(s: &str) -> Result<Cidr, String> {
-    let parts: Vec<&str> = s.split('/').collect();
-    if parts.len() != 2 {
-        return Err(format!("invalid CIDR: {s}"));
-    }
-    let ip: Ipv4Addr = parts[0]
-        .parse()
-        .map_err(|_| format!("invalid CIDR IP: {s}"))?;
-    let prefix: u8 = parts[1]
-        .parse()
-        .map_err(|_| format!("invalid CIDR prefix: {s}"))?;
-    let bits = u32::from(ip);
-    Cidr::new(bits, prefix).ok_or_else(|| format!("invalid CIDR {s}"))
+/// 解析 CIDR 字符串（`"10.0.0.0/8"` / `"fd00:144::/64"`）为双栈 [`IpCidr`]。
+fn parse_ip_cidr(s: &str) -> Result<IpCidr, String> {
+    s.parse::<IpCidr>()
+        .map_err(|e| format!("invalid CIDR: {e}"))
 }
 
 /// 从 IP 包提取目的地址（v4/v6；v6 只读固定头，扩展头不参与 N1 目的路由）。
