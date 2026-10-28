@@ -1024,6 +1024,9 @@ mod tests {
         wire::build_answer(query, &records, rcode).expect("test response builds")
     }
 
+    /// TCP 回退的预置应答：`(rcode, 记录, ttl)`。
+    type TcpAnswer = (DnsRcode, Vec<(u16, IpAddr)>, u32);
+
     #[derive(Default)]
     struct FakeTransport {
         next: u64,
@@ -1031,7 +1034,7 @@ mod tests {
         inbox: HashMap<u64, VecDeque<(SocketAddr, Vec<u8>)>>,
         script: VecDeque<Script>,
         tcp_waits: Vec<Duration>,
-        tcp_answer: Option<(DnsRcode, Vec<(u16, IpAddr)>, u32)>,
+        tcp_answer: Option<TcpAnswer>,
         tcp_error: bool,
     }
 

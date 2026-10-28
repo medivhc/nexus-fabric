@@ -1975,10 +1975,9 @@ impl Dataplane {
                     s.ipv6.classified_proxy += 1;
                     s.ipv6.proxy_dropped += 1;
                 });
-                if has_fragment {
-                    if self.ipv6_log_should_emit("ipv6_fragment_dropped", "path=proxy") {
-                        eprintln!("[nexusd] ipv6 WARN event=ipv6_fragment_dropped path=proxy");
-                    }
+                if has_fragment && self.ipv6_log_should_emit("ipv6_fragment_dropped", "path=proxy")
+                {
+                    eprintln!("[nexusd] ipv6 WARN event=ipv6_fragment_dropped path=proxy");
                 }
                 if let Some(hdr) = unsupported_extension {
                     let key = format!("hdr={hdr}");
@@ -6137,11 +6136,13 @@ outbounds:
         use crate::config::{DnsProxyPolicy, UpstreamConfig};
         use crate::dns_status::{UnevaluablePolicy, UnmatchedPolicy};
         use nexus_dns::DnsUnifiedConfig;
-        let mut unified = DnsUnifiedConfig::default();
-        unified.hosts = vec![(
-            "local.example".to_string(),
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-        )];
+        let unified = DnsUnifiedConfig {
+            hosts: vec![(
+                "local.example".to_string(),
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            )],
+            ..DnsUnifiedConfig::default()
+        };
         crate::config::DnsFileConfig {
             unified,
             mesh_hosts: Vec::new(),

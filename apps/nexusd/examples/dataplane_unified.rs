@@ -221,11 +221,13 @@ fn run() -> serde_json::Value {
 
 /// 本地可判定 DNS 配置（hosts 回答 example.com；不依赖真实上游）。
 fn local_dns_config() -> DnsFileConfig {
-    let mut unified = nexus_dns::DnsUnifiedConfig::default();
-    unified.hosts = vec![(
-        "example.com".to_string(),
-        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-    )];
+    let unified = nexus_dns::DnsUnifiedConfig {
+        hosts: vec![(
+            "example.com".to_string(),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        )],
+        ..nexus_dns::DnsUnifiedConfig::default()
+    };
     DnsFileConfig {
         unified,
         mesh_hosts: Vec::new(),

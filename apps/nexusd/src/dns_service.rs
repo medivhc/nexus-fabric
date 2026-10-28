@@ -312,6 +312,9 @@ struct LocalCounters {
     exhausted: u64,
 }
 
+// 单 owner 线程的入参刻意平铺（队列/状态/缓存视图各一个），拆 struct 只会把
+// 同一组所有权转移包一层；clippy 计数 8 > 7 是有意的。
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     mut unified: UnifiedDns,
     mut engine: UpstreamEngine,
@@ -636,8 +639,10 @@ mod tests {
     use nexus_dns::DnsUnifiedConfig;
 
     fn config_with_hosts(hosts: Vec<(String, IpAddr)>) -> DnsFileConfig {
-        let mut unified = DnsUnifiedConfig::default();
-        unified.hosts = hosts;
+        let unified = DnsUnifiedConfig {
+            hosts,
+            ..DnsUnifiedConfig::default()
+        };
         DnsFileConfig {
             unified,
             mesh_hosts: Vec::new(),
@@ -799,7 +804,7 @@ mod tests {
         let snapshot = handle.status.snapshot();
         assert_eq!(snapshot.service, DnsServiceState::Running);
         assert_eq!(snapshot.config_generation, 1);
-        assert_eq!(snapshot.upstream.plaintext, true);
+        assert!(snapshot.upstream.plaintext);
         assert_eq!(snapshot.upstream.servers.len(), 1);
         assert_eq!(snapshot.upstream.servers[0].addr, "127.0.0.1:5399");
         assert_eq!(snapshot.proxy_policy.unmatched, UnmatchedPolicy::Auto);

@@ -31,6 +31,9 @@ use serde_json::{Value, json};
 
 const PEER_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+/// fake N1 sender 记录到的帧：`(目的地址, 原始包字节)`。
+type Frames = Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>>;
+
 /// `MockTun` 读回范式（N-11）。
 struct SharedTun(Arc<Mutex<MockTun>>);
 
@@ -74,7 +77,7 @@ impl Drop for TempDir {
 
 /// 记录 N1 原始转发的 fake sender（AC6：dst 必须是 `IpAddr::V6`，字节逐字一致）。
 struct RecordingSender {
-    frames: Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>>,
+    frames: Frames,
     /// true = 模拟"bridge 无该 v6 路由"（send_to_mesh 失败）。
     fail: bool,
 }
@@ -240,7 +243,7 @@ fn truncated() -> Vec<u8> {
 /// AC6：v6/UDP → Mesh 原始转发（fake N1 记录 dst + 字节）。
 fn section_ac6() -> Result<Value, String> {
     let mut env = assemble("ac6", true)?;
-    let frames: Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let frames: Frames = Arc::new(Mutex::new(Vec::new()));
     env.dp.set_n1_sender(Arc::new(RecordingSender {
         frames: Arc::clone(&frames),
         fail: false,
@@ -366,7 +369,7 @@ fn section_ac7() -> Result<Value, String> {
 /// AC10：6 类包 × 10 = 60 个；每类只命中各自维度的计数，通用 dropped 不增。
 fn section_ac10() -> Result<Value, String> {
     let mut env = assemble("ac10", true)?;
-    let frames: Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let frames: Frames = Arc::new(Mutex::new(Vec::new()));
     env.dp.set_n1_sender(Arc::new(RecordingSender {
         frames,
         fail: false,

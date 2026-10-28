@@ -733,7 +733,7 @@ fn suite_degradation() -> Result<Value, String> {
         std::thread::sleep(Duration::from_millis(1));
     }
     let disabled_ok = !off.dp.dns_service_ready()
-        && off.status_snapshot().enabled == false
+        && !off.status_snapshot().enabled
         && off.status_snapshot().service.as_str() == "disabled"
         && off.stats().dns_answered == before;
 
