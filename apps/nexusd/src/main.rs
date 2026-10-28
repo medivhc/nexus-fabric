@@ -1274,6 +1274,8 @@ impl NatSwitchRuntime {
         hub: Option<Arc<nexus_discovery::hub::DiscoveryHub>>,
         sessions: Option<Arc<nexus_network::n1::session::N1SessionManager>>,
         static_peers: Vec<N1PeerId>,
+        nat_slot: nexusd::nat_consumer::NatHandleSlot,
+        punch_clock: Arc<dyn nexus_nat_traversal::PunchClock>,
     ) -> Option<JoinHandle<()>> {
         if let Some(id) = &identity {
             eprintln!(
@@ -1336,10 +1338,16 @@ impl NatSwitchRuntime {
             my_id,
             local,
             Vec::new(), // STUN 样本由 worker 周期性喂入
-            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+            Arc::clone(&punch_clock),
         );
 
         nexusd::nat_status::publish_nat_status_source(Box::new(Arc::clone(&sw)));
+
+        // P0: expose the narrow consumer seam. The dataplane may already be
+        // running; an empty slot simply means "all chunks fallback".
+        let provider: Arc<dyn nexusd::nat_consumer::NatPathProvider> = sw.clone();
+        nat_slot.set(provider);
+        eprintln!("[nat-consumer] handle attached");
 
         // D5: one address book for the whole process (provider publish + feed
         // poll). `relay_book_dir` selects the shared-directory book; otherwise
@@ -2083,6 +2091,21 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         Ok(pair) => pair,
         Err(code) => return code,
     };
+    // NAT chunk consumer scaffolding (P0 §3.1.3): the slot and the single
+    // monotonic PunchClock are created before the dataplane thread starts. The
+    // slot stays empty until the NAT runtime is up (all chunks fallback in the
+    // meantime, which is the honest degraded mode).
+    let punch_clock: Arc<dyn nexus_nat_traversal::PunchClock> =
+        Arc::new(nexus_nat_wireup::SystemPunchClock::new());
+    let nat_slot = nexusd::nat_consumer::NatHandleSlot::new();
+    // Consumed by the direct-stream receiver spawned in the next commit;
+    // created here so the composition root owns one shared clock.
+    let _direct_gate = Arc::new(nexusd::nat_chunk_recv::DirectGate::new(Arc::clone(
+        &punch_clock,
+    )));
+    let chunk_stats = Arc::new(nexusd::nat_chunk_stats::ChunkStats::default());
+    nexusd::nat_chunk_stats::publish_chunk_stats(Arc::clone(&chunk_stats));
+    nexusd::nat_chunk_stats::publish_nat_slot_for_status(nat_slot.clone());
     let dataplane_handle = if tun_enabled() || has_tproxy {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
@@ -2248,6 +2271,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 Some(Arc::clone(&n1.discovery)),
                 Some(Arc::clone(&n1.sessions)),
                 n1.static_peers.clone(),
+                nat_slot.clone(),
+                Arc::clone(&punch_clock),
             ))
         })() {
             Ok(handle) => handle,
