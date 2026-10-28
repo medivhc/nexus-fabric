@@ -111,6 +111,30 @@
   - 成功会话 JSON 新增 `socks.reply_sent` / `socks.reply_deferred_ms` 与
     `tunnel: { readiness, pre_payload_down_bytes, guard, window_ms }`（AC-13）；
     `ClientAbortedBeforeReady` 返回 `Ok` 会话（`reply_code=null`、readiness=`client_aborted`）。
+- SOCKS5 **UDP ASSOCIATE 产品路径**（fixes-6 Phase 1 / spec §3.2/§3.6/§3.9/§6.3/§7.2）：
+  `proxy_serve_once` 在 SOCKS5 `Established` 后先按 `Socks5Handshake::command()` 分流——
+  CONNECT 保持原路径逐字节不变；`CMD=0x03` 进 UDP 关联，关联生命周期**从属控制连接**
+  （EOF / RST / 控制连接上出现额外协议数据 → 立即终止、关闭 UDP socket、取消全部 session）。
+  - **准入（Q12）**：`listener.local_addr()` 非 loopback 且本产品无显式认证 → `REP=0x01`
+    拒绝（不 bind、不建关联，计 `associations_rejected`）；请求 `DST.ADDR` 为具体 IP 且
+    ≠ 控制连接对端 → 同样拒绝（§3.3，不静默改用学习值）。
+  - **绑定与应答**：先 `UdpSocket::bind(<listen_ip>:0)`，再用
+    `nexus_ingress::encode_udp_associate_reply` 回真实 BND（绑定失败 → `REP=0x01`）。
+  - **能力翻转点（全 run 唯一对外可见）**：VLESS → `Supported(VlessOverTcp)`（仅 `flow=None`）、
+    AnyTLS → `Supported(AnytlsUot)` 首次被生产路径消费（`association` 旁 `udp.modes` 可见）；
+    Trojan / Shadowsocks → `Unsupported`（R-3：`NotWired`，crate 无 UDP 帧 API，与 TUN 侧
+    `TlsVariantNotSupported` 的理由不同）、Hysteria2 → `Unsupported`；
+    Direct / Relay / Vmess / Socks5 出站 → 按 kind 先丢弃（Q11），**绝不直连**。
+  - **fail-closed 计数与日志**：§6.3 逐行计数（`dropped_*`；产品侧同名字段
+    `udp.unsupported_<proto>` / `udp.sent` / `udp.send_failed` 与 §7.3-3 对齐，不改 nexusd）；
+    结构化日志 `[proxy-udp] event=…`（§6.5 行格式，`detail` 走 `redact::sanitize` 128B 截断，
+    限频 10s 并在下一条回填 `suppressed=`）；源校验在解析前完成。
+  - **JSON（K-11）**：只新增 `association` / `udp` 两段；TCP 路径既有字段
+    （`socks.*` / `routing.*` / `bytes.*`）逐字不变。
+  - **并发事实（R-7=(a)）**：保留 `main.rs` 串行 accept 模型，关联在 serve 循环内阻塞至控制
+    连接结束；`MAX_UDP_ASSOCIATIONS=128` 是**进程内**上限（`association.max_associations`
+    如实输出），在串行 accept 下不可达——**单进程有效并发 = 1**
+    （`association.effective_concurrency`）。真实并发需改 main loop，另行立项，本 run 不做。
 - 真实节点测速（PRODUCT §11.10）：TcpLatencyProbe（std::net connect_timeout，非 portable）
   + Http204LatencyProbe（connect 后发单行 GET、等响应首行 204，非 portable）
   + proxy_speedtest_with(probe, candidates, timeout, target_label, probe_kind)（批量测速、RTT 排序 JSON 输出）；结果可经 MeasurementSource 喂 urltest。

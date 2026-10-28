@@ -13,8 +13,8 @@ use nexus_proxy_config::OutboundKind;
 
 use super::udp_outbound::{
     TargetAddr, UdpHandshakeFailure, UdpOutboundError, UdpSession, UdpStream, connect_tcp,
-    map_handshake_write, map_send_error, read_into, set_poll_timeouts, tls_client_config,
-    tls_connect,
+    map_handshake_write, map_send_error, read_into, set_poll_timeouts,
+    set_protocol_handshake_timeouts, tls_client_config, tls_connect,
 };
 
 const KIND: OutboundKind = OutboundKind::Vless;
@@ -54,6 +54,8 @@ pub(crate) fn open_vless_session(
         Box::new(socket)
     };
 
+    // §5.2：协议握手阶段（请求头 + 惰性响应头）显式 10s 上限。
+    set_protocol_handshake_timeouts(&handle, KIND)?;
     let request = VlessRequest {
         uuid: config.uuid,
         flow: config.flow,
@@ -197,6 +199,8 @@ pub(crate) fn encode_udp_datagram(payload: &[u8]) -> Result<Vec<u8>, UdpOutbound
 }
 
 /// 从流上读一个 UDP 数据报；无完整帧（含 100ms 超时）→ `Ok(None)`，EOF → `Closed`。
+// spec §4.1 冻结 API；产品路径用增量组帧（`take_len_prefixed`），本函数当前仅单测调用。
+#[allow(dead_code)]
 pub(crate) fn read_udp_datagram(
     stream: &mut dyn UdpStream,
     buf: &mut Vec<u8>,
@@ -212,6 +216,8 @@ pub(crate) fn read_udp_datagram(
 }
 
 /// 把一段完整字节切分成 UDP 数据报序列（尾部不完整 → `Truncated`）。
+// spec §4.1 冻结 API；产品路径用增量组帧，本函数当前仅单测调用。
+#[allow(dead_code)]
 pub(crate) fn decode_udp_datagrams(buf: &[u8]) -> Result<Vec<Vec<u8>>, UdpOutboundError> {
     nexus_outbound_vless::decode_udp_datagrams(buf).map_err(|_| UdpOutboundError::Handshake {
         kind: KIND,

@@ -41,6 +41,8 @@ pub(crate) const UDP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// 关联空闲超时默认值（None = 只随控制连接结束；可选 300s）。
 pub(crate) const UDP_ASSOCIATION_IDLE_TIMEOUT: Option<Duration> = None;
 /// 可选关联空闲超时（§5.2）。
+// 产品默认 `None`（只随控制连接结束）；该值由启用 300s 的测试与后续开关使用。
+#[allow(dead_code)]
 pub(crate) const UDP_ASSOCIATION_IDLE_TIMEOUT_OPTION: Duration = Duration::from_secs(300);
 
 /// 关联资源配置（§5.1；等价重构：`global_flows`/`global_rate` 由构造参数注入）。
@@ -133,28 +135,34 @@ pub(crate) enum Outcome {
     Completed,
     /// 失败结束。
     Failed(UdpAssociateError),
-    /// 进程/daemon 关闭。
+    /// 进程/daemon 关闭（spec §3.6 T4；进程级关闭信号未接入，当前不构造）。
+    #[allow(dead_code)]
     Cancelled,
 }
 
 /// 关联层错误（spec §4.7）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UdpAssociateError {
-    /// UDP bind 失败（C4）。
+    /// UDP bind 失败（spec §4.7；C4 在 bind 失败处直接回 REP=0x01，不构造本变体）。
+    #[allow(dead_code)]
     BindFailed { kind: std::io::ErrorKind },
-    /// 控制连接 EOF。
+    /// 控制连接 EOF（spec §3.6 T1；正常路径记 `Completed` + `control_closed`）。
+    #[allow(dead_code)]
     ControlClosed,
     /// 控制连接错误。
     ControlIo { kind: std::io::ErrorKind },
-    /// 全局关联数达上限（C4）。
+    /// 全局关联数达上限（spec §3.6 T6；C4 在握手阶段直接拒绝，不构造本变体）。
+    #[allow(dead_code)]
     AssociationLimit { active: usize, limit: usize },
-    /// UDP socket fatal error（C4）。
+    /// UDP socket fatal error。
     UdpSocketIo { kind: std::io::ErrorKind },
-    /// 出站工厂构造失败。
+    /// 出站工厂构造失败（spec §4.7；C4 归类为 `OutboundHandshake` 丢弃原因）。
+    #[allow(dead_code)]
     OutboundFactory { detail: &'static str },
     /// 控制连接上出现额外数据。
     ProtocolViolation,
     /// 不应发生。
+    #[allow(dead_code)]
     Internal { what: &'static str },
 }
 
@@ -170,13 +178,16 @@ pub(crate) struct FlowKey {
 pub(crate) enum Event {
     /// 无事件。
     None,
-    /// 控制连接已关闭（C4 owner 判定）。
+    /// 控制连接已关闭（spec §5.1；owner 在 serve 循环自行判定，关联内不构造）。
+    #[allow(dead_code)]
     ControlClosed,
     /// 关联空闲超时（启用时）。
     IdleTimeout,
-    /// 控制连接协议违规（C4 owner 判定）。
+    /// 控制连接协议违规（spec §5.1；owner 在 serve 循环自行判定，关联内不构造）。
+    #[allow(dead_code)]
     ProtocolViolation,
-    /// 致命错误。
+    /// 致命错误（spec §5.1；owner 在 serve 循环自行判定，关联内不构造）。
+    #[allow(dead_code)]
     Fatal(UdpAssociateError),
 }
 
@@ -184,20 +195,50 @@ pub(crate) enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UdpDropReason {
     MalformedDatagram,
-    FragmentUnsupported { fragment: u8 },
+    FragmentUnsupported {
+        fragment: u8,
+    },
     SourceMismatch,
     NoRoute,
-    UnsupportedProtocol { kind: OutboundKind },
-    DatagramTooLarge { len: usize, limit: usize },
-    FlowLimit { active: usize, limit: usize },
-    AssociationFlowLimit { active: usize, limit: usize },
-    GlobalFlowLimit { active: usize, limit: usize },
+    UnsupportedProtocol {
+        kind: OutboundKind,
+    },
+    DatagramTooLarge {
+        len: usize,
+        limit: usize,
+    },
+    /// 单 flow 上限（spec §5.1；当前按关联/全局两档判定，不构造本变体）。
+    #[allow(dead_code)]
+    FlowLimit {
+        active: usize,
+        limit: usize,
+    },
+    AssociationFlowLimit {
+        active: usize,
+        limit: usize,
+    },
+    GlobalFlowLimit {
+        active: usize,
+        limit: usize,
+    },
     RateLimited,
+    /// 队列满（spec §5.1；队列丢弃在 `collect_replies` 内直接计数，不构造本变体）。
+    #[allow(dead_code)]
     QueueFull,
-    OutboundIo { kind: OutboundKind },
-    OutboundClosed { kind: OutboundKind },
-    OutboundTimeout { kind: OutboundKind },
-    OutboundHandshake { kind: OutboundKind },
+    OutboundIo {
+        kind: OutboundKind,
+    },
+    OutboundClosed {
+        kind: OutboundKind,
+    },
+    OutboundTimeout {
+        kind: OutboundKind,
+    },
+    OutboundHandshake {
+        kind: OutboundKind,
+    },
+    /// 回包目标不在 flow 表（spec §5.1；`collect_replies` 内直接计数，不构造本变体）。
+    #[allow(dead_code)]
     UnmatchedReply,
     ControlClosed,
 }
@@ -293,6 +334,21 @@ impl AssociationRate {
     }
 }
 
+/// 被回收的 flow 观测（C4 的 `[proxy-udp] event=flow_reaped` 数据源）。
+///
+/// 只承载观测所需字段，不改变关联的 flow 表/终态语义；由 `take_reaped` 取走。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReapedFlow {
+    /// flow 目标。
+    pub(crate) target: TargetAddr,
+    /// 出站 tag。
+    pub(crate) outbound_tag: String,
+    /// 出站 kind。
+    pub(crate) outbound_kind: OutboundKind,
+    /// 回收时的空闲时长（`now - last_seen`）。
+    pub(crate) idle: Duration,
+}
+
 /// flow 表项（session 由关联独占持有；worker 不直接改统计/终态）。
 struct FlowEntry {
     target: TargetAddr,
@@ -318,6 +374,7 @@ pub(crate) struct UdpAssociation {
     rate: AssociationRate,
     global_rate: Arc<GlobalRateLimiter>,
     global_flows: Arc<AtomicUsize>,
+    reaped: Vec<ReapedFlow>,
 }
 
 impl UdpAssociation {
@@ -352,6 +409,7 @@ impl UdpAssociation {
             rate: AssociationRate::default(),
             global_rate,
             global_flows,
+            reaped: Vec::new(),
         }
     }
 
@@ -528,6 +586,14 @@ impl UdpAssociation {
             .map(|(key, _)| key.clone())
             .collect();
         for key in expired {
+            if let Some(entry) = self.flows.get(&key) {
+                self.reaped.push(ReapedFlow {
+                    target: entry.target.clone(),
+                    outbound_tag: entry.outbound_tag.clone(),
+                    outbound_kind: entry.outbound_kind,
+                    idle: now.saturating_duration_since(entry.last_seen),
+                });
+            }
             self.evict_flow(&key);
             self.stats.flows_reaped += 1;
         }
@@ -538,6 +604,11 @@ impl UdpAssociation {
             return Event::IdleTimeout;
         }
         Event::None
+    }
+
+    /// 取走自上次调用以来被回收的 flow 观测（C4 `flow_reaped` 日志用）。
+    pub(crate) fn take_reaped(&mut self) -> Vec<ReapedFlow> {
+        std::mem::take(&mut self.reaped)
     }
 
     /// 主动终止；幂等，只写一次终态（AGENTS §14）。
@@ -869,6 +940,12 @@ mod tests {
         assert_eq!(assoc.poll(base + Duration::from_secs(61)), Event::None);
         assert_eq!(assoc.flow_count(), 0);
         assert_eq!(assoc.stats().flows_reaped, 1);
+        let reaped = assoc.take_reaped();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].target, TargetAddr::from_socks5(&v4(53)));
+        assert_eq!(reaped[0].outbound_tag, "node");
+        assert!(reaped[0].idle >= Duration::from_secs(60));
+        assert!(assoc.take_reaped().is_empty(), "观测只取走一次");
     }
 
     #[test]

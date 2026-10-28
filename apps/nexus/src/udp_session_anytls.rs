@@ -15,7 +15,8 @@ use nexus_proxy_config::OutboundKind;
 
 use super::udp_outbound::{
     TargetAddr, UdpHandshakeFailure, UdpOutboundError, UdpSession, UdpStream, connect_tcp,
-    map_send_error, read_into, set_poll_timeouts, tls_client_config, tls_connect,
+    map_send_error, read_into, set_poll_timeouts, set_protocol_handshake_timeouts,
+    tls_client_config, tls_connect,
 };
 
 const KIND: OutboundKind = OutboundKind::Anytls;
@@ -44,6 +45,8 @@ pub(crate) fn open_anytls_session(
     let tls_config = tls_client_config(KIND, config.skip_cert_verify)?;
     let mut stream = tls_connect(KIND, socket, &config.sni, tls_config)?;
 
+    // §5.2：协议握手阶段（session + UoT stream）显式 10s 上限。
+    set_protocol_handshake_timeouts(&handle, KIND)?;
     let padding_md5 = padding_md5_hex(DEFAULT_PADDING_SCHEME);
     let mut handshake =
         client_handshake(&mut stream, &config.password, 0, CLIENT_IDENT, &padding_md5)
@@ -81,6 +84,8 @@ pub(crate) fn encode_uot_datagram(payload: &[u8]) -> Result<Vec<u8>, UdpOutbound
 }
 
 /// 按 `u16BE` 长度前缀切分完整缓冲（尾部不完整 → `InvalidFrame`）。
+// spec §4.2 冻结 API；产品路径用增量组帧（`take_uot_datagram`），本函数当前仅单测调用。
+#[allow(dead_code)]
 pub(crate) fn decode_uot_datagrams(buf: &[u8]) -> Result<Vec<Vec<u8>>, UdpOutboundError> {
     crate_decode_uot_datagrams(buf).map_err(|_| UdpOutboundError::Handshake {
         kind: KIND,

@@ -130,6 +130,8 @@ pub(crate) enum UdpOutboundError {
         limit: usize,
     },
     /// 不应发生的不一致。
+    // spec §4.7 冻结变体；Phase 1 生产路径不构造（防御性分类，仅 `outbound_drop_reason` 兜底）。
+    #[allow(dead_code)]
     Internal { what: &'static str },
 }
 
@@ -144,7 +146,8 @@ pub(crate) enum UdpPhase {
     ProtocolHandshake,
     /// 发送。
     Send,
-    /// 接收。
+    /// 接收（spec §4.7 冻结阶段；100ms 读超时按「暂无数据」处理，不构造本阶段）。
+    #[allow(dead_code)]
     Receive,
 }
 
@@ -178,9 +181,11 @@ pub(crate) enum UdpHandshakeFailure {
     ResponseInvalid,
     /// EOF 前不完整。
     Truncated,
-    /// 版本不符。
+    /// 版本不符（spec §4.7 冻结变体；响应头版本非法现归类为 `ResponseInvalid`）。
+    #[allow(dead_code)]
     VersionMismatch { got: u8 },
-    /// SOCKS5 类 CONNECT 拒绝。
+    /// SOCKS5 类 CONNECT 拒绝（spec §4.7 冻结变体；AnyTLS 拒绝现归类为 `StreamRejected`）。
+    #[allow(dead_code)]
     ConnectRejected { code: u8 },
     /// 不应发生。
     Internal,
@@ -461,6 +466,28 @@ pub(crate) fn connect_tcp(
             io: error.kind(),
         })?;
     Ok(socket)
+}
+
+/// 协议握手阶段（请求头/响应头、AnyTLS session+stream）的读写上限（§5.2 10s）。
+///
+/// 与 `connect_tcp` 的 TLS 握手期上限同值；显式收窄到协议握手阶段，避免握手拖到
+/// 会话读轮询超时才发现。
+pub(crate) fn set_protocol_handshake_timeouts(
+    handle: &TcpStream,
+    kind: OutboundKind,
+) -> Result<(), UdpOutboundError> {
+    handle
+        .set_read_timeout(Some(PROTOCOL_HANDSHAKE_TIMEOUT))
+        .map_err(|error| UdpOutboundError::Io {
+            kind,
+            io: error.kind(),
+        })?;
+    handle
+        .set_write_timeout(Some(PROTOCOL_HANDSHAKE_TIMEOUT))
+        .map_err(|error| UdpOutboundError::Io {
+            kind,
+            io: error.kind(),
+        })
 }
 
 /// 握手完成后切到 100ms 读轮询；句柄与原 socket 同 fd，设置对 TLS 包装同样生效。
