@@ -201,15 +201,19 @@ fn network_toml(with_v6: bool) -> String {
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"10.144.144.1\"\n\
-         mtu = 1200\n\
-         [[vpi.routes]]\n\
-         subnet = \"10.144.144.0/24\"\n\
-         peer = \"{PEER_ID}\"\n"
+         mtu = 1200\n"
     );
     if with_v6 {
+        text.push_str("address6 = \"fd00:144::1\"\n");
+    }
+    text.push_str(&format!(
+        "[[vpi.routes]]\n\
+         subnet = \"10.144.144.0/24\"\n\
+         peer = \"{PEER_ID}\"\n"
+    ));
+    if with_v6 {
         text.push_str(&format!(
-            "address6 = \"fd00:144::1\"\n\
-             [[vpi.routes6]]\n\
+            "[[vpi.routes6]]\n\
              subnet = \"fd00:144::/64\"\n\
              peer = \"{PEER_ID}\"\n"
         ));
