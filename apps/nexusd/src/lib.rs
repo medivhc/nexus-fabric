@@ -10,6 +10,8 @@ pub mod discovery_runtime;
 pub mod dns_classify;
 /// DNS service snapshot (`/dns/status`); wired in C11.
 pub mod dns_status;
+/// Non-blocking upstream DNS engine (pending table/retry/failover/cache).
+pub mod dns_upstream;
 /// 热路径日志限频（per `(tag, cause)`；PRODUCT hot-path 契约）。
 mod log_throttle;
 pub mod nat_gather;
