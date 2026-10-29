@@ -23,6 +23,8 @@ pub mod mesh_peer_map;
 pub mod n1_listener;
 /// N1 runtime 组合函数（spec §5.8/§7，WP1）。
 pub mod n1_runtime;
+/// N1 入站泵（spec §5.3/§5.4，WP3）：rx supervisor + reader + demux。
+pub mod n1_rx;
 pub mod nat_chunk_recv;
 pub mod nat_chunk_stats;
 pub mod nat_consumer;

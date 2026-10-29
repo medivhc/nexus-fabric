@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, sync_channel};
 
 use nexus_fabric::FabricIdentity;
 use nexus_network::n1::{N1Connection, N1PeerId};
@@ -54,26 +54,50 @@ pub enum N1InboundReject {
     ConnClosed,
 }
 
-/// N1 计数（spec §5.6/§7）。WP1 只落 rejected 大类；WP4/WP6 增补其余字段
-/// 与 `/localapi/v0/n1/stats` 序列化。
+/// N1 计数（spec §5.6/§7）。WP1 落 rejected 大类，WP3 增补 rx 侧字段；
+/// WP4/WP6 增补 dispatch/egress/tx 与 `/localapi/v0/n1/stats` 序列化。
 #[derive(Debug, Default)]
 pub struct N1Stats {
+    rx_datagrams: AtomicU64,
+    rx_bytes: AtomicU64,
+    rx_raw_ip: AtomicU64,
+    rx_stream_frames: AtomicU64,
     rx_rejected: AtomicU64,
     rx_rejected_admission: AtomicU64,
+    rx_queue_full: AtomicU64,
+    rx_ambiguous: AtomicU64,
+    rx_conn_closed: AtomicU64,
+    rx_transient_errors: AtomicU64,
 }
 
-/// `N1Stats` 的快照（WP1 子集；字段名与 §5.6 的 `rx.rejected` 对齐）。
+/// `N1Stats` 的快照（字段名与 §5.6 的 rx 侧点路径对齐）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct N1StatsSnapshot {
+    pub rx_datagrams: u64,
+    pub rx_bytes: u64,
+    pub rx_raw_ip: u64,
+    pub rx_stream_frames: u64,
     pub rx_rejected: u64,
     pub rx_rejected_admission: u64,
+    pub rx_queue_full: u64,
+    pub rx_ambiguous: u64,
+    pub rx_conn_closed: u64,
+    pub rx_transient_errors: u64,
 }
 
 impl N1Stats {
     pub fn snapshot(&self) -> N1StatsSnapshot {
         N1StatsSnapshot {
+            rx_datagrams: self.rx_datagrams.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            rx_raw_ip: self.rx_raw_ip.load(Ordering::Relaxed),
+            rx_stream_frames: self.rx_stream_frames.load(Ordering::Relaxed),
             rx_rejected: self.rx_rejected.load(Ordering::Relaxed),
             rx_rejected_admission: self.rx_rejected_admission.load(Ordering::Relaxed),
+            rx_queue_full: self.rx_queue_full.load(Ordering::Relaxed),
+            rx_ambiguous: self.rx_ambiguous.load(Ordering::Relaxed),
+            rx_conn_closed: self.rx_conn_closed.load(Ordering::Relaxed),
+            rx_transient_errors: self.rx_transient_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -83,6 +107,44 @@ impl N1Stats {
         if matches!(reason, N1InboundReject::AdmissionDenied { .. }) {
             self.rx_rejected_admission.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// `rx.datagrams` + `rx.bytes`：reader 从 `recv_datagram` 读到的（§5.6）。
+    pub fn record_rx_datagram(&self, len: usize) {
+        self.rx_datagrams.fetch_add(1, Ordering::Relaxed);
+        self.rx_bytes
+            .fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// `rx.raw_ip`：demux 判为 raw IPv4/IPv6。
+    pub fn record_rx_raw_ip(&self) {
+        self.rx_raw_ip.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `rx.stream_frames`：demux 判为 STREAM 帧。
+    pub fn record_rx_stream_frame(&self) {
+        self.rx_stream_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `rx.queue_full` 且 `rx.rejected{queue_full}`（§6.1 QueueFull 行）。
+    pub fn record_rx_queue_full(&self) {
+        self.rx_queue_full.fetch_add(1, Ordering::Relaxed);
+        self.rx_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `rx.ambiguous`（`rx.rejected` 由 `record_rx_rejected` 单独累计）。
+    pub fn record_rx_ambiguous(&self) {
+        self.rx_ambiguous.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `rx.conn_closed`：不算 rejected（§6.1 ConnClosed 行）。
+    pub fn record_rx_conn_closed(&self) {
+        self.rx_conn_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// reader 侧 transient 读取错误（10ms 续读，不算 rejected）。
+    pub fn record_rx_transient_error(&self) {
+        self.rx_transient_errors.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -101,24 +163,21 @@ pub struct N1RuntimeHandles {
     pub inbound_rx: Receiver<N1Inbound>,
     pub stats: Arc<N1Stats>,
     pub listener_state: N1ListenerState,
-    /// 保持 inbound channel 存活直到 WP3 的 rx supervisor 接管发送端。
-    pub(crate) _inbound_tx: Option<SyncSender<N1Inbound>>,
 }
 
 fn handles(
     accept: Option<std::thread::JoinHandle<()>>,
+    rx: Option<std::thread::JoinHandle<()>>,
     listener_state: N1ListenerState,
-    tx: SyncSender<N1Inbound>,
     inbound_rx: Receiver<N1Inbound>,
     stats: Arc<N1Stats>,
 ) -> N1RuntimeHandles {
     N1RuntimeHandles {
         accept,
-        rx: None,
+        rx,
         inbound_rx,
         stats,
         listener_state,
-        _inbound_tx: Some(tx),
     }
 }
 
@@ -142,10 +201,10 @@ pub fn assemble_n1_runtime(
         eprintln!("[n1-listener] listener disabled reason=no_listen_addr");
         return handles(
             None,
+            None,
             N1ListenerState::Disabled {
                 reason: "no_listen_addr",
             },
-            tx,
             inbound_rx,
             stats,
         );
@@ -161,10 +220,10 @@ pub fn assemble_n1_runtime(
             eprintln!("[n1-listener] WARN: bind failed addr={addr_text} reason={e}");
             return handles(
                 None,
+                None,
                 N1ListenerState::BindFailed {
                     reason: format!("invalid listen_addr: {e}"),
                 },
-                tx,
                 inbound_rx,
                 stats,
             );
@@ -175,10 +234,10 @@ pub fn assemble_n1_runtime(
         eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
         return handles(
             None,
+            None,
             N1ListenerState::BindFailed {
                 reason: "identity unavailable".to_string(),
             },
-            tx,
             inbound_rx,
             stats,
         );
@@ -193,10 +252,10 @@ pub fn assemble_n1_runtime(
             eprintln!("[n1-listener] WARN: bind failed addr={addr} reason={e}");
             return handles(
                 None,
+                None,
                 N1ListenerState::BindFailed {
                     reason: e.to_string(),
                 },
-                tx,
                 inbound_rx,
                 stats,
             );
@@ -208,10 +267,10 @@ pub fn assemble_n1_runtime(
             eprintln!("[n1-listener] WARN: bind failed addr={addr} reason={e}");
             return handles(
                 None,
+                None,
                 N1ListenerState::BindFailed {
                     reason: e.to_string(),
                 },
-                tx,
                 inbound_rx,
                 stats,
             );
@@ -226,19 +285,33 @@ pub fn assemble_n1_runtime(
         .spawn(move || sessions.accept_loop(&listener, &accept_stop))
         .map_err(|e| format!("spawn n1 accept thread: {e}"));
     match accept {
-        Ok(handle) => handles(
-            Some(handle),
-            N1ListenerState::Listening { addr: bound },
-            tx,
-            inbound_rx,
-            stats,
-        ),
+        Ok(handle) => {
+            let rx = match crate::n1_rx::spawn_n1_receiver(
+                Arc::clone(&assembly.sessions),
+                tx,
+                Arc::clone(&stats),
+                Arc::clone(&shutdown),
+            ) {
+                Ok(rx) => Some(rx),
+                Err(error) => {
+                    eprintln!("[n1-rx] WARN: supervisor spawn failed reason={error}");
+                    None
+                }
+            };
+            handles(
+                Some(handle),
+                rx,
+                N1ListenerState::Listening { addr: bound },
+                inbound_rx,
+                stats,
+            )
+        }
         Err(reason) => {
             eprintln!("[n1-listener] WARN: bind failed addr={bound} reason={reason}");
             handles(
                 None,
+                None,
                 N1ListenerState::BindFailed { reason },
-                tx,
                 inbound_rx,
                 stats,
             )

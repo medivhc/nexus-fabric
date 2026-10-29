@@ -405,6 +405,7 @@ mod tests {
             N1StatsSnapshot {
                 rx_rejected: 1,
                 rx_rejected_admission: 1,
+                ..N1StatsSnapshot::default()
             }
         );
     }

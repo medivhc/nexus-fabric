@@ -126,11 +126,11 @@ pub struct N1Assembly {
     pub config: N1Config,
 }
 
-/// 拨号退避初值（spec §8.1 `N1_DIAL_RETRY_INITIAL_MS`）。
-pub const N1_DIAL_RETRY_INITIAL_MS: u64 = 1000;
-
-/// 拨号退避封顶（spec §8.1 `N1_DIAL_RETRY_MAX_MS`）。
-pub const N1_DIAL_RETRY_MAX_MS: u64 = 30000;
+/// 拨号退避初值/封顶（spec §8.1 `N1_DIAL_RETRY_INITIAL_MS` / `N1_DIAL_RETRY_MAX_MS`）。
+///
+/// 唯一定义点在 `n1_rx.rs`（spec §7 冻结落点）；此处只重导出，
+/// 保持 WP2 既有的 `assembly::N1_DIAL_RETRY_*` 引用路径。
+pub use crate::n1_rx::{N1_DIAL_RETRY_INITIAL_MS, N1_DIAL_RETRY_MAX_MS};
 
 /// 已连接 peer 的存活轮询间隔。复用退避初值，不引入新的量化判据。
 const N1_DIAL_CONNECTED_POLL_MS: u64 = N1_DIAL_RETRY_INITIAL_MS;
