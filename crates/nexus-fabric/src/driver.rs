@@ -425,7 +425,14 @@ impl Driver {
     pub(crate) fn new_mtls_client() -> Result<Arc<Self>, FabricError> {
         let transport = StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
             .map_err(|e| FabricError::Transport(e.to_string()))?;
-        Self::spawn_mode(Box::new(transport), None, true)
+        Self::new_mtls_client_with_transport(Box::new(transport))
+    }
+
+    /// mTLS client on a caller-provided transport (spec §7 additive support).
+    pub(crate) fn new_mtls_client_with_transport(
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<Arc<Self>, FabricError> {
+        Self::spawn_mode(transport, None, true)
     }
 
     pub(crate) fn new_mtls_server(
