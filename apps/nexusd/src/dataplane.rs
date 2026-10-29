@@ -1171,9 +1171,13 @@ impl Dataplane {
                 let conn = self.n1_peer_conns.get(peer_hex).cloned();
                 let fallback = |_chunk: &[u8]| -> io::Result<()> {
                     match &conn {
-                        Some(conn) => conn
-                            .send_datagram(frame)
-                            .map_err(|e| io::Error::other(format!("n1 send failed: {e}"))),
+                        // chunk 本体不切分（direct 路径逐字节不变）；这条
+                        // fallback 走的是 N1 datagram，与正向/`N1` sink 同根，
+                        // 必须共用切分助手。
+                        Some(conn) => {
+                            send_stream_frame_fragmented(frame, |f| conn.send_datagram(f))
+                                .map_err(|e| io::Error::other(format!("n1 send failed: {e}")))
+                        }
                         None => Err(io::Error::new(
                             io::ErrorKind::NotConnected,
                             "n1 fallback conn missing",
@@ -9064,6 +9068,45 @@ outbounds:
         let snap = stats.snapshot();
         assert_eq!(snap.tx_errors, 1, "reply failure is counted");
         assert_eq!(snap.tx_frames, 0);
+    }
+
+    /// Q-1 同类扫描：Direct sink 的 **N1 fallback** 也共用切分助手（chunk 本体
+    /// 不切分，逐字节不变保持）。
+    #[test]
+    fn direct_sink_n1_fallback_fragments_oversize_reply() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let peer = nexus_fabric::PeerId([0x68; 32]);
+        let peer_hex = N1PeerId(peer.0).to_hex();
+        let conn = Arc::new(TestConn::new(N1PeerId(peer.0)));
+        let sent = Arc::clone(&conn.sent);
+        dp.n1_peer_conns
+            .insert(peer_hex.clone(), conn as Arc<dyn N1Connection>);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let slot = NatHandleSlot::new();
+        slot.set(Arc::new(RecordingProvider {
+            chunks: Arc::clone(&chunks),
+            direct: false, // 无 direct conn → provider 调 fallback
+            statuses: Vec::new(),
+        }));
+        dp.set_nat_path_slot(slot);
+
+        let payload = vec![0x7eu8; 8192];
+        let frame = encode_stream_frame(0x91, 0x00, &payload);
+        dp.send_reply(&ReplySink::Direct(peer), &peer_hex, &frame);
+
+        assert_eq!(chunks.lock().unwrap().len(), 1, "chunk attempted");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 7, "N1 fallback must be fragmented");
+        let mut rebuilt = Vec::new();
+        for piece in sent.iter() {
+            assert!(piece.len() <= N1_DATAGRAM_CAP);
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (0x91, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        drop(sent);
+        assert_eq!(stats.snapshot().tx_frames, 1);
     }
 
     /// AC-F4 回归（装配层）：egress connect 失败 → `n1_egress_poll` 编码
