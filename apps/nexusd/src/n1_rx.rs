@@ -40,7 +40,9 @@ pub const N1_DIAL_RETRY_MAX_MS: u64 = 30000;
 /// transient 读取错误的续读退避（spec §5.3，与 `pump.rs` 同语义）。
 const N1_RX_TRANSIENT_BACKOFF_MS: u64 = 10;
 
-/// 歧义帧 WARN 限频窗口（spec §6.1：计数必到，日志限频）。
+/// demux 拒绝 WARN 的限频窗口（spec §6.1：计数必到，日志限频）。
+///
+/// 同一 reader 内按 `reason`（empty/ambiguous/queue_full）分键，互不吞日志。
 const N1_RX_AMBIGUOUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// demux 判定结果（spec §5.4 五规则的逐条落点）。
@@ -99,6 +101,37 @@ fn try_enqueue(tx: &SyncSender<N1Inbound>, msg: N1Inbound) -> Enqueued {
 
 fn peer_hex8(peer: &N1PeerId) -> String {
     peer.to_hex().chars().take(8).collect()
+}
+
+/// §8.2 冻结行的 `<hex16>` peer 前缀。
+fn peer_hex16(peer: &N1PeerId) -> String {
+    peer.to_hex().chars().take(16).collect()
+}
+
+/// §8.2 逐字模板：`[n1-rx] conn peer=<hex16> conn=<n> started|closed`。
+///
+/// 级别口径（§8.2）：`started` = INFO、`closed` = WARN；既有日志面没有级别
+/// 通道（`eprintln!` 风格把 WARN 内嵌为 `WARN:`），而 §8.2 原文的这两行不含
+/// `WARN:` 标记，故逐字句按原文输出。
+fn conn_lifecycle_line(peer: &N1PeerId, conn_id: u64, phase: &str) -> String {
+    format!(
+        "[n1-rx] conn peer={} conn={conn_id} {phase}",
+        peer_hex16(peer)
+    )
+}
+
+/// §8.2 逐字模板：`[n1-rx] rejected peer=<hex16> reason=<reason>`。
+///
+/// `detail`（如 ambiguous 的 `first=0x45`）与 `suppressed=<n>` 是 §8.2 之外的
+/// 附加字段，与既有 `bad_frame` 行同形（前缀与字段顺序不变）。
+fn rejected_line(peer: &N1PeerId, reason: &str, detail: Option<&str>, suppressed: u64) -> String {
+    let mut line = format!("[n1-rx] rejected peer={} reason={reason}", peer_hex16(peer));
+    if let Some(detail) = detail {
+        line.push(' ');
+        line.push_str(detail);
+    }
+    line.push_str(&format!(" suppressed={suppressed}"));
+    line
 }
 
 /// 启动 rx supervisor 线程（spec §7 冻结签名）。
@@ -259,6 +292,10 @@ fn spawn_reader(
 /// - `Ok(d)` → 计数 → demux → 入队；满则计 `queue_full` 丢该 datagram；
 /// - `Closed/PeerClosed` → `sessions.remove` → `rx_conn_closed` → 退出；
 /// - 其它错误 → `rx_transient_errors` → 10ms 后续读，不退出。
+///
+/// 日志（§8.2，均与对应计数点同位）：启动/退出各一条 `[n1-rx] conn …`
+/// （退出行与 `rx_conn_closed` 1:1）；demux 拒绝按 reason 限频发
+/// `[n1-rx] rejected peer=… reason=empty|ambiguous|queue_full`。
 fn reader_loop(
     peer: N1PeerId,
     conn: Arc<dyn N1Connection>,
@@ -269,6 +306,8 @@ fn reader_loop(
     sessions: Arc<N1SessionManager>,
 ) {
     let mut throttle = KeyedLogThrottle::new();
+    // §8.2：reader 启动 INFO（与退出行成对，conn=<connection_id>）。
+    eprintln!("{}", conn_lifecycle_line(&peer, conn_id, "started"));
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -294,20 +333,38 @@ fn reader_loop(
                     }
                     Demuxed::Rejected(reject) => {
                         stats.record_rx_rejected(reject);
-                        if let N1InboundReject::AmbiguousKind { first } = reject {
-                            stats.record_rx_ambiguous();
-                            let decision = throttle.decide(
-                                "n1-rx",
-                                "ambiguous",
-                                std::time::Instant::now(),
-                                N1_RX_AMBIGUOUS_LOG_INTERVAL,
-                            );
-                            if decision.emit {
-                                eprintln!(
-                                    "[n1-rx] WARN: rejected reason=ambiguous first={first:#04x} suppressed={}",
-                                    decision.suppressed
-                                );
+                        let (reason, detail) = match reject {
+                            N1InboundReject::EmptyDatagram => ("empty", None),
+                            N1InboundReject::AmbiguousKind { first } => {
+                                stats.record_rx_ambiguous();
+                                ("ambiguous", Some(format!("first={first:#04x}")))
                             }
+                            // demux（§5.4）只产生 empty/ambiguous；其余变体
+                            // 由各自的发射点（入队失败 / dispatch）记录，
+                            // 此处不重复发日志。
+                            N1InboundReject::QueueFull
+                            | N1InboundReject::BadFrame { .. }
+                            | N1InboundReject::UnknownStream { .. }
+                            | N1InboundReject::AdmissionDenied { .. }
+                            | N1InboundReject::DuplicatePeer { .. }
+                            | N1InboundReject::ConnClosed => continue,
+                        };
+                        let decision = throttle.decide(
+                            "n1-rx",
+                            reason,
+                            std::time::Instant::now(),
+                            N1_RX_AMBIGUOUS_LOG_INTERVAL,
+                        );
+                        if decision.emit {
+                            eprintln!(
+                                "{}",
+                                rejected_line(
+                                    &peer,
+                                    reason,
+                                    detail.as_deref(),
+                                    decision.suppressed
+                                )
+                            );
                         }
                         continue;
                     }
@@ -319,6 +376,18 @@ fn reader_loop(
                         // `rx.queue_full` + `rx.rejected{queue_full}`（§6.1）。
                         stats.record_rx_queue_full();
                         stats.record_rx_rejected(N1InboundReject::QueueFull);
+                        let decision = throttle.decide(
+                            "n1-rx",
+                            "queue_full",
+                            std::time::Instant::now(),
+                            N1_RX_AMBIGUOUS_LOG_INTERVAL,
+                        );
+                        if decision.emit {
+                            eprintln!(
+                                "{}",
+                                rejected_line(&peer, "queue_full", None, decision.suppressed)
+                            );
+                        }
                     }
                     // dataplane 侧已退出：没有消费者，reader 收工并撤下回程 conn。
                     Enqueued::Disconnected => {
@@ -332,6 +401,10 @@ fn reader_loop(
             }
             Err(N1Error::Closed) | Err(N1Error::PeerClosed(_)) => {
                 stats.record_rx_conn_closed();
+                // §8.2：reader 退出 WARN；与 `rx_conn_closed` 同一分支、
+                // 同一处递增 → 计数与日志严格 1:1（stop/Disconnected 退出
+                // 不计 conn_closed，故也不发本行）。
+                eprintln!("{}", conn_lifecycle_line(&peer, conn_id, "closed"));
                 remove_if_current(&sessions, peer, conn_id);
                 break;
             }
@@ -580,6 +653,38 @@ mod tests {
         let shutdown = Arc::clone(shutdown);
         let tx = tx.clone();
         std::thread::spawn(move || run_supervisor(&sessions, &tx, &stats, &shutdown, poll_ms))
+    }
+
+    // ---- §8.2 冻结日志行模板 ----------------------------------------------
+
+    #[test]
+    fn frozen_conn_lifecycle_lines_match_spec_8_2() {
+        let peer = N1PeerId([0xab; 32]);
+        assert_eq!(
+            conn_lifecycle_line(&peer, 7, "started"),
+            "[n1-rx] conn peer=abababababababab conn=7 started"
+        );
+        assert_eq!(
+            conn_lifecycle_line(&peer, 7, "closed"),
+            "[n1-rx] conn peer=abababababababab conn=7 closed"
+        );
+    }
+
+    #[test]
+    fn frozen_rejected_lines_match_spec_8_2() {
+        let peer = N1PeerId([0x01; 32]);
+        assert_eq!(
+            rejected_line(&peer, "empty", None, 0),
+            "[n1-rx] rejected peer=0101010101010101 reason=empty suppressed=0"
+        );
+        assert_eq!(
+            rejected_line(&peer, "queue_full", None, 3),
+            "[n1-rx] rejected peer=0101010101010101 reason=queue_full suppressed=3"
+        );
+        assert_eq!(
+            rejected_line(&peer, "ambiguous", Some("first=0x45"), 2),
+            "[n1-rx] rejected peer=0101010101010101 reason=ambiguous first=0x45 suppressed=2"
+        );
     }
 
     // ---- demux 五规则（spec §5.4）------------------------------------------

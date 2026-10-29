@@ -15,6 +15,7 @@ use nexus_fabric::{
     FabricConn, FabricError, FabricIdentity, FabricListener, PeerId as FabricPeerId, RecvStream,
     SendStream,
 };
+use nexus_network::n1::session::N1SessionManager;
 use nexus_network::n1::{
     N1Connection, N1Error, N1KeepaliveIo, N1KeepaliveStream, N1Listener, N1PeerId,
 };
@@ -121,6 +122,13 @@ pub struct FabricN1Listener {
     /// WP1b：`record_rx_rejected(AdmissionDenied)` 的既有 stats 句柄。
     /// `None` 只用于不关心统计的单测；生产装配经 [`Self::with_stats`] 必填。
     stats: Option<Arc<N1Stats>>,
+    /// M-5（§5.7/§8.2）：重复 peer 的可观测性只读句柄。
+    ///
+    /// `N1SessionManager::insert_accepted` 对已存在 peer 的新 conn 静默
+    /// `close()`（机制零改动）。本字段**只读**查询会话表，在 accept 侧把该
+    /// 关闭变成 `[n1-listener] rejected peer=… reason=duplicate`；
+    /// `None` 只用于不关心该日志的单测（不改变任何行为）。
+    sessions: Option<Arc<N1SessionManager>>,
     /// 上一次观测到的 fabric 拒绝计数（增量检测）。
     last_rejected: AtomicU64,
     /// §19 日志句限频；`KeyedLogThrottle` 保证首次出现立即发射。
@@ -146,6 +154,7 @@ impl FabricN1Listener {
             allowed,
             stop,
             stats: None,
+            sessions: None,
             last_rejected,
             reject_log: Mutex::new(KeyedLogThrottle::new()),
         })
@@ -156,6 +165,25 @@ impl FabricN1Listener {
     pub fn with_stats(mut self, stats: Arc<N1Stats>) -> Self {
         self.stats = Some(stats);
         self
+    }
+
+    /// M-5：接入会话表（只读）以观测重复 peer 的新 conn 关闭。
+    #[must_use]
+    pub(crate) fn with_sessions(mut self, sessions: Arc<N1SessionManager>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// M-5：accept 时刻会话表里是否已有该 peer 的连接。
+    ///
+    /// 与机制判定点（`insert_accepted` 的 `contains_key`）相邻：本谓词在
+    /// `accept()` 内求值，调用方随即用它返回的 conn 调 `insert_accepted`。
+    /// 两者之间只有一次函数返回 + 一次 `accept_loop` 调用，唯一偏差来源是
+    /// 并发的 dial/remove 恰好落在该窗口（只影响本条日志，不改变关闭行为）。
+    fn duplicate_peer(&self, peer: N1PeerId) -> bool {
+        self.sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions.connection_for(&peer).is_some())
     }
 
     /// 绑定后的本地 UDP 地址（诊断/测试用）。
@@ -181,6 +209,15 @@ impl FabricN1Listener {
     ///
     /// 返回本次观测到的增量（0 = 纯空闲）。首次出现必定发射（限频器语义），
     /// 后续同键在窗口内只抑制输出，不丢计数。
+    ///
+    /// 口径注记（review-r1 M-2，不改语义，只把边界写清）：
+    /// - fabric 侧 C2 计数含「握手完成前死亡的全部入站 conn」——包括客户端
+    ///   中途断开、网络抖动等**非对抗原因**；闩锁（`rejection_counted` +
+    ///   `handshake_authenticated`）保证每连接至多计一次（下限正确），但
+    ///   分子不是纯「恶意拒绝数」，不得读作攻击计数。
+    /// - 本函数只在 `accept_timeout` 返回 `Timeout` 时被调用；持续成功 accept
+    ///   的负载下拒绝计数的统计与日志会**延迟**呈现（差值语义保证不丢失，
+    ///   成功后下一次超时轮询即补齐）。
     fn poll_rejected_handshakes(&self) -> u64 {
         let total = self.listener.rejected_handshakes();
         let last = self.last_rejected.load(Ordering::Relaxed);
@@ -230,11 +267,23 @@ impl N1Listener for FabricN1Listener {
                         conn.close(0, b"n1 admission");
                         return Err(N1Error::PeerUnknown);
                     }
-                    eprintln!(
-                        "[n1-listener] accepted peer={} conn={}",
-                        short_peer(peer),
-                        conn.id().0
-                    );
+                    // M-5（§5.7/§8.2）：重复 peer 的新 conn 会被
+                    // `insert_accepted` 静默关闭（机制零改动）。这一行与
+                    // accepted 行互斥：同一 conn 只会是「会话层接收」或
+                    // 「会话层拒绝重复」之一，不双写。判定后仍返回 Ok——
+                    // 关闭动作仍由机制执行，本层只加可观测。
+                    if self.duplicate_peer(peer) {
+                        eprintln!(
+                            "[n1-listener] rejected peer={} reason=duplicate",
+                            short_peer(peer)
+                        );
+                    } else {
+                        eprintln!(
+                            "[n1-listener] accepted peer={} conn={}",
+                            short_peer(peer),
+                            conn.id().0
+                        );
+                    }
                     return Ok((peer, Box::new(N1ConnAdapter { inner: conn })));
                 }
                 Err(FabricError::Timeout) => {
@@ -422,5 +471,95 @@ mod tests {
         .unwrap();
         assert!(listener.allows(allowed));
         assert!(!listener.allows(N1PeerId(identity(39).peer_id().0)));
+    }
+
+    // ---- M-5：重复 peer 的可观测（只读会话表；机制零改动）-----------------
+
+    struct NullDialer;
+    impl nexus_network::n1::N1Dialer for NullDialer {
+        fn dial(
+            &self,
+            _peer: &N1PeerId,
+            _addrs: &[std::net::SocketAddr],
+        ) -> Result<Box<dyn N1Connection>, N1Error> {
+            Err(N1Error::PeerUnknown)
+        }
+    }
+
+    struct NullDiscovery;
+    impl nexus_network::n1::N1Discovery for NullDiscovery {
+        fn resolve(&self, _peer: &N1PeerId) -> Result<Vec<std::net::SocketAddr>, N1Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NullSink;
+    impl nexus_network::n1::N1EventSink for NullSink {
+        fn emit(&self, _event: nexus_network::n1::N1Event) {}
+    }
+
+    fn empty_sessions() -> Arc<N1SessionManager> {
+        Arc::new(N1SessionManager::new(
+            Arc::new(NullDialer),
+            Arc::new(NullDiscovery),
+            Arc::new(NullSink),
+            nexus_network::n1::link::LinkConfig {
+                probe_interval: Duration::from_secs(3600),
+                heartbeat_timeout: Duration::from_secs(3600),
+                enable_rebind: false,
+                // watcher 一开就会 accept_keepalive 并阻塞在测试连接上。
+                enable_watcher: false,
+            },
+        ))
+    }
+
+    /// M-5：`duplicate_peer` 只在会话表已持有该 peer 时为真；accept 行为
+    /// 不变（仍返回 Ok，由 `insert_accepted` 按既有语义关闭新 conn）。
+    #[test]
+    fn duplicate_peer_is_observable_at_accept_without_changing_behavior() {
+        let server = identity(51);
+        let client = identity(52);
+        let sessions = empty_sessions();
+        let listener = FabricN1Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &server,
+            vec![N1PeerId(client.peer_id().0)],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+        .with_sessions(Arc::clone(&sessions));
+        let addr = listener.local_addr().unwrap();
+
+        // 第一条入站 conn：会话表为空 → 不是重复；登记后成为持有者。
+        let _dialer1 = FabricConn::connect_mtls(server.peer_id(), &client, &config(addr)).unwrap();
+        let (peer, conn) = listener.accept().unwrap();
+        assert_eq!(peer, N1PeerId(client.peer_id().0));
+        assert!(
+            !listener.duplicate_peer(peer),
+            "unregistered peer must not look duplicate"
+        );
+        let first_id = conn.connection_id();
+        sessions.insert_accepted(peer, conn);
+        assert!(
+            listener.duplicate_peer(peer),
+            "registered peer must look duplicate for the next conn"
+        );
+
+        // 同一 peer 的第二条入站 conn：accept 侧判定重复，仍返回 Ok（行为不变）。
+        let _dialer2 = FabricConn::connect_mtls(server.peer_id(), &client, &config(addr)).unwrap();
+        let (peer2, conn2) = listener.accept().unwrap();
+        assert_eq!(peer2, peer);
+        assert!(
+            listener.duplicate_peer(peer),
+            "duplicate branch must be observable at accept time"
+        );
+        drop(conn2);
+        assert_eq!(
+            sessions
+                .connection_for(&peer)
+                .map(|conn| conn.connection_id()),
+            Some(first_id),
+            "the first connection stays the session holder"
+        );
     }
 }
