@@ -407,7 +407,11 @@
   跨平台同一套代码（TUN 经 `Box<dyn TunDevice>`，VirtualPacketInterface
   抽象）；UDP 分片/重组后置。
 - 诚实边界：Proxy 方向只计数到 `proxy_tcp_*`（传输接线 = GAP-1）；
-  Mesh 方向 STREAM 帧经 N1 datagram 承载（egress 侧 `TcpRelay` 接线不在本契约）。
+  Mesh 方向 STREAM 帧经 N1 datagram 承载；egress 侧 `TcpRelay` **已接线**
+  （dataplane 持有 relay，`n1_egress_poll` 每轮驱动，计数见
+  `/localapi/v0/n1/stats` 的 `egress.*`）。计数口径：`egress.connect_ok` 只计
+  本地 socket 已产出证据的连接（静默连接少计、不多计）；`egress.bytes_to_local`
+  计 DATA 载荷进入 relay 写路径的字节（正常缓冲下等于写入本地 socket）。
 
 ### 常规要求
 

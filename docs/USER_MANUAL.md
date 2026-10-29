@@ -617,6 +617,72 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
 
 `Migrated` 只表示 direct 成为候选、PathManager 可能还没有切换，**此时 `tunnel_proto` 仍是 `turn`**；Migrated 不等于 direct。只有真实路径切换（`Switched`/`Adopted`）才写 `direct`。
 
+#### 4.1.14 N1 入站监听（`[network.n1]`）
+
+* **能力**：daemon 在本机 UDP 端口上以 mTLS 接受其他节点的 N1 入站连接，
+  收 raw IP / STREAM 帧并交给统一 dispatch（本节点发起的流回 TCP 终结器，
+  对端发起的流交 egress relay 连本地目标）。整节省略 = **禁用**（默认行为与
+  未引入本功能时一致：不 bind、不起 accept/rx 线程）。
+
+* **配置（`daemon.toml`，全部可选）**：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `[network.n1].enabled` | `false` | 总开关；`listen_addr` 显式出现且 `enabled` 缺省时按 `true` 处理 |
+| `[network.n1].listen_addr` | 缺省 = 禁用 | `ip:port`（如 `0.0.0.0:9000`）；缺省时静默降级为禁用（日志 `reason=no_listen_addr`，**不退出**） |
+| `[network.identity].seed_file` | listen 启用时必填 | 缺失/不可读/与 `peer_id` 不匹配 → fail-closed，exit 1（`[n1-listener] ERROR: identity unavailable`） |
+| `network.toml [[peers]]` | 既有 | listener 的 allowlist；空 `[[peers]]` 时拒绝所有入站（纯拨号节点仍可出站） |
+
+  配置错误行为：`listen_addr` 仅格式非法 → `CONFIG_INVALID [network.n1].listen_addr` + exit 1；
+  端口占用 → `bind_failed` + WARN，进程继续。注意 `[[peers]].addrs[0]`（对端拨号地址）
+  必须等于本端 `listen_addr` 的 `ip:port`，否则对端 dial 只会超时。
+
+* **启动日志**：
+
+```
+[n1-listener] listener disabled reason=no_listen_addr
+[n1-listener] listening addr=0.0.0.0:9000 peers=1
+```
+
+* **状态查询**：`GET /localapi/v0/n1/stats`（需 bearer token；只读）。
+  禁用时固定 `runtime="disabled"` + 全 0 + HTTP 200（不返回 404/500）。
+  以下为 enabled 形态示例（disabled 时 `runtime`/`listener.state` 均为 `disabled`，
+  所有计数为 0）：
+
+```json
+{
+  "verdict": "PASS",
+  "runtime": "enabled",
+  "listener": { "state": "listening", "addr": "0.0.0.0:9000" },
+  "rx": {
+    "datagrams": 0, "bytes": 0, "raw_ip": 0, "stream_frames": 0,
+    "rejected": 0, "queue_full": 0, "ambiguous": 0
+  },
+  "dispatch": { "to_terminator": 0, "to_relay": 0, "bad_frame": 0, "unknown_stream": 0 },
+  "egress": {
+    "syn": 0, "connect_ok": 0, "connect_failed": 0,
+    "bytes_to_local": 0, "bytes_from_local": 0, "table_full": 0
+  },
+  "tx": { "frames": 0, "errors": 0 },
+  "generated_at_ms": 0
+}
+```
+
+  `listener.state` 取值 `listening` / `bind_failed` / `disabled`；`runtime="enabled"`
+  当且仅当 `state != "disabled"`（`bind_failed` 时 `addr` 为空串）。
+
+* **计数口径（必须随对外说明复述）**：
+
+  * `rx.datagrams/bytes` 是 reader 从 `recv_datagram` 读到的；`rx.stream_frames` /
+    `rx.raw_ip` 是 demux 分类后的；`rx.rejected` 只计被丢弃的数据报（reason 见日志）。
+  * `egress.connect_ok` 只计**本地 socket 已产出证据**的连接（读到字节或 EOF）；
+    连上后一直静默到退出的流不会被计入——**只少计、不多计**，不要读作“全部连接成功数”。
+  * `egress.bytes_to_local` 计 DATA 载荷**进入 relay 写路径**的字节；正常 socket
+    缓冲下等于写入本地 socket，但部分写时两者不可区分，不是逐字节严格语义。
+  * **`recv_chunks == 0` 不表示没有数据到达**：`recv_chunks` 是 direct-conn chunk
+    接收端专用（语义未变）。N1 投递看 `n1.rx.stream_frames` 与
+    `n1.egress.bytes_to_local`，不要用 `recv_chunks` 证明 N1 送达。
+
 ### 4.2 Service
 
 #### 4.2.1 Service 资源生命周期
