@@ -900,23 +900,50 @@ fn no_direct_fallback_matches_golden_fixture() {
     assert!(dp.process_one().expect("fin"));
 
     // `stream_id` is randomly seeded per TcpTerminator instance, so the
-    // reproducible fixture hashes `flags || payload` per frame (see
-    // golden-fixture-baseline.txt).
-    let mut normalized = Vec::new();
+    // reproducible fixture hashes `flags || payload` per datagram.
+    //
+    // H2（N1 R1）：1205B 的 DATA 帧现在被切成两张 datagram（1195 + 5 载荷），
+    // 保证每张 N1 datagram 都在 fabric 的 1200B 上限内。本 fixture 保护的
+    // 不变量是**载荷字节流**（顺序与内容）不变；datagram 数量与帧头会多一份。
+    let mut wire = Vec::new();
+    let mut payload_stream = Vec::new();
+    let mut flags_seq = Vec::new();
     {
         let captured = frames.lock().unwrap();
-        assert_eq!(captured.len(), 7, "frame count must match the baseline");
+        assert_eq!(
+            captured.len(),
+            8,
+            "7 logical frames; the 1205B DATA frame is split into 2 datagrams"
+        );
         for (_, frame) in captured.iter() {
+            assert!(
+                frame.len() <= 1200,
+                "every N1 datagram must stay within the fabric cap"
+            );
             let (_, flags, payload) = decode_stream_frame(frame).expect("decode");
-            normalized.push(flags);
-            normalized.extend_from_slice(payload);
+            flags_seq.push(flags);
+            wire.push(flags);
+            wire.extend_from_slice(payload);
+            if flags == 0x00 {
+                payload_stream.extend_from_slice(payload);
+            }
         }
     }
-    assert_eq!(normalized.len(), 1543);
     assert_eq!(
-        sha256_hex(&normalized),
-        "aa0c6c24c5bae35e20287ecdcb09084c94bd5891ffe0499d848e6937d3f07abd",
-        "AC-H-2/AC-C-4: baseline N1 sequence must be unchanged"
+        flags_seq,
+        vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
+        "SYN, six DATA datagrams (one extra from the split), FIN"
+    );
+    assert_eq!(
+        payload_stream,
+        payloads.concat(),
+        "AC-H-2/AC-C-4: payload byte stream unchanged by fragmentation"
+    );
+    assert_eq!(wire.len(), 1544);
+    assert_eq!(
+        sha256_hex(&wire),
+        "74282d6ec26f56ccb97f648861378eba471da49e540d9b6a1f1ca9881db91d24",
+        "baseline N1 wire sequence (fragmented form)"
     );
 
     let snap = stats.snapshot();
