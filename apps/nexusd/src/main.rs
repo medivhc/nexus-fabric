@@ -1144,6 +1144,7 @@ fn setup_tproxy_frontend(
         .name("nexusd-tproxy".to_string())
         .spawn(move || {
             let started = std::time::Instant::now();
+            let mut reply_failures = nexusd::dataplane::UdpReplyFailureLog::new();
             while !thread_stop.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
                 let now_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 match tcp.accept(now_millis) {
@@ -1193,10 +1194,13 @@ fn setup_tproxy_frontend(
                         payload,
                     } = output
                     {
-                        if udp.send_from(orig_dst, peer, &payload).is_err() {
-                            if let Ok(mut guard) = counters.lock() {
-                                guard.udp_reply_failed += 1;
-                            }
+                        if let Err(error) = udp.send_from(orig_dst, peer, &payload) {
+                            reply_failures.record(
+                                &counters,
+                                orig_dst,
+                                &error,
+                                std::time::Instant::now(),
+                            );
                         }
                     }
                 }

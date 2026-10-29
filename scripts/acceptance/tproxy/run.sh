@@ -290,9 +290,11 @@ step_s2() {
     assert_ge udp_reply_failed_counted \
         "$(stats_value "$ev/status-held.json" '.tproxy.counters.udp_reply_failed')" \
         $((failed_before + 1))
-    for ns in "${NS_U}" "${NS_R}"; do
-        ns_exec "${ns}" pkill -f -- "--tag ${tag}" >/dev/null 2>&1 || true
-    done
+    assert_contains udp_reply_failed_logged "$(cat "$ev/nexusd.log" 2>/dev/null)" \
+        "event=udp_reply_failed orig_dst=${SITE_ADDR}:9000"
+    # 记录的 `timeout … sudo …` 包装 pid：timeout 把 TERM 转给子进程；helper 自身
+    # 也在 --secs 后退出（不用 pkill -f，它会匹配到自己的包装命令行）。
+    kill "${echo_pid}" "${holder_pid}" 2>/dev/null || true
     wait "${echo_pid}" "${holder_pid}" 2>/dev/null || true
 
     finalize_step

@@ -761,4 +761,67 @@ mod tests {
         assert!(socket.send_from(orig_dst, peer, b"y").is_err());
         assert_no_datagram(&client);
     }
+
+    /// LRU order with three slots: a hit on the oldest entry must make the
+    /// *second* oldest the next victim (cap 2 cannot tell rotate from swap).
+    #[test]
+    fn tproxy_udp_lru_order_with_three_slots() {
+        let Some(mut socket) = privileged_socket(3) else {
+            return;
+        };
+        let (client, peer) = client();
+        let d: Vec<SocketAddrV4> = (71..75).map(|i| non_local(i, 9000)).collect();
+        for dst in [d[0], d[1], d[2], d[0], d[3]] {
+            socket.send_from(dst, peer, b"x").unwrap();
+            assert_eq!(recv_from_source(&client).1, SocketAddr::V4(dst));
+        }
+        assert!(socket.has_reply_socket(d[0]));
+        assert!(!socket.has_reply_socket(d[1]), "d1 was least recently used");
+        assert!(socket.has_reply_socket(d[2]));
+        assert!(socket.has_reply_socket(d[3]));
+    }
+
+    /// A sendto failure after a successful bind is an error (so nexusd counts
+    /// udp_reply_failed), not Ok.
+    #[test]
+    fn tproxy_udp_sendto_failure_is_reported() {
+        let Some(mut socket) = privileged_socket(8) else {
+            return;
+        };
+        let (_client, peer) = client();
+        let too_big = vec![0u8; 70_000];
+        assert!(
+            socket
+                .send_from(non_local(81, 9000), peer, &too_big)
+                .is_err()
+        );
+    }
+
+    /// Dropping the frontend without shutdown() also closes reply sockets.
+    #[test]
+    fn tproxy_udp_drop_closes_reply_sockets() {
+        let Some(mut socket) = privileged_socket(8) else {
+            return;
+        };
+        let (client, peer) = client();
+        let orig_dst = non_local(91, 9000);
+        socket.send_from(orig_dst, peer, b"x").unwrap();
+        recv_from_source(&client);
+        drop(socket);
+        drop(exclusive_bind(orig_dst).expect("reply socket must close on drop"));
+    }
+
+    /// shutdown() is idempotent with reply sockets present, and is privileged
+    /// (the existing tproxy_udp_shutdown_is_idempotent skips silently).
+    #[test]
+    fn tproxy_udp_shutdown_is_idempotent_with_reply_sockets() {
+        let Some(mut socket) = privileged_socket(8) else {
+            return;
+        };
+        let (client, peer) = client();
+        socket.send_from(non_local(92, 9000), peer, b"x").unwrap();
+        recv_from_source(&client);
+        socket.shutdown().unwrap();
+        socket.shutdown().unwrap();
+    }
 }

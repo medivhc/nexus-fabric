@@ -1131,6 +1131,7 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   `IP_TRANSPARENT` 回包 socket（bind `orig_dst` 后 `sendto` 客户端）发出；回包 socket
   数量有界（LRU 淘汰），随 TPROXY UDP 前端一起关闭。为某个 `orig_dst` 建立回包 socket
   失败（如该地址端口已被本机其它 socket 独占）时丢弃该回包并计 `udp_reply_failed`，
+  按失败类别每 10 s 至多一条 stderr `[nexusd] WARN tproxy event=udp_reply_failed orig_dst=<ip:port> cause=<code> detail="…" suppressed=<n>`，
   **不得**以监听端口或其它源端口冒充发出。
 - **平台边界（ARCHITECTURE §10/§11）**：`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` /
   透明回包 socket 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core

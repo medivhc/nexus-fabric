@@ -54,6 +54,12 @@
 
 - 仅允许 Responsibility 所需且在架构层中明确归属的副作用。
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
+- TPROXY UDP 回包 socket（PRODUCT §11.18）在宿主上 bind `orig_dst` 的 IP 与端口
+  （`SO_REUSEADDR` + `IP_TRANSPARENT`），直到 LRU 淘汰（上限 `max_reply_sockets`，默认 256）或
+  前端关闭才释放；不按空闲时间过期。持有期间，本机随后以**不带** `SO_REUSEADDR` 的方式 bind
+  `0.0.0.0:P`（或该 `orig_dst`）的程序会得到 `EADDRINUSE`；反过来，已独占该端口的本机 socket
+  （含 nexusd 自身不带 `SO_REUSEADDR` 的 TPROXY 监听端口）使所有发往端口 P 的透明 UDP 流回包
+  失败（计 `udp_reply_failed`）。回包 socket 只发不收（从不读取）。
 
 ## Public API
 

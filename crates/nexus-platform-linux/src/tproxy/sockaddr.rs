@@ -1,6 +1,6 @@
 //! sockaddr / ancillary cmsg 的安全解析（spec §9.3 / §12.2 AC-G8-02）。
 //!
-//! 这些函数只处理字节切片，不接触裸指针；真正的 `recvmsg` / `sendmsg`
+//! 这些函数只处理字节切片，不接触裸指针；真正的 `recvmsg` / `sendto`
 //! 在 `tcp.rs` / `udp.rs` 的 unsafe 块中，并逐条写明 Safety Invariant。
 
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -127,7 +127,7 @@ pub fn sockaddr_in_to_v4(bytes: &[u8]) -> Result<SocketAddrV4, TransparentIngres
     Ok(SocketAddrV4::new(ip, port))
 }
 
-/// 构造 `sockaddr_in` 供 `bind` / `sendmsg` 使用。
+/// 构造 `sockaddr_in` 供 `bind` / `sendto` 使用。
 pub(crate) fn to_sockaddr_in(addr: SocketAddrV4) -> libc::sockaddr_in {
     // SAFETY: sockaddr_in is plain-old-data; zeroing is a valid initial value.
     let mut out: libc::sockaddr_in = unsafe { std::mem::zeroed() };
