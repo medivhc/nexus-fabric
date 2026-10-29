@@ -265,7 +265,11 @@ mod tests {
         out
     }
 
-    fn assembly(server: &FabricIdentity, client: &FabricIdentity) -> crate::assembly::N1Assembly {
+    fn assembly(
+        server: &FabricIdentity,
+        client: &FabricIdentity,
+        shutdown: Arc<AtomicBool>,
+    ) -> crate::assembly::N1Assembly {
         let server_hex = hex32(&server.peer_id().0);
         let client_hex = hex32(&client.peer_id().0);
         let text = format!(
@@ -281,8 +285,9 @@ mod tests {
         crate::assembly::assemble_n1_with_discovery(
             &text,
             None,
-            Arc::new(AtomicBool::new(false)),
+            shutdown,
             nexus::network::DiscoveryParams::static_only(),
+            None,
         )
         .expect("assembly")
     }
@@ -291,7 +296,8 @@ mod tests {
     fn absent_section_is_disabled_without_threads() {
         let server = identity(41);
         let client = identity(42);
-        let asm = assembly(&server, &client);
+        let dial_shutdown = Arc::new(AtomicBool::new(false));
+        let asm = assembly(&server, &client, Arc::clone(&dial_shutdown));
         let handles = assemble_n1_runtime(
             &asm,
             &N1Section::default(),
@@ -307,13 +313,15 @@ mod tests {
         assert!(handles.accept.is_none());
         assert!(handles.rx.is_none());
         assert_eq!(handles.stats.snapshot(), N1StatsSnapshot::default());
+        dial_shutdown.store(true, Ordering::SeqCst);
     }
 
     #[test]
     fn enabled_without_addr_degrades_to_disabled() {
         let server = identity(43);
         let client = identity(44);
-        let asm = assembly(&server, &client);
+        let dial_shutdown = Arc::new(AtomicBool::new(false));
+        let asm = assembly(&server, &client, Arc::clone(&dial_shutdown));
         let section = N1Section {
             enabled: true,
             listen_addr: None,
@@ -331,13 +339,15 @@ mod tests {
             }
         );
         assert!(handles.accept.is_none());
+        dial_shutdown.store(true, Ordering::SeqCst);
     }
 
     #[test]
     fn enabled_without_identity_fails_closed_without_threads() {
         let server = identity(45);
         let client = identity(46);
-        let asm = assembly(&server, &client);
+        let dial_shutdown = Arc::new(AtomicBool::new(false));
+        let asm = assembly(&server, &client, Arc::clone(&dial_shutdown));
         let section = N1Section {
             enabled: true,
             listen_addr: Some("127.0.0.1:0".to_string()),
@@ -348,6 +358,7 @@ mod tests {
             N1ListenerState::BindFailed { .. }
         ));
         assert!(handles.accept.is_none());
+        dial_shutdown.store(true, Ordering::SeqCst);
     }
 
     #[test]
@@ -355,8 +366,8 @@ mod tests {
         let server = identity(47);
         let server_id = server.peer_id();
         let client = identity(48);
-        let asm = assembly(&server, &client);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let asm = assembly(&server, &client, Arc::clone(&shutdown));
         let section = N1Section {
             enabled: true,
             listen_addr: Some("127.0.0.1:0".to_string()),
@@ -379,6 +390,104 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         dialer.close(0, b"done");
+        shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = handles.accept {
+            handle.join().expect("accept thread joins");
+        }
+    }
+
+    #[test]
+    fn larger_id_listens_and_smaller_id_dials_over_mtls() {
+        // 生成一对身份，确保 listener 是大 id、dialer 是小 id（tie-break 所有权）。
+        let mut listener_seed = 0x71u8;
+        let mut dialer_seed = 0x72u8;
+        let (listener, dialer) = loop {
+            let listener = identity(listener_seed);
+            let dialer = identity(dialer_seed);
+            if listener.peer_id().0 > dialer.peer_id().0 {
+                break (listener, dialer);
+            }
+            std::mem::swap(&mut listener_seed, &mut dialer_seed);
+        };
+        let listener_peer = listener.peer_id();
+        let dialer_peer = dialer.peer_id();
+
+        let listener_text = format!(
+            "peer_id = \"{}\"\n\
+             [[peers]]\n\
+             id = \"{}\"\n\
+             addrs = [\"127.0.0.1:1\"]\n\
+             [vpi]\n\
+             interface = \"nexus0\"\n\
+             address = \"10.200.0.1\"\n\
+             mtu = 1200\n",
+            hex32(&listener_peer.0),
+            hex32(&dialer_peer.0),
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let listener_assembly = crate::assembly::assemble_n1_with_discovery(
+            &listener_text,
+            None,
+            Arc::clone(&shutdown),
+            nexus::network::DiscoveryParams::static_only(),
+            Some(listener),
+        )
+        .expect("listener assembly");
+        let section = N1Section {
+            enabled: true,
+            listen_addr: Some("127.0.0.1:0".to_string()),
+        };
+        let listener_identity = identity(listener_seed);
+        let handles = assemble_n1_runtime(
+            &listener_assembly,
+            &section,
+            Some(listener_identity),
+            Arc::clone(&shutdown),
+        );
+        let N1ListenerState::Listening { addr } = handles.listener_state else {
+            panic!("expected listening, got {:?}", handles.listener_state);
+        };
+
+        let dialer_text = format!(
+            "peer_id = \"{}\"\n\
+             [[peers]]\n\
+             id = \"{}\"\n\
+             addrs = [\"{addr}\"]\n\
+             [vpi]\n\
+             interface = \"nexus0\"\n\
+             address = \"10.200.0.2\"\n\
+             mtu = 1200\n",
+            hex32(&dialer_peer.0),
+            hex32(&listener_peer.0),
+        );
+        let dialer_assembly = crate::assembly::assemble_n1_with_discovery(
+            &dialer_text,
+            None,
+            Arc::clone(&shutdown),
+            nexus::network::DiscoveryParams::static_only(),
+            Some(dialer),
+        )
+        .expect("dialer assembly");
+
+        let listener_key = N1PeerId(listener_peer.0);
+        let dialer_key = N1PeerId(dialer_peer.0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dialer_assembly
+            .sessions
+            .connection_for(&listener_key)
+            .is_none()
+            || listener_assembly
+                .sessions
+                .connection_for(&dialer_key)
+                .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "smaller id never completed mTLS dial to larger id"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = handles.accept {
             handle.join().expect("accept thread joins");

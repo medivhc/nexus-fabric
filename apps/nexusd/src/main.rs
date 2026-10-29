@@ -2069,6 +2069,37 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         },
         lsa_stale_after: Duration::from_secs(discovery_section.lsa_stale_sec),
     };
+    // N1 listen 请求：identity 缺失/不匹配时 fail-closed（spec §5.1/§9）。
+    let n1_listen_requested = loaded.daemon.n1.enabled && loaded.daemon.n1.listen_addr.is_some();
+    // dial 侧与 listen 侧都从同一 seed 派生身份。`FabricIdentity` 不可 Clone，
+    // 因此按需派生两次（确定性，成本为一次 ed25519 公钥推导）。
+    let load_n1_identity = |text: &str| -> Result<nexus_fabric::FabricIdentity, String> {
+        let path = loaded
+            .daemon
+            .identity
+            .seed_file
+            .as_deref()
+            .ok_or_else(|| "seed_file not configured".to_string())?;
+        let seed = nexusd::nat_relay::load_seed_file(std::path::Path::new(path))
+            .map_err(|e| e.to_string())?;
+        assembly::identity_from_network_seed(text, seed)
+    };
+    let dial_identity = match loaded.network_toml.as_deref() {
+        Some(text) => match load_n1_identity(text) {
+            Ok(identity) => Some(identity),
+            Err(e) => {
+                if n1_listen_requested {
+                    eprintln!(
+                        "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
+                    );
+                    return ExitCode::from(1);
+                }
+                eprintln!("[nexusd] WARN: N1 identity unavailable ({e}); dialing without mTLS");
+                None
+            }
+        },
+        None => None,
+    };
     let n1_assembly: Option<assembly::N1Assembly> = match loaded.network_toml.as_deref() {
         Some(text) => {
             match assembly::assemble_n1_with_discovery(
@@ -2076,6 +2107,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 loaded.daemon.proxy.as_ref(),
                 Arc::clone(&shutdown),
                 discovery_params,
+                dial_identity,
             ) {
                 Ok(assembly) => Some(assembly),
                 Err(e) => {
@@ -2099,30 +2131,19 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let n1_runtime = match n1_assembly.as_ref() {
         Some(assembly) => {
             let section = &loaded.daemon.n1;
-            let listen_requested = section.enabled && section.listen_addr.is_some();
-            let identity = if listen_requested {
-                let Some(path) = loaded.daemon.identity.seed_file.as_deref() else {
-                    eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
-                    return ExitCode::from(1);
-                };
-                let seed = match nexusd::nat_relay::load_seed_file(std::path::Path::new(path)) {
-                    Ok(seed) => seed,
-                    Err(e) => {
-                        eprintln!(
-                            "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
-                        );
-                        return ExitCode::from(1);
-                    }
-                };
-                match nexusd::nat_relay::identity_from_seed(
-                    seed,
-                    FabricPeerId(assembly.config.peer_id.0),
-                ) {
-                    Ok(identity) => Some(identity),
-                    Err(e) => {
-                        eprintln!(
-                            "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
-                        );
+            let identity = if n1_listen_requested {
+                match loaded.network_toml.as_deref() {
+                    Some(text) => match load_n1_identity(text) {
+                        Ok(identity) => Some(identity),
+                        Err(e) => {
+                            eprintln!(
+                                "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
+                            );
+                            return ExitCode::from(1);
+                        }
+                    },
+                    None => {
+                        eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
                         return ExitCode::from(1);
                     }
                 }
