@@ -2593,6 +2593,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 /// 内部 feed → switch → turn）→ Workspace unmount（D7）→ Dataplane（1s）→
 /// N1（5s）→ TUN（随 dataplane 线程退出）。
 /// 任一步超时 → warn 日志后强制继续，不无限等。
+// 每个参数是一个独立子系统的 join 句柄，拆结构体只会把同一条关闭序列拆散。
+#[allow(clippy::too_many_arguments)]
 fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
@@ -3490,10 +3492,9 @@ mod parse_flags_tests {
             LOCALAPI_ACCEPT_POLL_MS, 5,
             "WP0 定版值：spec §11.2 LOCALAPI_ACCEPT_POLL_MS = 5"
         );
-        assert!(
-            LOCALAPI_ACCEPT_POLL_MS < 100,
-            "空闲 accept 轮询粒度必须细于 100ms，实测 {LOCALAPI_ACCEPT_POLL_MS}ms"
-        );
+        // 常量断言放编译期（与下方 N2 常量断言同一写法），避免 clippy
+        // assertions_on_constants；运行期数值由上面 assert_eq! 钉死。
+        const { assert!(LOCALAPI_ACCEPT_POLL_MS < 100) };
     }
 
     #[test]
