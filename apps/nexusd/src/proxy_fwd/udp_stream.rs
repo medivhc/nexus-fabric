@@ -5,10 +5,11 @@
 //! - 每条流一个 worker 线程：在 dataplane 线程之外建流（`OutboundDialer::open_udp`），
 //!   之后循环「排空写命令 → 带短超时读回包」；建流结果、写出、回包与关闭都以事件回到流表。
 //! - 流表在 dataplane 线程上记账（时间由调用方传入）：
-//!   - 未写出的数据报每条流最多 64 个：建流期间即契约的建流队列，之后同一上限作为写背压；
-//!     超出的丢弃并计 `udp_send_failed`；
-//!   - 建流失败 → 已排队的数据报每个计一次 `udp_send_failed`，打限频日志
-//!     `event=udp_stream_open_failed`（每 `(tag, cause)` 10 s），同键 1 s 内不重试；
+//!   - 建流期间每条流最多排队 64 个数据报（契约的建流队列）；建流之后未写出的字节以 1 MiB
+//!     为上限（写背压，防止节点不读时无限缓存）。超出的丢弃并计 `udp_send_failed`；
+//!   - 建流失败（含节点在确认之前就结束流，如 VLESS 未回响应头即断开）→ 未写出的数据报
+//!     每个计一次 `udp_send_failed`，打限频日志 `event=udp_stream_open_failed`
+//!     （每 `(tag, cause)` 10 s），同键 1 s 内不重试；
 //!   - 任一方向空闲 60 s 关闭；对端关闭或出错同样关闭，下一个数据报重新建流；
 //!   - 同时存在的流上限 1024，超出时新流键的数据报丢弃，不驱逐既有流。
 //! - Owner = 流表：关闭的 worker 进入回收列表，结束后 join；Drop 时关闭全部流并有界等待。
@@ -27,8 +28,10 @@ use super::ProxyFwdStats;
 use super::adapter::{OutboundDialer, UdpStream};
 use crate::log_throttle::KeyedLogThrottle;
 
-/// 每条流未写出的数据报上限（建流队列）。
-const MAX_PENDING_PER_STREAM: u64 = 64;
+/// 建流期间每条流的排队上限（数据报数）。
+const MAX_QUEUED_DURING_OPEN: u64 = 64;
+/// 建流之后每条流未写出的字节上限（写背压）。
+const MAX_PENDING_BYTES_AFTER_OPEN: u64 = 1024 * 1024;
 /// 同时存在的流上限（既有 `MAX_UDP_FLOWS`）。
 pub(super) const MAX_STREAMS: usize = 1024;
 /// 空闲回收（既有 `UDP_FLOW_TIMEOUT`）。
@@ -37,13 +40,18 @@ pub(super) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const OPEN_RETRY_SPACING: Duration = Duration::from_secs(1);
 /// 建流失败日志的限频间隔（与 `event=udp_unsupported` 相同）。
 const OPEN_FAILED_LOG_INTERVAL: Duration = Duration::from_secs(10);
-/// worker 读超时：两次检查写命令之间的最长间隔（上行数据报的额外延迟上限）。
-const STREAM_POLL: Duration = Duration::from_millis(20);
+/// worker 读超时 = 两次检查写命令之间的最长间隔，即上行数据报的额外延迟上限。最近
+/// `ACTIVE_WINDOW` 内有流量时用短间隔，空闲时用长间隔（少唤醒）。
+const ACTIVE_POLL: Duration = Duration::from_millis(2);
+const IDLE_POLL: Duration = Duration::from_millis(20);
+const ACTIVE_WINDOW: Duration = Duration::from_secs(1);
 /// worker 写超时：对端不读时不无限阻塞。
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Drop 时等待 worker 结束的上限；仍在建流的 worker 在建流返回后立即退出
 /// （命令通道已断开），其寿命以拨号超时为界。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// 节点在确认之前结束流时的建流失败原因。
+const UNCONFIRMED_CAUSE: &str = "protocol_handshake";
 
 /// 流键：（本地源，目的地址）。
 type StreamKey = (SocketAddr, SocketAddr);
@@ -75,6 +83,7 @@ enum StreamEvent {
     Sent {
         key: StreamKey,
         id: u64,
+        bytes: u64,
     },
     Reply {
         key: StreamKey,
@@ -90,13 +99,27 @@ enum StreamEvent {
 struct Stream {
     id: u64,
     cmd_tx: Sender<StreamCmd>,
+    /// 已建流（决定适用建流队列上限还是写背压上限）。
     opened: bool,
-    /// 交给 worker 的数据报数。
+    /// 交给 worker 的数据报数 / 字节数。
     enqueued: u64,
-    /// worker 已写出的数据报数。
+    enqueued_bytes: u64,
+    /// worker 已写出的数据报数 / 字节数。
     sent: u64,
+    sent_bytes: u64,
     last_activity: Instant,
     worker: JoinHandle<()>,
+}
+
+impl Stream {
+    /// 本数据报是否超出当前上限。
+    fn full(&self, len: u64) -> bool {
+        if self.opened {
+            self.enqueued_bytes - self.sent_bytes + len > MAX_PENDING_BYTES_AFTER_OPEN
+        } else {
+            self.enqueued >= MAX_QUEUED_DURING_OPEN
+        }
+    }
 }
 
 /// 一个出站的 UDP 代理流表（dataplane 线程拥有）。
@@ -115,6 +138,9 @@ pub(super) struct StreamTable {
     /// 已收到、尚未交给调用方的回包。
     replies: Vec<UdpReply>,
     open_failures: KeyedLogThrottle,
+    /// 实际输出的建流失败日志行（测试观察）。
+    #[cfg(test)]
+    logged: Vec<String>,
 }
 
 impl StreamTable {
@@ -132,11 +158,12 @@ impl StreamTable {
             closing: Vec::new(),
             replies: Vec::new(),
             open_failures: KeyedLogThrottle::new(),
+            #[cfg(test)]
+            logged: Vec::new(),
         }
     }
 
-    /// 发送一个数据报；写入或进入队列返回 `true`，在本次调用内被丢弃返回 `false`
-    /// （均已计数）。
+    /// 发送一个数据报；进入队列返回 `true`，在本次调用内被丢弃返回 `false`（均已计数）。
     pub(super) fn send(
         &mut self,
         local: SocketAddr,
@@ -147,14 +174,14 @@ impl StreamTable {
     ) -> bool {
         self.pump(now, stats);
         let key = (local, remote);
+        let len = payload.len() as u64;
         if let Some(stream) = self.streams.get_mut(&key) {
-            if stream.enqueued - stream.sent >= MAX_PENDING_PER_STREAM
-                || stream.cmd_tx.send(StreamCmd::Datagram(payload)).is_err()
-            {
+            if stream.full(len) || stream.cmd_tx.send(StreamCmd::Datagram(payload)).is_err() {
                 stats.udp_send_failed += 1;
                 return false;
             }
             stream.enqueued += 1;
+            stream.enqueued_bytes += len;
             stream.last_activity = now;
             return true;
         }
@@ -205,6 +232,7 @@ impl StreamTable {
         let id = self.next_id;
         self.next_id += 1;
         let (cmd_tx, cmd_rx) = mpsc::channel();
+        let first_len = first.len() as u64;
         let _ = cmd_tx.send(StreamCmd::Datagram(first));
         let dialer = Arc::clone(&self.dialer);
         let events = self.events_tx.clone();
@@ -216,7 +244,9 @@ impl StreamTable {
             cmd_tx,
             opened: false,
             enqueued: 1,
+            enqueued_bytes: first_len,
             sent: 0,
+            sent_bytes: 0,
             last_activity: now,
             worker,
         })
@@ -230,10 +260,11 @@ impl StreamTable {
                         stream.opened = true;
                     }
                 }
-                StreamEvent::Sent { key, id } => {
+                StreamEvent::Sent { key, id, bytes } => {
                     stats.udp_sent += 1;
                     if let Some(stream) = self.current(key, id) {
                         stream.sent += 1;
+                        stream.sent_bytes += bytes;
                     }
                 }
                 StreamEvent::Reply { key, id, payload } => {
@@ -253,6 +284,8 @@ impl StreamTable {
                         self.failed_at.insert(key, now);
                         self.retire(stream, stats);
                         if let Some(line) = self.open_failed_line(cause, now) {
+                            #[cfg(test)]
+                            self.logged.push(line.clone());
                             eprintln!("{line}");
                         }
                     }
@@ -353,7 +386,7 @@ fn run_stream(
         }
     };
     let _ = events.send(StreamEvent::Opened { key, id });
-    if stream.set_read_timeout(Some(STREAM_POLL)).is_err()
+    if stream.set_read_timeout(Some(IDLE_POLL)).is_err()
         || stream
             .set_write_timeout(Some(STREAM_WRITE_TIMEOUT))
             .is_err()
@@ -362,12 +395,22 @@ fn run_stream(
         return;
     }
     if relay(stream.as_mut(), key, id, commands, events) {
-        let _ = events.send(StreamEvent::Closed { key, id });
+        // 节点在确认之前就结束了流：按建流失败处理（日志、重试间隔、计数）。
+        let event = if stream.established() {
+            StreamEvent::Closed { key, id }
+        } else {
+            StreamEvent::OpenFailed {
+                key,
+                id,
+                cause: UNCONFIRMED_CAUSE,
+            }
+        };
+        let _ = events.send(event);
     }
     let _ = stream.shutdown();
 }
 
-/// 返回 `true` = 流因对端或 I/O 结束（需报告 `Closed`）；`false` = 流表要求关闭。
+/// 返回 `true` = 流因对端或 I/O 结束（需报告）；`false` = 流表要求关闭。
 fn relay(
     stream: &mut dyn UdpStream,
     key: StreamKey,
@@ -376,6 +419,8 @@ fn relay(
     events: &Sender<StreamEvent>,
 ) -> bool {
     let mut batch = Vec::new();
+    let mut poll = IDLE_POLL;
+    let mut last_traffic = Instant::now();
     loop {
         // 先取完当前全部命令：流表已要求关闭时，排在 `Close` 之前的数据报也不再写出。
         loop {
@@ -389,10 +434,24 @@ fn relay(
             if stream.send_datagram(&datagram).is_err() {
                 return true;
             }
-            let _ = events.send(StreamEvent::Sent { key, id });
+            last_traffic = Instant::now();
+            let bytes = datagram.len() as u64;
+            let _ = events.send(StreamEvent::Sent { key, id, bytes });
+        }
+        let wanted = if last_traffic.elapsed() < ACTIVE_WINDOW {
+            ACTIVE_POLL
+        } else {
+            IDLE_POLL
+        };
+        if wanted != poll {
+            if stream.set_read_timeout(Some(wanted)).is_err() {
+                return true;
+            }
+            poll = wanted;
         }
         match stream.recv_datagrams() {
             Ok(Some(datagrams)) => {
+                last_traffic = Instant::now();
                 for payload in datagrams {
                     let _ = events.send(StreamEvent::Reply { key, id, payload });
                 }

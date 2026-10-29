@@ -279,6 +279,10 @@ impl UdpStream for VlessUdpStream {
     fn shutdown(&mut self) -> io::Result<()> {
         self.reader.get_mut().shutdown_write()
     }
+
+    fn established(&self) -> bool {
+        !self.response_pending
+    }
 }
 
 /// `VlessError` → `OutboundError`（spec §2.7 冻结映射）。

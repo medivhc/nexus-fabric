@@ -79,6 +79,11 @@ pub trait UdpStream: Send {
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
     /// 关闭写方向（AnyTLS 发 Fin）。
     fn shutdown(&mut self) -> io::Result<()>;
+    /// 节点是否已确认这条流（VLESS：已读到响应头；AnyTLS 在 `open_udp` 内等到 SynAck）。
+    /// 未确认就结束的流按建流失败处理（拒绝 / 不支持 UDP 的节点不会被逐包重连）。
+    fn established(&self) -> bool {
+        true
+    }
 }
 
 /// 单个出站配置错误（spec §2.6）。错误消息不得包含密码/UUID/hash/obfs_key。

@@ -360,6 +360,9 @@ pub struct ProxyPollResult {
     pub tun_packets: Vec<Vec<u8>>,
     /// 异步流事件。
     pub stream_events: Vec<ProxyStreamEvent>,
+    /// 自上次 poll 以来 UDP 代理流（VLESS / AnyTLS）实际写出的数据报数：入队时不计
+    /// 转发，写出时才计（`proxy_forwarded` 只计真实转发）。
+    pub udp_forwarded: u64,
 }
 
 /// Proxy 转发引擎（dataplane 拥有）。
@@ -475,7 +478,7 @@ impl ProxyEngine {
             .udp
             .entry(outbound_tag.to_string())
             .or_insert_with(|| udp_relay::UdpForwarder::new(dialer));
-        let forwarded = forwarder.handle_packet(packet);
+        let forwarded = forwarder.handle_packet(packet) == udp_relay::UdpSend::Written;
         Ok(ProxyHandleResult {
             tun_packets: Vec::new(),
             forwarded,
@@ -502,8 +505,10 @@ impl ProxyEngine {
         let mut out = ProxyPollResult {
             tun_packets,
             stream_events,
+            udp_forwarded: 0,
         };
         for forwarder in self.udp.values_mut() {
+            out.udp_forwarded += forwarder.take_stream_writes();
             for reply in forwarder.drain_replies() {
                 if let Some(pkt) = build_udp_reply(reply.local, reply.remote, &reply.payload) {
                     out.tun_packets.push(pkt);

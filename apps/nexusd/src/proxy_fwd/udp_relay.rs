@@ -49,6 +49,32 @@ pub struct UdpInbound {
     pub payload: Vec<u8>,
 }
 
+/// 一个 UDP 包的去向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpSend {
+    /// 已写出（数据报中继：同步发送成功）。
+    Written,
+    /// 已交给代理流（写出后经 [`UdpForwarder::take_stream_writes`] 计入转发）。
+    Queued,
+    /// 在本次调用内被丢弃（已计 `udp_send_failed` / `udp_unsupported*`）。
+    Dropped,
+}
+
+impl UdpSend {
+    /// 写出或入队（TPROXY `send_udp` 的 `Ok`）。
+    pub fn accepted(self) -> bool {
+        !matches!(self, Self::Dropped)
+    }
+}
+
+fn queued(accepted: bool) -> UdpSend {
+    if accepted {
+        UdpSend::Queued
+    } else {
+        UdpSend::Dropped
+    }
+}
+
 /// UDP 转发器（dataplane 线程拥有）。
 pub struct UdpForwarder {
     dialer: Arc<dyn OutboundDialer>,
@@ -59,6 +85,8 @@ pub struct UdpForwarder {
     relay: Option<UdpRelay>,
     /// 惰性初始化的代理流表（VLESS / AnyTLS）。
     streams: Option<StreamTable>,
+    /// 已报告为转发的代理流写出数（`udp_sent` 快照）。
+    reported_stream_writes: u64,
     inbound_rx: Receiver<UdpInbound>,
     inbound_tx: Sender<UdpInbound>,
     /// remote → (local, last_seen)。
@@ -85,6 +113,7 @@ impl UdpForwarder {
             tag,
             relay: None,
             streams: None,
+            reported_stream_writes: 0,
             inbound_rx,
             inbound_tx,
             flows: HashMap::new(),
@@ -94,20 +123,30 @@ impl UdpForwarder {
     }
 
     /// 处理一个 proxy 分类的 UDP 包（完整 IP 包）。
-    /// 写出或进入代理流队列返回 true；在本次调用内被丢弃返回 false。
-    pub fn handle_packet(&mut self, packet: &[u8]) -> bool {
+    pub fn handle_packet(&mut self, packet: &[u8]) -> UdpSend {
         self.handle_packet_at(packet, Instant::now())
     }
 
-    fn handle_packet_at(&mut self, packet: &[u8], now: Instant) -> bool {
+    /// 自上次调用以来代理流写出的数据报数（数据报中继的转发在 [`Self::handle_packet`]
+    /// 返回 `Written` 时即已发生，这里恒为 0）。
+    pub fn take_stream_writes(&mut self) -> u64 {
+        if self.streams.is_none() {
+            return 0;
+        }
+        let writes = self.stats.udp_sent - self.reported_stream_writes;
+        self.reported_stream_writes = self.stats.udp_sent;
+        writes
+    }
+
+    fn handle_packet_at(&mut self, packet: &[u8], now: Instant) -> UdpSend {
         // 排空入站（实际写 TUN 由调用方通过 drain_replies 完成）。
         self.reap();
         let (local, remote, payload) = match parse_udp_packet(packet) {
             Some(t) => t,
-            None => return false,
+            None => return UdpSend::Dropped,
         };
         if let Some(streams) = self.streams.as_mut() {
-            return streams.send(local, remote, payload, now, &mut self.stats);
+            return queued(streams.send(local, remote, payload, now, &mut self.stats));
         }
         // 确保中继已建立。
         if self.relay.is_none() {
@@ -118,26 +157,26 @@ impl UdpForwarder {
                     let streams = self
                         .streams
                         .insert(StreamTable::new(Arc::clone(&self.dialer)));
-                    return streams.send(local, remote, payload, now, &mut self.stats);
+                    return queued(streams.send(local, remote, payload, now, &mut self.stats));
                 }
                 UdpCapability::Supported(mode) => match self.establish(mode) {
                     Ok(r) => self.relay = Some(r),
                     Err(e) => {
                         eprintln!("[proxy-fwd] udp relay establish failed: {e}");
-                        return false;
+                        return UdpSend::Dropped;
                     }
                 },
                 UdpCapability::Unsupported { reason } => {
                     // §2.6.2：该 UDP 包丢弃；udp_send_failed + udp_unsupported；
                     // 限频日志；绝不直连。
                     self.record_unsupported(reason);
-                    return false;
+                    return UdpSend::Dropped;
                 }
             }
         }
         let relay = match self.relay.as_mut() {
             Some(r) => r,
-            None => return false,
+            None => return UdpSend::Dropped,
         };
         let ok = match relay {
             UdpRelay::Socks5(r) => r.send(remote, &payload).is_ok(),
@@ -153,10 +192,10 @@ impl UdpForwarder {
             }
             self.flows.insert(remote, (local, Instant::now()));
             self.stats.udp_sent += 1;
-            true
+            UdpSend::Written
         } else {
             self.stats.udp_send_failed += 1;
-            false
+            UdpSend::Dropped
         }
     }
 
@@ -567,8 +606,8 @@ mod tests {
     fn trojan_udp_is_unsupported_and_rate_limited() {
         let mut forwarder = UdpForwarder::new(Arc::new(TrojanUnsupportedDialer));
         let packet = udp_packet(b"dns-ish");
-        assert!(!forwarder.handle_packet(&packet));
-        assert!(!forwarder.handle_packet(&packet));
+        assert_eq!(forwarder.handle_packet(&packet), UdpSend::Dropped);
+        assert_eq!(forwarder.handle_packet(&packet), UdpSend::Dropped);
         let stats = forwarder.stats();
         assert_eq!(stats.udp_unsupported, 2);
         assert_eq!(stats.udp_send_failed, 2);
@@ -616,8 +655,8 @@ mod tests {
         ] {
             let mut forwarder = UdpForwarder::new(Arc::new(NotWiredDialer { kind, tag }));
             let packet = udp_packet(b"business-udp");
-            assert!(!forwarder.handle_packet(&packet));
-            assert!(!forwarder.handle_packet(&packet));
+            assert_eq!(forwarder.handle_packet(&packet), UdpSend::Dropped);
+            assert_eq!(forwarder.handle_packet(&packet), UdpSend::Dropped);
             let stats = forwarder.stats();
             assert_eq!(stats.udp_unsupported, 2, "{tag}");
             assert_eq!(stats.udp_send_failed, 2, "{tag}");

@@ -10,7 +10,7 @@ use std::sync::{Condvar, Mutex};
 
 use super::*;
 use crate::proxy_fwd::adapter::{OutboundError, TunnelStream, UdpCapability, UdpMode};
-use crate::proxy_fwd::udp_relay::UdpForwarder;
+use crate::proxy_fwd::udp_relay::{UdpForwarder, UdpSend};
 
 fn addr(last: u8, port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, last), port))
@@ -27,10 +27,19 @@ struct FakeStream {
     written: Arc<Mutex<Vec<Vec<u8>>>>,
     replies: Receiver<Option<Vec<u8>>>,
     timeout: Duration,
+    stall: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl UdpStream for FakeStream {
     fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<()> {
+        let (stalled, resumed) = &*self.stall;
+        let mut stalled = stalled.lock().map_err(|_| io::Error::other("lock"))?;
+        while *stalled {
+            stalled = resumed
+                .wait(stalled)
+                .map_err(|_| io::Error::other("lock"))?;
+        }
+        drop(stalled);
         self.written
             .lock()
             .map_err(|_| io::Error::other("lock"))?
@@ -86,6 +95,8 @@ struct FakeDialer {
     state: Mutex<FakeState>,
     unblocked: Condvar,
     fail: Mutex<Fail>,
+    /// 为 `true` 时所有流的写出阻塞（节点不读）。
+    stall: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl FakeDialer {
@@ -94,7 +105,13 @@ impl FakeDialer {
             state: Mutex::new(FakeState::default()),
             unblocked: Condvar::new(),
             fail: Mutex::new(Fail::No),
+            stall: Arc::new((Mutex::new(false), Condvar::new())),
         })
+    }
+
+    fn stall_writes(&self, stalled: bool) {
+        *self.stall.0.lock().expect("lock") = stalled;
+        self.stall.1.notify_all();
     }
 
     fn block(&self, target: SocketAddr) {
@@ -162,6 +179,7 @@ impl OutboundDialer for FakeDialer {
             written,
             replies: replies_rx,
             timeout: Duration::from_secs(3600),
+            stall: Arc::clone(&self.stall),
         }))
     }
 }
@@ -311,6 +329,12 @@ fn open_failure_drops_the_queue_and_counts_each() {
     assert_eq!(stats.udp_send_failed, 5);
     assert_eq!(stats.udp_sent, 0);
     assert!(dialer.opened().is_empty());
+    assert_eq!(
+        table.logged,
+        vec![
+            "[proxy-fwd] event=udp_stream_open_failed kind=vless tag=t cause=tcp_connect suppressed=0"
+        ]
+    );
 }
 
 #[test]
@@ -586,8 +610,14 @@ fn forwarder_attributes_replies_to_the_source_that_opened_the_stream() {
     let dialer = FakeDialer::new();
     let mut forwarder = UdpForwarder::new(Arc::clone(&dialer) as Arc<dyn OutboundDialer>);
     let (a, b) = (addr(SRC_A, 5000), addr(SRC_B, 6000));
-    assert!(forwarder.handle_packet(&ipv4_udp(a, dst(53), b"from-a")));
-    assert!(forwarder.handle_packet(&ipv4_udp(b, dst(53), b"from-b")));
+    assert_eq!(
+        forwarder.handle_packet(&ipv4_udp(a, dst(53), b"from-a")),
+        UdpSend::Queued
+    );
+    assert_eq!(
+        forwarder.handle_packet(&ipv4_udp(b, dst(53), b"from-b")),
+        UdpSend::Queued
+    );
     let opened = wait_opened(&dialer, 2);
     for stream in &opened {
         wait_written(stream, 1);
@@ -679,7 +709,11 @@ fn forwarder_carries_the_largest_ipv4_datagram_both_ways() {
     let mut forwarder = UdpForwarder::new(Arc::clone(&dialer) as Arc<dyn OutboundDialer>);
     let payload: Vec<u8> = (0..65_507u32).map(|i| (i % 251) as u8).collect();
     let local = addr(SRC_A, 5000);
-    assert!(forwarder.handle_packet(&ipv4_udp(local, dst(53), &payload)));
+    assert!(
+        forwarder
+            .handle_packet(&ipv4_udp(local, dst(53), &payload))
+            .accepted()
+    );
     let opened = wait_opened(&dialer, 1);
     wait_written(&opened[0], 1);
     assert_eq!(written(&opened[0])[0], payload);
@@ -739,7 +773,11 @@ fn failed_opens_never_send_directly_to_the_destination() {
     let mut forwarder = UdpForwarder::new(dialer);
     let local = addr(SRC_A, 5000);
     for i in 0..3u8 {
-        assert!(forwarder.handle_packet(&ipv4_udp(local, destination, &[i])));
+        assert!(
+            forwarder
+                .handle_packet(&ipv4_udp(local, destination, &[i]))
+                .accepted()
+        );
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while forwarder.stats().udp_send_failed < 3 {
@@ -748,7 +786,10 @@ fn failed_opens_never_send_directly_to_the_destination() {
         std::thread::sleep(Duration::from_millis(5));
     }
     // 重试间隔内：调用内丢弃。
-    assert!(!forwarder.handle_packet(&ipv4_udp(local, destination, b"gap")));
+    assert_eq!(
+        forwarder.handle_packet(&ipv4_udp(local, destination, b"gap")),
+        UdpSend::Dropped
+    );
     std::thread::sleep(Duration::from_millis(200));
     assert!(forwarder.drain_replies().is_empty(), "no fabricated reply");
     let stats = forwarder.stats();
@@ -760,4 +801,239 @@ fn failed_opens_never_send_directly_to_the_destination() {
         0,
         "nothing reached the destination"
     );
+}
+
+// ---- 代码评审 r1 的回归 ----
+
+/// B1：VLESS 节点不回响应头就断开（UUID 错误 / 不支持 UDP）= 建流失败：打日志、同键 1 s
+/// 内不重连，而不是逐包重开连接。
+#[test]
+fn vless_close_before_the_response_header_is_an_open_failure() {
+    use crate::proxy_fwd::OutboundRegistry;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let node = listener.local_addr().expect("addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for mut sock in listener.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 256];
+            let _ = sock.read(&mut buf);
+            // 拒绝：不回响应头，直接关闭。
+        }
+    });
+    let yaml = format!(
+        "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: v\noutbounds:\n  - tag: v\n    kind: vless\n    locator: {node}\n    uuid: 11111111-1111-1111-1111-111111111111\n"
+    );
+    let registry = OutboundRegistry::build(Some(&yaml))
+        .expect("registry")
+        .expect("some");
+    let mut table = StreamTable::new(Arc::clone(registry.dialer("v").expect("dialer")));
+    let mut stats = ProxyFwdStats::default();
+    let t_fail = Instant::now();
+    let at = |ms: u64| t_fail + Duration::from_millis(ms);
+    assert!(table.send(
+        addr(SRC_A, 5000),
+        dst(53),
+        b"q".to_vec(),
+        t_fail,
+        &mut stats
+    ));
+    poll_until(&mut table, t_fail, &mut stats, |t, _, _| {
+        t.live_streams() == 0
+    });
+    assert_eq!(
+        table.logged,
+        vec![
+            "[proxy-fwd] event=udp_stream_open_failed kind=vless tag=v cause=protocol_handshake suppressed=0"
+        ]
+    );
+    for ms in [100, 500, 999] {
+        assert!(!table.send(
+            addr(SRC_A, 5000),
+            dst(53),
+            b"q".to_vec(),
+            at(ms),
+            &mut stats
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "no reconnect inside the retry gap"
+    );
+    assert!(table.send(
+        addr(SRC_A, 5000),
+        dst(53),
+        b"q".to_vec(),
+        at(1_000),
+        &mut stats
+    ));
+    poll_until(&mut table, at(1_000), &mut stats, |t, _, _| {
+        t.live_streams() == 0
+    });
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+/// 只有发出的数据报也刷新空闲计时（空闲按任一方向计）。
+#[test]
+fn outgoing_traffic_alone_keeps_a_stream_open() {
+    let dialer = FakeDialer::new();
+    let mut table = table(&dialer);
+    let mut stats = ProxyFwdStats::default();
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    assert!(table.send(addr(SRC_A, 5000), dst(1), b"x".to_vec(), t0, &mut stats));
+    wait_opened(&dialer, 1);
+    assert!(table.send(
+        addr(SRC_A, 5000),
+        dst(1),
+        b"y".to_vec(),
+        at(30_000),
+        &mut stats
+    ));
+    let _ = table.poll(at(89_999), &mut stats);
+    assert_eq!(
+        table.live_streams(),
+        1,
+        "still open 59.999 s after the last send"
+    );
+    let _ = table.poll(at(90_000), &mut stats);
+    assert_eq!(table.live_streams(), 0);
+}
+
+/// 已建流的流上，一次突发的 100 个数据报不因 64 的建流队列上限被丢。
+#[test]
+fn a_burst_on_an_open_stream_is_not_dropped() {
+    let dialer = FakeDialer::new();
+    let mut table = table(&dialer);
+    let mut stats = ProxyFwdStats::default();
+    let t0 = Instant::now();
+    assert!(table.send(addr(SRC_A, 5000), dst(1), vec![0; 1200], t0, &mut stats));
+    let opened = wait_opened(&dialer, 1);
+    wait_written(&opened[0], 1);
+    poll_until(&mut table, t0, &mut stats, |_, s, _| s.udp_sent == 1);
+    for _ in 0..100 {
+        assert!(table.send(addr(SRC_A, 5000), dst(1), vec![1; 1200], t0, &mut stats));
+    }
+    wait_written(&opened[0], 101);
+    poll_until(&mut table, t0, &mut stats, |_, s, _| s.udp_sent == 101);
+    assert_eq!(stats.udp_send_failed, 0);
+}
+
+/// 建流之后，节点不读时未写出的字节以 1 MiB 为上限。
+#[test]
+fn unwritten_bytes_after_open_are_bounded() {
+    let dialer = FakeDialer::new();
+    let mut table = table(&dialer);
+    let mut stats = ProxyFwdStats::default();
+    let t0 = Instant::now();
+    assert!(table.send(addr(SRC_A, 5000), dst(1), vec![0; 10], t0, &mut stats));
+    let opened = wait_opened(&dialer, 1);
+    wait_written(&opened[0], 1);
+    poll_until(&mut table, t0, &mut stats, |_, s, _| s.udp_sent == 1);
+    dialer.stall_writes(true);
+    let accepted = (0..20)
+        .filter(|_| table.send(addr(SRC_A, 5000), dst(1), vec![2; 65_000], t0, &mut stats))
+        .count();
+    assert_eq!(accepted, 16, "16 x 65000 B fit in 1 MiB, the 17th does not");
+    assert_eq!(stats.udp_send_failed, 4);
+    dialer.stall_writes(false);
+    wait_written(&opened[0], 17);
+}
+
+/// N3：`proxy_forwarded` 只计写出到代理流的数据报；入队后因建流失败丢弃的不计。
+#[test]
+fn dataplane_counts_stream_datagrams_as_forwarded_only_when_written() {
+    use crate::dataplane::{Dataplane, DataplaneConfig};
+    use crate::proxy_fwd::ProxyEngine;
+    use nexus_projection::{MockTun, TunDevice};
+    use std::io::Read;
+
+    struct SharedTun(Arc<Mutex<MockTun>>);
+    impl TunDevice for SharedTun {
+        fn name(&self) -> &str {
+            "n3-udp0"
+        }
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("lock"))?
+                .read(buf)
+        }
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("lock"))?
+                .write(buf)
+        }
+    }
+
+    // 接受并读住请求的 VLESS 节点（写出成功）；以及一个关闭的端口（建流失败）。
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let live = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for mut sock in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                while matches!(sock.read(&mut buf), Ok(n) if n > 0) {}
+            });
+        }
+    });
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("port");
+    for (node, forwarded, dropped) in [(closed, 0, 1), (live, 1, 0)] {
+        let yaml = format!(
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: v\noutbounds:\n  - tag: v\n    kind: vless\n    locator: {node}\n    uuid: 11111111-1111-1111-1111-111111111111\n"
+        );
+        let mock = Arc::new(Mutex::new(MockTun::new("n3-udp0")));
+        let config = DataplaneConfig {
+            proxy_configured: true,
+            ..Default::default()
+        };
+        let mut dp =
+            Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None).expect("dp");
+        dp.set_proxy_engine(
+            ProxyEngine::new(Some(&yaml))
+                .expect("engine")
+                .expect("some"),
+        );
+        dp.set_rule_engine(Box::new(
+            nexus_proxy::domain_engine::DomainRuleEngine::from_yaml(&yaml).expect("rules"),
+        ));
+        let epoch = Instant::now();
+        let now = || u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        mock.lock()
+            .expect("lock")
+            .inject(ipv4_udp(addr(SRC_A, 5000), dst(53), b"q"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = dp.tick(now());
+            let stats = dp.stats();
+            if stats.proxy_forwarded + stats.proxy_dropped_no_proxy > 0 {
+                // 再跑几轮，确认不会两边都计。
+                for _ in 0..20 {
+                    let _ = dp.tick(now());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let stats = dp.stats();
+                assert_eq!(
+                    (stats.proxy_forwarded, stats.proxy_dropped_no_proxy),
+                    (forwarded, dropped),
+                    "{node}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{node}: datagram never accounted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }

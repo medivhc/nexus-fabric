@@ -1423,6 +1423,9 @@ impl Dataplane {
         let wrote = !result.tun_packets.is_empty();
         self.write_proxy_tun_packets(result.tun_packets);
         self.record_proxy_stream_failures(result.stream_events);
+        if result.udp_forwarded > 0 {
+            self.with_stats(|s| s.proxy_forwarded += result.udp_forwarded);
+        }
         // C6：唯一同步点（每 tick 一次，含 WouldBlock 轮）。
         self.sync_proxy_stats();
         wrote
@@ -1880,6 +1883,9 @@ impl Dataplane {
                             .unwrap_or_default();
                         self.write_proxy_tun_packets(more.tun_packets);
                         self.record_proxy_stream_failures(more.stream_events);
+                        if more.udp_forwarded > 0 {
+                            self.with_stats(|s| s.proxy_forwarded += more.udp_forwarded);
+                        }
                         if packet.get(9) == Some(&17) && result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }

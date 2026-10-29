@@ -219,7 +219,7 @@ impl ProxyFlowEgress for StreamProxyEgress {
             .udp
             .entry(tag.clone())
             .or_insert_with(|| crate::proxy_fwd::udp_relay::UdpForwarder::new(dialer));
-        if forwarder.handle_packet(&packet) {
+        if forwarder.handle_packet(&packet).accepted() {
             self.udp_peers.insert(key, (key_peer(key), orig_dst));
             Ok(())
         } else {
