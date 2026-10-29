@@ -93,6 +93,25 @@ pub struct DaemonConfig {
     pub identity: IdentitySection,
     /// `[network.discovery]` 小节：peer 发现（LSA/mDNS pump 与订阅 feed）。
     pub discovery: DiscoverySection,
+    /// `[network.n1]` 小节：N1 入站监听（缺省禁用；spec §5.8/§9）。
+    pub n1: N1Section,
+}
+
+/// `[network.n1]`：N1 mTLS 监听配置（spec §5.8/§9）。
+///
+/// 四态（AC-N1-0a…0d）：
+/// - 整节省略 → `enabled=false`、`listen_addr=None`（禁用）；
+/// - `listen_addr` 显式出现且 `enabled` 缺省 → `enabled=true`；
+/// - `enabled=true` + 合法 `ip:port` → 监听；
+/// - `enabled=false` → 地址被忽略（不校验、不 bind）。
+/// - `enabled=true` 但 `listen_addr` 缺省 → 运行期静默降级为禁用
+///   （`reason=no_listen_addr`），不 exit 1。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct N1Section {
+    /// 是否启用 N1 入站监听（默认 false）。
+    pub enabled: bool,
+    /// 监听地址（`ip:port`）；缺省 = 禁用。
+    pub listen_addr: Option<String>,
 }
 
 /// `[network.identity]`：daemon 的 fabric ed25519 seed 来源。
@@ -470,6 +489,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
             punch: PunchSection::default(),
             identity: IdentitySection::default(),
             discovery: DiscoverySection::default(),
+            n1: N1Section::default(),
         },
         ..Default::default()
     };
@@ -548,6 +568,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         punch: PunchSection::default(),
         identity: IdentitySection::default(),
         discovery: DiscoverySection::default(),
+        n1: N1Section::default(),
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -602,6 +623,10 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     if let Some(t) = v.get("network").and_then(|n| n.get("discovery")) {
         cfg.discovery = parse_discovery_section(t)?;
     }
+    // [network.n1] 小节（可选；缺失 = 禁用）
+    if let Some(t) = v.get("network").and_then(|n| n.get("n1")) {
+        cfg.n1 = parse_n1_section(t)?;
+    }
     // [network.punch] 小节（可选；缺失 = 默认值）
     if let Some(t) = v.get("network").and_then(|n| n.get("punch")) {
         cfg.punch = parse_punch_section(t)?;
@@ -610,6 +635,43 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
             .map_err(|e| format!("{DAEMON_TOML}: [network.punch] {e}"))?;
     }
     Ok(cfg)
+}
+
+/// 解析 `daemon.toml` 的 `[network.n1]` 小节（spec §5.8/§9）。
+///
+/// `listen_addr` 显式出现且 `enabled` 缺省 → 视为启用；只有启用时才校验地址
+/// 格式（`CONFIG_INVALID [network.n1].listen_addr`，exit 1）。显式
+/// `enabled=false` 时地址被忽略，不做格式校验。
+fn parse_n1_section(t: &toml::Value) -> Result<N1Section, String> {
+    let enabled_explicit =
+        match t.get("enabled") {
+            None => None,
+            Some(x) => Some(x.as_bool().ok_or_else(|| {
+                "CONFIG_INVALID [network.n1].enabled: must be a boolean".to_string()
+            })?),
+        };
+    let listen_addr = match t.get("listen_addr") {
+        None => None,
+        Some(x) => Some(
+            x.as_str()
+                .ok_or_else(|| {
+                    "CONFIG_INVALID [network.n1].listen_addr: must be a string".to_string()
+                })?
+                .to_string(),
+        ),
+    };
+    let enabled = enabled_explicit.unwrap_or(listen_addr.is_some());
+    if enabled {
+        if let Some(addr) = listen_addr.as_deref() {
+            addr.parse::<std::net::SocketAddr>().map_err(|e| {
+                format!("CONFIG_INVALID [network.n1].listen_addr: invalid ip:port '{addr}': {e}")
+            })?;
+        }
+    }
+    Ok(N1Section {
+        enabled,
+        listen_addr,
+    })
 }
 
 /// 解析 `daemon.toml` 的 `[network.discovery]` 小节。
@@ -1976,6 +2038,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     // daemon.toml：[network.discovery] 小节变化需重启（pump/feed 生命周期
     // 需重建；与 [network.turn] 同口径，spec §4.11.1）。
     if old.daemon.discovery != new.daemon.discovery {
+        return ChangeKind::NeedsRestart;
+    }
+    // daemon.toml：[network.n1] 小节变化需重启（mTLS listener 需重建）。
+    if old.daemon.n1 != new.daemon.n1 {
         return ChangeKind::NeedsRestart;
     }
     // daemon.toml：[network.proxy] 小节变化需重启（#3：代理客户端生命周期需重建）
@@ -3699,5 +3765,70 @@ max_inflight = 16
         };
         assert!(e.to_string().contains("dns.max_inflight"));
         assert!(e.to_string().contains("1..=1024"));
+    }
+}
+
+/// `[network.n1]` 配置面四态（spec §5.8 / §9 / AC-N1-0a…0d）。
+#[cfg(test)]
+mod n1_section_tests {
+    use super::{N1Section, parse_daemon_toml};
+
+    #[test]
+    fn absent_section_is_disabled_with_no_addr() {
+        let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
+        assert_eq!(cfg.n1, N1Section::default());
+        assert!(!cfg.n1.enabled);
+        assert_eq!(cfg.n1.listen_addr, None);
+    }
+
+    #[test]
+    fn explicit_enabled_with_valid_addr_is_accepted() {
+        let cfg =
+            parse_daemon_toml("[network.n1]\nenabled = true\nlisten_addr = \"127.0.0.1:9100\"\n")
+                .unwrap();
+        assert!(cfg.n1.enabled);
+        assert_eq!(cfg.n1.listen_addr.as_deref(), Some("127.0.0.1:9100"));
+    }
+
+    #[test]
+    fn listen_addr_present_without_enabled_implies_enabled() {
+        let cfg = parse_daemon_toml("[network.n1]\nlisten_addr = \"[::1]:9100\"\n").unwrap();
+        assert!(cfg.n1.enabled);
+        assert_eq!(cfg.n1.listen_addr.as_deref(), Some("[::1]:9100"));
+    }
+
+    #[test]
+    fn enabled_with_malformed_addr_is_config_invalid() {
+        let err = parse_daemon_toml("[network.n1]\nenabled = true\nlisten_addr = \"nope\"\n")
+            .unwrap_err();
+        assert!(
+            err.contains("CONFIG_INVALID [network.n1].listen_addr"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn enabled_must_be_a_boolean() {
+        let err = parse_daemon_toml("[network.n1]\nenabled = \"yes\"\n").unwrap_err();
+        assert!(err.contains("CONFIG_INVALID [network.n1].enabled"), "{err}");
+    }
+
+    /// 显式 `enabled = false` 时地址被忽略：即使格式非法也不触发校验，
+    /// 因为 runtime 不会 bind（spec §5.8/S-12：只有 enabled 的地址才要求格式）。
+    #[test]
+    fn disabled_section_ignores_listen_addr() {
+        let cfg =
+            parse_daemon_toml("[network.n1]\nenabled = false\nlisten_addr = \"not-an-address\"\n")
+                .unwrap();
+        assert!(!cfg.n1.enabled);
+        assert_eq!(cfg.n1.listen_addr.as_deref(), Some("not-an-address"));
+    }
+
+    #[test]
+    fn enabled_without_addr_keeps_enabled_but_has_no_addr() {
+        // 缺省地址 → 运行期静默降级为 disabled（reason=no_listen_addr），不 exit 1。
+        let cfg = parse_daemon_toml("[network.n1]\nenabled = true\n").unwrap();
+        assert!(cfg.n1.enabled);
+        assert_eq!(cfg.n1.listen_addr, None);
     }
 }

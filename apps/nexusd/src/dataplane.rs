@@ -9,7 +9,7 @@
 //! - MVP：转发为计数（N1/proxy 实际发送由子系统就绪后接入）；
 //! - DNS：UDP dport 53 短路到 `UnifiedDns`，响应写回 TUN。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{
@@ -23,6 +23,7 @@ use nexus_flow_session::{
     ChainDeps, ConnectivityEstablisher, FlowDecision, FlowKey, FlowSignal, IpProto, SessionManager,
     SessionManagerConfig,
 };
+use nexus_network::n1::N1Connection;
 use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_platform::{AcceptedTcpStream, ReceivedDatagram, TransparentIngressError};
@@ -33,8 +34,8 @@ use nexus_projection::dns::{DEFAULT_DNS_CACHE_ENTRIES, DnsCache};
 use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
 use nexus_projection::routing::IpCidr;
 use nexus_projection::tcp::{
-    FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
-    decode_stream_frame, encode_stream_frame, encode_syn_payload,
+    FourTuple, MAX_TCP_CONNS, RelayEvent, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpRelay,
+    TcpTermStats, TcpTerminator, decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
 use nexus_projection::transparent::direct::{DirectEgressConfig, DirectTcpEvent, DirectTcpRelay};
 use nexus_projection::transparent::runtime::{TransparentFailureKind, TransparentPipeline};
@@ -52,6 +53,281 @@ pub use chain_wiring::{
 use nexus_projection::transparent::decision::{
     CachedDecision, FlowDecisionCache, FlowDecisionCacheStats, FlowDecisionKey, Frontend,
 };
+
+/// 回程帧走哪条传输（spec §7）：
+///
+/// - `N1`：N1 入站帧 → 同一 N1 conn 的 datagram；
+/// - `Direct`：direct N1 chunk 入站 → 同一 NAT direct 路径的 chunk，N1 仅作
+///   fallback（`n1_peer_conns` 里该 peer 的 conn，没有则丢 + `tx.errors`）。
+#[derive(Clone)]
+pub enum ReplySink {
+    N1(Arc<dyn N1Connection>),
+    Direct(nexus_fabric::PeerId),
+}
+
+/// egress relay 的分派接口（spec §5.5/§7）。
+///
+/// WP4 只定版接口与分派走向；真实 `TcpRelay` 由 WP5 通过
+/// [`Dataplane::set_n1_relay`] 装入。`Err(N1RelayError::UnknownStream)` 表示
+/// relay 不拥有该流（spec §6.1 `UnknownStream`），分派侧计
+/// `dispatch.unknown_stream` 并丢弃。
+pub trait N1EgressRelay: Send {
+    /// 处理一条入站 STREAM 帧；成功返回需立即编码回程的事件（§5.5 第 2 步）。
+    fn handle_frame(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        from_peer: &str,
+    ) -> Result<Vec<RelayEvent>, N1RelayError>;
+
+    /// 驱动 egress 侧（连接完成 / 本地 socket 可读）并返回回程事件。
+    ///
+    /// `Dataplane::n1_egress_poll` 在 dataplane 主循环每轮调用一次
+    /// （spec §5.5/§5.7：egress relay 跑在 dataplane 线程，不另起忙等线程）。
+    fn poll(&mut self) -> Vec<RelayEvent>;
+}
+
+/// egress relay 的失败分类（spec §6.2；不新增 wire 变体）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N1RelayError {
+    /// terminator 与 relay 都不认识该 stream（`tcp.rs` unknown 分支）。
+    UnknownStream,
+}
+
+/// egress `TcpRelay` 的生产适配器（spec §5.5 Q-EGRESS-IMPL = additive 接线）。
+///
+/// 机制本体（`crates/nexus-projection/src/tcp.rs`）**零改动**：本适配器只做
+/// ①所有权判定（`TcpRelay::has`，不拥有 → [`N1RelayError::UnknownStream`]）；
+/// ②`egress.*` 计数（机制侧已有计数器取差值 + 适配器可观测的事件）；
+/// ③§8.2 日志。回程帧的编码/发送仍由 dispatch 侧 `send_reply` 负责（WP4 §4.2）。
+///
+/// 所有权口径有两个**机制语义要求的例外**（否则会丢 §6.2 规定的回 RST）：
+/// - SYN 被表满拒绝：`handle_frame` 返回 `Closed{reset:true}` 但不会把流放进表，
+///   调用后 `has=false`；事件非空 → 仍按 relay 消费处理。
+/// - 短/非法 SYN（`SynDecode`）：机制只计 `short_syn_dropped`、按既有语义不回 RST；
+///   它确实被 relay 消费，不冒充 `unknown_stream`。
+///
+/// `egress.*` 的可观测边界（冻结机制面所限，实现不猜机制内部状态）：
+/// - `connect_ok` 只能在本地 socket 首次产出证据时观测（读到字节或 EOF）：机制
+///   的 connect 成功没有事件、`TcpRelayStats` 也没有该计数；连上后一直静默到
+///   进程退出的流不会被计入（**只会少计，不会多计**）。
+/// - `bytes_to_local` 按 relay 接受的 DATA 载荷计数；机制 API 不暴露
+///   `write_pending` 余量，故「已进入非阻塞写路径」与「已写入内核 socket」在
+///   部分写时不可区分（正常 socket 缓冲区足够时二者相等）。
+pub struct TcpRelayEgress {
+    relay: TcpRelay,
+    stats: Arc<crate::n1_stats::N1Stats>,
+    /// 已发 SYN、尚未观测到本地连接成功证据的 `(peer, stream_id)`。
+    ///
+    /// 只用于把「connect 成功 / 失败」归类；上界是 relay 表大小（≤1024），
+    /// 每次 poll 后按 `has()` 剪枝（表里没有的键不再等待）。
+    awaiting: HashSet<(String, u32)>,
+    /// 机制侧计数器差值基线（`table_full` / `connect_failed` 只在机制内部递增）。
+    seen_table_full: u64,
+    seen_connect_failed: u64,
+}
+
+impl TcpRelayEgress {
+    pub fn new(stats: Arc<crate::n1_stats::N1Stats>) -> Self {
+        Self {
+            relay: TcpRelay::new(),
+            stats,
+            awaiting: HashSet::new(),
+            seen_table_full: 0,
+            seen_connect_failed: 0,
+        }
+    }
+
+    /// 把机制侧计数器的增量转成 `egress.*`（每个增量只记一次）。
+    ///
+    /// 返回 `(table_full_delta, connect_failed_delta)` 供日志按流标注。
+    fn sync_mechanism_counters(&mut self) -> (u64, u64) {
+        let stats = self.relay.stats();
+        let table_full = stats.table_full.saturating_sub(self.seen_table_full);
+        let connect_failed = stats
+            .connect_failed
+            .saturating_sub(self.seen_connect_failed);
+        self.seen_table_full = stats.table_full;
+        self.seen_connect_failed = stats.connect_failed;
+        for _ in 0..table_full {
+            self.stats
+                .record_egress(crate::n1_stats::N1EgressEvent::TableFull);
+        }
+        for _ in 0..connect_failed {
+            self.stats
+                .record_egress(crate::n1_stats::N1EgressEvent::ConnectFailed);
+        }
+        (table_full, connect_failed)
+    }
+}
+
+impl N1EgressRelay for TcpRelayEgress {
+    fn handle_frame(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        from_peer: &str,
+    ) -> Result<Vec<RelayEvent>, N1RelayError> {
+        let is_syn = flags & STREAM_SYN != 0;
+        if is_syn {
+            self.stats
+                .record_egress(crate::n1_stats::N1EgressEvent::Syn);
+            eprintln!(
+                "[n1-egress] syn peer={} stream={stream_id} target={}",
+                hex16(from_peer),
+                syn_target_display(payload)
+            );
+        }
+        // 所有权口径：调用前后任一时刻拥有该流即算 relay 消费。
+        // RST/FIN 会让机制在 `handle_frame` 内移除连接（调用后 `has=false`），
+        // 但该帧仍属于 relay 的流，不能误计 `dispatch.unknown_stream`。
+        let owned_before = self.relay.has(from_peer, stream_id);
+        let events = self
+            .relay
+            .handle_frame(stream_id, flags, payload, from_peer);
+        let owned = self.relay.has(from_peer, stream_id);
+        let (table_full, _) = self.sync_mechanism_counters();
+        if table_full > 0 {
+            eprintln!(
+                "[n1-egress] WARN: table full peer={} stream={stream_id} limit={MAX_TCP_CONNS}",
+                hex16(from_peer)
+            );
+        }
+
+        let key = (from_peer.to_string(), stream_id);
+        if is_syn {
+            if owned && events.is_empty() {
+                // SYN 已被接受，connect 在 worker 线程里进行（§6.2 异步语义）。
+                self.awaiting.insert(key);
+            } else {
+                self.awaiting.remove(&key);
+            }
+        } else if !owned {
+            // relay 已丢弃该流（RST/写失败/连接失败），不再等待成功证据。
+            self.awaiting.remove(&key);
+        }
+
+        let is_data = flags & (STREAM_SYN | STREAM_FIN | STREAM_RST) == 0;
+        if is_data && !payload.is_empty() && owned && events.is_empty() {
+            self.stats
+                .record_egress(crate::n1_stats::N1EgressEvent::BytesToLocal(payload.len()));
+        }
+
+        if owned || owned_before || !events.is_empty() {
+            Ok(events)
+        } else if is_syn {
+            // 短/非法 SYN：机制侧已计 `short_syn_dropped` 并按既有语义不回 RST
+            // （§6.2 SynDecode）。它确实被 relay 消费，不冒充 unknown stream。
+            Ok(events)
+        } else {
+            Err(N1RelayError::UnknownStream)
+        }
+    }
+
+    fn poll(&mut self) -> Vec<RelayEvent> {
+        let events = self.relay.poll();
+        let (_, connect_failed) = self.sync_mechanism_counters();
+        let mut failures_left = connect_failed;
+        for event in &events {
+            let (peer, stream_id) = match event {
+                RelayEvent::Data {
+                    stream_id, peer, ..
+                }
+                | RelayEvent::Closed {
+                    stream_id, peer, ..
+                } => (peer, *stream_id),
+            };
+            let first_evidence = self.awaiting.remove(&(peer.clone(), stream_id));
+            match event {
+                RelayEvent::Data { bytes, .. } => {
+                    if first_evidence {
+                        self.record_connect_ok(peer, stream_id);
+                    }
+                    self.stats
+                        .record_egress(crate::n1_stats::N1EgressEvent::BytesFromLocal(bytes.len()));
+                }
+                RelayEvent::Closed { reset: false, .. } => {
+                    if first_evidence {
+                        self.record_connect_ok(peer, stream_id);
+                    }
+                }
+                RelayEvent::Closed { reset: true, .. } => {
+                    if first_evidence && failures_left > 0 {
+                        failures_left -= 1;
+                        // 机制侧 connect worker 丢弃了 `io::ErrorKind`（tcp.rs 的
+                        // `TcpStream::connect_timeout(...).ok()`），故只能给 `Other`；
+                        // 失败**本身**由 `egress.connect_failed` 精确计数。
+                        eprintln!(
+                            "[n1-egress] connect peer={} stream={stream_id} result=failed kind=Other",
+                            hex16(peer)
+                        );
+                    }
+                }
+            }
+        }
+        let relay = &self.relay;
+        self.awaiting.retain(|(peer, id)| relay.has(peer, *id));
+        events
+    }
+}
+
+impl TcpRelayEgress {
+    fn record_connect_ok(&self, peer: &str, stream_id: u32) {
+        self.stats
+            .record_egress(crate::n1_stats::N1EgressEvent::ConnectOk);
+        eprintln!(
+            "[n1-egress] connect peer={} stream={stream_id} result=ok",
+            hex16(peer)
+        );
+    }
+}
+
+/// SYN 载荷目标的**日志展示**（§8.2 `target=<ip:port>`）。
+///
+/// 只读展示，不参与任何判定；格式与 `nexus_projection::tcp::encode_syn_payload`
+/// 的冻结线格式一致（该解码器是机制 crate 私有面，nexusd 不复制其解析语义）。
+fn syn_target_display(payload: &[u8]) -> String {
+    if payload.len() == 6 {
+        let ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+        let port = u16::from_be_bytes([payload[4], payload[5]]);
+        return format!("{ip}:{port}");
+    }
+    match payload.first() {
+        Some(0x01) if payload.len() >= 7 => {
+            let ip = Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]);
+            let port = u16::from_be_bytes([payload[5], payload[6]]);
+            format!("{ip}:{port}")
+        }
+        Some(0x02) if payload.len() >= 19 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&payload[1..17]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([payload[17], payload[18]]);
+            format!("[{ip}]:{port}")
+        }
+        Some(0x03) if payload.len() >= 4 => {
+            let len = payload[1] as usize;
+            if payload.len() < len + 4 {
+                return "-".to_string();
+            }
+            let host = String::from_utf8_lossy(&payload[2..2 + len]);
+            let port = u16::from_be_bytes([payload[2 + len], payload[3 + len]]);
+            format!("{host}:{port}")
+        }
+        _ => "-".to_string(),
+    }
+}
+
+/// C-3 前向发送失败的种类日志（`[nat-chunk]` 既有风格；§8.2 之外的诊断行）。
+///
+/// 不额外限频：同一 fallback 路径的 `[nat-chunk] fallback … reason=` 行本就
+/// 逐帧发射（既有先例），另加限频会打散 Q3 归因需要的「首个失败种类 + 帧长」
+/// 序列；每失败帧恒一条，与 `mesh_dropped_no_n1` 增量 1:1。
+fn n1_send_failure_line(dst: IpAddr, kind: &str, len: usize) -> String {
+    format!("[nat-chunk] n1 send failed dst={dst} kind={kind} len={len}")
+}
 
 /// TPROXY 跨线程消息（spec §9.14）。
 #[derive(Debug)]
@@ -415,6 +691,16 @@ pub struct Dataplane {
     chunk_stats: Arc<crate::nat_chunk_stats::ChunkStats>,
     /// Inbound direct chunks produced by the receiver thread.
     nat_inbound_rx: Option<std::sync::mpsc::Receiver<crate::nat_chunk_recv::NatInboundChunk>>,
+    /// WP4 N1 入站队列（`ConnUp/ConnDown/RawIp/Stream`；spec §5.5）。
+    n1_inbound_rx: Option<std::sync::mpsc::Receiver<crate::n1_runtime::N1Inbound>>,
+    /// N1 计数（rx 侧由 WP3 写；dispatch/tx 由本段写）。
+    n1_stats: Arc<crate::n1_stats::N1Stats>,
+    /// egress relay 分派接口（真实 `TcpRelay` 由 WP5 装入）。
+    n1_relay: Option<Box<dyn N1EgressRelay>>,
+    /// peer hex → N1 conn（direct 回程的 fallback；spec §5.5）。
+    n1_peer_conns: HashMap<String, Arc<dyn N1Connection>>,
+    /// unknown-stream 日志限频（首条立即，其后 10s；spec §6.1）。
+    n1_dispatch_log: crate::log_throttle::KeyedLogThrottle,
     /// AC-H-1 `[P]`: the one-time `[nat-consumer] handle not attached` notice
     /// has been emitted (spec §13.2).
     nat_not_attached_logged: AtomicBool,
@@ -572,6 +858,11 @@ impl Dataplane {
             direct_gate: None,
             chunk_stats: Arc::new(crate::nat_chunk_stats::ChunkStats::default()),
             nat_inbound_rx: None,
+            n1_inbound_rx: None,
+            n1_stats: Arc::new(crate::n1_stats::N1Stats::default()),
+            n1_relay: None,
+            n1_peer_conns: HashMap::new(),
+            n1_dispatch_log: crate::log_throttle::KeyedLogThrottle::new(),
             nat_not_attached_logged: AtomicBool::new(false),
         })
     }
@@ -614,10 +905,13 @@ impl Dataplane {
         self.chunk_stats = stats;
     }
 
-    /// Drain direct chunks into the TCP terminator. Called once per dataplane
-    /// loop iteration (never inside `process_one`, so the proxy branch is
-    /// untouched). Malformed frames are counted by the existing `dropped`
-    /// counter; this never panics.
+    /// Drain direct chunks into the unified dispatch (ERRATA-2 / spec §5.5).
+    ///
+    /// Direct chunks use [`ReplySink::Direct`]; the originator/relay decision is
+    /// the same code path as N1 inbound (`dispatch_inbound_stream`). Called once
+    /// per dataplane loop iteration (never inside `process_one`, so the proxy
+    /// branch is untouched). Malformed frames are counted by the dispatch
+    /// counters; this never panics.
     pub fn pump_nat_inbound(&mut self) {
         let Some(rx) = self.nat_inbound_rx.take() else {
             return;
@@ -626,13 +920,275 @@ impl Dataplane {
             match rx.try_recv() {
                 Ok(chunk) => {
                     let peer = crate::nat_consumer::peer_hex(&chunk.peer);
-                    self.inject_stream_frame_from_n1(&peer, &chunk.stream_frame);
+                    self.dispatch_inbound_stream(
+                        &peer,
+                        ReplySink::Direct(chunk.peer),
+                        &chunk.stream_frame,
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
         self.nat_inbound_rx = Some(rx);
+    }
+
+    // ---- WP4 N1 inbound consumer (spec §5.5) ----
+
+    /// Inject the N1 inbound queue (WP3's supervisor owns the sender).
+    pub fn set_n1_inbound_rx(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<crate::n1_runtime::N1Inbound>,
+    ) {
+        self.n1_inbound_rx = Some(rx);
+    }
+
+    /// Share the composition root's N1 counters (`rx` written by WP3,
+    /// dispatch/tx written here).
+    pub fn set_n1_stats(&mut self, stats: Arc<crate::n1_stats::N1Stats>) {
+        self.n1_stats = stats;
+    }
+
+    /// Install the egress relay dispatch interface (WP5 installs `TcpRelay`).
+    pub fn set_n1_relay(&mut self, relay: Box<dyn N1EgressRelay>) {
+        self.n1_relay = Some(relay);
+    }
+
+    /// Drain the N1 inbound queue (spec §5.5；调用点是 `run_dataplane` 循环
+    /// `pump_nat_inbound` 紧邻处)。
+    ///
+    /// `Disconnected` 是「N1 未启用 / 已停机」的常态（WP3：disabled 路径不
+    /// spawn supervisor，发送端不存在）：不报错、不刷日志、不计拒绝。
+    pub fn pump_n1_inbound(&mut self) {
+        let Some(rx) = self.n1_inbound_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(crate::n1_runtime::N1Inbound::ConnUp { peer, conn }) => {
+                    self.n1_peer_conns.insert(peer.to_hex(), conn);
+                }
+                Ok(crate::n1_runtime::N1Inbound::ConnDown { peer }) => {
+                    self.n1_peer_conns.remove(&peer.to_hex());
+                }
+                Ok(crate::n1_runtime::N1Inbound::RawIp { packet, .. }) => {
+                    self.inject_from_n1(&packet);
+                }
+                Ok(crate::n1_runtime::N1Inbound::Stream { peer, conn, frame }) => {
+                    let peer_hex = peer.to_hex();
+                    self.dispatch_inbound_stream(&peer_hex, ReplySink::N1(conn), &frame);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        self.n1_inbound_rx = Some(rx);
+    }
+
+    /// Drive the egress relay once per dataplane loop iteration (spec §5.5/§5.7).
+    ///
+    /// The relay lives on the dataplane thread; this never spawns a thread or
+    /// busy-waits. `RelayEvent`s are encoded as STREAM frames and sent over the
+    /// peer's N1 conn (`n1_peer_conns`, §7). Missing conns are counted as
+    /// `tx.errors` and logged — never silently dropped.
+    pub fn n1_egress_poll(&mut self) {
+        let Some(mut relay) = self.n1_relay.take() else {
+            return;
+        };
+        let events = relay.poll();
+        self.n1_relay = Some(relay);
+        for event in events {
+            let (peer, reply) = match event {
+                RelayEvent::Data {
+                    stream_id,
+                    peer,
+                    bytes,
+                } => (peer, encode_stream_frame(stream_id, 0x00, &bytes)),
+                RelayEvent::Closed {
+                    stream_id,
+                    peer,
+                    reset,
+                } => {
+                    let flags = if reset { STREAM_RST } else { STREAM_FIN };
+                    (peer, encode_stream_frame(stream_id, flags, &[]))
+                }
+            };
+            self.send_egress_reply(&peer, &reply);
+        }
+    }
+
+    /// Send one egress reply frame to `peer_hex` over its N1 conn (§5.5 第 3 步)。
+    fn send_egress_reply(&mut self, peer_hex: &str, frame: &[u8]) {
+        match self.n1_peer_conns.get(peer_hex).cloned() {
+            Some(conn) => {
+                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f));
+            }
+            None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
+        }
+    }
+
+    /// Unified inbound STREAM dispatch (spec §5.5)：originator 判定用
+    /// [`TcpTerminator::peer_for`]，否则交 egress relay。
+    fn dispatch_inbound_stream(&mut self, peer_hex: &str, sink: ReplySink, frame: &[u8]) {
+        let Some((stream_id, flags, payload)) = decode_stream_frame(frame) else {
+            self.n1_stats.record_dispatch_bad_frame();
+            self.log_n1_dispatch_throttled("bad_frame", peer_hex, 0, frame.len());
+            return;
+        };
+
+        if self.tcp.peer_for(stream_id).is_some() {
+            self.n1_stats
+                .record_dispatch(crate::n1_stats::N1DispatchTarget::Terminator);
+            // 既有注入函数（spec §5.5；不通过 relay 的 originator 回程）。
+            self.inject_stream_frame_from_n1(peer_hex, frame);
+            return;
+        }
+
+        let Some(relay) = self.n1_relay.as_mut() else {
+            // WP5 之前没有 egress relay：该流既不是本节点的 originator，
+            // 也没有 relay 能消费 → 计入 unknown_stream（不静默吞掉）。
+            self.n1_stats
+                .record_dispatch(crate::n1_stats::N1DispatchTarget::Unknown);
+            self.log_n1_dispatch_throttled("unknown_stream", peer_hex, stream_id, frame.len());
+            return;
+        };
+
+        match relay.handle_frame(stream_id, flags, payload, peer_hex) {
+            Ok(events) => {
+                self.n1_stats
+                    .record_dispatch(crate::n1_stats::N1DispatchTarget::Relay);
+                for event in events {
+                    let reply = match event {
+                        RelayEvent::Data {
+                            stream_id, bytes, ..
+                        } => encode_stream_frame(stream_id, 0x00, &bytes),
+                        RelayEvent::Closed {
+                            stream_id, reset, ..
+                        } => {
+                            let flags = if reset { STREAM_RST } else { STREAM_FIN };
+                            encode_stream_frame(stream_id, flags, &[])
+                        }
+                    };
+                    self.send_reply(&sink, peer_hex, &reply);
+                }
+            }
+            Err(N1RelayError::UnknownStream) => {
+                self.n1_stats
+                    .record_dispatch(crate::n1_stats::N1DispatchTarget::Unknown);
+                self.log_n1_dispatch_throttled("unknown_stream", peer_hex, stream_id, frame.len());
+            }
+        }
+    }
+
+    /// Reply to an inbound STREAM frame (spec §5.5 第 3 步)。
+    ///
+    /// `Direct` 的 N1 fallback **不带** `CHUNK_KIND_TUN_STREAM`：KIND 是
+    /// direct chunk 的本地前缀，进 N1 wire 会破坏 P0 AC-C-4 的逐字节不变。
+    fn send_reply(&mut self, sink: &ReplySink, peer_hex: &str, frame: &[u8]) {
+        match sink {
+            ReplySink::N1(conn) => {
+                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+            }
+            ReplySink::Direct(peer) => {
+                let chunk = {
+                    let mut chunk = Vec::with_capacity(1 + frame.len());
+                    chunk.push(crate::nat_chunk_recv::CHUNK_KIND_TUN_STREAM);
+                    chunk.extend_from_slice(frame);
+                    chunk
+                };
+                let provider = self.nat_path.as_ref().and_then(|slot| slot.get());
+                let Some(provider) = provider else {
+                    // 无 NAT path：诚实降级到同一 peer 的 N1 conn（direct 路径
+                    // 的 fallback 语义；没有 conn 则计 tx.errors）。
+                    let conn = self.n1_peer_conns.get(peer_hex).cloned();
+                    match conn {
+                        Some(conn) => {
+                            self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+                        }
+                        None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
+                    }
+                    return;
+                };
+                let conn = self.n1_peer_conns.get(peer_hex).cloned();
+                let fallback = |_chunk: &[u8]| -> io::Result<()> {
+                    match &conn {
+                        Some(conn) => conn
+                            .send_datagram(frame)
+                            .map_err(|e| io::Error::other(format!("n1 send failed: {e}"))),
+                        None => Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "n1 fallback conn missing",
+                        )),
+                    }
+                };
+                match provider.send_chunk(*peer, &fallback, &chunk) {
+                    Ok(_path) => self.n1_stats.record_tx(frame.len(), true),
+                    Err(e) => {
+                        self.n1_stats.record_tx(frame.len(), false);
+                        eprintln!(
+                            "[n1-egress] WARN: tx failed peer={} stream={} kind={:?}",
+                            hex16(peer_hex),
+                            stream_id_of(frame),
+                            e.kind()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn send_reply_over_n1(
+        &mut self,
+        peer_hex: &str,
+        frame: &[u8],
+        send: impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
+    ) {
+        match send(frame) {
+            Ok(()) => self.n1_stats.record_tx(frame.len(), true),
+            Err(e) => {
+                self.record_tx_error(peer_hex, frame, &format!("{e:?}"));
+            }
+        }
+    }
+
+    fn record_tx_error(&mut self, peer_hex: &str, frame: &[u8], reason: &str) {
+        self.n1_stats.record_tx(frame.len(), false);
+        eprintln!(
+            "[n1-egress] WARN: tx failed peer={} stream={} kind={reason}",
+            hex16(peer_hex),
+            stream_id_of(frame)
+        );
+    }
+
+    /// unknown-stream / bad-frame 日志限频（首条立即，其后 10s；spec §6.1）。
+    fn log_n1_dispatch_throttled(
+        &mut self,
+        cause: &str,
+        peer_hex: &str,
+        stream_id: u32,
+        frame_len: usize,
+    ) {
+        let decision = self.n1_dispatch_log.decide(
+            "n1-dispatch",
+            cause,
+            std::time::Instant::now(),
+            N1_DISPATCH_LOG_INTERVAL,
+        );
+        if !decision.emit {
+            return;
+        }
+        let peer16 = hex16(peer_hex);
+        if cause == "bad_frame" {
+            eprintln!(
+                "[n1-rx] rejected peer={peer16} reason=bad_frame len={frame_len} suppressed={}",
+                decision.suppressed
+            );
+        } else {
+            eprintln!(
+                "[n1-dispatch] WARN: unknown stream peer={peer16} stream={stream_id} suppressed={}",
+                decision.suppressed
+            );
+        }
     }
 
     /// 显式注入无代理配置默认引擎（`SimpleRuleEngine`，全部流量交 `proxy` 标签）。
@@ -2972,17 +3528,37 @@ impl Dataplane {
     ///
     /// 成功 → `mesh_tcp_frames += 1`；失败（无 sender/无路由/发送错）→
     /// `mesh_dropped_no_n1 += 1`（W1 语义复用）。
+    ///
+    /// C-3：失败分支同时记录 `N1Error` 种类（`[nat-chunk]` 既有风格）。
+    /// 此前只回 `bool`，`PeerUnknown`（无路由/无 conn）、
+    /// `OversizeDatagram`、`Transport` 在 dataplane 层不可区分，Q3 无法归因。
+    /// 计数语义、返回值与控制流不变；日志点与 `mesh_dropped_no_n1` 同一分支
+    /// （严格 1:1），因此本函数是 `send_mesh_data_frame` 全部 fallback 失败
+    /// 分支（NoPeer/NoPath/QuietGate/NoDirect）与 DATA/FIN/RST 发送失败的
+    /// 唯一发射点。
     fn send_mesh_tcp_frame(&self, dst: IpAddr, frame: &[u8]) -> bool {
-        let sent = match &self.n1_sender {
-            Some(sender) => sender.send_to_mesh(dst, frame).is_ok(),
-            None => false,
-        };
-        if sent {
-            self.with_stats(|s| s.mesh_tcp_frames += 1);
-        } else {
-            self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+        match &self.n1_sender {
+            Some(sender) => match sender.send_to_mesh(dst, frame) {
+                Ok(()) => {
+                    self.with_stats(|s| s.mesh_tcp_frames += 1);
+                    true
+                }
+                Err(error) => {
+                    self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                    eprintln!(
+                        "{}",
+                        n1_send_failure_line(dst, &format!("{error:?}"), frame.len())
+                    );
+                    false
+                }
+            },
+            None => {
+                // 装配未注入 N1 sender：没有 `N1Error` 可记，用哨兵 kind。
+                self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                eprintln!("{}", n1_send_failure_line(dst, "NoSender", frame.len()));
+                false
+            }
         }
-        sent
     }
 
     /// S9：N1 下行的 STREAM 帧注入终结器（fabric → app 方向）。
@@ -3042,6 +3618,22 @@ impl Dataplane {
 fn parse_ip_cidr(s: &str) -> Result<IpCidr, String> {
     s.parse::<IpCidr>()
         .map_err(|e| format!("invalid CIDR: {e}"))
+}
+
+/// unknown-stream / bad-frame 日志限频窗口（spec §6.1：首次 + 每 10s）。
+const N1_DISPATCH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// peer hex 的 16 字符前缀（spec §8.2 日志格式）。
+fn hex16(hex: &str) -> &str {
+    &hex[..hex.len().min(16)]
+}
+
+/// STREAM 帧的 stream id（日志用；短帧返回 0，不 panic）。
+fn stream_id_of(frame: &[u8]) -> u32 {
+    if frame.len() < 4 {
+        return 0;
+    }
+    u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]])
 }
 
 /// 从 IP 包提取目的地址（v4/v6；v6 只读固定头，扩展头不参与 N1 目的路由）。
@@ -3888,6 +4480,9 @@ pub fn dataplane_stats_json(
             "dns_reply_write_failed": stats.dns_reply_write_failed,
             "qos_dropped": stats.qos_dropped,
             "mesh_dropped_no_n1": stats.mesh_dropped_no_n1,
+            // C-4：N1 STREAM 帧生产计数器（SYN/DATA/FIN/RST）。
+            // AC-N1-R1 的 A 端判据 `mesh_tcp_frames Δ>0` 依赖本字段可读。
+            "mesh_tcp_frames": stats.mesh_tcp_frames,
             "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
             "proxy_tcp_streams": stats.proxy_tcp_streams,
             "proxy_tcp_streams_ok": stats.proxy_tcp_streams_ok,
@@ -6955,5 +7550,919 @@ outbounds:
         publish_runtime_basics("system-level", Ipv6Paths::from_capabilities(false));
         assert_eq!(runtime_status_snapshot().ingress_ip_family, "ipv4");
         assert_eq!(runtime_status_snapshot().ipv6_paths.mesh, "unsupported");
+    }
+    // -----------------------------------------------------------------
+    // WP4：N1 入站消费 + 统一 dispatch（spec §5.5/§5.6/§7）
+    // -----------------------------------------------------------------
+
+    use crate::n1_runtime::N1Inbound;
+    use crate::n1_stats::{N1Stats, N1StatsSnapshot};
+    use crate::nat_chunk_recv::{CHUNK_KIND_TUN_STREAM, NatInboundChunk};
+    use crate::nat_consumer::{NatActiveConn, NatHandleSlot, NatPathProvider};
+    use crate::nat_switch::ChunkPath;
+    use nexus_network::n1::{N1Connection, N1Error, N1KeepaliveStream, N1PeerId};
+
+    /// 测试替身：N1 conn 只捕获回程 datagram。
+    struct TestConn {
+        peer: N1PeerId,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl TestConn {
+        fn new(peer: N1PeerId) -> Self {
+            Self {
+                peer,
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl N1Connection for TestConn {
+        fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+        fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn open_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn accept_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn rebind(&self) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn connection_id(&self) -> u64 {
+            7
+        }
+        fn peer(&self) -> N1PeerId {
+            self.peer
+        }
+        fn close(&self) {}
+    }
+
+    /// 测试替身：egress relay 的分派走向（真实 `TcpRelay` 在 WP5 装入）。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RelayMode {
+        Data,
+        ClosedReset,
+        Unknown,
+    }
+
+    type RelayCalls = Arc<Mutex<Vec<(String, u32, u8, Vec<u8>)>>>;
+
+    struct TestRelay {
+        mode: RelayMode,
+        calls: RelayCalls,
+    }
+
+    impl N1EgressRelay for TestRelay {
+        fn handle_frame(
+            &mut self,
+            stream_id: u32,
+            flags: u8,
+            payload: &[u8],
+            from_peer: &str,
+        ) -> Result<Vec<RelayEvent>, N1RelayError> {
+            self.calls.lock().unwrap().push((
+                from_peer.to_string(),
+                stream_id,
+                flags,
+                payload.to_vec(),
+            ));
+            match self.mode {
+                RelayMode::Data => Ok(vec![RelayEvent::Data {
+                    stream_id,
+                    peer: from_peer.to_string(),
+                    bytes: b"relayed".to_vec(),
+                }]),
+                RelayMode::ClosedReset => Ok(vec![RelayEvent::Closed {
+                    stream_id,
+                    peer: from_peer.to_string(),
+                    reset: true,
+                }]),
+                RelayMode::Unknown => Err(N1RelayError::UnknownStream),
+            }
+        }
+
+        fn poll(&mut self) -> Vec<RelayEvent> {
+            // 分派走向替身：poll 不属于本替身的观察面（WP5 egress 四态用真实
+            // `TcpRelayEgress` 覆盖）。
+            Vec::new()
+        }
+    }
+
+    /// 测试替身：direct sink 的 `send_chunk` 只记录 chunk。
+    struct RecordingProvider {
+        chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+        direct: bool,
+    }
+
+    impl NatPathProvider for RecordingProvider {
+        fn active_conn(&self, _peer_hex: &str) -> Option<NatActiveConn> {
+            None
+        }
+        fn send_chunk(
+            &self,
+            _peer: nexus_fabric::PeerId,
+            fallback: &dyn Fn(&[u8]) -> io::Result<()>,
+            chunk: &[u8],
+        ) -> io::Result<ChunkPath> {
+            self.chunks.lock().unwrap().push(chunk.to_vec());
+            if self.direct {
+                Ok(ChunkPath::Direct)
+            } else {
+                fallback(chunk)?;
+                Ok(ChunkPath::Fallback)
+            }
+        }
+        fn peer_statuses(&self) -> Vec<nexus_nat_wireup::PunchPeerStatus> {
+            Vec::new()
+        }
+        fn path_active_switches(&self) -> u64 {
+            0
+        }
+    }
+
+    fn n1_test_dataplane() -> (
+        Dataplane,
+        Arc<Mutex<nexus_projection::MockTun>>,
+        Arc<N1Stats>,
+    ) {
+        let (mut dp, mock) = test_dataplane();
+        let stats = Arc::new(N1Stats::default());
+        dp.set_n1_stats(Arc::clone(&stats));
+        (dp, mock, stats)
+    }
+
+    /// SYN → SYN-ACK → ACK，返回终结器分配的 stream id。
+    fn establish_originator_stream(
+        dp: &mut Dataplane,
+        mock: &Arc<Mutex<nexus_projection::MockTun>>,
+    ) -> u32 {
+        let syn = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("syn"));
+        let written = mock.lock().unwrap().take_written();
+        let srv_seq = syn_ack_srv_seq(&written[0]);
+        let ack = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1001,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.process_one().expect("ack"));
+        assert_eq!(dp.stats().tcp_handshakes, 1);
+        let _ = mock.lock().unwrap().take_written();
+        *dp.tcp_streams.keys().next().expect("originator stream")
+    }
+
+    /// AC-N1-1 第 1 项生产路径：`pump_n1_inbound` 消费 `Stream`，originator
+    /// 帧走既有 `inject_stream_frame_from_n1`。
+    #[test]
+    fn pump_n1_inbound_dispatches_originator_stream_to_the_terminator() {
+        let (mut dp, mock, stats) = n1_test_dataplane();
+        let sid = establish_originator_stream(&mut dp, &mock);
+
+        let peer = N1PeerId([0x51; 32]);
+        let conn = Arc::new(TestConn::new(peer));
+        let frame = encode_stream_frame(sid, 0x00, b"downlink");
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_n1_inbound_rx(rx);
+        tx.try_send(N1Inbound::ConnUp {
+            peer,
+            conn: Arc::clone(&conn) as Arc<dyn N1Connection>,
+        })
+        .expect("conn up");
+        tx.try_send(N1Inbound::Stream {
+            peer,
+            conn: conn as Arc<dyn N1Connection>,
+            frame,
+        })
+        .expect("stream");
+
+        let tun_before = dp.stats().tun_written;
+        dp.pump_n1_inbound();
+
+        assert!(
+            dp.stats().tun_written > tun_before,
+            "originator frame must reach the TCP terminator and write TUN"
+        );
+        assert_eq!(dp.n1_peer_conns.len(), 1, "ConnUp registered the peer conn");
+        let snap = stats.snapshot();
+        assert_eq!(snap.dispatch_to_terminator, 1);
+        assert_eq!(snap.dispatch_to_relay, 0);
+        assert_eq!(snap.dispatch_unknown_stream, 0);
+
+        // ConnDown 回收回程 conn（direct fallback 不再命中该 peer）。
+        tx.try_send(N1Inbound::ConnDown { peer })
+            .expect("conn down");
+        dp.pump_n1_inbound();
+        assert!(
+            dp.n1_peer_conns.is_empty(),
+            "ConnDown removed the peer conn"
+        );
+    }
+
+    /// AC-N1-3 分派侧：非 originator 流走 relay 接口；`RelayEvent::Data`
+    /// 编码为 STREAM 帧经同一 N1 conn 回程。
+    #[test]
+    fn pump_n1_inbound_dispatches_relay_stream_and_sends_reply_over_n1() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let calls: RelayCalls = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_relay(Box::new(TestRelay {
+            mode: RelayMode::Data,
+            calls: Arc::clone(&calls),
+        }));
+
+        let peer = N1PeerId([0x52; 32]);
+        let conn = Arc::new(TestConn::new(peer));
+        let sent = Arc::clone(&conn.sent);
+        let frame = encode_stream_frame(0x0000_00AB, 0x00, b"uplink");
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_n1_inbound_rx(rx);
+        tx.try_send(N1Inbound::Stream {
+            peer,
+            conn: conn as Arc<dyn N1Connection>,
+            frame,
+        })
+        .expect("stream");
+
+        dp.pump_n1_inbound();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "relay saw exactly one frame");
+        assert_eq!(calls[0].0, peer.to_hex());
+        assert_eq!(calls[0].1, 0xAB);
+        assert_eq!(calls[0].2, 0x00);
+        assert_eq!(calls[0].3, b"uplink");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "relay Data event replied on the sink");
+        let (sid, flags, payload) = decode_stream_frame(&sent[0]).expect("encoded frame");
+        assert_eq!(sid, 0xAB);
+        assert_eq!(flags, 0x00);
+        assert_eq!(payload, b"relayed");
+        drop(sent);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.dispatch_to_relay, 1);
+        assert_eq!(snap.dispatch_to_terminator, 0);
+        assert_eq!(snap.tx_frames, 1);
+        assert_eq!(snap.tx_errors, 0);
+    }
+
+    /// §6.1 `BadFrame`：短帧只计 `dispatch.bad_frame`，不进 terminator/relay。
+    #[test]
+    fn dispatch_bad_frame_is_counted_and_dropped() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let calls: RelayCalls = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_relay(Box::new(TestRelay {
+            mode: RelayMode::Data,
+            calls: Arc::clone(&calls),
+        }));
+        let peer = N1PeerId([0x53; 32]);
+        let conn = Arc::new(TestConn::new(peer));
+        let sent = Arc::clone(&conn.sent);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_n1_inbound_rx(rx);
+        tx.try_send(N1Inbound::Stream {
+            peer,
+            conn: conn as Arc<dyn N1Connection>,
+            frame: vec![0x00, 0x01],
+        })
+        .expect("stream");
+
+        dp.pump_n1_inbound();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.dispatch_bad_frame, 1);
+        assert_eq!(snap.dispatch_to_relay, 0);
+        assert_eq!(snap.dispatch_to_terminator, 0);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "relay never sees a bad frame"
+        );
+        assert!(sent.lock().unwrap().is_empty(), "no reply for a bad frame");
+    }
+
+    /// §5.5 第 2 步：relay 不认识该流 → `dispatch.unknown_stream`，不回帧。
+    #[test]
+    fn dispatch_unknown_stream_is_counted_when_the_relay_rejects() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let calls: RelayCalls = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_relay(Box::new(TestRelay {
+            mode: RelayMode::Unknown,
+            calls: Arc::clone(&calls),
+        }));
+        let peer = N1PeerId([0x54; 32]);
+        let conn = Arc::new(TestConn::new(peer));
+        let sent = Arc::clone(&conn.sent);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_n1_inbound_rx(rx);
+        tx.try_send(N1Inbound::Stream {
+            peer,
+            conn: conn as Arc<dyn N1Connection>,
+            frame: encode_stream_frame(0x99, 0x00, b"x"),
+        })
+        .expect("stream");
+
+        dp.pump_n1_inbound();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.dispatch_unknown_stream, 1);
+        assert_eq!(snap.dispatch_to_relay, 0);
+        assert_eq!(snap.tx_frames, 0);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// ERRATA-2：`pump_nat_inbound` 与 N1 路径共用同一 dispatch；direct 的
+    /// originator 帧仍进终结器。
+    #[test]
+    fn pump_nat_inbound_dispatches_originator_stream_to_the_terminator() {
+        let (mut dp, mock, stats) = n1_test_dataplane();
+        let sid = establish_originator_stream(&mut dp, &mock);
+
+        let peer = nexus_fabric::PeerId([0x61; 32]);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_nat_inbound_rx(rx);
+        tx.try_send(NatInboundChunk {
+            peer,
+            stream_frame: encode_stream_frame(sid, 0x00, b"direct-down"),
+        })
+        .expect("chunk");
+
+        let tun_before = dp.stats().tun_written;
+        dp.pump_nat_inbound();
+
+        assert!(dp.stats().tun_written > tun_before);
+        let snap = stats.snapshot();
+        assert_eq!(snap.dispatch_to_terminator, 1);
+        assert_eq!(snap.dispatch_to_relay, 0);
+    }
+
+    /// ERRATA-2：direct 的未知流进 relay；回程走 `send_chunk` 且带 KIND 前缀。
+    #[test]
+    fn pump_nat_inbound_routes_unknown_stream_to_relay_with_kind_prefix() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let peer = nexus_fabric::PeerId([0x62; 32]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let slot = NatHandleSlot::new();
+        slot.set(Arc::new(RecordingProvider {
+            chunks: Arc::clone(&chunks),
+            direct: true,
+        }));
+        dp.set_nat_path_slot(slot);
+        let calls: RelayCalls = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_relay(Box::new(TestRelay {
+            mode: RelayMode::Data,
+            calls: Arc::clone(&calls),
+        }));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_nat_inbound_rx(rx);
+        tx.try_send(NatInboundChunk {
+            peer,
+            stream_frame: encode_stream_frame(0x77, 0x00, b"direct-up"),
+        })
+        .expect("chunk");
+
+        dp.pump_nat_inbound();
+
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0][0], CHUNK_KIND_TUN_STREAM, "KIND prefix on direct");
+        let (sid, flags, payload) = decode_stream_frame(&chunks[0][1..]).expect("frame");
+        assert_eq!(sid, 0x77);
+        assert_eq!(flags, 0x00);
+        assert_eq!(payload, b"relayed");
+        drop(chunks);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.dispatch_to_relay, 1);
+        assert_eq!(snap.tx_frames, 1);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// §5.5 第 3 步 fallback：无 direct provider 时 direct 回程落到该 peer 的
+    /// N1 conn，且**不带** KIND 字节（P0 wire 逐字节不变）。
+    #[test]
+    fn direct_reply_falls_back_to_the_n1_conn_without_kind_byte() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let peer_id = nexus_fabric::PeerId([0x63; 32]);
+        let n1_peer = N1PeerId(peer_id.0);
+        let conn = Arc::new(TestConn::new(n1_peer));
+        let sent = Arc::clone(&conn.sent);
+        dp.n1_peer_conns
+            .insert(n1_peer.to_hex(), conn as Arc<dyn N1Connection>);
+        let calls: RelayCalls = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_relay(Box::new(TestRelay {
+            mode: RelayMode::ClosedReset,
+            calls: Arc::clone(&calls),
+        }));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        dp.set_nat_inbound_rx(rx);
+        tx.try_send(NatInboundChunk {
+            peer: peer_id,
+            stream_frame: encode_stream_frame(0x88, 0x00, b"up"),
+        })
+        .expect("chunk");
+
+        dp.pump_nat_inbound();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "fallback used the N1 conn");
+        let (sid, flags, payload) = decode_stream_frame(&sent[0]).expect("frame");
+        assert_eq!(sid, 0x88);
+        assert_eq!(flags, STREAM_RST, "Closed{{reset:true}} replies RST");
+        assert!(payload.is_empty());
+        drop(sent);
+        assert_eq!(stats.snapshot().tx_frames, 1);
+    }
+
+    /// §8.1 队列有界：4096 深度可入队，第 4097 条被拒（不无界积压）；消费端
+    /// 一次 drain 全量。
+    #[test]
+    fn pump_n1_inbound_drains_a_full_backlog_and_the_producer_sees_full() {
+        use std::sync::mpsc::TrySendError;
+        let (mut dp, _mock, _stats) = n1_test_dataplane();
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::n1_runtime::N1_INBOUND_QUEUE_CAP);
+        dp.set_n1_inbound_rx(rx);
+        let peer = N1PeerId([0x64; 32]);
+        let packet = craft_udp([10, 200, 0, 2], [10, 200, 0, 5], 1, 2, b"x");
+        for _ in 0..crate::n1_runtime::N1_INBOUND_QUEUE_CAP {
+            tx.try_send(N1Inbound::RawIp {
+                peer,
+                packet: packet.clone(),
+            })
+            .expect("queue has room up to the cap");
+        }
+        assert!(matches!(
+            tx.try_send(N1Inbound::RawIp {
+                peer,
+                packet: packet.clone(),
+            }),
+            Err(TrySendError::Full(_))
+        ));
+        dp.pump_n1_inbound();
+        assert_eq!(
+            dp.stats().tun_written,
+            crate::n1_runtime::N1_INBOUND_QUEUE_CAP as u64
+        );
+        assert!(
+            tx.try_send(N1Inbound::RawIp { peer, packet }).is_ok(),
+            "draining frees capacity again"
+        );
+    }
+
+    /// WP3 交接项：disabled 路径的队列立即 `Disconnected`，必须当常态处理
+    /// （不报错、不刷日志、不计拒绝）。
+    #[test]
+    fn pump_n1_inbound_treats_a_disconnected_queue_as_disabled() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(tx);
+        dp.set_n1_inbound_rx(rx);
+        dp.pump_n1_inbound();
+        assert_eq!(stats.snapshot(), N1StatsSnapshot::default());
+    }
+
+    // ---- WP5：egress `TcpRelay` 接线（spec §5.5/§5.6/§6.2） ----
+
+    /// 装配式 egress harness：**只经 `Dataplane` 公开面**驱动
+    /// （`set_n1_relay` / `pump_n1_inbound` / `n1_egress_poll`），
+    /// 不直调 `TcpRelay::handle_frame` 充当接线证据。
+    struct EgressHarness {
+        dp: Dataplane,
+        stats: Arc<N1Stats>,
+        conn: Arc<TestConn>,
+        tx: std::sync::mpsc::SyncSender<N1Inbound>,
+        peer: N1PeerId,
+    }
+
+    impl EgressHarness {
+        fn new() -> Self {
+            let (mut dp, _mock) = test_dataplane();
+            let stats = Arc::new(N1Stats::default());
+            dp.set_n1_stats(Arc::clone(&stats));
+            dp.set_n1_relay(Box::new(TcpRelayEgress::new(Arc::clone(&stats))));
+            let peer = N1PeerId([0x71; 32]);
+            let conn = Arc::new(TestConn::new(peer));
+            let (tx, rx) = std::sync::mpsc::sync_channel(2048);
+            dp.set_n1_inbound_rx(rx);
+            tx.try_send(N1Inbound::ConnUp {
+                peer,
+                conn: Arc::clone(&conn) as Arc<dyn N1Connection>,
+            })
+            .expect("conn up");
+            dp.pump_n1_inbound();
+            Self {
+                dp,
+                stats,
+                conn,
+                tx,
+                peer,
+            }
+        }
+
+        fn send_frame(&self, stream_id: u32, flags: u8, payload: &[u8]) {
+            self.tx
+                .try_send(N1Inbound::Stream {
+                    peer: self.peer,
+                    conn: Arc::clone(&self.conn) as Arc<dyn N1Connection>,
+                    frame: encode_stream_frame(stream_id, flags, payload),
+                })
+                .expect("queue has room");
+        }
+
+        fn pump(&mut self) {
+            self.dp.pump_n1_inbound();
+        }
+
+        fn conn_down(&self) {
+            self.tx
+                .try_send(N1Inbound::ConnDown { peer: self.peer })
+                .expect("conn down");
+        }
+
+        fn poll(&mut self) {
+            self.dp.n1_egress_poll();
+        }
+
+        fn sent(&self) -> Vec<(u32, u8, Vec<u8>)> {
+            self.conn
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|raw| {
+                    let (sid, flags, payload) = decode_stream_frame(raw).expect("reply frame");
+                    (sid, flags, payload.to_vec())
+                })
+                .collect()
+        }
+
+        fn wait_for(&mut self, mut pred: impl FnMut(&[(u32, u8, Vec<u8>)]) -> bool) {
+            for _ in 0..400 {
+                self.poll();
+                if pred(&self.sent()) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("egress reply did not arrive: {:?}", self.sent());
+        }
+    }
+
+    fn syn_payload_for(addr: std::net::SocketAddr) -> Vec<u8> {
+        let std::net::SocketAddr::V4(v4) = addr else {
+            panic!("test only uses IPv4 targets");
+        };
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(&v4.ip().octets());
+        payload.extend_from_slice(&v4.port().to_be_bytes());
+        payload
+    }
+
+    /// 本地 echo 服务：accept 一条连接并回显到 EOF（连接关闭即退出）。
+    fn spawn_echo_server() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind echo");
+        let addr = listener.local_addr().expect("echo addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut buf = [0u8; 4096];
+                loop {
+                    match io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if io::Write::write_all(&mut stream, &buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// 已关闭的本地端口：connect 必然失败（用于 connect 失败 / 表满态）。
+    fn closed_port() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closed");
+        let addr = listener.local_addr().expect("closed addr");
+        drop(listener);
+        addr
+    }
+
+    /// 四态①：SYN → connect 成功 → DATA 转发到本地 socket；回程字节编码为
+    /// STREAM DATA 经同一 N1 conn 发出，`egress.*` 按 §5.6 推进。
+    #[test]
+    fn egress_relay_connects_forwards_and_replies_over_n1() {
+        let (addr, echo) = spawn_echo_server();
+        let mut h = EgressHarness::new();
+        let sid = 0x51;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        h.send_frame(sid, 0x00, b"hello");
+        h.pump();
+
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid && *f == 0x00 && p == b"hello")
+        });
+
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.egress_syn, 1, "one SYN handed to the relay");
+        assert_eq!(snap.egress_connect_ok, 1, "connect success observed");
+        assert_eq!(snap.egress_connect_failed, 0);
+        assert_eq!(snap.egress_table_full, 0);
+        assert_eq!(
+            snap.egress_bytes_to_local, 5,
+            "DATA payload written to the local socket"
+        );
+        assert_eq!(
+            snap.egress_bytes_from_local, 5,
+            "echoed bytes handed back to N1"
+        );
+        assert!(snap.tx_frames >= 1);
+        assert_eq!(snap.tx_errors, 0);
+        assert_eq!(snap.dispatch_to_relay, 2, "SYN + DATA consumed by relay");
+        assert_eq!(snap.dispatch_unknown_stream, 0);
+
+        drop(h);
+        echo.join().expect("echo thread");
+    }
+
+    /// 四态②：connect 失败 → 回 RST + `egress.connect_failed` + `tx.frames`；
+    /// 不 panic、不静默（失败的流随后按 unknown 处理）。
+    #[test]
+    fn egress_relay_connect_failure_replies_rst_and_counts() {
+        let addr = closed_port();
+        let mut h = EgressHarness::new();
+        let sid = 0x61;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid && *f == STREAM_RST && p.is_empty())
+        });
+
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.egress_syn, 1);
+        assert_eq!(snap.egress_connect_failed, 1);
+        assert_eq!(snap.egress_connect_ok, 0);
+        assert_eq!(snap.egress_table_full, 0);
+        assert_eq!(snap.dispatch_to_relay, 1);
+        assert_eq!(snap.tx_frames, 1, "RST is the only reply");
+        assert_eq!(snap.tx_errors, 0);
+
+        // 失败的流已被 relay 移出表：后续 DATA 诚实计 unknown_stream。
+        h.send_frame(sid, 0x00, b"late");
+        h.pump();
+        assert_eq!(h.stats.snapshot().dispatch_unknown_stream, 1);
+    }
+
+    /// 四态③：连接表满（`MAX_TCP_CONNS = 1024`）→ 回 RST + `table_full`。
+    ///
+    /// 1024 条 SYN 在一次 pump 内进入 pending（connect 结果只在 `poll` 的
+    /// `drain_connects` 里回收），第 1025 条即触发机制侧表满分支。
+    #[test]
+    fn egress_relay_table_full_replies_rst_and_counts() {
+        let addr = closed_port();
+        let mut h = EgressHarness::new();
+        for i in 0..nexus_projection::tcp::MAX_TCP_CONNS as u32 {
+            h.send_frame(i + 1, STREAM_SYN, &syn_payload_for(addr));
+        }
+        h.pump();
+        assert!(h.sent().is_empty(), "SYN 不产生回程帧");
+
+        let overflow_sid = 0x0FFF_FFFF;
+        h.send_frame(overflow_sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+
+        let frames = h.sent();
+        assert_eq!(frames.len(), 1, "only the table-full SYN gets a reply");
+        assert_eq!(frames[0].0, overflow_sid);
+        assert_eq!(frames[0].1, STREAM_RST);
+        assert!(frames[0].2.is_empty());
+
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.egress_syn, 1025);
+        assert_eq!(snap.egress_table_full, 1);
+        assert_eq!(snap.egress_connect_failed, 0);
+        assert_eq!(snap.dispatch_to_relay, 1025);
+        assert_eq!(snap.tx_frames, 1);
+    }
+
+    /// 四态④：FIN 收尾回 FIN（EOF），RST 收尾不回帧并从表中移除。
+    #[test]
+    fn egress_relay_fin_and_rst_teardown() {
+        let (addr_a, echo_a) = spawn_echo_server();
+        let mut h = EgressHarness::new();
+        let sid = 0x71;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr_a));
+        h.pump();
+        h.send_frame(sid, 0x00, b"fin-me");
+        h.pump();
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid && *f == 0x00 && p == b"fin-me")
+        });
+
+        // 本端 FIN → relay shutdown(Write) → 对端 EOF → 回程 FIN。
+        h.send_frame(sid, STREAM_FIN, &[]);
+        h.pump();
+        h.wait_for(|frames| frames.iter().any(|(s, f, _)| *s == sid && *f == STREAM_FIN));
+        echo_a.join().expect("echo a");
+
+        // RST 收尾：relay 移除连接、不回帧；后续 DATA 变成 unknown。
+        let (addr_b, echo_b) = spawn_echo_server();
+        let sid_b = 0x72;
+        h.send_frame(sid_b, STREAM_SYN, &syn_payload_for(addr_b));
+        h.pump();
+        h.send_frame(sid_b, 0x00, b"x");
+        h.pump();
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid_b && *f == 0x00 && p == b"x")
+        });
+        let before = h.stats.snapshot();
+        h.send_frame(sid_b, STREAM_RST, &[]);
+        h.pump();
+        assert_eq!(
+            h.stats.snapshot().tx_frames,
+            before.tx_frames,
+            "originator RST must not trigger a reply"
+        );
+
+        h.send_frame(sid_b, 0x00, b"after-rst");
+        h.pump();
+        assert_eq!(h.stats.snapshot().dispatch_unknown_stream, 1);
+        drop(h);
+        echo_b.join().expect("echo b");
+    }
+
+    /// 装配收口（WP4 §5.8 交接）：同一条「非 originator SYN」在无 relay 的
+    /// 装配下计 `dispatch.unknown_stream`，装入真实 relay 后计 `to_relay`。
+    #[test]
+    fn egress_relay_takes_over_the_unknown_stream_path() {
+        let addr = closed_port();
+        let frame = encode_stream_frame(0x7A, STREAM_SYN, &syn_payload_for(addr));
+
+        // 形态一：无 relay（WP4 现状）。
+        let (mut bare, _mock, bare_stats) = n1_test_dataplane();
+        let peer = N1PeerId([0x72; 32]);
+        let conn = Arc::new(TestConn::new(peer));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        bare.set_n1_inbound_rx(rx);
+        tx.try_send(N1Inbound::Stream {
+            peer,
+            conn: conn as Arc<dyn N1Connection>,
+            frame,
+        })
+        .expect("frame");
+        bare.pump_n1_inbound();
+        assert_eq!(bare_stats.snapshot().dispatch_unknown_stream, 1);
+        assert_eq!(bare_stats.snapshot().dispatch_to_relay, 0);
+
+        // 形态二：装入真实 `TcpRelay` 适配器。
+        let mut h = EgressHarness::new();
+        h.send_frame(0x7A, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.dispatch_to_relay, 1);
+        assert_eq!(snap.dispatch_unknown_stream, 0);
+        assert_eq!(snap.egress_syn, 1);
+    }
+
+    /// §6.2 `TxError`：回程时 peer 的 N1 conn 已下线 → `tx.errors` + WARN；
+    /// 回程字节不静默消失。
+    #[test]
+    fn egress_relay_reply_without_a_peer_conn_counts_tx_errors() {
+        let (addr, echo) = spawn_echo_server();
+        let mut h = EgressHarness::new();
+        let sid = 0x81;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        h.send_frame(sid, 0x00, b"hi");
+        h.pump();
+        h.conn_down();
+        h.pump();
+
+        for _ in 0..400 {
+            h.poll();
+            if h.stats.snapshot().tx_errors > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let snap = h.stats.snapshot();
+        assert_eq!(
+            snap.tx_errors, 1,
+            "missing peer conn is counted, not swallowed"
+        );
+        assert_eq!(snap.tx_frames, 0);
+        assert_eq!(snap.egress_bytes_from_local, 2);
+        assert_eq!(snap.egress_connect_ok, 1);
+
+        drop(h);
+        echo.join().expect("echo thread");
+    }
+
+    // ---- fix-r1：C-3 / C-4 / S-1 -------------------------------------------
+
+    /// C-3：失败种类行逐字模板（`kind` 取 `N1Error` 的 Debug 名）。
+    #[test]
+    fn n1_send_failure_line_carries_kind_and_len() {
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        assert_eq!(
+            n1_send_failure_line(dst, "PeerUnknown", 42),
+            "[nat-chunk] n1 send failed dst=10.200.0.5 kind=PeerUnknown len=42"
+        );
+        assert_eq!(
+            n1_send_failure_line(dst, "OversizeDatagram(1245)", 1245),
+            "[nat-chunk] n1 send failed dst=10.200.0.5 kind=OversizeDatagram(1245) len=1245"
+        );
+    }
+
+    /// C-3：无 sender 时仍按既有语义返回 false 并计 `mesh_dropped_no_n1`
+    /// （只加日志，返回值/计数/控制流不变）。
+    #[test]
+    fn mesh_send_without_sender_returns_false_and_counts_drop() {
+        let (dp, _mock) = test_dataplane();
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        assert!(!dp.send_mesh_tcp_frame(dst, &encode_stream_frame(1, 0x00, b"x")));
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 1);
+        assert_eq!(dp.stats().mesh_tcp_frames, 0);
+    }
+
+    /// C-4：`/localapi/v0/dataplane/stats` 的 `dataplane` 对象暴露
+    /// `mesh_tcp_frames`（AC-N1-R1 A 端判据），且不改既有字段。
+    #[test]
+    fn dataplane_stats_json_exposes_mesh_tcp_frames() {
+        let stats = DataplaneStats {
+            mesh_tcp_frames: 17,
+            mesh_dropped_no_n1: 2,
+            ..DataplaneStats::default()
+        };
+        let json = dataplane_stats_json(
+            true,
+            &RuntimeStatus::default(),
+            &stats,
+            serde_json::Value::Null,
+        );
+        assert_eq!(json["dataplane"]["mesh_tcp_frames"], 17);
+        assert_eq!(json["dataplane"]["mesh_dropped_no_n1"], 2);
+    }
+
+    /// S-1：`syn_target_display` 与 `encode_syn_payload` 的对等性——覆盖
+    /// 全部 addr-type（IPv4 / IPv6 / 域名），保证展示解码与冻结线格式同源。
+    #[test]
+    fn syn_target_display_matches_encode_syn_payload_for_every_addr_type() {
+        let cases: [(&str, u16, &str, &str); 5] = [
+            ("10.1.2.3", 443, "10.1.2.3:443", "IPv4"),
+            ("127.0.0.1", 80, "127.0.0.1:80", "IPv4 loopback"),
+            ("fd00:144::6", 8080, "[fd00:144::6]:8080", "IPv6"),
+            ("example.org", 443, "example.org:443", "domain"),
+            // F1：2 字符域名用 FQDN trailing-dot 形式编码（7 字节）。
+            ("ab", 21, "ab.:21", "2-char domain (F1)"),
+        ];
+        for (host, port, expected, label) in cases {
+            let payload = encode_syn_payload(host, port);
+            assert_eq!(
+                syn_target_display(&payload),
+                expected,
+                "{label}: display must match encode_syn_payload's wire form"
+            );
+        }
+
+        // 3b-5 旧 6 字节形态（encode_syn_payload 不产生，但 wire 兼容需展示）。
+        let legacy = [192, 0, 2, 7, 0x1f, 0x90];
+        assert_eq!(syn_target_display(&legacy), "192.0.2.7:8080");
+
+        // 非法/截断载荷 → 占位符（不 panic、不误报目标）。
+        assert_eq!(syn_target_display(&[]), "-");
+        assert_eq!(syn_target_display(&[0x02, 0x00]), "-");
     }
 }
