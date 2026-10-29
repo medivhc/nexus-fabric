@@ -138,16 +138,19 @@ fn a_panicking_probe_does_not_wedge_the_gate() {
 fn a_waiter_reprobes_when_the_prober_unwinds() {
     let gate = ProbeGate::new("t".to_string());
     let waiter_probed = Mutex::new(false);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let prober = scope.spawn(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 gate.verdict(|| {
+                    // 探测已在进行（in_flight）：之后到达的拨号一定是等待者。
+                    let _ = started_tx.send(());
                     std::thread::sleep(Duration::from_millis(300));
                     panic!("probe panicked")
                 })
             }))
         });
-        std::thread::sleep(Duration::from_millis(100));
+        started_rx.recv().expect("probe started");
         let verdict = gate.verdict(|| {
             *waiter_probed.lock().expect("lock") = true;
             ProbeReport {
@@ -652,11 +655,37 @@ fn inconclusive_probe_leaves_the_dial_failure_reason_to_the_dial() {
             )
         };
         let without_probe = dial(&registry(&yaml(&[outbound(false)])), "t");
+        let before = node.conns().len();
         let with_probe = dial(&registry(&yaml(&[outbound(true)])), "t");
         assert!(without_probe.is_err(), "{addr}");
         assert_ne!(with_probe, Err("auth_rejected"), "{addr}");
         assert_eq!(with_probe, without_probe, "{addr}");
+        if addr == node.addr && before > 0 {
+            // 拨号能连上节点时，探测也连上了：开启探测多出恰好一条连接。
+            assert_eq!(node.conns().len() - before, before + 1, "probe ran");
+        }
     }
+}
+
+#[test]
+fn ipv6_targets_skip_the_probe() {
+    let node = Node::spawn(Spec::default());
+    let reg = registry(&yaml(&[trojan_outbound(
+        "t",
+        node.addr,
+        WRONG_PASSWORD,
+        "",
+    )]));
+    let target: SocketAddr = "[2001:db8::1]:443".parse().expect("v6");
+    let result = reg
+        .dialer("t")
+        .expect("dialer")
+        .dial_tcp(target)
+        .map(|_| ())
+        .map_err(|error| error.reason());
+    // 探测会因密码错误判 rejected（auth_rejected）；跳过探测时是既有的目标校验失败。
+    assert_eq!(result, Err("config"));
+    assert!(node.conns().is_empty(), "no probe connection");
 }
 
 #[test]

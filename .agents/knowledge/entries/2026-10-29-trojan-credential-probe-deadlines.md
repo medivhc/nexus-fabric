@@ -27,6 +27,8 @@ nexusd 的 Trojan 凭据探测（PRODUCT §11.9.5）要求单次探测 ≤ 13 s�
 1. socket 读超时是「每次调用」的，不是「整个阶段」的。
 2. `nexus-projection` 的 `TcpTerminator` 用 smoltcp 状态机，`Established` 之后才上报 Syn。
 3. proxy-transport 在 `write_all` 里隐式握手，所有 I/O 错误都落成 `ProxyError::Io`。
+4. rustls 的 `process_new_packets` 按顺序处理一次读入的全部记录：坏记录之前的完整记录已经
+   解密进明文缓冲，随后才因坏记录返回错误——错误不代表「没有收到数据」。
 
 ## 解决方案
 
@@ -36,8 +38,8 @@ nexusd 的 Trojan 凭据探测（PRODUCT §11.9.5）要求单次探测 ≤ 13 s�
 2. 测试按 SYN → 取 SYN-ACK 序号 → ACK 走完握手，再观察拨号。
 3. 不改既有拨号的错误映射；改为断言「探测开 / 关时拨号失败原因完全相同」——这才是契约
    （inconclusive 照常拨号）真正约束的不变量。
-4. `process_new_packets` 出错后先 `reader().read`：错误之前已解密的明文照样判 rejected；回归
-   测试让节点在一次写里发出 404 记录 + AEAD 必败的 application_data 记录。
+4. `process_new_packets` 出错后先 `reader().read`：已解密的明文照样判 rejected。回归测试让
+   节点在一次写里发出 404 记录 + AEAD 必败的 application_data 记录。
 
 ## 教训/可复用要点
 
