@@ -7,7 +7,8 @@
 //! - allowlist 复核（深度防御；TLS 层已拒绝未知客户端）。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use nexus_fabric::{
@@ -17,6 +18,9 @@ use nexus_fabric::{
 use nexus_network::n1::{
     N1Connection, N1Error, N1KeepaliveIo, N1KeepaliveStream, N1Listener, N1PeerId,
 };
+
+use crate::log_throttle::KeyedLogThrottle;
+use crate::n1_runtime::{N1InboundReject, N1Stats};
 
 /// `accept_timeout` 轮询粒度（spec §8.1 `N1_ACCEPT_POLL_MS`）。
 pub const N1_ACCEPT_POLL_MS: u64 = 500;
@@ -105,10 +109,22 @@ impl N1KeepaliveIo for FabricKaStream {
 }
 
 /// mTLS N1 listener：`FabricListener` + allowlist 复核 + stop 协作退出。
+///
+/// WP1b（spec §19）：fabric 侧把被拒入站握手计入只读计数器；本类型在
+/// `accept_timeout` 的 `Timeout` 分支比较增量，把拒绝变成可观测事件
+/// （逐字日志句 + `rx.rejected{admission}` 计数）。`accept_timeout` 的
+/// 错误形态不变（拒绝仍表现为 `Timeout`）。
 pub struct FabricN1Listener {
     listener: FabricListener,
     allowed: Vec<N1PeerId>,
     stop: Arc<AtomicBool>,
+    /// WP1b：`record_rx_rejected(AdmissionDenied)` 的既有 stats 句柄。
+    /// `None` 只用于不关心统计的单测；生产装配经 [`Self::with_stats`] 必填。
+    stats: Option<Arc<N1Stats>>,
+    /// 上一次观测到的 fabric 拒绝计数（增量检测）。
+    last_rejected: AtomicU64,
+    /// §19 日志句限频；`KeyedLogThrottle` 保证首次出现立即发射。
+    reject_log: Mutex<KeyedLogThrottle>,
 }
 
 impl FabricN1Listener {
@@ -124,11 +140,22 @@ impl FabricN1Listener {
         let fabric_allowed: Vec<FabricPeerId> = allowed.iter().map(|p| FabricPeerId(p.0)).collect();
         let listener =
             FabricListener::bind_mtls(addr, identity, &fabric_allowed).map_err(map_fabric_err)?;
+        let last_rejected = AtomicU64::new(listener.rejected_handshakes());
         Ok(Self {
             listener,
             allowed,
             stop,
+            stats: None,
+            last_rejected,
+            reject_log: Mutex::new(KeyedLogThrottle::new()),
         })
+    }
+
+    /// WP1b：接入生产 stats（`rx.rejected{admission}` 可观测计数）。
+    #[must_use]
+    pub fn with_stats(mut self, stats: Arc<N1Stats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// 绑定后的本地 UDP 地址（诊断/测试用）。
@@ -139,6 +166,48 @@ impl FabricN1Listener {
     /// allowlist 复核（深度防御谓词；纯函数便于单测）。
     fn allows(&self, peer: N1PeerId) -> bool {
         self.allowed.iter().any(|p| p.0 == peer.0)
+    }
+
+    fn record_admission_denied(&self) {
+        if let Some(stats) = &self.stats {
+            // 被拒握手从未通过 mTLS，peer 身份按 P0 既有约定为零值哨兵。
+            stats.record_rx_rejected(N1InboundReject::AdmissionDenied {
+                peer: N1PeerId([0u8; 32]),
+            });
+        }
+    }
+
+    /// WP1b：比较 fabric 拒绝计数器增量；`delta > 0` 时计数并（限频）发逐字句。
+    ///
+    /// 返回本次观测到的增量（0 = 纯空闲）。首次出现必定发射（限频器语义），
+    /// 后续同键在窗口内只抑制输出，不丢计数。
+    fn poll_rejected_handshakes(&self) -> u64 {
+        let total = self.listener.rejected_handshakes();
+        let last = self.last_rejected.load(Ordering::Relaxed);
+        if total <= last {
+            return 0;
+        }
+        let delta = total - last;
+        self.last_rejected.store(total, Ordering::Relaxed);
+        if let Some(stats) = &self.stats {
+            for _ in 0..delta {
+                stats.record_rx_rejected(N1InboundReject::AdmissionDenied {
+                    peer: N1PeerId([0u8; 32]),
+                });
+            }
+        }
+        let decision = self.reject_log.lock().unwrap().decide(
+            "n1_listen",
+            "tls_handshake_rejected",
+            std::time::Instant::now(),
+            crate::log_throttle::OUTBOUND_UNAVAILABLE_LOG_INTERVAL,
+        );
+        if decision.emit {
+            eprintln!(
+                "[n1-listen] tls handshake rejected (peer unauthenticated or protocol error)"
+            );
+        }
+        delta
     }
 }
 
@@ -153,6 +222,7 @@ impl N1Listener for FabricN1Listener {
                     let peer = N1PeerId(conn.peer().0);
                     // 深度防御：TLS 层已按 allowlist 拒绝未知客户端。
                     if !self.allows(peer) {
+                        self.record_admission_denied();
                         eprintln!(
                             "[n1-listener] rejected peer={} reason=admission",
                             short_peer(peer)
@@ -168,6 +238,9 @@ impl N1Listener for FabricN1Listener {
                     return Ok((peer, Box::new(N1ConnAdapter { inner: conn })));
                 }
                 Err(FabricError::Timeout) => {
+                    // WP1b/§19：TLS 拒绝与空闲在 accept 错误上同形；增量在
+                    // fabric 计数器里，只有 delta > 0 才是拒绝。
+                    self.poll_rejected_handshakes();
                     if self.stop.load(Ordering::SeqCst) {
                         return Err(N1Error::Closed);
                     }
@@ -196,7 +269,9 @@ fn map_fabric_err(e: FabricError) -> N1Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::n1_runtime::N1StatsSnapshot;
     use nexus_fabric::ConnConfig;
+    use std::time::Instant;
 
     fn identity(seed: u8) -> FabricIdentity {
         FabricIdentity::from_ed25519_seed([seed; 32]).unwrap()
@@ -274,21 +349,34 @@ mod tests {
         assert!(matches!(listener.accept(), Err(N1Error::Closed)));
     }
 
-    /// WP1b 前提实测（spec §19）：TLS 层拒绝的握手在 `accept_timeout` 上只表现为
-    /// `Timeout`（与空闲轮询不可区分），因此 accept 侧无法分类出
-    /// `FabricError::HandshakeFailed`。本测试固化该前提，防止后续把
-    /// “代码里有日志句”误当成可观测。
+    /// WP1b 前提更新（spec §19 / MSR-n1-wp1b-ruling-20261029）：accept 的错误
+    /// 形态保持 `Timeout`（被拒握手与空闲仍同形），但 fabric 计数器可区分二者；
+    /// listener 的增量检测据此触发逐字句与 `rx.rejected{admission}` 计数。
+    /// 旧前提「完全不可区分」已被选项 (ii) 取代，此处固化新事实。
     #[test]
-    fn rejected_handshake_is_indistinguishable_from_idle_timeout() {
+    fn rejected_handshake_is_distinguishable_via_counter_while_accept_still_times_out() {
         let server = identity(40);
         let stranger = identity(41);
+        let stats = Arc::new(N1Stats::default());
         let listener = FabricN1Listener::bind(
             "127.0.0.1:0".parse().unwrap(),
             &server,
             vec![N1PeerId(identity(42).peer_id().0)],
             Arc::new(AtomicBool::new(false)),
         )
-        .unwrap();
+        .unwrap()
+        .with_stats(Arc::clone(&stats));
+
+        // 纯空闲：accept 超时、计数器不动、增量 0、无 stats 计数。
+        assert!(matches!(
+            listener.listener.accept_timeout(Duration::from_millis(80)),
+            Err(FabricError::Timeout)
+        ));
+        assert_eq!(listener.poll_rejected_handshakes(), 0);
+        assert_eq!(listener.listener.rejected_handshakes(), 0);
+        assert_eq!(stats.snapshot(), N1StatsSnapshot::default());
+
+        // 未列名身份在 TLS 层被拒：fabric 计数器递增。
         assert!(
             FabricConn::connect_mtls(
                 server.peer_id(),
@@ -297,10 +385,28 @@ mod tests {
             )
             .is_err()
         );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while listener.listener.rejected_handshakes() == 0 {
+            assert!(Instant::now() < deadline, "rejection counter never moved");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // accept 语义不变：被拒握手仍只表现为 `Timeout`。
         assert!(matches!(
             listener.listener.accept_timeout(Duration::from_millis(80)),
             Err(FabricError::Timeout)
         ));
+
+        // 增量检测：第一次观测 delta = 1（首次发句不被吞），第二次为 0。
+        assert_eq!(listener.poll_rejected_handshakes(), 1);
+        assert_eq!(listener.poll_rejected_handshakes(), 0);
+        assert_eq!(
+            stats.snapshot(),
+            N1StatsSnapshot {
+                rx_rejected: 1,
+                rx_rejected_admission: 1,
+            }
+        );
     }
 
     #[test]

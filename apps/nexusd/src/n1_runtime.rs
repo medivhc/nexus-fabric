@@ -188,7 +188,7 @@ pub fn assemble_n1_runtime(
     let allowed_count = allowed.len();
     let stop = Arc::clone(&shutdown);
     let listener = match FabricN1Listener::bind(addr, &identity, allowed, stop) {
-        Ok(listener) => listener,
+        Ok(listener) => listener.with_stats(Arc::clone(&stats)),
         Err(e) => {
             eprintln!("[n1-listener] WARN: bind failed addr={addr} reason={e}");
             return handles(
