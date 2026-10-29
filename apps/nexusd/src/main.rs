@@ -2678,6 +2678,10 @@ fn log_enabled_subsystems(cfg: &LoadedConfig) {
 /// socket 都中招）。设置失败只告警——超时机制本身不阻断服务。
 const LOCALAPI_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// WP0 测量底座（spec §11.2 唯一定义处：`LOCALAPI_ACCEPT_POLL_MS = 5`）：
+/// 空闲 accept 轮询粒度。100ms 会注入 38–100ms 的采样延迟，使冻结带不可达。
+const LOCALAPI_ACCEPT_POLL_MS: u64 = 5;
+
 macro_rules! apply_localapi_io_timeouts {
     ($stream:expr) => {{
         if let Err(e) = $stream.set_read_timeout(Some(LOCALAPI_IO_TIMEOUT)) {
@@ -2692,7 +2696,7 @@ macro_rules! apply_localapi_io_timeouts {
 /// LocalAPI 服务（后台线程版；复用既有 serve 逻辑，READY 经 channel 上报）。
 /// LocalAPI 服务（后台线程版；R4：经 shutdown 标志可停止）。
 ///
-/// 非阻塞 accept + 100ms 轮询，关闭信号置位后退出循环。
+/// 非阻塞 accept + `LOCALAPI_ACCEPT_POLL_MS` 轮询，关闭信号置位后退出循环。
 fn serve_localapi(
     addr_raw: &str,
     ready_tx: std::sync::mpsc::Sender<String>,
@@ -2762,7 +2766,7 @@ fn serve_localapi(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(LOCALAPI_ACCEPT_POLL_MS));
             }
             Err(e) => {
                 eprintln!("[nexusd] localapi accept error: {e}");
@@ -3367,7 +3371,9 @@ fn write_http_json(
 
 #[cfg(test)]
 mod parse_flags_tests {
-    use super::{LOCALAPI_IO_TIMEOUT, N2_SESSION_SWEEP_INTERVAL_SECS, parse_flags};
+    use super::{
+        LOCALAPI_ACCEPT_POLL_MS, LOCALAPI_IO_TIMEOUT, N2_SESSION_SWEEP_INTERVAL_SECS, parse_flags,
+    };
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -3410,6 +3416,20 @@ mod parse_flags_tests {
         // P1-15：读请求行/头必须有超时，否则一个不发换行的客户端永久占住控制面。
         assert!(LOCALAPI_IO_TIMEOUT.as_secs() > 0);
         assert!(LOCALAPI_IO_TIMEOUT <= std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn localapi_accept_poll_is_not_100ms_granular() {
+        // WP0（spec §11.2 第 1 步）：空闲 accept 若仍以 100ms 为粒度，
+        // LocalAPI 采样 poll_ms 会出现 38–100ms 的结构性延迟，冻结带不可达。
+        assert_eq!(
+            LOCALAPI_ACCEPT_POLL_MS, 5,
+            "WP0 定版值：spec §11.2 LOCALAPI_ACCEPT_POLL_MS = 5"
+        );
+        assert!(
+            LOCALAPI_ACCEPT_POLL_MS < 100,
+            "空闲 accept 轮询粒度必须细于 100ms，实测 {LOCALAPI_ACCEPT_POLL_MS}ms"
+        );
     }
 
     #[test]
