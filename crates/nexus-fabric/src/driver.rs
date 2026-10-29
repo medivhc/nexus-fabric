@@ -306,6 +306,11 @@ pub struct DriverShared {
     pub accept_cv: Condvar,
     pub local_addr: Mutex<SocketAddr>,
     pub peer_id: Option<PeerId>,
+    /// Additive (WP1b/spec §19): inbound mTLS handshakes this driver rejected
+    /// (anonymous, unlisted, wrongly pinned, or protocol error). Monotonic and
+    /// exactly once per inbound connection; see `Loop::publish_mutual_connection`
+    /// and the `ConnectionLost` handler. No logging or callbacks here.
+    pub rejected_handshakes: AtomicU64,
 }
 
 impl Driver {
@@ -355,6 +360,7 @@ impl Driver {
             accept_cv: Condvar::new(),
             local_addr: Mutex::new(local_addr),
             peer_id,
+            rejected_handshakes: AtomicU64::new(0),
         });
         let lp = Loop {
             rx,
@@ -425,7 +431,14 @@ impl Driver {
     pub(crate) fn new_mtls_client() -> Result<Arc<Self>, FabricError> {
         let transport = StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
             .map_err(|e| FabricError::Transport(e.to_string()))?;
-        Self::spawn_mode(Box::new(transport), None, true)
+        Self::new_mtls_client_with_transport(Box::new(transport))
+    }
+
+    /// mTLS client on a caller-provided transport (spec §7 additive support).
+    pub(crate) fn new_mtls_client_with_transport(
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<Arc<Self>, FabricError> {
+        Self::spawn_mode(transport, None, true)
     }
 
     pub(crate) fn new_mtls_server(
@@ -664,6 +677,11 @@ struct LiveConn {
     dgram_tx_q: VecDeque<Vec<u8>>,
     bytes_sent: u64,
     bytes_recv: u64,
+    /// WP1b/§19: set once the QUIC/TLS handshake completed (`Connected`).
+    /// A connection that dies before this point never authenticated.
+    handshake_authenticated: bool,
+    /// WP1b/§19: exactly-once latch for `DriverShared::rejected_handshakes`.
+    rejection_counted: bool,
 }
 
 struct Loop {
@@ -856,6 +874,8 @@ impl Loop {
                 dgram_tx_q: VecDeque::new(),
                 bytes_sent: 0,
                 bytes_recv: 0,
+                handshake_authenticated: false,
+                rejection_counted: false,
             },
         );
         self.shared.conns.lock().unwrap().insert(id, shared);
@@ -1065,6 +1085,8 @@ impl Loop {
                         dgram_tx_q: VecDeque::new(),
                         bytes_sent: 0,
                         bytes_recv: 0,
+                        handshake_authenticated: false,
+                        rejection_counted: false,
                     },
                 );
                 self.shared.conns.lock().unwrap().insert(id, shared);
@@ -1313,6 +1335,16 @@ impl Loop {
             Err(error) => {
                 lc.shared.state.lock().unwrap().closed = Some(error);
                 lc.shared.state_cv.notify_all();
+                // WP1b/§19 authoritative rejection point: the handshake got far
+                // enough to verify a peer, but no mutually authenticated
+                // identity could be established. Count once (the latch also
+                // protects the later `ConnectionLost` path).
+                if self.mutual_auth && !lc.quic.side().is_client() && !lc.rejection_counted {
+                    lc.rejection_counted = true;
+                    self.shared
+                        .rejected_handshakes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 lc.quic.close(
                     Instant::now(),
                     VarInt::from_u32(1),
@@ -1326,16 +1358,20 @@ impl Loop {
         match ev {
             quinn_proto::Event::HandshakeDataReady => {}
             quinn_proto::Event::Connected => {
-                if let Some(lc) = self.live.get(&id) {
+                if let Some(lc) = self.live.get_mut(&id) {
                     if !self.mutual_auth {
                         lc.shared.state.lock().unwrap().connected = true;
                         lc.shared.state_cv.notify_all();
+                    } else {
+                        // Server side: QUIC `Connected` already validated the
+                        // mandatory client certificate and the allowlist.
+                        lc.handshake_authenticated = true;
                     }
                 }
             }
             quinn_proto::Event::ConnectionLost { reason } => {
                 let err = map_close_reason(&reason);
-                if let Some(lc) = self.live.get(&id) {
+                if let Some(lc) = self.live.get_mut(&id) {
                     lc.shared.state.lock().unwrap().closed = Some(err.clone());
                     lc.shared.state_cv.notify_all();
                     for sh in lc.streams.values() {
@@ -1345,6 +1381,20 @@ impl Loop {
                     }
                     lc.shared.dgram_cv.notify_all();
                     lc.shared.accepted_cv.notify_all();
+                    // WP1b/§19: an inbound mTLS connection that dies before the
+                    // handshake completed never authenticated — count it as a
+                    // rejected handshake (anonymous / unlisted / wrong pin /
+                    // protocol error). Exactly once via the per-conn latch.
+                    if self.mutual_auth
+                        && !lc.quic.side().is_client()
+                        && !lc.handshake_authenticated
+                        && !lc.rejection_counted
+                    {
+                        lc.rejection_counted = true;
+                        self.shared
+                            .rejected_handshakes
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened { dir: Dir::Bi }) => {

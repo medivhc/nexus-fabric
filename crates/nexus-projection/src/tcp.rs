@@ -53,6 +53,13 @@ pub const STREAM_SYN: u8 = 0x01;
 pub const STREAM_FIN: u8 = 0x02;
 pub const STREAM_RST: u8 = 0x04;
 
+/// Originator-side stream id bound (spec §5.4/§8.1).
+///
+/// Stream ids are confined to 24 bits so the STREAM frame's first byte is
+/// always `0x00`; the N1 fallback demux can then tell a STREAM frame apart
+/// from a raw IPv4/IPv6 datagram purely by its first nibble (0x4/0x6).
+pub const N1_STREAM_ID_MASK: u32 = 0x00FF_FFFF;
+
 /// TTL for cancelled-connect keys (N-new-1): pruned in `drain_connects` so
 /// a worker thread that never reports back cannot grow the set without bound.
 const CANCELLED_TTL: Duration = Duration::from_secs(60);
@@ -615,6 +622,33 @@ impl TcpTerminator {
         self.max_conns = max;
     }
 
+    #[cfg(test)]
+    fn set_next_id(&mut self, next: u32) {
+        self.next_id = AtomicU32::new(next);
+    }
+
+    /// Allocate the next 24-bit stream id (spec §5.4).
+    ///
+    /// The counter is masked with [`N1_STREAM_ID_MASK`] so the encoded STREAM
+    /// frame always starts with `0x00` (never mistaken for a raw IP packet by
+    /// the N1 demux). `0` is reserved and skipped; on wrap-around an id that
+    /// is still live in `by_id` is skipped by advancing the counter.
+    ///
+    /// Upper bound: `by_id` holds at most `MAX_TCP_CONNS` (1024) entries and
+    /// each probe yields a distinct 24-bit id, so `2 * (len + 1)` probes can
+    /// never be exhausted while a free id exists. The `0` skip consumes at
+    /// most one extra probe per wrap, which the factor 2 covers.
+    fn alloc_stream_id(&self) -> Option<u32> {
+        let probes = 2 * (self.by_id.len() + 1);
+        for _ in 0..probes {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) & N1_STREAM_ID_MASK;
+            if id != 0 && !self.by_id.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub fn stats(&self) -> TcpTermStats {
         self.stats
     }
@@ -698,7 +732,13 @@ impl TcpTerminator {
                 self.stats.table_full += 1;
                 return vec![];
             }
-            let stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let Some(stream_id) = self.alloc_stream_id() else {
+                // 24-bit space with <= MAX_TCP_CONNS live ids cannot be
+                // exhausted; treat the impossible case like a full table
+                // instead of silently reusing a live id (misrouting risk).
+                self.stats.table_full += 1;
+                return vec![];
+            };
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; 16384]);
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; 16384]);
             let mut sock = tcp::Socket::new(rx_buf, tx_buf);
@@ -1863,6 +1903,55 @@ mod tests {
         }
         assert_eq!(got, b"ping");
         assert!(relay.stats().relayed_bytes >= 4);
+    }
+
+    #[test]
+    fn stream_ids_are_24_bit_and_skip_zero() {
+        // Spec §5.4: the originator restricts stream ids to 24 bits so a
+        // STREAM frame's first byte is always 0x00 (never a raw IPv4/IPv6
+        // first nibble). id 0 is reserved and skipped.
+        let mut term = TcpTerminator::new();
+        term.set_next_id(N1_STREAM_ID_MASK); // masked id = MASK
+        let syn1 = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 41000, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn1, "peer-B");
+        let mut ids = term.stream_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![N1_STREAM_ID_MASK]);
+
+        // Next probe wraps to 0 (skipped) and then to 1.
+        let syn2 = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 41001, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn2, "peer-B");
+        let mut ids = term.stream_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, N1_STREAM_ID_MASK]);
+        for id in term.stream_ids() {
+            assert_ne!(id, 0, "stream id 0 must be skipped");
+            assert!(id <= N1_STREAM_ID_MASK, "stream id {id:#x} exceeds 24 bits");
+            // Every encoded frame starts with a 0x00 byte, so the N1 demux
+            // can never mistake it for a raw IP packet.
+            assert_eq!(encode_stream_frame(id, 0, b"")[0], 0x00);
+        }
+    }
+
+    #[test]
+    fn stream_id_allocation_skips_ids_still_in_table_on_wrap() {
+        // Wrap-around: the allocator must advance past an id that is still
+        // live in `by_id` instead of reusing it (which would misroute).
+        let mut term = TcpTerminator::new();
+        term.set_next_id(N1_STREAM_ID_MASK);
+        let syn1 = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 41010, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn1, "peer-B");
+        assert_eq!(term.stream_ids(), vec![N1_STREAM_ID_MASK]);
+
+        // Re-arm the counter on the live id: first probe collides, then 0 is
+        // skipped, then 1 is free.
+        term.set_next_id(N1_STREAM_ID_MASK);
+        let syn2 = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 41011, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn2, "peer-B");
+        let mut ids = term.stream_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, N1_STREAM_ID_MASK]);
+        assert_eq!(term.conn_count(), 2);
     }
 
     #[test]

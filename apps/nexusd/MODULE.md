@@ -407,7 +407,18 @@
   跨平台同一套代码（TUN 经 `Box<dyn TunDevice>`，VirtualPacketInterface
   抽象）；UDP 分片/重组后置。
 - 诚实边界：Proxy 方向只计数到 `proxy_tcp_*`（传输接线 = GAP-1）；
-  Mesh 方向 STREAM 帧经 N1 datagram 承载（egress 侧 `TcpRelay` 接线不在本契约）。
+  Mesh 方向 STREAM 帧经 N1 datagram 承载；egress 侧 `TcpRelay` **已接线**
+  （dataplane 持有 relay，`n1_egress_poll` 每轮驱动，计数见
+  `/localapi/v0/n1/stats` 的 `egress.*`）。计数口径：`egress.connect_ok` 只计
+  本地 socket 已产出证据的连接（静默连接少计、不多计）；`egress.bytes_to_local`
+  计 DATA 载荷进入 relay 写路径的字节（正常缓冲下等于写入本地 socket）。
+- **已知失败 / 待诊断**：2026-10-29 公网 [R] 窗口 10 MiB relay 传输在
+  145,400 字节（1.39%）处中断，SHA-256 不一致；两端应用均未报错
+  （发送端 `send` 成功、接收端干净 EOF `reset=false`），根因未定性，且
+  按 spec §12.3 **不是** `FAIL(loss)`（接收端收到发送端几乎全部帧，发送端
+  `fallback_errors` +8,339）。诊断 follow-up：
+  `n1-mid-stream-send-failure-diagnosis`。本能力状态按 **preview** 记录，
+  不得据此宣称 N1 可用；用户文档的诚实边界见 `docs/USER_MANUAL.md` §4.1.14。
 
 ### 常规要求
 
@@ -422,6 +433,10 @@
 - 门：`DIRECT_ACCEPT_QUIET_MS=30000`（接收）、`DIRECT_SEND_GUARD_MS=32000`（发送）；两端共享同一个单调 `PunchClock`，判据是 `PunchState::Succeeded` + `last_success_ms` 差值。不使用 `direct_conn_id`。
 - 接收端：只 accept active 为 `Direct` 的 conn；读到一帧后继续 drain 到 EOF 并关闭己方发送方向（quinn 双半释放后才补发 `MAX_STREAMS`）；帧读失败只关闭发送方向。队列满丢该 chunk，不阻塞 accept。
 - 状态面：只读路由 `GET /localapi/v0/nat/chunks`（新文件 `nat_chunk_stats.rs` 构建 JSON）；`/localapi/v0/connectivity/nat` 与 `/localapi/v0/dataplane/stats` 的既有字段零改动。计数字段用 `direct_attempts` 语义：只表示发送尝试，不表示送达。
+- **ERRATA-2（spec 批准的修正，用户可见行为变化）**：direct chunk 路径下 terminator
+  **不认识**的流不再静默丢弃，改为交 egress relay（以前直接丢）。这是 additive 修正、
+  不是回归，但确实改变了 P0 direct 路径对未知流的用户可见行为——排障/公告时按
+  「未知流改走 relay」表述，不要沿用旧的「丢弃」口径。
 - 诚实边界：本段不引入 seq/ack/重排/重试，不声称 chunk 级顺序、送达或“不中断”；跨 conn 不迁移在途 stream；fabric driver 的流条目在 conn 关闭前不回收（既有 L-1）。
 
 ## Verification

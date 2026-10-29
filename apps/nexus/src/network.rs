@@ -13,8 +13,8 @@
 use nexus_control_api::ControlCommand;
 use nexus_discovery::{DiscoveryHub, PeerId as DiscoveryPeerId, mdns::MdnsDiscovery};
 use nexus_fabric::{
-    ConnConfig, FabricConn, FabricError, PeerId as FabricPeerId, RecvStream, SendStream,
-    StdUdpTransport, UdpTransport,
+    ConnConfig, FabricConn, FabricError, FabricIdentity, PeerId as FabricPeerId, RecvStream,
+    SendStream, StdUdpTransport, UdpTransport,
 };
 use nexus_network::n1::{
     N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
@@ -177,9 +177,29 @@ struct FabricDialer {
     handshake_timeout: Duration,
     proxy: Option<ProxyConfig>,
     cancel: Arc<AtomicBool>,
+    /// `Some` → 每 tier 都走 mTLS（`connect_mtls_with_transport`）；
+    /// `None` → 既有 legacy 握手（CLI/测试路径）。
+    identity: Option<FabricIdentity>,
 }
 
 impl FabricDialer {
+    fn connect(
+        &self,
+        peer: FabricPeerId,
+        cfg: &ConnConfig,
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<FabricConn, N1Error> {
+        match self.identity.as_ref() {
+            Some(identity) => {
+                FabricConn::connect_mtls_with_transport(peer, identity, cfg, transport)
+                    .map_err(map_fabric_err)
+            }
+            None => {
+                FabricConn::connect_with_transport(peer, cfg, transport).map_err(map_fabric_err)
+            }
+        }
+    }
+
     fn dial_direct(
         &self,
         peer: FabricPeerId,
@@ -200,8 +220,7 @@ impl FabricDialer {
             addrs: vec![cand.remote_addr],
             handshake_timeout,
         };
-        let conn =
-            FabricConn::connect_with_transport(peer, &cfg, transport).map_err(map_fabric_err)?;
+        let conn = self.connect(peer, &cfg, transport)?;
         Ok(Box::new(FabricConnAdapter { inner: conn }))
     }
 
@@ -265,8 +284,7 @@ impl FabricDialer {
             addrs: vec![peer_addr],
             handshake_timeout: quic_budget,
         };
-        let conn =
-            FabricConn::connect_with_transport(peer, &cfg, transport).map_err(map_fabric_err)?;
+        let conn = self.connect(peer, &cfg, transport)?;
         Ok(Box::new(FabricConnAdapter { inner: conn }))
     }
 }
@@ -522,6 +540,31 @@ pub fn build_session_manager_with_discovery(
     cancel: Arc<AtomicBool>,
     params: DiscoveryParams,
 ) -> Result<(N1Config, Arc<N1SessionManager>, Arc<DiscoveryHub>), String> {
+    build_session_manager_inner(config_text, proxy, cancel, params, None)
+}
+
+/// 与 [`build_session_manager_with_discovery`] 相同，但拨号走 mTLS
+/// （spec §5.1/§7 additive：`connect_mtls_with_transport` 的消费者）。
+///
+/// # Errors
+/// - 同 [`build_session_manager_with_discovery`]。
+pub fn build_session_manager_with_discovery_mtls(
+    config_text: &str,
+    proxy: Option<ProxyConfig>,
+    cancel: Arc<AtomicBool>,
+    params: DiscoveryParams,
+    identity: FabricIdentity,
+) -> Result<(N1Config, Arc<N1SessionManager>, Arc<DiscoveryHub>), String> {
+    build_session_manager_inner(config_text, proxy, cancel, params, Some(identity))
+}
+
+fn build_session_manager_inner(
+    config_text: &str,
+    proxy: Option<ProxyConfig>,
+    cancel: Arc<AtomicBool>,
+    params: DiscoveryParams,
+    identity: Option<FabricIdentity>,
+) -> Result<(N1Config, Arc<N1SessionManager>, Arc<DiscoveryHub>), String> {
     let config =
         N1Config::parse_toml(config_text).map_err(|e| format!("parse network.toml: {e:?}"))?;
     let sink = Arc::new(LogSink);
@@ -551,6 +594,7 @@ pub fn build_session_manager_with_discovery(
         handshake_timeout: Duration::from_secs(10),
         proxy,
         cancel,
+        identity,
     });
     let mgr = Arc::new(N1SessionManager::new(
         dialer,
@@ -661,6 +705,7 @@ fn network_up_linux(config_text: &str) -> i32 {
         handshake_timeout: Duration::from_secs(10),
         proxy: None,
         cancel: Arc::new(AtomicBool::new(false)),
+        identity: None,
     });
     let mgr = Arc::new(N1SessionManager::new(
         dialer,
@@ -838,6 +883,49 @@ mod tests {
             N1PeerId([0u8; 32])
         }
         fn close(&self) {}
+    }
+
+    #[test]
+    fn mtls_builder_dials_and_listener_verifies_client_identity() {
+        use nexus_fabric::FabricListener;
+
+        fn hex32(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        let server = FabricIdentity::from_ed25519_seed([0x61; 32]).unwrap();
+        let client = FabricIdentity::from_ed25519_seed([0x62; 32]).unwrap();
+        let client_peer = client.peer_id();
+        let listener = FabricListener::bind_mtls(addr(0), &server, &[client_peer]).expect("bind");
+        let bound = listener.local_addr().expect("bound addr");
+        let text = format!(
+            "peer_id = \"{}\"\n\
+             [[peers]]\n\
+             id = \"{}\"\n\
+             addrs = [\"{bound}\"]\n\
+             [vpi]\n\
+             interface = \"nexus0\"\n\
+             address = \"10.200.0.1\"\n\
+             mtu = 1200\n",
+            hex32(&client.peer_id().0),
+            hex32(&server.peer_id().0),
+        );
+        let (_config, manager, _hub) = build_session_manager_with_discovery_mtls(
+            &text,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            DiscoveryParams::static_only(),
+            client,
+        )
+        .expect("mtls assembly");
+        manager
+            .dial(&N1PeerId(server.peer_id().0))
+            .expect("mtls dial");
+        let accepted = listener
+            .accept_timeout(Duration::from_secs(3))
+            .expect("accept");
+        assert_eq!(accepted.mutually_authenticated_peer(), Some(client_peer));
+        manager.shutdown();
     }
 
     #[test]

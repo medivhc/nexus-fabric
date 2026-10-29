@@ -4,8 +4,8 @@
 //! assertions. It can never close AC-C-1; only the `[R]` dual-node window can.
 
 use std::collections::VecDeque;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::io::{self, Read};
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,11 +13,18 @@ use std::time::Duration;
 use nexus_fabric::{ConnShared, Driver, PeerId as FabricPeerId};
 use nexus_nat_traversal::PunchClock;
 use nexus_nat_wireup::{PunchPeerStatus, PunchState};
-use nexus_projection::tcp::{decode_stream_frame, encode_stream_frame, ip_checksum, tcp_checksum};
+use nexus_projection::tcp::{
+    STREAM_SYN, decode_stream_frame, encode_stream_frame, encode_syn_payload, ip_checksum,
+    tcp_checksum,
+};
 use nexus_projection::{MockTun, TunDevice};
 use nexusd::dataplane::DataplaneConfig;
+use nexusd::dataplane::TcpRelayEgress;
 use nexusd::mesh_peer_map::{MeshPeerResolver, StaticMeshPeerMap};
-use nexusd::nat_chunk_recv::{self, DirectGate, NAT_INBOUND_QUEUE_CAP, NatChunkRecvError};
+use nexusd::n1_stats::N1Stats;
+use nexusd::nat_chunk_recv::{
+    self, DirectGate, NAT_INBOUND_QUEUE_CAP, NatChunkRecvError, NatInboundChunk,
+};
 use nexusd::nat_chunk_stats::{ChunkStats, ChunkStatsSnapshot, build_chunk_status_json};
 use nexusd::nat_consumer::{NatActiveConn, NatHandleSlot, NatPathProvider};
 use nexusd::nat_switch::ChunkPath;
@@ -761,6 +768,109 @@ fn single_conn_serial_150_chunks_all_direct() {
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = handle.join();
+}
+
+// ---------------------------------------------------------------------------
+// 8. AC-N1-R3 half-duplex: direct-chunk DATA for a stream the terminator does
+//    not own must enter the real egress relay and be delivered locally.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_chunk_unknown_stream_is_delivered_through_the_real_relay() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("receiver bind");
+    let port = listener.local_addr().expect("receiver addr").port();
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 239) as u8).collect();
+    let want = payload.clone();
+    let total = payload.len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let recv = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("local accept");
+        accepted_tx.send(()).expect("signal accept");
+        let mut got = Vec::with_capacity(total);
+        let mut buf = [0u8; 1024];
+        while got.len() < total {
+            let n = stream.read(&mut buf).expect("local read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let _ = tx.send(got);
+    });
+
+    let peer = FabricPeerId([0x43; 32]);
+    let n1_stats = Arc::new(N1Stats::default());
+    let stats = Arc::new(ChunkStats::default());
+    let provider = FakeProvider::new(Mode::Direct, peer);
+    let slot = NatHandleSlot::new();
+    slot.set(provider.clone());
+    let (mut dp, _mock, _frames) = dataplane_with(None, None, None, Arc::clone(&stats));
+    dp.set_nat_path_slot(slot);
+    dp.set_n1_stats(Arc::clone(&n1_stats));
+    dp.set_n1_relay(Box::new(TcpRelayEgress::new(Arc::clone(&n1_stats))));
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(16);
+    dp.set_nat_inbound_rx(chunk_rx);
+
+    let stream_id = 0x0042_0001u32;
+    let syn = encode_stream_frame(
+        stream_id,
+        STREAM_SYN,
+        &encode_syn_payload("127.0.0.1", port),
+    );
+    chunk_tx
+        .send(NatInboundChunk {
+            peer,
+            stream_frame: syn,
+        })
+        .expect("queue SYN chunk");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut connected = false;
+    while !connected {
+        dp.pump_nat_inbound();
+        dp.n1_egress_poll();
+        connected = accepted_rx.try_recv().is_ok();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "direct-chunk SYN never reached the real relay"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let data = encode_stream_frame(stream_id, 0x00, &payload);
+    chunk_tx
+        .send(NatInboundChunk {
+            peer,
+            stream_frame: data,
+        })
+        .expect("queue DATA chunk");
+    dp.pump_nat_inbound();
+    dp.n1_egress_poll();
+
+    let got = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("relay did not deliver the direct-chunk payload");
+    recv.join().expect("receiver thread");
+    assert_eq!(got, want, "direct-chunk payload delivered byte-for-byte");
+
+    let snap = n1_stats.snapshot();
+    assert!(
+        snap.dispatch_to_relay >= 2,
+        "SYN + DATA both dispatched to relay: {snap:?}"
+    );
+    assert!(
+        snap.egress_bytes_to_local >= total as u64,
+        "egress.bytes_to_local counts the delivered payload: {snap:?}"
+    );
+    assert_eq!(snap.dispatch_unknown_stream, 0, "relay owns the stream");
+    assert_eq!(snap.egress_syn, 1, "one SYN entered the relay");
+
+    assert_eq!(
+        stats.snapshot().recv_chunks,
+        0,
+        "recv_chunks stays direct-only"
+    );
 }
 
 // ---------------------------------------------------------------------------
