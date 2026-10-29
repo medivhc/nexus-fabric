@@ -1512,13 +1512,21 @@ impl NatSwitchRuntime {
         };
 
         let stun_servers = stun_servers(section);
-        let worker = std::thread::Builder::new()
+        let worker = match std::thread::Builder::new()
             .name("nexusd-nat-switch".to_string())
             .spawn(move || {
                 runtime.run(stun_servers);
-            })
-            .map_err(|e| format!("spawn nat-switch thread: {e}"))
-            .ok()?;
+            }) {
+            Ok(worker) => worker,
+            Err(e) => {
+                // `not_started` without any explanation is a dead end for
+                // operators (product-review r1 FRICTION).
+                eprintln!(
+                    "[nat-switch] WARN: nat-switch worker thread spawn failed ({e}); TURN/NAT switching stays not_started"
+                );
+                return None;
+            }
+        };
         Some(worker)
     }
 

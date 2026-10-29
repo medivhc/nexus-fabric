@@ -401,8 +401,24 @@ impl TurnRelayProvider {
                 .turn
                 .lock()
                 .map_err(|_| RelayError::Turn("lock".into()))?;
-            turn.ensure_allocated()
-                .map_err(|e| RelayError::Turn(format!("{e:?}")))?
+            match turn.ensure_allocated() {
+                Ok(relayed) => {
+                    // Same shape as `on_turn_allocated`: the status row is
+                    // written inside the `turn` critical section, after the
+                    // TURN I/O, with lock order `turn -> nat_status` (the
+                    // status guard never leaves `update_turn_status`). Without
+                    // this a peer-less relay stays `allocating` forever.
+                    publish_provider_status(&turn);
+                    relayed
+                }
+                Err(e) => {
+                    // Publish the manager's failure projection (`degraded` +
+                    // `last_error`) before returning: the attach-time
+                    // `allocating` write must not survive a failed allocation.
+                    publish_provider_status(&turn);
+                    return Err(RelayError::Turn(format!("{e:?}")));
+                }
+            }
         };
         if self.book.relay_addr(&self.my_id.0) != Some(relayed) {
             self.book
@@ -427,6 +443,17 @@ impl TurnRelayProvider {
             let before = turn.state();
             let outcome = turn.refresh_if_needed();
             let after = turn.state();
+            // Publish the settled projection here, still inside the `turn`
+            // critical section (`turn -> nat_status`, status guard released
+            // inside `update_turn_status`). This is the only place a
+            // post-allocation loss becomes visible: `provider_lost()` below
+            // only clears the relay slot, so without this write the row would
+            // stay `active` after the allocation expired. A no-op tick
+            // (`NotDue`/`Inactive`) cannot change health, so it skips the
+            // write; `update_turn_status` also dedups identical rows.
+            if !matches!(outcome, RefreshOutcome::NotDue | RefreshOutcome::Inactive) {
+                publish_provider_status(&turn);
+            }
             (before, after, outcome, turn.relayed_addr())
         };
         let was_up = matches!(before, TurnState::Active | TurnState::Refreshing);

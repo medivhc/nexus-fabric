@@ -26,7 +26,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use nexus_domain::nat::NatType;
-use nexus_fabric::{Driver, PeerId as FabricPeerId};
+use nexus_fabric::{Driver, FabricIdentity, PeerId as FabricPeerId};
 use nexus_nat_traversal::{
     DefaultPredictor, LocalCandidates, PortSample, Predictability, PunchConfig, PunchPredictor,
     PunchResult,
@@ -220,6 +220,77 @@ address = "10.144.0.1"
 "#
     );
     std::fs::write(dir.join("network.toml"), text).expect("write network.toml");
+}
+
+/// Identity helpers for the provider test: the daemon derives its fabric
+/// identity from `[network.identity].seed_file` and fails closed unless the
+/// derived peer id equals `network.toml`'s `peer_id`.
+fn peer_id_hex(seed: u8) -> String {
+    FabricIdentity::from_ed25519_seed([seed; 32])
+        .expect("ed25519 identity")
+        .peer_id()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn write_seed_file(dir: &Path, seed: u8) -> PathBuf {
+    let path = dir.join("identity.seed");
+    std::fs::write(&path, format!("{seed:02x}").repeat(32)).expect("write seed file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod seed file");
+    }
+    path
+}
+
+/// Provider-enabled variant: `relay_provider_enabled = true` plus a matching
+/// `[network.identity].seed_file`.
+fn write_daemon_toml_provider(
+    dir: &Path,
+    server: SocketAddr,
+    bind_addr: &str,
+    refresh_sec: u64,
+    seed_file: &Path,
+) {
+    let text = format!(
+        r#"localapi_addr = "127.0.0.1:0"
+
+[tun]
+enabled = false
+
+[network.turn]
+server = "{server}"
+realm = "nexus"
+username = "nexus"
+password = "test-secret"
+refresh_interval_sec = {refresh_sec}
+bind_addr = "{bind_addr}"
+
+[network.identity]
+seed_file = "{}"
+
+[network.punch]
+relay_provider_enabled = true
+"#,
+        seed_file.display()
+    );
+    std::fs::write(dir.join("daemon.toml"), text).expect("write daemon.toml (provider)");
+}
+
+fn write_network_toml_with_peer(dir: &Path, peer_hex: &str, vip: &str) {
+    let text = format!(
+        r#"peer_id = "{peer_hex}"
+
+[vpi]
+interface = "nxtun0"
+address = "{vip}"
+"#
+    );
+    std::fs::write(dir.join("network.toml"), text).expect("write network.toml (provider)");
 }
 
 /// A spawned `nexusd <config-dir>` with its stderr collected line by line.
@@ -1073,4 +1144,78 @@ fn p3_ac2_production_construction_points() {
         1,
         "P3-AC2: real_factory definition must be unique"
     );
+}
+
+/// BLOCKER-1 (product-review r1): a provider-enabled daemon with **no peer**
+/// must publish `active` on its first allocation, and must publish `expired`
+/// after the TURN server dies (worker 500ms tick + 3-strike refresh).
+///
+/// The empty `peers` array is part of the assertion: `on_turn_allocated` is
+/// never reached without a subscriber, so `active` can only come from
+/// `ensure_relay_ready`'s publish point.
+#[test]
+fn provider_status_active_then_expired_without_peers() {
+    if !udp_loopback_available() {
+        eprintln!("SKIP: loopback UDP unavailable in this environment");
+        return;
+    }
+    if !bindable("127.0.0.2:0") {
+        eprintln!("SKIP: 127.0.0.2 is not bindable in this environment");
+        return;
+    }
+    let turn = TurnServer::bind("127.0.0.1:0".parse().expect("addr"), creds())
+        .expect("bind in-process TURN server");
+    let dir = TempDir::new("provider-status");
+    let seed = 0x5a;
+    let seed_file = write_seed_file(dir.path(), seed);
+    // `refresh_interval_sec = 1` puts the next refresh immediately in the past
+    // (`interval - REFRESH_MARGIN` saturates to zero), so the provider settles
+    // on the worker's 500ms tick instead of waiting 300s.
+    write_daemon_toml_provider(dir.path(), turn.main_addr(), "127.0.0.2:0", 1, &seed_file);
+    write_network_toml_with_peer(dir.path(), &peer_id_hex(seed), "10.144.0.77");
+
+    let mut daemon = Daemon::spawn(dir.path());
+    let value = wait_for_nat(
+        &mut daemon,
+        |v| v["turn"]["provider"]["health"] == "active",
+        Duration::from_secs(20),
+    );
+    assert_eq!(value["turn"]["provider"]["bind_addr"], "127.0.0.2:0");
+    assert!(
+        value["turn"]["provider"]["last_error"].is_null(),
+        "healthy provider must not carry last_error: {value}"
+    );
+    assert_eq!(value["runtime"], "enabled");
+    assert_eq!(
+        value["peers"].as_array().map(Vec::len),
+        Some(0),
+        "no peer may exist: provider status came from ensure_relay_ready, not on_turn_allocated: {value}"
+    );
+
+    // Kill the TURN server. Three consecutive refresh timeouts (3s each, 1s
+    // retry delay) drive Active -> Expired through `provider_lost`.
+    drop(turn);
+
+    let value = wait_for_nat(
+        &mut daemon,
+        |v| v["turn"]["provider"]["health"] == "expired",
+        Duration::from_secs(60),
+    );
+    assert_eq!(value["turn"]["provider"]["health"], "expired");
+
+    // Terminal: no later worker tick may resurrect it to active/allocating.
+    // Poll instead of sleeping a fixed once.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        daemon.drain_available();
+        let (status, value) = get_json(&daemon.localapi_addr, "/localapi/v0/connectivity/nat");
+        assert_eq!(status, 200, "LocalAPI must stay up: {value}");
+        assert_eq!(
+            value["turn"]["provider"]["health"],
+            "expired",
+            "expired is terminal: {value}\nstderr:\n{}",
+            daemon.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
