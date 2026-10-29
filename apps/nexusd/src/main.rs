@@ -778,7 +778,13 @@ fn run_dataplane(
 
     // WP4：N1 入站队列（WP3 supervisor 持发送端）+ 共享计数面。
     dp.set_n1_inbound_rx(n1_inbound_rx);
-    dp.set_n1_stats(n1_stats);
+    dp.set_n1_stats(Arc::clone(&n1_stats));
+    // WP5：把真实 `TcpRelay` 装进 dataplane（§5.5 additive 接线；与上面两个
+    // setter 同处）。egress relay 跑在 dataplane 线程，由主循环 `n1_egress_poll`
+    // 每轮驱动（§5.7）。
+    dp.set_n1_relay(Box::new(nexusd::dataplane::TcpRelayEgress::new(
+        Arc::clone(&n1_stats),
+    )));
 
     #[cfg(target_os = "linux")]
     let mut tproxy_frontend = match tproxy_config {
@@ -827,6 +833,8 @@ fn run_dataplane(
         dp.pump_nat_inbound();
         // WP4：紧邻 drain N1 入站队列（spec §5.5；与 direct 共用 dispatch）。
         dp.pump_n1_inbound();
+        // WP5：每轮驱动 egress relay（spec §5.5/§5.7：线程模型 = dataplane 线程）。
+        dp.n1_egress_poll();
         if last_tproxy_publish.elapsed() >= std::time::Duration::from_secs(1) {
             nexusd::dataplane::publish_flow_sessions(dp.flow_sessions_state());
             nexusd::dataplane::publish_tproxy_counters(
