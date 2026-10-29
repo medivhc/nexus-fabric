@@ -54,6 +54,23 @@ pub enum N1InboundReject {
     ConnClosed,
 }
 
+/// egress relay 计数事件（spec §5.6/§7 `egress.*`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N1EgressEvent {
+    /// SYN 帧交给 relay（含重复 SYN / 短 SYN；机制侧另有 `short_syn_dropped`）。
+    Syn,
+    /// 已观测到本地连接建立成功的证据（本地 socket 读出字节或 FIN）。
+    ConnectOk,
+    /// relay 的 connect worker 报告失败（机制侧 `TcpRelayStats::connect_failed`）。
+    ConnectFailed,
+    /// 成功交给本地 socket 写路径的字节（§5.6 口径）。
+    BytesToLocal(usize),
+    /// 从本地 socket 读出并交给回程的字节（§5.6 口径）。
+    BytesFromLocal(usize),
+    /// `conns + pending >= MAX_TCP_CONNS`（1024）；该 SYN 已回 RST。
+    TableFull,
+}
+
 /// 消费侧分派目标（spec §5.6/§7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum N1DispatchTarget {
@@ -84,6 +101,12 @@ pub struct N1Stats {
     dispatch_to_relay: AtomicU64,
     dispatch_bad_frame: AtomicU64,
     dispatch_unknown_stream: AtomicU64,
+    egress_syn: AtomicU64,
+    egress_connect_ok: AtomicU64,
+    egress_connect_failed: AtomicU64,
+    egress_bytes_to_local: AtomicU64,
+    egress_bytes_from_local: AtomicU64,
+    egress_table_full: AtomicU64,
     tx_frames: AtomicU64,
     tx_errors: AtomicU64,
 }
@@ -105,6 +128,12 @@ pub struct N1StatsSnapshot {
     pub dispatch_to_relay: u64,
     pub dispatch_bad_frame: u64,
     pub dispatch_unknown_stream: u64,
+    pub egress_syn: u64,
+    pub egress_connect_ok: u64,
+    pub egress_connect_failed: u64,
+    pub egress_bytes_to_local: u64,
+    pub egress_bytes_from_local: u64,
+    pub egress_table_full: u64,
     pub tx_frames: u64,
     pub tx_errors: u64,
 }
@@ -126,6 +155,12 @@ impl N1Stats {
             dispatch_to_relay: self.dispatch_to_relay.load(Ordering::Relaxed),
             dispatch_bad_frame: self.dispatch_bad_frame.load(Ordering::Relaxed),
             dispatch_unknown_stream: self.dispatch_unknown_stream.load(Ordering::Relaxed),
+            egress_syn: self.egress_syn.load(Ordering::Relaxed),
+            egress_connect_ok: self.egress_connect_ok.load(Ordering::Relaxed),
+            egress_connect_failed: self.egress_connect_failed.load(Ordering::Relaxed),
+            egress_bytes_to_local: self.egress_bytes_to_local.load(Ordering::Relaxed),
+            egress_bytes_from_local: self.egress_bytes_from_local.load(Ordering::Relaxed),
+            egress_table_full: self.egress_table_full.load(Ordering::Relaxed),
             tx_frames: self.tx_frames.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
         }
@@ -194,6 +229,26 @@ impl N1Stats {
     ///（§6.1 只要求 `dispatch.bad_frame`）。
     pub fn record_dispatch_bad_frame(&self) {
         self.dispatch_bad_frame.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `egress.*`：egress relay 计数（spec §5.6/§7）。
+    pub fn record_egress(&self, ev: N1EgressEvent) {
+        let counter = match ev {
+            N1EgressEvent::Syn => &self.egress_syn,
+            N1EgressEvent::ConnectOk => &self.egress_connect_ok,
+            N1EgressEvent::ConnectFailed => &self.egress_connect_failed,
+            N1EgressEvent::BytesToLocal(_) => &self.egress_bytes_to_local,
+            N1EgressEvent::BytesFromLocal(_) => &self.egress_bytes_from_local,
+            N1EgressEvent::TableFull => &self.egress_table_full,
+        };
+        match ev {
+            N1EgressEvent::BytesToLocal(n) | N1EgressEvent::BytesFromLocal(n) => {
+                counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+            }
+            _ => {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// `tx.frames / tx.errors`：回程 STREAM 帧（§5.6）。
