@@ -454,5 +454,13 @@
     "module": "apps/nexusd",
     "category": "implementation-pattern",
     "summary": "每请求入口完整校验一次已确认 prefix，同请求复核只查绑定，提交摘要由入口 Sha256Stream 续算；字节预算须列出幂等重试比较路径。"
+  },
+  {
+    "id": "trojan-late-guard-client-payload",
+    "file": "entries/2026-10-28-trojan-late-guard-client-payload.md",
+    "date": "2026-10-28",
+    "module": "apps/nexus",
+    "category": "implementation-pitfall",
+    "summary": "首包判别守卫的前提「客户端尚未载荷」失效时（读到 n>0 的客户端载荷）必须清除守卫并按序交付已暂存前缀；echo 载荷的矩阵覆盖不到明文 HTTP 误判。"
   }
 ]
