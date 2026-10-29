@@ -2094,6 +2094,58 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         .clone()
         .map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
 
+    // 3a. N1 入站监听（spec §5.8/§9）：默认 disabled 时零 bind/零线程。
+    //     listen enabled 时身份 fail-closed（与 NAT BLOCKED-1 同口径）。
+    let n1_runtime = match n1_assembly.as_ref() {
+        Some(assembly) => {
+            let section = &loaded.daemon.n1;
+            let listen_requested = section.enabled && section.listen_addr.is_some();
+            let identity = if listen_requested {
+                let Some(path) = loaded.daemon.identity.seed_file.as_deref() else {
+                    eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
+                    return ExitCode::from(1);
+                };
+                let seed = match nexusd::nat_relay::load_seed_file(std::path::Path::new(path)) {
+                    Ok(seed) => seed,
+                    Err(e) => {
+                        eprintln!(
+                            "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
+                        );
+                        return ExitCode::from(1);
+                    }
+                };
+                match nexusd::nat_relay::identity_from_seed(
+                    seed,
+                    FabricPeerId(assembly.config.peer_id.0),
+                ) {
+                    Ok(identity) => Some(identity),
+                    Err(e) => {
+                        eprintln!(
+                            "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
+                        );
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            Some(nexusd::n1_runtime::assemble_n1_runtime(
+                assembly,
+                section,
+                identity,
+                Arc::clone(&shutdown),
+            ))
+        }
+        None => {
+            if loaded.daemon.n1.enabled && loaded.daemon.n1.listen_addr.is_some() {
+                eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
+                return ExitCode::from(1);
+            }
+            eprintln!("[n1-listener] listener disabled reason=no_listen_addr");
+            None
+        }
+    };
+
     // 3b. 发现 pump：即使没有 `[network.turn]` 也启动（发现/状态面独立，
     // 启动顺序冻结：装配 → DiscoveryRuntime::start → NatSwitchRuntime::start）。
     let discovery_handle = match n1_assembly.as_ref() {
@@ -2526,6 +2578,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         localapi_handle,
         dataplane_handle,
         n1_bridge,
+        n1_runtime,
         n2_sweeper_handle,
         discovery_handle,
         nat_switch_handle,
@@ -2544,6 +2597,7 @@ fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
+    n1_runtime: Option<nexusd::n1_runtime::N1RuntimeHandles>,
     n2_sweeper_handle: Option<std::thread::JoinHandle<()>>,
     discovery_handle: Option<nexusd::discovery_runtime::DiscoveryRuntimeHandle>,
     nat_switch_handle: Option<std::thread::JoinHandle<()>>,
@@ -2588,6 +2642,16 @@ fn shutdown_sequence(
         assembly::join_with_timeout(handle, Duration::from_secs(1), "dataplane");
     } else {
         eprintln!("[nexusd] shutdown: dataplane not running (no-tun mode)");
+    }
+
+    if let Some(mut handles) = n1_runtime {
+        eprintln!("[nexusd] shutdown: stopping N1 runtime");
+        if let Some(handle) = handles.accept.take() {
+            assembly::join_with_timeout(handle, Duration::from_secs(5), "n1-accept");
+        }
+        if let Some(handle) = handles.rx.take() {
+            assembly::join_with_timeout(handle, Duration::from_secs(5), "n1-rx");
+        }
     }
 
     if let Some(bridge) = n1_bridge {

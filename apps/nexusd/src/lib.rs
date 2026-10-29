@@ -21,6 +21,8 @@ mod log_throttle;
 pub mod mesh_peer_map;
 /// N1 入站 mTLS listener 适配（spec §5.2，WP1）。
 pub mod n1_listener;
+/// N1 runtime 组合函数（spec §5.8/§7，WP1）。
+pub mod n1_runtime;
 pub mod nat_chunk_recv;
 pub mod nat_chunk_stats;
 pub mod nat_consumer;
