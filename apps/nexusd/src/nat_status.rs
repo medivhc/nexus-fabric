@@ -3,7 +3,7 @@
 //! Reads an in-memory publisher (no per-request probing). With no publisher
 //! the route still returns 200 with `runtime=disabled` and `peers=[]`.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use nexus_domain::NexusError;
 use nexus_domain::nat::NatType;
@@ -11,6 +11,84 @@ use nexus_nat_wireup::{PunchPeerStatus, RelaySource, TunnelProto};
 use serde_json::{Value, json};
 
 pub const SCHEMA_VERSION: u32 = 2;
+
+/// TURN manager health values (spec §4.10.2). `not_started` is an
+/// assembly-side pseudo value and never comes out of `TurnManager::health()`.
+pub const TURN_HEALTH_UNCONFIGURED: &str = "unconfigured";
+pub const TURN_HEALTH_NOT_STARTED: &str = "not_started";
+pub const TURN_HEALTH_ALLOCATING: &str = "allocating";
+pub const TURN_HEALTH_ACTIVE: &str = "active";
+pub const TURN_HEALTH_EXPIRED: &str = "expired";
+pub const TURN_HEALTH_DEGRADED: &str = "degraded";
+
+pub const TURN_ERROR_BIND: &str = "bind_failed";
+pub const TURN_ERROR_ALLOCATE: &str = "allocate_failed";
+pub const TURN_ERROR_SERVER: &str = "server_invalid";
+
+/// One TURN manager's projection row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnManagerStatus {
+    pub health: &'static str,
+    pub bind_addr: Option<String>,
+    pub last_error: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnStatusSnapshot {
+    pub warm_backup: Option<TurnManagerStatus>,
+    pub provider: Option<TurnManagerStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnManagerKind {
+    WarmBackup,
+    Provider,
+}
+
+static TURN_STATUS: OnceLock<Mutex<TurnStatusSnapshot>> = OnceLock::new();
+
+/// Publish one manager's status. A poisoned lock keeps the old value (no
+/// panic on a status write); identical values are not rewritten.
+pub fn update_turn_status(kind: TurnManagerKind, status: TurnManagerStatus) {
+    let Ok(mut guard) = TURN_STATUS
+        .get_or_init(|| Mutex::new(TurnStatusSnapshot::default()))
+        .lock()
+    else {
+        return;
+    };
+    let slot = match kind {
+        TurnManagerKind::WarmBackup => &mut guard.warm_backup,
+        TurnManagerKind::Provider => &mut guard.provider,
+    };
+    if slot.as_ref() != Some(&status) {
+        *slot = Some(status);
+    }
+}
+
+/// Read both TURN manager rows. A poisoned lock returns the inner value
+/// instead of reporting null: once assembled, `warm_backup` should stay an
+/// object.
+pub fn turn_status_snapshot() -> TurnStatusSnapshot {
+    match TURN_STATUS.get() {
+        Some(m) => match m.lock() {
+            Ok(g) => g.clone(),
+            Err(e) => e.into_inner().clone(),
+        },
+        None => TurnStatusSnapshot::default(),
+    }
+}
+
+fn manager_json(s: &TurnManagerStatus) -> Value {
+    json!({"health": s.health, "bind_addr": s.bind_addr, "last_error": s.last_error})
+}
+
+/// Shared by the enabled and disabled response branches.
+fn turn_status_json(snapshot: &TurnStatusSnapshot) -> Value {
+    json!({
+        "warm_backup": snapshot.warm_backup.as_ref().map(manager_json),
+        "provider": snapshot.provider.as_ref().map(manager_json),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatRuntimeState {
@@ -242,6 +320,7 @@ pub fn connectivity_nat() -> Result<Value, NexusError> {
                 "runtime": NatRuntimeState::Enabled.as_str(),
                 "generated_at_ms": now,
                 "peers": peers,
+                "turn": turn_status_json(&turn_status_snapshot()),
                 "peer_source": peer_source_json(),
                 "discovery": discovery_json(),
             }))
@@ -251,6 +330,7 @@ pub fn connectivity_nat() -> Result<Value, NexusError> {
             "runtime": NatRuntimeState::Disabled.as_str(),
             "generated_at_ms": now,
             "peers": [],
+            "turn": turn_status_json(&turn_status_snapshot()),
             // No NAT stack: the state row is `disabled:no-turn`, counters are
             // all zero, and the discovery block still reports the real pump.
             "peer_source": {
@@ -351,5 +431,84 @@ mod tests {
         assert!(v["discovery"]["mdns"].is_string());
         assert_eq!(v["discovery"]["discovery_metrics"]["miss"], 0);
         assert!(v["peers"].as_array().expect("peers array").is_empty());
+    }
+
+    #[test]
+    fn turn_status_json_shape() {
+        let empty = turn_status_json(&TurnStatusSnapshot::default());
+        assert_eq!(empty, json!({"warm_backup": null, "provider": null}));
+        let filled = turn_status_json(&TurnStatusSnapshot {
+            warm_backup: Some(TurnManagerStatus {
+                health: TURN_HEALTH_DEGRADED,
+                bind_addr: Some("192.0.2.1:0".into()),
+                last_error: Some(TURN_ERROR_BIND),
+            }),
+            provider: None,
+        });
+        assert_eq!(
+            filled["warm_backup"],
+            json!({"health": "degraded", "bind_addr": "192.0.2.1:0", "last_error": "bind_failed"})
+        );
+        assert!(filled["provider"].is_null());
+    }
+
+    #[test]
+    fn turn_status_update_warm_backup_and_dedupe() {
+        let status = TurnManagerStatus {
+            health: TURN_HEALTH_UNCONFIGURED,
+            bind_addr: None,
+            last_error: None,
+        };
+        update_turn_status(TurnManagerKind::WarmBackup, status.clone());
+        assert_eq!(turn_status_snapshot().warm_backup, Some(status));
+        let degraded = TurnManagerStatus {
+            health: TURN_HEALTH_DEGRADED,
+            bind_addr: Some("127.0.0.2:0".into()),
+            last_error: Some(TURN_ERROR_BIND),
+        };
+        update_turn_status(TurnManagerKind::WarmBackup, degraded.clone());
+        assert_eq!(turn_status_snapshot().warm_backup, Some(degraded));
+        // A second identical publish is a no-op (same value).
+        update_turn_status(
+            TurnManagerKind::WarmBackup,
+            TurnManagerStatus {
+                health: TURN_HEALTH_DEGRADED,
+                bind_addr: Some("127.0.0.2:0".into()),
+                last_error: Some(TURN_ERROR_BIND),
+            },
+        );
+        assert_eq!(
+            turn_status_snapshot()
+                .warm_backup
+                .expect("warm backup")
+                .health,
+            TURN_HEALTH_DEGRADED
+        );
+    }
+
+    #[test]
+    fn turn_health_and_error_constants() {
+        assert_eq!(
+            [
+                TURN_HEALTH_UNCONFIGURED,
+                TURN_HEALTH_NOT_STARTED,
+                TURN_HEALTH_ALLOCATING,
+                TURN_HEALTH_ACTIVE,
+                TURN_HEALTH_EXPIRED,
+                TURN_HEALTH_DEGRADED,
+            ],
+            [
+                "unconfigured",
+                "not_started",
+                "allocating",
+                "active",
+                "expired",
+                "degraded"
+            ]
+        );
+        assert_eq!(
+            [TURN_ERROR_BIND, TURN_ERROR_ALLOCATE, TURN_ERROR_SERVER],
+            ["bind_failed", "allocate_failed", "server_invalid"]
+        );
     }
 }

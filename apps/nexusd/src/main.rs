@@ -1262,10 +1262,33 @@ struct NatSwitchRuntime {
     feed: Option<peer_source::PeerSourceFeed>,
     /// Feed tick interval (from `[network.discovery]`).
     feed_interval: Duration,
+    /// Single-target WARN is emitted once per process.
+    single_target_warned: bool,
+    /// Test-only projection of the last `sample_round` candidates (production
+    /// never reads or writes it).
+    #[cfg(test)]
+    last_local: Option<LocalCandidates>,
 }
 
 /// STUN 端口样本滚动历史上限（D2 判定最少需要 3 个；保留 8 个抗抖动）。
 const MAX_PORT_SAMPLES: usize = 8;
+
+/// Project a `TurnManager` onto the status row (spec §4.10.2/§4.10.4).
+fn turn_status_of(m: &nat_turn::TurnManager) -> nexusd::nat_status::TurnManagerStatus {
+    nexusd::nat_status::TurnManagerStatus {
+        health: m.health().as_str(),
+        bind_addr: m.bind_addr_text().map(str::to_string),
+        last_error: m.last_failure().map(|f| f.as_str()),
+    }
+}
+
+/// Publish the warm-backup row after every allocation/refresh attempt.
+fn publish_warm_backup(m: &nat_turn::TurnManager) {
+    nexusd::nat_status::update_turn_status(
+        nexusd::nat_status::TurnManagerKind::WarmBackup,
+        turn_status_of(m),
+    );
+}
 
 impl NatSwitchRuntime {
     /// 从 `[network.turn]` 配置创建并启动运行时。
@@ -1304,18 +1327,21 @@ impl NatSwitchRuntime {
         // TURN 生命周期管理器（配置缺失时由调用方保证为 Some）。
         let turn = nat_turn::TurnManager::new(Some(section.clone()));
 
-        // STUN 探测器：真实 UDP 传输。
-        let stun_transport: Box<dyn nat_stun::StunTransport> = match nat_stun::UdpStunTransport::new(
-            "0.0.0.0:0".parse().expect("0.0.0.0:0 parses"),
-        ) {
-            Ok(t) => Box::new(t),
-            Err(e) => {
-                eprintln!(
-                    "[nat-switch] WARN: STUN socket bind failed ({e}); stun disabled, punch disabled"
-                );
-                return None;
-            }
-        };
+        // STUN 探测器：生产 tap，跑在 punch driver 的 UDP socket 上。
+        let stun_transport: Box<dyn nat_stun::StunTransport> =
+            match nat_stun::DriverStunTransport::new(driver.clone()) {
+                Ok(t) => {
+                    let driver_addr = *driver.shared().local_addr.lock().unwrap();
+                    eprintln!("[nat-stun] tap_installed driver={driver_addr}");
+                    Box::new(t)
+                }
+                Err(e) => {
+                    eprintln!("[nat-stun] WARN: tap install failed ({e}); punch disabled");
+                    // Spec §3.5: without the tap the runtime does not start;
+                    // the assembly side then publishes `not_started`.
+                    return None;
+                }
+            };
         let stun = nat_stun::StunProber::new(stun_transport);
 
         // B14 fix: initial candidates go through the gatherer, not a
@@ -1418,6 +1444,14 @@ impl NatSwitchRuntime {
                 sw.attach_relay_provider(
                     Arc::clone(&provider) as Arc<dyn nexusd::nat_relay::RelayConnProvider>
                 );
+                nexusd::nat_status::update_turn_status(
+                    nexusd::nat_status::TurnManagerKind::Provider,
+                    nexusd::nat_status::TurnManagerStatus {
+                        health: nexusd::nat_status::TURN_HEALTH_ALLOCATING,
+                        bind_addr: Some(section.bind_addr.clone()),
+                        last_error: None,
+                    },
+                );
                 Some(provider)
             }
             _ => None,
@@ -1472,16 +1506,27 @@ impl NatSwitchRuntime {
             port_samples: Vec::new(),
             feed,
             feed_interval,
+            single_target_warned: false,
+            #[cfg(test)]
+            last_local: None,
         };
 
         let stun_servers = stun_servers(section);
-        let worker = std::thread::Builder::new()
+        let worker = match std::thread::Builder::new()
             .name("nexusd-nat-switch".to_string())
             .spawn(move || {
                 runtime.run(stun_servers);
-            })
-            .map_err(|e| format!("spawn nat-switch thread: {e}"))
-            .ok()?;
+            }) {
+            Ok(worker) => worker,
+            Err(e) => {
+                // `not_started` without any explanation is a dead end for
+                // operators (product-review r1 FRICTION).
+                eprintln!(
+                    "[nat-switch] WARN: nat-switch worker thread spawn failed ({e}); TURN/NAT switching stays not_started"
+                );
+                return None;
+            }
+        };
         Some(worker)
     }
 
@@ -1499,6 +1544,7 @@ impl NatSwitchRuntime {
                 nat_gather::GatherError::Turn(e)
             ),
         }
+        publish_warm_backup(&self.turn);
 
         // 1b. The provider allocates and publishes **its own** relayed address.
         // The runtime's warm-backup allocation is never published (peers would
@@ -1509,17 +1555,24 @@ impl NatSwitchRuntime {
             }
         }
 
-        // 2. 初始 STUN 采样（失败不阻断）。
+        // 2. 初始 STUN 采样（3 轮 × 2 目标；首轮失败即停，失败不阻断）。
         let mut last_stun = std::time::Instant::now();
         if let Some((s1, s2)) = servers {
-            self.sample_and_update(s1, s2);
+            let _rounds = self.bootstrap_samples(s1, s2);
+            last_stun = std::time::Instant::now();
         }
 
         // 3. 节奏循环：Refresh 保活（runtime + provider）+ 周期 STUN + feed tick。
         let mut last_feed: Option<std::time::Instant> = None;
         let feed_interval = self.feed_interval;
         while !self.stop.load(Ordering::Relaxed) {
-            self.turn.refresh_if_needed();
+            let refresh = self.turn.refresh_if_needed();
+            if !matches!(
+                refresh,
+                nat_turn::RefreshOutcome::NotDue | nat_turn::RefreshOutcome::Inactive
+            ) {
+                publish_warm_backup(&self.turn);
+            }
             if let Some(provider) = &self.provider {
                 // `Lost` is fully handled inside the provider (slot cleared,
                 // sinks notified); the feed re-arms on the next book poll.
@@ -1566,88 +1619,161 @@ impl NatSwitchRuntime {
         server1: std::net::SocketAddr,
         server2: Option<std::net::SocketAddr>,
     ) {
+        if let Err(e) = self.sample_round(server1, server2) {
+            eprintln!("[nat-switch] WARN: {e}; keeping previous candidates");
+        }
+    }
+
+    /// One STUN sampling round: exactly two samples (s1 then s2) sharing one
+    /// `at_ms` and one `observed_from`, then the candidate projection.
+    fn sample_round(
+        &mut self,
+        server1: std::net::SocketAddr,
+        server2: Option<std::net::SocketAddr>,
+    ) -> Result<(), nat_gather::GatherError> {
         // Tech debt (W-1)：时间源直接用 std；见模块级说明。
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let probed = match server2 {
-            Some(s2) => self.gatherer.stun_prober().probe_and_detect(server1, s2),
+        let before = *self._driver.shared().local_addr.lock().unwrap();
+        let (m1, m2, nat_type) = match server2 {
+            Some(s2) => self
+                .gatherer
+                .stun_prober()
+                .probe_pair(server1, s2)
+                .map(|(a, b, t)| (a, Some(b), t))
+                .map_err(nat_gather::GatherError::Stun)?,
             None => {
                 eprintln!(
                     "[nat-switch] single STUN server; NAT-type detection skipped (nat_type=Unknown)"
                 );
-                self.gatherer
+                if !self.single_target_warned {
+                    self.single_target_warned = true;
+                    eprintln!(
+                        "[nat-stun] WARN: single_target; prediction unavailable (nat_type=unknown)"
+                    );
+                }
+                let m = self
+                    .gatherer
                     .stun_prober()
                     .probe_once(server1, nat_stun::STUN_PROBE_TIMEOUT)
-                    .map(|m| (m, nexus_domain::nat::NatType::Unknown))
+                    .map_err(nat_gather::GatherError::Stun)?;
+                (m, None, nexus_domain::nat::NatType::Unknown)
             }
         };
-        match probed {
-            Ok((mapping, nat_type)) => {
-                let sample = PortSample {
-                    port: mapping.public.port(),
-                    at_ms,
-                    target: server1,
-                    observed_from: mapping.local,
-                };
-                self.port_samples.push(sample);
-                if self.port_samples.len() > MAX_PORT_SAMPLES {
-                    let excess = self.port_samples.len() - MAX_PORT_SAMPLES;
-                    self.port_samples.drain(..excess);
-                }
-                // B14 fix: the TURN mapping flows through the gatherer.
-                // Composition-root assertion (spec §4.1 item 3): the
-                // TurnManager owns a separate UDP socket, never the punch
-                // driver socket, so turn_same_socket is false until a
-                // shared-socket TURN path exists. The gatherer therefore
-                // records srflx_turn as diagnostic here; the copy path is
-                // proven by nat_gather quadrant tests and activates if/when
-                // TURN shares the punch socket.
-                let turn_mapped = self.turn.mapped_addr();
-                self.gatherer.set_nat_type(nat_type);
-                let mut local = match self.gatherer.gather(
-                    turn_mapped,
-                    false,
-                    &mut self.port_samples,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!(
-                            "[nat-switch] WARN: candidate gather failed ({e}); keeping STUN-derived candidates"
-                        );
-                        LocalCandidates {
-                            host: nexusd::nat_switch::gather_host_candidates(&self._driver),
-                            srflx: None,
-                            srflx_stun: None,
-                            srflx_turn: turn_mapped,
-                            nat_type,
-                        }
-                    }
-                };
-                // STUN-derived values are primary; the gatherer copy (if any)
-                // agrees with them under same-socket+cone. Hosts always come
-                // from the G3 enumeration.
-                if local.srflx.is_none() {
-                    local.srflx = Some(mapping.public);
-                }
-                local.srflx_stun = Some(server1);
-                local.host = nexusd::nat_switch::gather_host_candidates(&self._driver);
-                local.nat_type = nat_type;
-                self.sw.set_local(local, self.port_samples.clone());
-                eprintln!(
-                    "[nat-switch] STUN sample: public={} nat_type={:?} samples={} (local={})",
-                    mapping.public,
-                    nat_type,
-                    self.port_samples.len(),
-                    mapping.local
-                );
-            }
-            Err(e) => eprintln!(
-                "[nat-switch] WARN: {}; keeping previous candidates",
-                nat_gather::GatherError::Stun(e)
-            ),
+        let after = *self._driver.shared().local_addr.lock().unwrap();
+        // INV-1: `probe_pair` reads `transport.local_addr()` once per probe, so
+        // comparing only before/after is not enough — both mappings must also
+        // carry the post-round driver address.
+        let both_same_driver = m2.as_ref().map(|m| m.local == m1.local).unwrap_or(true);
+        if before != after || m1.local != after || !both_same_driver {
+            eprintln!("[nat-stun] WARN: driver addr changed during probe; sample dropped");
+            return Ok(()); // drop the round, write no candidate
         }
+
+        let mut round = vec![PortSample {
+            port: m1.public.port(),
+            at_ms,
+            target: server1,
+            observed_from: m1.local,
+        }];
+        if let (Some(m2), Some(s2)) = (&m2, server2) {
+            round.push(PortSample {
+                port: m2.public.port(),
+                at_ms,
+                target: s2,
+                observed_from: m2.local,
+            });
+        }
+        for s in &round {
+            eprintln!(
+                "[nat-stun] sample port={} target={} observed_from={} nat={} age_ms=0",
+                s.port,
+                s.target,
+                s.observed_from,
+                nexusd::nat_status::nat_type_label(nat_type)
+            );
+        }
+        self.port_samples.extend(round);
+        if self.port_samples.len() > MAX_PORT_SAMPLES {
+            let excess = self.port_samples.len() - MAX_PORT_SAMPLES;
+            self.port_samples.drain(..excess);
+        }
+
+        // B14 fix: the TURN mapping flows through the gatherer.
+        // Composition-root assertion (spec §4.1 item 3): the TurnManager owns a
+        // separate UDP socket, never the punch driver socket, so
+        // turn_same_socket stays false until a shared-socket TURN path exists.
+        let turn_mapped = self.turn.mapped_addr();
+        self.gatherer.set_nat_type(nat_type);
+        let mut local = match self
+            .gatherer
+            .gather(turn_mapped, false, &mut self.port_samples)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "[nat-switch] WARN: candidate gather failed ({e}); keeping STUN-derived candidates"
+                );
+                LocalCandidates {
+                    host: nexusd::nat_switch::gather_host_candidates(&self._driver),
+                    srflx: None,
+                    srflx_stun: None,
+                    srflx_turn: turn_mapped,
+                    nat_type,
+                }
+            }
+        };
+        // INV-3: srflx is always the last round's s1 XOR-MAPPED (unconditional
+        // overwrite, not only when the gatherer left it empty).
+        local.srflx = Some(m1.public);
+        local.srflx_stun = Some(server1);
+        local.host = nexusd::nat_switch::gather_host_candidates(&self._driver);
+        local.nat_type = nat_type;
+        #[cfg(test)]
+        {
+            self.last_local = Some(local.clone());
+        }
+        self.sw.set_local(local, self.port_samples.clone());
+        eprintln!(
+            "[nat-switch] STUN sample: public={} nat_type={:?} samples={} (local={})",
+            m1.public,
+            nat_type,
+            self.port_samples.len(),
+            m1.local
+        );
+        Ok(())
+    }
+
+    /// Cold-start sampling: 3 rounds, one second apart, two targets per round.
+    /// Only a first-round failure stops the sequence (frozen S4); later
+    /// failures are logged and the next round still runs. Returns the number
+    /// of successful rounds.
+    fn bootstrap_samples(
+        &mut self,
+        s1: std::net::SocketAddr,
+        s2: Option<std::net::SocketAddr>,
+    ) -> u8 {
+        let mut ok = 0u8;
+        for round in 0..3u8 {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match self.sample_round(s1, s2) {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    eprintln!("[nat-switch] WARN: {e}; keeping previous candidates");
+                    if round == 0 {
+                        break;
+                    }
+                }
+            }
+            if round < 2 {
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+        }
+        ok
     }
 }
 
@@ -2254,6 +2380,22 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let punch_section = loaded.daemon.punch.clone();
     let identity_section = loaded.daemon.identity.clone();
     let turn_section = loaded.daemon.turn.clone();
+    // Initial TURN state row, before any worker exists (spec §4.10.4).
+    nexusd::nat_status::update_turn_status(
+        nexusd::nat_status::TurnManagerKind::WarmBackup,
+        match turn_section.as_ref() {
+            None => nexusd::nat_status::TurnManagerStatus {
+                health: nexusd::nat_status::TURN_HEALTH_UNCONFIGURED,
+                bind_addr: None,
+                last_error: None,
+            },
+            Some(section) => nexusd::nat_status::TurnManagerStatus {
+                health: nexusd::nat_status::TURN_HEALTH_ALLOCATING,
+                bind_addr: Some(section.bind_addr.clone()),
+                last_error: None,
+            },
+        },
+    );
     let nat_switch_handle = match turn_section.as_ref() {
         None => None,
         Some(section) => match (|| -> Result<Option<std::thread::JoinHandle<()>>, ExitCode> {
@@ -2321,6 +2463,22 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             Err(code) => return code,
         },
     };
+
+    // No worker started although TURN is configured (identity missing, driver
+    // bind failed, ...): the row is `not_started`, not `unconfigured`. The
+    // `is_some()` guard keeps the no-TURN case on `unconfigured`.
+    if let Some(section) = turn_section.as_ref() {
+        if nat_switch_handle.is_none() {
+            nexusd::nat_status::update_turn_status(
+                nexusd::nat_status::TurnManagerKind::WarmBackup,
+                nexusd::nat_status::TurnManagerStatus {
+                    health: nexusd::nat_status::TURN_HEALTH_NOT_STARTED,
+                    bind_addr: Some(section.bind_addr.clone()),
+                    last_error: None,
+                },
+            );
+        }
+    }
 
     // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();
@@ -3538,5 +3696,122 @@ mod reload_restore_tests {
             "file sha must match active sha after restore"
         );
         let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// F1 (P1-AC2 projection half): the production `sample_round` must project
+/// `srflx` from the last round's **s1** XOR-MAPPED, not s2 and not a gatherer
+/// leftover. Ports are deterministic via a shared sequential responder.
+#[cfg(test)]
+mod nat_sample_round_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+
+    use nexus_turn::stun::{Attribute, StunMessage};
+
+    use crate::nat_stun::{DriverStunTransport, StunProber};
+
+    fn spawn_stun_responder(counter: Arc<AtomicU16>) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind STUN responder");
+        let addr = socket.local_addr().expect("responder addr");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let Ok(request) = nexus_turn::stun::decode(&buf[..n]) else {
+                    continue;
+                };
+                if request.msg_type != 0x0001 {
+                    continue;
+                }
+                let port = counter.fetch_add(1, Ordering::SeqCst);
+                let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                let response = StunMessage {
+                    msg_type: 0x0101,
+                    txn: request.txn,
+                    attrs: vec![Attribute::XorMappedAddress(public)],
+                }
+                .encode();
+                let _ = socket.send_to(&response, from);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn sample_round_projects_last_s1_as_srflx() {
+        if UdpSocket::bind("127.0.0.1:0").is_err() {
+            eprintln!("SKIP: loopback UDP unavailable in this environment");
+            return;
+        }
+        let counter = Arc::new(AtomicU16::new(40_000));
+        let s1 = spawn_stun_responder(counter.clone());
+        let s2 = spawn_stun_responder(counter.clone());
+
+        let driver = Driver::new_client().expect("bind driver");
+        let transport = DriverStunTransport::new(driver.clone()).expect("install stun tap");
+        let gatherer = nat_gather::CandidateGatherer::new(
+            StunProber::new(Box::new(transport)),
+            "127.0.0.1:50000".parse().expect("gather bind"),
+        );
+        let candidates = LocalCandidates {
+            host: vec![],
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: nexus_domain::nat::NatType::Unknown,
+        };
+        let sw = nexusd::nat_switch::NatSwitching::new(
+            driver.clone(),
+            FabricPeerId([7; 32]),
+            candidates,
+            Vec::new(),
+            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+        );
+        let mut runtime = NatSwitchRuntime {
+            turn: nat_turn::TurnManager::new(None),
+            gatherer,
+            sw,
+            _driver: driver,
+            provider: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            port_samples: Vec::new(),
+            feed: None,
+            feed_interval: Duration::from_secs(60),
+            single_target_warned: false,
+            last_local: None,
+        };
+
+        for _ in 0..3 {
+            runtime.sample_round(s1, Some(s2)).expect("sample round");
+        }
+
+        let ports: Vec<u16> = runtime.port_samples.iter().map(|s| s.port).collect();
+        assert_eq!(
+            ports,
+            vec![40_000, 40_001, 40_002, 40_003, 40_004, 40_005],
+            "s1/s2 must be interleaved, two samples per round"
+        );
+        let targets: std::collections::HashSet<SocketAddr> =
+            runtime.port_samples.iter().map(|s| s.target).collect();
+        assert_eq!(targets.len(), 2, "two distinct STUN targets");
+        let observed = runtime.port_samples[0].observed_from;
+        assert!(
+            runtime
+                .port_samples
+                .iter()
+                .all(|s| s.observed_from == observed),
+            "one observed_from (the punch driver socket)"
+        );
+
+        let local = runtime.last_local.clone().expect("last_local captured");
+        assert_eq!(
+            local.srflx.map(|a| a.port()),
+            Some(40_004),
+            "INV-3: srflx must be the last round's s1 mapping, not s2 (40005)"
+        );
+        assert_eq!(local.srflx_stun, Some(s1));
+        assert_eq!(local.srflx_turn, None, "TurnManager(None) has no mapping");
+        runtime.sw.shutdown();
     }
 }
