@@ -107,6 +107,12 @@ pub fn assemble_n1_runtime(
     let addr = match addr_text.parse::<std::net::SocketAddr>() {
         Ok(addr) => addr,
         Err(e) => {
+            // M-4（review-r1）：§9 要求 `listen_addr` 格式非法时
+            // `CONFIG_INVALID` + exit 1，而本分支只降级为 `BindFailed`。
+            // **生产不可达**（防御性口径）：`parse_n1_section`（config.rs）
+            // 在启用时先校验该字段格式，解析失败 daemon 在装配前已 exit 1；
+            // 保留本分支只为非配置来源（测试/复用装配函数）的兜底，
+            // 不得读作第二条配置错误口径。
             eprintln!("[n1-listener] WARN: bind failed addr={addr_text} reason={e}");
             return handles(
                 None,
@@ -137,7 +143,11 @@ pub fn assemble_n1_runtime(
     let allowed_count = allowed.len();
     let stop = Arc::clone(&shutdown);
     let listener = match FabricN1Listener::bind(addr, &identity, allowed, stop) {
-        Ok(listener) => listener.with_stats(Arc::clone(&stats)),
+        Ok(listener) => listener
+            .with_stats(Arc::clone(&stats))
+            // M-5：接入会话表（只读）以便在 accept 侧发
+            // `[n1-listener] rejected peer=… reason=duplicate`；机制零改动。
+            .with_sessions(Arc::clone(&assembly.sessions)),
         Err(e) => {
             eprintln!("[n1-listener] WARN: bind failed addr={addr} reason={e}");
             return handles(

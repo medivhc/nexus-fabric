@@ -679,6 +679,10 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
     连上后一直静默到退出的流不会被计入——**只少计、不多计**，不要读作“全部连接成功数”。
   * `egress.bytes_to_local` 计 DATA 载荷**进入 relay 写路径**的字节；正常 socket
     缓冲下等于写入本地 socket，但部分写时两者不可区分，不是逐字节严格语义。
+  * `rx.rejected` 里也包含 **TLS 握手完成前死亡**的入站连接（含客户端中途断开、
+    网络抖动等非对抗原因；每连接至多计一次），且该部分只在 `accept_timeout`
+    超时轮询时并入——持续成功 accept 时会**延迟**呈现（不丢失）。不要把它
+    读作攻击/恶意连接计数。
   * **`recv_chunks == 0` 不表示没有数据到达**：`recv_chunks` 是 direct-conn chunk
     接收端专用（语义未变）。N1 投递看 `n1.rx.stream_frames` 与
     `n1.egress.bytes_to_local`，不要用 `recv_chunks` 证明 N1 送达。
