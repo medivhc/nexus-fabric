@@ -562,6 +562,61 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
   `apps/nexusd/tests/peer_source_discovery_production.rs`（daemon 二进制的无 IPv4 降级、
   默认 per-self book 可见性；非真机）。真机 AC2/AC3 证据归 evidence 阶段。
 
+#### 4.1.13 TURN 状态面判读（`connectivity/nat` 的 `turn` 块）
+
+`GET /localapi/v0/connectivity/nat` 的 `turn` 块有两个独立槽位：
+
+| 槽位 | 含义 |
+|---|---|
+| `turn.warm_backup` | NAT worker 自己的 TURN allocation，用于打洞的 warm backup；装配期必定发布 |
+| `turn.provider` | relay provider 的 TURN allocation，供 peer 经本机 relay 建连；`null` 表示未装配 provider |
+
+每个槽位是 `{health, bind_addr, last_error}`。**判断 TURN 健康只看 `turn.*.health`，不要看 `runtime`**：`runtime` 只表示 NAT 源是否在发布，`degraded`（例如 TURN bind 失败）时 `runtime` 仍可能是 `enabled`。
+
+**六个 `health` 值**
+
+| health | 含义 | 处置 |
+|---|---|---|
+| `unconfigured` | 没有 `[network.turn]` 配置 | 需要 TURN 时补配置并重启 |
+| `not_started` | 已配置，但 nat-switch 未启动（identity/network.toml/driver/tap/worker spawn 等前置失败） | 看同刻 stderr 的 WARN/ERROR 定位前置条件 |
+| `allocating` | 已启动，首次 Allocate 尚未完成（provider 槽位 attach 后的初始值也是它） | 观察数秒；长期停留说明分配未完成，查 TURN 服务端/网络 |
+| `active` | allocation 有效（分配成功或 Refresh 成功） | 正常 |
+| `degraded` | 分配/绑定失败，已回退 peer relay；`last_error` 给出原因 | 按 `last_error` 修配置或环境后重启 |
+| `expired` | 连续 3 次 Refresh 失败，allocation 已释放 | **终态，不会自愈，需重启 daemon** |
+
+`last_error` 仅在三值之一时非 `null`（且只出现在 `degraded`）：
+
+| last_error | 含义 |
+|---|---|
+| `bind_failed` | 本地 `bind_addr` 不可用（地址不可用 / 端口占用 / 权限 / 非法输入） |
+| `allocate_failed` | Allocate 本身的认证、超时或其他 TURN 侧失败 |
+| `server_invalid` | `[network.turn].server` 地址不可解析/非法 |
+
+**`bind_addr` 是配置原文**：端口写 `0` 表示交给内核分配，因此 JSON 里会一直显示 `:0`，它不是实际绑定端口。实际地址看 daemon 日志的 mapped 行，例如：
+
+```text
+[nat-switch] TURN allocation active: relayed=127.0.0.1:45396 mapped=203.0.113.7:41948 bind=127.0.0.2:0 refresh_in=65s
+```
+
+其中 `mapped=` 才是 TURN 服务端观测到的实际地址。
+
+**`provider: null` 的三义**（按启动路径区分）：
+
+1. `relay_provider_enabled = false`：provider 路径关闭，槽位永不写入；
+2. identity / seed 不可用而未 attach：例如缺少 `network.toml` 导致 N1 装配缺失（此时 `warm_backup` 通常是 `not_started`）；注意 `relay_provider_enabled = true` 但 `[network.identity].seed_file` 缺失/不匹配时 daemon 会 fail-closed 直接退出，根本不会返回 LocalAPI；
+3. 尚未走到装配：进程刚起步或 `turn.warm_backup` 也是 `null` 的单元测试直调场景。
+
+**`peers[].tunnel_proto` 语义**
+
+| tunnel_proto | 含义 |
+|---|---|
+| `direct` | 当前生产流量真实走 direct 路径（只在路径**实际切换/采纳**时写入） |
+| `turn` | 当前生产流量走 TURN relay |
+| `peer_relay` | 当前走其他 peer/mesh 提供的 relay |
+| `none` | 尚未有活动路径 |
+
+`Migrated` 只表示 direct 成为候选、PathManager 可能还没有切换，**此时 `tunnel_proto` 仍是 `turn`**；Migrated 不等于 direct。只有真实路径切换（`Switched`/`Adopted`）才写 `direct`。
+
 ### 4.2 Service
 
 #### 4.2.1 Service 资源生命周期
