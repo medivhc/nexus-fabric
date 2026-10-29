@@ -9,7 +9,7 @@ carrier = "n1-fabric"
 topology = "loopback：每轮新建两个本地 UDP echo（回 echo:+载荷并计实收）+ 本地 VLESS 节点（明文 TCP，只接受配置 UUID、flow 为空、command=UDP）+ 本地 AnyTLS 节点（TLS 自签，UoT v2 connect 模式，计 TLS 会话）；节点按目的地址计流数与经手数，回包改写为 node:+echo 回包"
 tun = "MockTun + 生产 Dataplane / ProxyEngine：源 A 向两个目的地址各发 2 个数据报，源 B 向第一个目的地址发 2 个"
 tproxy = "生产 StreamProxyEgress（TPROXY 前端代理出口）：客户端 A、C 发往第一个目的地址、B 发往第二个，各 2 个数据报"
-relay_gate = "节点在本轮全部数据报发出之前不中继：回包全部晚于发送，串流每次暴露；建流期间的数据报必经排队"
+relay_gate = "节点在本轮全部数据报发出之前不中继：回包全部晚于发送，串流每次暴露。闸门只扣住中继，不保证经过建流队列（队列由实现期测试守护）；闸门超时计 gate_timeouts（期望 0）"
 offline = "no public network; std::net + threads"
 # 夹具自检：crate 自带客户端（不经 nexusd）确认两个本地节点可用、VLESS 节点拒绝错误 UUID。
 # 夹具失败 → failed_step=fixture，不会误判为实现 FAIL。
@@ -53,6 +53,10 @@ equals = [4, 2]
 
 [[expect]]
 field = "vless.tun.ledger.bypassed"
+equals = 0
+
+[[expect]]
+field = "vless.tun.ledger.gate_timeouts"
 equals = 0
 
 [[expect]]
@@ -112,6 +116,10 @@ field = "vless.tproxy.ledger.bypassed"
 equals = 0
 
 [[expect]]
+field = "vless.tproxy.ledger.gate_timeouts"
+equals = 0
+
+[[expect]]
 field = "anytls.tun.replies_ok"
 equals = true
 
@@ -137,6 +145,10 @@ equals = [4, 2]
 
 [[expect]]
 field = "anytls.tun.ledger.bypassed"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.ledger.gate_timeouts"
 equals = 0
 
 [[expect]]
@@ -197,6 +209,10 @@ equals = [4, 2]
 
 [[expect]]
 field = "anytls.tproxy.ledger.bypassed"
+equals = 0
+
+[[expect]]
+field = "anytls.tproxy.ledger.gate_timeouts"
 equals = 0
 
 [[expect]]

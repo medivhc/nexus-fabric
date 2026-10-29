@@ -12,7 +12,8 @@
 //! - 两种节点都按目的地址记录打开的流与经手的数据报，并把回包改写为 `node:` + echo 回包——
 //!   绕过节点直发目的地的数据报拿不到 `node:` 前缀，也不会出现在节点计数里。
 //! - 节点在本轮全部数据报发出之前不中继（闸门）：所有回包都晚于所有发送，「回包发给最后一个
-//!   发送者」一类的串流每次都会暴露，建流期间到达的数据报也一定经过排队。
+//!   发送者」一类的串流每次都会暴露。闸门只扣住中继，不保证数据报经过建流队列；闸门超时计入
+//!   `gate_timeouts`，夹具故障不会伪装成实现 FAIL。
 //! - TUN 轮：MockTun + 生产 `Dataplane` / `ProxyEngine`。源 A 向两个目的地址各发 2 个数据报，
 //!   源 B 向第一个目的地址发 2 个：每个（源，目的地址）一条代理流，回包只回到发出它的源。
 //! - TPROXY 轮：生产 `StreamProxyEgress`，客户端 A、C 发往第一个目的地址、B 发往第二个，
@@ -61,6 +62,8 @@ struct NodeLog {
     rejected: usize,
     /// 闸门：为 `false` 时节点不中继（本轮数据报全部发出后由驱动打开）。
     relay_open: bool,
+    /// 闸门等待超时的次数（夹具故障；期望 0）。
+    gate_timeouts: usize,
 }
 
 /// 闸门已打开的节点记账（`--self-test` 用）。
@@ -129,6 +132,9 @@ fn relay_once(log: &SharedLog, target: SocketAddr, datagram: &[u8]) -> io::Resul
     let gate_deadline = Instant::now() + ROUND_DEADLINE;
     while !log.lock().map(|l| l.relay_open).unwrap_or(true) {
         if Instant::now() >= gate_deadline {
+            if let Ok(mut log) = log.lock() {
+                log.gate_timeouts += 1;
+            }
             return Err(io::Error::other("relay gate never opened"));
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -489,7 +495,7 @@ fn spawn_echoes() -> Result<Echoes, String> {
 /// 节点与 echo 的记账（每个目的地址）：流数、经节点数、echo 实收数、AnyTLS 会话数。
 fn ledger(log: &SharedLog, echoes: &Echoes) -> Value {
     std::thread::sleep(Duration::from_millis(100));
-    let (streams, relayed, sessions, rejected) = log
+    let (streams, relayed, sessions, rejected, gate_timeouts) = log
         .lock()
         .map(|l| {
             let per = |m: &HashMap<SocketAddr, usize>| -> Vec<usize> {
@@ -499,7 +505,13 @@ fn ledger(log: &SharedLog, echoes: &Echoes) -> Value {
                     .map(|a| m.get(a).copied().unwrap_or(0))
                     .collect()
             };
-            (per(&l.streams), per(&l.relayed), l.sessions, l.rejected)
+            (
+                per(&l.streams),
+                per(&l.relayed),
+                l.sessions,
+                l.rejected,
+                l.gate_timeouts,
+            )
         })
         .unwrap_or_default();
     let received: Vec<usize> = echoes
@@ -514,6 +526,7 @@ fn ledger(log: &SharedLog, echoes: &Echoes) -> Value {
         "bypassed": received.iter().zip(&relayed).map(|(r, v)| r.saturating_sub(*v)).sum::<usize>(),
         "anytls_sessions": sessions,
         "vless_rejected": rejected,
+        "gate_timeouts": gate_timeouts,
     })
 }
 
@@ -718,6 +731,7 @@ fn main() {
             && tun["ledger"]["relayed_per_destination"] == json!([4, 2])
             && tun["ledger"]["echo_received_per_destination"] == json!([4, 2])
             && tun["ledger"]["bypassed"] == 0
+            && tun["ledger"]["gate_timeouts"] == 0
             && sessions_ok(&tun, 3)
             && tun["udp_sent"] == 6
             && tun["udp_send_failed"] == 0
@@ -729,6 +743,7 @@ fn main() {
             && tproxy["ledger"]["relayed_per_destination"] == json!([4, 2])
             && tproxy["ledger"]["echo_received_per_destination"] == json!([4, 2])
             && tproxy["ledger"]["bypassed"] == 0
+            && tproxy["ledger"]["gate_timeouts"] == 0
             && sessions_ok(&tproxy, 3);
         report[kind] = json!({"tun": tun, "tproxy": tproxy});
     }
