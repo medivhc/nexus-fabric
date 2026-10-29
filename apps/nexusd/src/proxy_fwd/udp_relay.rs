@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn vless_and_anytls_udp_fail_closed_with_per_protocol_counters() {
+    fn not_wired_udp_capability_fails_closed_with_per_protocol_counters() {
         struct NotWiredDialer {
             kind: OutboundKind,
             tag: &'static str,

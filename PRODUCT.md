@@ -1167,33 +1167,52 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   （两前端共用 `proxy_fwd::udp_relay::UdpForwarder`）。TLS Trojan、未接线的 Hysteria2 / VMess
   不变：仍 `Unsupported`，丢包 + 计数 + 限频日志，绝不直连、不伪造回包。`nexus proxy`
   （frozen）不涉及。
-- **承载**：每个（出站，UDP 目的地址）一条代理流，传输参数与该出站的 TCP 拨号相同：
-  - `vless`：VLESS 请求 `command = UDP (0x02)`、目标 = 目的地址、不带 flow（Vision 不用于
-    UDP）；读到响应头后，数据报按 u16 大端长度前缀成帧（crate `encode_udp_datagram`）。
-  - `anytls`：新 AnyTLS 会话上开一条 UoT v2 connect 模式 stream（魔法地址
-    `sp.v2.udp-over-tcp.arpa`，目标 = 目的地址；crate `client_open_uot_stream`），数据报按
-    u16 长度前缀成帧放入 PSH（crate `encode_uot_datagram`）。
-- **生命周期**：
-  - 目的地址的第一个数据报触发建流；建流在 dataplane 线程之外进行，不阻塞其他流。
-  - 建流期间到达的数据报按序排队，每个目的地址最多 64 个；超出的丢弃并计 `udp_send_failed`。
-  - 建流失败 → 已排队的数据报丢弃，每个计一次 `udp_send_failed`，并打一条限频日志；下一个
-    数据报重新建流，但与上次失败至少间隔 1 s，间隔内的数据报丢弃并计数。
-  - 空闲 60 s（既有 `UDP_FLOW_TIMEOUT`）关闭代理流并回收其读线程；对端关闭或出错同样关闭
-    回收，下一个数据报重新建流。
-  - 每个 forwarder 同时存在的代理流上限 1024（既有 `MAX_UDP_FLOWS`）；超出时新目的地址的
-    数据报丢弃并计 `udp_send_failed`。
-- **回包**：代理流读出的每个数据报作为来自该目的地址的回包写回（TUN：重构 IPv4/UDP 包，
-  源 = 目的地址；TPROXY：经 §11.18「UDP 回包源地址」以 `orig_dst` 发出）。
+- **承载**：每个（出站，本地源地址，UDP 目的地址）一条代理流（流键；本地源 = TUN 内层源
+  IP:端口 / TPROXY 客户端地址）。两个本地 socket 发往同一目的地址各开一条流，回包只回到打开它
+  的那个源，绝不串流。传输参数与该出站的 TCP 拨号相同：
+  - `vless`：VLESS 请求 `command = UDP (0x02)`、目标 = 目的地址、配置的 UUID、不带 flow
+    （Vision 不用于 UDP）；读到响应头后，数据报按 u16 大端长度前缀成帧（crate
+    `encode_udp_datagram`）。
+  - `anytls`：每条代理流一个新 AnyTLS 会话（不复用、不池化），会话上开一条 UoT v2 connect
+    模式 stream（魔法地址 `sp.v2.udp-over-tcp.arpa`，目标 = 目的地址；crate
+    `client_open_uot_stream`），数据报按 u16 长度前缀成帧放入 PSH（crate `encode_uot_datagram`）。
+  - 数据报只经代理流到达目的地址：任何情况下都不从本机直接发往目的地址。
+- **生命周期**（以下"每条流"均指每个流键）：
+  - 流键的第一个数据报触发建流；建流在 dataplane 线程之外进行，不阻塞其他流。
+  - 建流期间到达的数据报按序排队，每条流最多 64 个；超出的丢弃并计 `udp_send_failed`。
+  - 建流失败 → 已排队的数据报丢弃，每个计一次 `udp_send_failed`，并打一条限频日志
+    `[proxy-fwd] event=udp_stream_open_failed kind=<vless|anytls> tag=<tag> cause=<cause> suppressed=<n>`
+    （每 `(tag, cause)` 首次与之后每 10 s 至多一条，`suppressed` 为期间被抑制的条数；与
+    `event=udp_unsupported` 同一限频语义）；该流键的下一个数据报重新建流，但与上次失败至少
+    间隔 1 s，间隔内的数据报丢弃并计数。
+  - 空闲 60 s（既有 `UDP_FLOW_TIMEOUT`；任一方向——发出的数据报或收到的回包——都刷新空闲
+    计时）关闭代理流并回收（join）其读线程；对端关闭或出错同样关闭回收，下一个数据报重新建流。
+  - 每个 forwarder 同时存在的代理流上限 1024（既有 `MAX_UDP_FLOWS`）；超出时新流键的数据报
+    丢弃并计 `udp_send_failed`，不驱逐既有流。
+- **回包**：代理流读出的每个数据报作为来自该目的地址、发往该流键本地源的回包写回（TUN：重构
+  IPv4/UDP 包，源 = 目的地址、目的 = 本地源；TPROXY：经 §11.18「UDP 回包源地址」以
+  `orig_dst` 发回该客户端）。
 - **计数**：写入代理流的数据报计 `udp_sent`；vless / anytls 不再计
-  `udp_unsupported{,_vless,_anytls}`（两字段保留，恒为 0）。
-- **不做**：XUDP / mux、UDP over Vision、FullCone 语义（每个目的地址独立一条流，不承诺共享
+  `udp_unsupported{,_vless,_anytls}`（两字段保留，恒为 0）。TPROXY 前端：数据报写入或进入
+  建流队列时 `send_udp` 返回 `Ok`（之后才能把该 flow 记入透明流表、回包才能路由）；被丢弃
+  （队列满、建流失败、重试间隔内、超上限）时返回 `Err`，计入既有 TPROXY 计数
+  `upstream_failed` 与 `udp_dropped`。
+- **不做**：XUDP / mux、UDP over Vision、FullCone 语义（每个流键独立一条流，不承诺共享
   源端口）、Hysteria2 / Trojan UDP。
-- **E4 场景**：`scenarios/product/proxy_fwd_udp_vless_anytls.toml`（`carrier = "n1-fabric"`）——
-  本地 VLESS（明文）与 AnyTLS（TLS 自签）节点把 UDP 中继到两个本地 UDP echo：
-  - TUN 轮（MockTun + 生产 `Dataplane` / `ProxyEngine`）：每协议向两个目的地址各发 2 个数据报，
-    断言 4 个回包源地址与载荷正确、节点上每个目的地址恰好 1 条流、`udp_sent = 4`、
-    `udp_unsupported = 0`、无直连。
-  - TPROXY 轮（生产 `StreamProxyEgress`）：每协议 2 个数据报，经 `UdpReply` 回到同一 flow key。
+- **E4 场景**：`scenarios/product/proxy_fwd_udp_vless_anytls.toml`（`carrier = "n1-fabric"`；
+  `[given].fixture` 先跑 `--self-test`，用 crate 自带客户端确认两个本地节点可用、VLESS 节点
+  拒绝错误 UUID）——本地 VLESS（明文）与 AnyTLS（TLS 自签）节点把 UDP 中继到本轮新建的两个
+  本地 UDP echo。节点只接受配置的凭据（VLESS 还要求 `flow` 为空、`command = UDP`），按目的
+  地址记录打开的流与经手的数据报，并把回包改写为 `node:` + echo 回包；echo 记录实收数据报。
+  绕过节点直发的数据报因此既拿不到 `node:` 前缀，也会让 echo 实收数大于节点经手数（`bypassed`）：
+  - TUN 轮（MockTun + 生产 `Dataplane` / `ProxyEngine`）：源 A 向两个目的地址各发 2 个数据报，
+    源 B 向第一个目的地址发 2 个。断言 6 个回包各自回到发出它的源、源地址与载荷正确，收齐后
+    再排空 200 ms 无多余回包；节点上每目的地址的流数 `[2, 1]`、经手数与 echo 实收数均为
+    `[4, 2]`、`bypassed = 0`；AnyTLS 会话数 3；`udp_sent = 6`，`udp_send_failed`、
+    `udp_unsupported{,_vless,_anytls}`、`proxy_dropped_no_proxy`、`direct_forwarded` 均为 0。
+  - TPROXY 轮（生产 `StreamProxyEgress`）：两个 flow（不同客户端、不同目的地址）各 2 个
+    数据报，`send_udp` 全部 `Ok`，4 个回包经 `UdpReply` 回到各自 flow key、无多余回包；节点
+    流数 `[1, 1]`、经手数 `[2, 2]`、`bypassed = 0`；AnyTLS 会话数 2。
   - `product.proxy-fwd-udp-unsupported` 同步改为只覆盖 TLS Trojan（删除其 VLESS / AnyTLS 期望）。
   - 旧实现两协议 UDP 全部丢弃 → FAIL（Red Evidence）。
 

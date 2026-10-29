@@ -461,9 +461,12 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   - 解析 IP/UDP 头 → `dialer.udp_capability()` 分派 → `UdpMode` 承载：
     SOCKS5 = `Socks5Associate`；SS = `ShadowsocksAead`（仍由 `ss_std::SsUdp` 承载，
     删除门归 fixes-6）；VLESS = `VlessOverTcp`、AnyTLS = `AnytlsUot`（PRODUCT §11.18.1，
-    2026-10-28：每个目的地址一条代理流，建流在 dataplane 线程外、每目的地址排队 ≤ 64、
-    失败后重试间隔 ≥ 1 s、空闲 60 s 回收并 join 读线程、上限 1024 条）；Trojan（恒 TLS）=
-    `Unsupported{TlsVariantNotSupported}`；
+    2026-10-28：每个（出站，本地源，目的地址）一条代理流，回包只回到该本地源；AnyTLS 每条
+    流一个新会话；建流在 dataplane 线程外、每条流排队 ≤ 64、失败计 `udp_send_failed` 并打
+    `event=udp_stream_open_failed`（每 `(tag,cause)` 10 s 限频）、失败后重试间隔 ≥ 1 s、
+    任一方向空闲 60 s 回收并 join 读线程、上限 1024 条且不驱逐；绝不直发目的地址；TPROXY
+    `send_udp` 写入或入队即 `Ok`，丢弃即 `Err`（计 `upstream_failed` + `udp_dropped`））；
+    Trojan（恒 TLS）= `Unsupported{TlsVariantNotSupported}`；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
   - `Unsupported` → 丢包 + `udp_send_failed`/`udp_unsupported*` 计数 +
     每 `(kind,tag)` 首次与每 10 s 一条限频日志，**绝不直连**；

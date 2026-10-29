@@ -1,19 +1,24 @@
 schema_version = 1
 id = "product.proxy-fwd-udp-vless-anytls"
-title = "nexusd 代理 UDP：VLESS / AnyTLS 出站经 TUN 与 TPROXY 转发 UDP（每目的地址一条代理流）"
+title = "nexusd 代理 UDP：VLESS / AnyTLS 出站经 TUN 与 TPROXY 转发 UDP（每（本地源，目的地址）一条代理流）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-proxy-udp"
 carrier = "n1-fabric"
 
 [given]
-topology = "loopback：两个本地 UDP echo（回 echo:+载荷）+ 本地 VLESS 节点（明文 TCP，只接受 command=UDP）+ 本地 AnyTLS 节点（TLS 自签，UoT v2 connect 模式）"
-tun = "MockTun + 生产 Dataplane / ProxyEngine：每协议向两个目的地址各发 2 个数据报"
-tproxy = "生产 StreamProxyEgress（TPROXY 前端代理出口）：每协议同一 flow key 2 个数据报"
-fixture_check = "同一 example 的 --self-test 用 crate 自带客户端（不经 nexusd）验证两个本地节点"
+topology = "loopback：每轮新建两个本地 UDP echo（回 echo:+载荷并计实收）+ 本地 VLESS 节点（明文 TCP，只接受配置 UUID、flow 为空、command=UDP）+ 本地 AnyTLS 节点（TLS 自签，UoT v2 connect 模式，计 TLS 会话）；节点按目的地址计流数与经手数，回包改写为 node:+echo 回包"
+tun = "MockTun + 生产 Dataplane / ProxyEngine：源 A 向两个目的地址各发 2 个数据报，源 B 向第一个目的地址发 2 个"
+tproxy = "生产 StreamProxyEgress（TPROXY 前端代理出口）：两个 flow（不同客户端、不同目的地址）各 2 个数据报"
 offline = "no public network; std::net + threads"
+# 夹具自检：crate 自带客户端（不经 nexusd）确认两个本地节点可用、VLESS 节点拒绝错误 UUID。
+# 夹具失败 → failed_step=fixture，不会误判为实现 FAIL。
+fixture = [
+  "cargo run --quiet -p nexusd --example proxy_fwd_udp_vless_anytls -- --self-test",
+]
 
 # 可执行 E4（PRODUCT §11.18.1）。旧实现 vless / anytls 的 UDP 为 Unsupported{NotWired}，
 # 全部丢弃并计 udp_unsupported → verdict FAIL（Red Evidence）。
+# bypassed = echo 实收 − 节点经手：绕过节点直发目的地址的数据报在此暴露。
 [when]
 command = "cargo run --quiet -p nexusd --example proxy_fwd_udp_vless_anytls -- --json"
 
@@ -26,15 +31,47 @@ field = "vless.tun.replies_ok"
 equals = true
 
 [[expect]]
-field = "vless.tun.one_stream_per_destination"
-equals = true
+field = "vless.tun.missing_replies"
+equals = 0
+
+[[expect]]
+field = "vless.tun.unexpected_replies"
+equals = 0
+
+[[expect]]
+field = "vless.tun.ledger.streams_per_destination"
+equals = [2, 1]
+
+[[expect]]
+field = "vless.tun.ledger.relayed_per_destination"
+equals = [4, 2]
+
+[[expect]]
+field = "vless.tun.ledger.echo_received_per_destination"
+equals = [4, 2]
+
+[[expect]]
+field = "vless.tun.ledger.bypassed"
+equals = 0
 
 [[expect]]
 field = "vless.tun.udp_sent"
-equals = 4
+equals = 6
+
+[[expect]]
+field = "vless.tun.udp_send_failed"
+equals = 0
 
 [[expect]]
 field = "vless.tun.udp_unsupported"
+equals = 0
+
+[[expect]]
+field = "vless.tun.udp_unsupported_vless"
+equals = 0
+
+[[expect]]
+field = "vless.tun.proxy_dropped_no_proxy"
 equals = 0
 
 [[expect]]
@@ -46,23 +83,83 @@ field = "vless.tproxy.replies_ok"
 equals = true
 
 [[expect]]
-field = "vless.tproxy.one_stream_per_destination"
-equals = true
+field = "vless.tproxy.missing_replies"
+equals = 0
+
+[[expect]]
+field = "vless.tproxy.unexpected_replies"
+equals = 0
+
+[[expect]]
+field = "vless.tproxy.send_errors"
+equals = 0
+
+[[expect]]
+field = "vless.tproxy.ledger.streams_per_destination"
+equals = [1, 1]
+
+[[expect]]
+field = "vless.tproxy.ledger.relayed_per_destination"
+equals = [2, 2]
+
+[[expect]]
+field = "vless.tproxy.ledger.echo_received_per_destination"
+equals = [2, 2]
+
+[[expect]]
+field = "vless.tproxy.ledger.bypassed"
+equals = 0
 
 [[expect]]
 field = "anytls.tun.replies_ok"
 equals = true
 
 [[expect]]
-field = "anytls.tun.one_stream_per_destination"
-equals = true
+field = "anytls.tun.missing_replies"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.unexpected_replies"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.ledger.streams_per_destination"
+equals = [2, 1]
+
+[[expect]]
+field = "anytls.tun.ledger.relayed_per_destination"
+equals = [4, 2]
+
+[[expect]]
+field = "anytls.tun.ledger.echo_received_per_destination"
+equals = [4, 2]
+
+[[expect]]
+field = "anytls.tun.ledger.bypassed"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.ledger.anytls_sessions"
+equals = 3
 
 [[expect]]
 field = "anytls.tun.udp_sent"
-equals = 4
+equals = 6
+
+[[expect]]
+field = "anytls.tun.udp_send_failed"
+equals = 0
 
 [[expect]]
 field = "anytls.tun.udp_unsupported"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.udp_unsupported_anytls"
+equals = 0
+
+[[expect]]
+field = "anytls.tun.proxy_dropped_no_proxy"
 equals = 0
 
 [[expect]]
@@ -74,5 +171,33 @@ field = "anytls.tproxy.replies_ok"
 equals = true
 
 [[expect]]
-field = "anytls.tproxy.one_stream_per_destination"
-equals = true
+field = "anytls.tproxy.missing_replies"
+equals = 0
+
+[[expect]]
+field = "anytls.tproxy.unexpected_replies"
+equals = 0
+
+[[expect]]
+field = "anytls.tproxy.send_errors"
+equals = 0
+
+[[expect]]
+field = "anytls.tproxy.ledger.streams_per_destination"
+equals = [1, 1]
+
+[[expect]]
+field = "anytls.tproxy.ledger.relayed_per_destination"
+equals = [2, 2]
+
+[[expect]]
+field = "anytls.tproxy.ledger.echo_received_per_destination"
+equals = [2, 2]
+
+[[expect]]
+field = "anytls.tproxy.ledger.bypassed"
+equals = 0
+
+[[expect]]
+field = "anytls.tproxy.ledger.anytls_sessions"
+equals = 2
