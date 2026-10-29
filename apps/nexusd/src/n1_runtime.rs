@@ -54,8 +54,20 @@ pub enum N1InboundReject {
     ConnClosed,
 }
 
-/// N1 计数（spec §5.6/§7）。WP1 落 rejected 大类，WP3 增补 rx 侧字段；
-/// WP4/WP6 增补 dispatch/egress/tx 与 `/localapi/v0/n1/stats` 序列化。
+/// 消费侧分派目标（spec §5.6/§7）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N1DispatchTarget {
+    /// 本节点发起的流：回程帧注入 TCP 终结器。
+    Terminator,
+    /// 对端发起的流：本节点是 egress，交 relay。
+    Relay,
+    /// terminator 与 relay 都不认识该流。
+    Unknown,
+}
+
+/// N1 计数（spec §5.6/§7）。WP1 落 rejected 大类，WP3 增补 rx 侧字段，
+/// WP4 增补 dispatch/tx 消费侧字段；WP6 增补 egress 与
+/// `/localapi/v0/n1/stats` 序列化。
 #[derive(Debug, Default)]
 pub struct N1Stats {
     rx_datagrams: AtomicU64,
@@ -68,6 +80,12 @@ pub struct N1Stats {
     rx_ambiguous: AtomicU64,
     rx_conn_closed: AtomicU64,
     rx_transient_errors: AtomicU64,
+    dispatch_to_terminator: AtomicU64,
+    dispatch_to_relay: AtomicU64,
+    dispatch_bad_frame: AtomicU64,
+    dispatch_unknown_stream: AtomicU64,
+    tx_frames: AtomicU64,
+    tx_errors: AtomicU64,
 }
 
 /// `N1Stats` 的快照（字段名与 §5.6 的 rx 侧点路径对齐）。
@@ -83,6 +101,12 @@ pub struct N1StatsSnapshot {
     pub rx_ambiguous: u64,
     pub rx_conn_closed: u64,
     pub rx_transient_errors: u64,
+    pub dispatch_to_terminator: u64,
+    pub dispatch_to_relay: u64,
+    pub dispatch_bad_frame: u64,
+    pub dispatch_unknown_stream: u64,
+    pub tx_frames: u64,
+    pub tx_errors: u64,
 }
 
 impl N1Stats {
@@ -98,6 +122,12 @@ impl N1Stats {
             rx_ambiguous: self.rx_ambiguous.load(Ordering::Relaxed),
             rx_conn_closed: self.rx_conn_closed.load(Ordering::Relaxed),
             rx_transient_errors: self.rx_transient_errors.load(Ordering::Relaxed),
+            dispatch_to_terminator: self.dispatch_to_terminator.load(Ordering::Relaxed),
+            dispatch_to_relay: self.dispatch_to_relay.load(Ordering::Relaxed),
+            dispatch_bad_frame: self.dispatch_bad_frame.load(Ordering::Relaxed),
+            dispatch_unknown_stream: self.dispatch_unknown_stream.load(Ordering::Relaxed),
+            tx_frames: self.tx_frames.load(Ordering::Relaxed),
+            tx_errors: self.tx_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -146,6 +176,36 @@ impl N1Stats {
     /// reader 侧 transient 读取错误（10ms 续读，不算 rejected）。
     pub fn record_rx_transient_error(&self) {
         self.rx_transient_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `dispatch.to_terminator / to_relay / unknown_stream`（§5.6 消费侧）。
+    pub fn record_dispatch(&self, target: N1DispatchTarget) {
+        let counter = match target {
+            N1DispatchTarget::Terminator => &self.dispatch_to_terminator,
+            N1DispatchTarget::Relay => &self.dispatch_to_relay,
+            N1DispatchTarget::Unknown => &self.dispatch_unknown_stream,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `dispatch.bad_frame`：`decode_stream_frame` 失败（§6.1 `BadFrame`）。
+    ///
+    /// 与 `dispatch.to_*` 互斥：坏帧不进任何一路，也不计 `rx.rejected`
+    ///（§6.1 只要求 `dispatch.bad_frame`）。
+    pub fn record_dispatch_bad_frame(&self) {
+        self.dispatch_bad_frame.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `tx.frames / tx.errors`：回程 STREAM 帧（§5.6）。
+    ///
+    /// `bytes` 只作日志/未来扩展用；§5.6 不定义 `tx.bytes` 字段。
+    pub fn record_tx(&self, bytes: usize, ok: bool) {
+        let _ = bytes;
+        if ok {
+            self.tx_frames.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

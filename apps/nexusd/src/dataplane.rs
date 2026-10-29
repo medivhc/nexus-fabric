@@ -23,6 +23,7 @@ use nexus_flow_session::{
     ChainDeps, ConnectivityEstablisher, FlowDecision, FlowKey, FlowSignal, IpProto, SessionManager,
     SessionManagerConfig,
 };
+use nexus_network::n1::N1Connection;
 use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_platform::{AcceptedTcpStream, ReceivedDatagram, TransparentIngressError};
@@ -33,8 +34,8 @@ use nexus_projection::dns::{DEFAULT_DNS_CACHE_ENTRIES, DnsCache};
 use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
 use nexus_projection::routing::IpCidr;
 use nexus_projection::tcp::{
-    FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
-    decode_stream_frame, encode_stream_frame, encode_syn_payload,
+    FourTuple, RelayEvent, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats,
+    TcpTerminator, decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
 use nexus_projection::transparent::direct::{DirectEgressConfig, DirectTcpEvent, DirectTcpRelay};
 use nexus_projection::transparent::runtime::{TransparentFailureKind, TransparentPipeline};
@@ -52,6 +53,41 @@ pub use chain_wiring::{
 use nexus_projection::transparent::decision::{
     CachedDecision, FlowDecisionCache, FlowDecisionCacheStats, FlowDecisionKey, Frontend,
 };
+
+/// 回程帧走哪条传输（spec §7）：
+///
+/// - `N1`：N1 入站帧 → 同一 N1 conn 的 datagram；
+/// - `Direct`：direct N1 chunk 入站 → 同一 NAT direct 路径的 chunk，N1 仅作
+///   fallback（`n1_peer_conns` 里该 peer 的 conn，没有则丢 + `tx.errors`）。
+#[derive(Clone)]
+pub enum ReplySink {
+    N1(Arc<dyn N1Connection>),
+    Direct(nexus_fabric::PeerId),
+}
+
+/// egress relay 的分派接口（spec §5.5/§7）。
+///
+/// WP4 只定版接口与分派走向；真实 `TcpRelay` 由 WP5 通过
+/// [`Dataplane::set_n1_relay`] 装入。`Err(N1RelayError::UnknownStream)` 表示
+/// relay 不拥有该流（spec §6.1 `UnknownStream`），分派侧计
+/// `dispatch.unknown_stream` 并丢弃。
+pub trait N1EgressRelay: Send {
+    /// 处理一条入站 STREAM 帧；成功返回需立即编码回程的事件（§5.5 第 2 步）。
+    fn handle_frame(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        from_peer: &str,
+    ) -> Result<Vec<RelayEvent>, N1RelayError>;
+}
+
+/// egress relay 的失败分类（spec §6.2；不新增 wire 变体）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N1RelayError {
+    /// terminator 与 relay 都不认识该 stream（`tcp.rs` unknown 分支）。
+    UnknownStream,
+}
 
 /// TPROXY 跨线程消息（spec §9.14）。
 #[derive(Debug)]
@@ -415,6 +451,16 @@ pub struct Dataplane {
     chunk_stats: Arc<crate::nat_chunk_stats::ChunkStats>,
     /// Inbound direct chunks produced by the receiver thread.
     nat_inbound_rx: Option<std::sync::mpsc::Receiver<crate::nat_chunk_recv::NatInboundChunk>>,
+    /// WP4 N1 入站队列（`ConnUp/ConnDown/RawIp/Stream`；spec §5.5）。
+    n1_inbound_rx: Option<std::sync::mpsc::Receiver<crate::n1_runtime::N1Inbound>>,
+    /// N1 计数（rx 侧由 WP3 写；dispatch/tx 由本段写）。
+    n1_stats: Arc<crate::n1_runtime::N1Stats>,
+    /// egress relay 分派接口（真实 `TcpRelay` 由 WP5 装入）。
+    n1_relay: Option<Box<dyn N1EgressRelay>>,
+    /// peer hex → N1 conn（direct 回程的 fallback；spec §5.5）。
+    n1_peer_conns: HashMap<String, Arc<dyn N1Connection>>,
+    /// unknown-stream 日志限频（首条立即，其后 10s；spec §6.1）。
+    n1_dispatch_log: crate::log_throttle::KeyedLogThrottle,
     /// AC-H-1 `[P]`: the one-time `[nat-consumer] handle not attached` notice
     /// has been emitted (spec §13.2).
     nat_not_attached_logged: AtomicBool,
@@ -572,6 +618,11 @@ impl Dataplane {
             direct_gate: None,
             chunk_stats: Arc::new(crate::nat_chunk_stats::ChunkStats::default()),
             nat_inbound_rx: None,
+            n1_inbound_rx: None,
+            n1_stats: Arc::new(crate::n1_runtime::N1Stats::default()),
+            n1_relay: None,
+            n1_peer_conns: HashMap::new(),
+            n1_dispatch_log: crate::log_throttle::KeyedLogThrottle::new(),
             nat_not_attached_logged: AtomicBool::new(false),
         })
     }
@@ -614,10 +665,13 @@ impl Dataplane {
         self.chunk_stats = stats;
     }
 
-    /// Drain direct chunks into the TCP terminator. Called once per dataplane
-    /// loop iteration (never inside `process_one`, so the proxy branch is
-    /// untouched). Malformed frames are counted by the existing `dropped`
-    /// counter; this never panics.
+    /// Drain direct chunks into the unified dispatch (ERRATA-2 / spec §5.5).
+    ///
+    /// Direct chunks use [`ReplySink::Direct`]; the originator/relay decision is
+    /// the same code path as N1 inbound (`dispatch_inbound_stream`). Called once
+    /// per dataplane loop iteration (never inside `process_one`, so the proxy
+    /// branch is untouched). Malformed frames are counted by the dispatch
+    /// counters; this never panics.
     pub fn pump_nat_inbound(&mut self) {
         let Some(rx) = self.nat_inbound_rx.take() else {
             return;
@@ -626,13 +680,233 @@ impl Dataplane {
             match rx.try_recv() {
                 Ok(chunk) => {
                     let peer = crate::nat_consumer::peer_hex(&chunk.peer);
-                    self.inject_stream_frame_from_n1(&peer, &chunk.stream_frame);
+                    self.dispatch_inbound_stream(
+                        &peer,
+                        ReplySink::Direct(chunk.peer),
+                        &chunk.stream_frame,
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
         self.nat_inbound_rx = Some(rx);
+    }
+
+    // ---- WP4 N1 inbound consumer (spec §5.5) ----
+
+    /// Inject the N1 inbound queue (WP3's supervisor owns the sender).
+    pub fn set_n1_inbound_rx(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<crate::n1_runtime::N1Inbound>,
+    ) {
+        self.n1_inbound_rx = Some(rx);
+    }
+
+    /// Share the composition root's N1 counters (`rx` written by WP3,
+    /// dispatch/tx written here).
+    pub fn set_n1_stats(&mut self, stats: Arc<crate::n1_runtime::N1Stats>) {
+        self.n1_stats = stats;
+    }
+
+    /// Install the egress relay dispatch interface (WP5 installs `TcpRelay`).
+    pub fn set_n1_relay(&mut self, relay: Box<dyn N1EgressRelay>) {
+        self.n1_relay = Some(relay);
+    }
+
+    /// Drain the N1 inbound queue (spec §5.5；调用点是 `run_dataplane` 循环
+    /// `pump_nat_inbound` 紧邻处)。
+    ///
+    /// `Disconnected` 是「N1 未启用 / 已停机」的常态（WP3：disabled 路径不
+    /// spawn supervisor，发送端不存在）：不报错、不刷日志、不计拒绝。
+    pub fn pump_n1_inbound(&mut self) {
+        let Some(rx) = self.n1_inbound_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(crate::n1_runtime::N1Inbound::ConnUp { peer, conn }) => {
+                    self.n1_peer_conns.insert(peer.to_hex(), conn);
+                }
+                Ok(crate::n1_runtime::N1Inbound::ConnDown { peer }) => {
+                    self.n1_peer_conns.remove(&peer.to_hex());
+                }
+                Ok(crate::n1_runtime::N1Inbound::RawIp { packet, .. }) => {
+                    self.inject_from_n1(&packet);
+                }
+                Ok(crate::n1_runtime::N1Inbound::Stream { peer, conn, frame }) => {
+                    let peer_hex = peer.to_hex();
+                    self.dispatch_inbound_stream(&peer_hex, ReplySink::N1(conn), &frame);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        self.n1_inbound_rx = Some(rx);
+    }
+
+    /// Unified inbound STREAM dispatch (spec §5.5)：originator 判定用
+    /// [`TcpTerminator::peer_for`]，否则交 egress relay。
+    fn dispatch_inbound_stream(&mut self, peer_hex: &str, sink: ReplySink, frame: &[u8]) {
+        let Some((stream_id, flags, payload)) = decode_stream_frame(frame) else {
+            self.n1_stats.record_dispatch_bad_frame();
+            self.log_n1_dispatch_throttled("bad_frame", peer_hex, 0, frame.len());
+            return;
+        };
+
+        if self.tcp.peer_for(stream_id).is_some() {
+            self.n1_stats
+                .record_dispatch(crate::n1_runtime::N1DispatchTarget::Terminator);
+            // 既有注入函数（spec §5.5；不通过 relay 的 originator 回程）。
+            self.inject_stream_frame_from_n1(peer_hex, frame);
+            return;
+        }
+
+        let Some(relay) = self.n1_relay.as_mut() else {
+            // WP5 之前没有 egress relay：该流既不是本节点的 originator，
+            // 也没有 relay 能消费 → 计入 unknown_stream（不静默吞掉）。
+            self.n1_stats
+                .record_dispatch(crate::n1_runtime::N1DispatchTarget::Unknown);
+            self.log_n1_dispatch_throttled("unknown_stream", peer_hex, stream_id, frame.len());
+            return;
+        };
+
+        match relay.handle_frame(stream_id, flags, payload, peer_hex) {
+            Ok(events) => {
+                self.n1_stats
+                    .record_dispatch(crate::n1_runtime::N1DispatchTarget::Relay);
+                for event in events {
+                    let reply = match event {
+                        RelayEvent::Data {
+                            stream_id, bytes, ..
+                        } => encode_stream_frame(stream_id, 0x00, &bytes),
+                        RelayEvent::Closed {
+                            stream_id, reset, ..
+                        } => {
+                            let flags = if reset { STREAM_RST } else { STREAM_FIN };
+                            encode_stream_frame(stream_id, flags, &[])
+                        }
+                    };
+                    self.send_reply(&sink, peer_hex, &reply);
+                }
+            }
+            Err(N1RelayError::UnknownStream) => {
+                self.n1_stats
+                    .record_dispatch(crate::n1_runtime::N1DispatchTarget::Unknown);
+                self.log_n1_dispatch_throttled("unknown_stream", peer_hex, stream_id, frame.len());
+            }
+        }
+    }
+
+    /// Reply to an inbound STREAM frame (spec §5.5 第 3 步)。
+    ///
+    /// `Direct` 的 N1 fallback **不带** `CHUNK_KIND_TUN_STREAM`：KIND 是
+    /// direct chunk 的本地前缀，进 N1 wire 会破坏 P0 AC-C-4 的逐字节不变。
+    fn send_reply(&mut self, sink: &ReplySink, peer_hex: &str, frame: &[u8]) {
+        match sink {
+            ReplySink::N1(conn) => {
+                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+            }
+            ReplySink::Direct(peer) => {
+                let chunk = {
+                    let mut chunk = Vec::with_capacity(1 + frame.len());
+                    chunk.push(crate::nat_chunk_recv::CHUNK_KIND_TUN_STREAM);
+                    chunk.extend_from_slice(frame);
+                    chunk
+                };
+                let provider = self.nat_path.as_ref().and_then(|slot| slot.get());
+                let Some(provider) = provider else {
+                    // 无 NAT path：诚实降级到同一 peer 的 N1 conn（direct 路径
+                    // 的 fallback 语义；没有 conn 则计 tx.errors）。
+                    let conn = self.n1_peer_conns.get(peer_hex).cloned();
+                    match conn {
+                        Some(conn) => {
+                            self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+                        }
+                        None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
+                    }
+                    return;
+                };
+                let conn = self.n1_peer_conns.get(peer_hex).cloned();
+                let fallback = |_chunk: &[u8]| -> io::Result<()> {
+                    match &conn {
+                        Some(conn) => conn
+                            .send_datagram(frame)
+                            .map_err(|e| io::Error::other(format!("n1 send failed: {e}"))),
+                        None => Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "n1 fallback conn missing",
+                        )),
+                    }
+                };
+                match provider.send_chunk(*peer, &fallback, &chunk) {
+                    Ok(_path) => self.n1_stats.record_tx(frame.len(), true),
+                    Err(e) => {
+                        self.n1_stats.record_tx(frame.len(), false);
+                        eprintln!(
+                            "[n1-egress] WARN: tx failed peer={} stream={} kind={:?}",
+                            hex16(peer_hex),
+                            stream_id_of(frame),
+                            e.kind()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn send_reply_over_n1(
+        &mut self,
+        peer_hex: &str,
+        frame: &[u8],
+        send: impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
+    ) {
+        match send(frame) {
+            Ok(()) => self.n1_stats.record_tx(frame.len(), true),
+            Err(e) => {
+                self.record_tx_error(peer_hex, frame, &format!("{e:?}"));
+            }
+        }
+    }
+
+    fn record_tx_error(&mut self, peer_hex: &str, frame: &[u8], reason: &str) {
+        self.n1_stats.record_tx(frame.len(), false);
+        eprintln!(
+            "[n1-egress] WARN: tx failed peer={} stream={} kind={reason}",
+            hex16(peer_hex),
+            stream_id_of(frame)
+        );
+    }
+
+    /// unknown-stream / bad-frame 日志限频（首条立即，其后 10s；spec §6.1）。
+    fn log_n1_dispatch_throttled(
+        &mut self,
+        cause: &str,
+        peer_hex: &str,
+        stream_id: u32,
+        frame_len: usize,
+    ) {
+        let decision = self.n1_dispatch_log.decide(
+            "n1-dispatch",
+            cause,
+            std::time::Instant::now(),
+            N1_DISPATCH_LOG_INTERVAL,
+        );
+        if !decision.emit {
+            return;
+        }
+        let peer16 = hex16(peer_hex);
+        if cause == "bad_frame" {
+            eprintln!(
+                "[n1-rx] rejected peer={peer16} reason=bad_frame len={frame_len} suppressed={}",
+                decision.suppressed
+            );
+        } else {
+            eprintln!(
+                "[n1-dispatch] WARN: unknown stream peer={peer16} stream={stream_id} suppressed={}",
+                decision.suppressed
+            );
+        }
     }
 
     /// 显式注入无代理配置默认引擎（`SimpleRuleEngine`，全部流量交 `proxy` 标签）。
@@ -3041,6 +3315,22 @@ impl Dataplane {
 fn parse_ip_cidr(s: &str) -> Result<IpCidr, String> {
     s.parse::<IpCidr>()
         .map_err(|e| format!("invalid CIDR: {e}"))
+}
+
+/// unknown-stream / bad-frame 日志限频窗口（spec §6.1：首次 + 每 10s）。
+const N1_DISPATCH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// peer hex 的 16 字符前缀（spec §8.2 日志格式）。
+fn hex16(hex: &str) -> &str {
+    &hex[..hex.len().min(16)]
+}
+
+/// STREAM 帧的 stream id（日志用；短帧返回 0，不 panic）。
+fn stream_id_of(frame: &[u8]) -> u32 {
+    if frame.len() < 4 {
+        return 0;
+    }
+    u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]])
 }
 
 /// 从 IP 包提取目的地址（v4/v6；v6 只读固定头，扩展头不参与 N1 目的路由）。

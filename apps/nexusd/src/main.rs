@@ -561,6 +561,8 @@ fn run_dataplane(
     direct_gate: Arc<nexusd::nat_chunk_recv::DirectGate>,
     nat_inbound_rx: std::sync::mpsc::Receiver<nexusd::nat_chunk_recv::NatInboundChunk>,
     chunk_stats: Arc<nexusd::nat_chunk_stats::ChunkStats>,
+    n1_inbound_rx: std::sync::mpsc::Receiver<nexusd::n1_runtime::N1Inbound>,
+    n1_stats: Arc<nexusd::n1_runtime::N1Stats>,
 ) {
     use nexus_projection::TunDevice;
     // D1：TUN 模式创建单个 TUN；纯 TPROXY 模式使用 InertTun（不伪造数据面）。
@@ -774,6 +776,10 @@ fn run_dataplane(
     dp.set_nat_inbound_rx(nat_inbound_rx);
     dp.set_chunk_stats(chunk_stats);
 
+    // WP4：N1 入站队列（WP3 supervisor 持发送端）+ 共享计数面。
+    dp.set_n1_inbound_rx(n1_inbound_rx);
+    dp.set_n1_stats(n1_stats);
+
     #[cfg(target_os = "linux")]
     let mut tproxy_frontend = match tproxy_config {
         Some(config) => setup_tproxy_frontend(
@@ -819,6 +825,8 @@ fn run_dataplane(
         }
         // P0：每轮 drain direct chunk（不放进 process_one，Proxy 分支零改动）。
         dp.pump_nat_inbound();
+        // WP4：紧邻 drain N1 入站队列（spec §5.5；与 direct 共用 dispatch）。
+        dp.pump_n1_inbound();
         if last_tproxy_publish.elapsed() >= std::time::Duration::from_secs(1) {
             nexusd::dataplane::publish_flow_sessions(dp.flow_sessions_state());
             nexusd::dataplane::publish_tproxy_counters(
@@ -2128,7 +2136,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
     // 3a. N1 入站监听（spec §5.8/§9）：默认 disabled 时零 bind/零线程。
     //     listen enabled 时身份 fail-closed（与 NAT BLOCKED-1 同口径）。
-    let n1_runtime = match n1_assembly.as_ref() {
+    let mut n1_runtime = match n1_assembly.as_ref() {
         Some(assembly) => {
             let section = &loaded.daemon.n1;
             let identity = if n1_listen_requested {
@@ -2164,6 +2172,24 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             }
             eprintln!("[n1-listener] listener disabled reason=no_listen_addr");
             None
+        }
+    };
+
+    // WP4：N1 入站队列的所有权移交给 dataplane 线程（§5.8「run_daemon 只负责把
+    // inbound_rx 交给 run_dataplane」）。shutdown 只 join `accept`/`rx`，因此在
+    // 句柄里留一个已断开占位（disabled 路径本来就是 Disconnected 常态）。
+    let (dp_n1_inbound_rx, dp_n1_stats) = match n1_runtime.as_mut() {
+        Some(handles) => {
+            let (_placeholder_tx, placeholder) = std::sync::mpsc::channel();
+            (
+                std::mem::replace(&mut handles.inbound_rx, placeholder),
+                Arc::clone(&handles.stats),
+            )
+        }
+        None => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(nexusd::n1_runtime::N1_INBOUND_QUEUE_CAP);
+            drop(tx);
+            (rx, Arc::new(nexusd::n1_runtime::N1Stats::default()))
         }
     };
 
@@ -2361,6 +2387,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         dp_direct_gate,
                         nat_rx,
                         dp_chunk_stats,
+                        dp_n1_inbound_rx,
+                        dp_n1_stats,
                     );
                 })
                 .expect("spawn dataplane thread"),
