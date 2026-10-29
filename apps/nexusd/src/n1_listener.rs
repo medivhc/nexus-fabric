@@ -274,6 +274,35 @@ mod tests {
         assert!(matches!(listener.accept(), Err(N1Error::Closed)));
     }
 
+    /// WP1b 前提实测（spec §19）：TLS 层拒绝的握手在 `accept_timeout` 上只表现为
+    /// `Timeout`（与空闲轮询不可区分），因此 accept 侧无法分类出
+    /// `FabricError::HandshakeFailed`。本测试固化该前提，防止后续把
+    /// “代码里有日志句”误当成可观测。
+    #[test]
+    fn rejected_handshake_is_indistinguishable_from_idle_timeout() {
+        let server = identity(40);
+        let stranger = identity(41);
+        let listener = FabricN1Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &server,
+            vec![N1PeerId(identity(42).peer_id().0)],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(
+            FabricConn::connect_mtls(
+                server.peer_id(),
+                &stranger,
+                &config(listener.local_addr().unwrap())
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            listener.listener.accept_timeout(Duration::from_millis(80)),
+            Err(FabricError::Timeout)
+        ));
+    }
+
     #[test]
     fn allowlist_predicate_is_exact() {
         let allowed = N1PeerId(identity(37).peer_id().0);
