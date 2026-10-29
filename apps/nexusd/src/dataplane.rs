@@ -9,7 +9,7 @@
 //! - MVP：转发为计数（N1/proxy 实际发送由子系统就绪后接入）；
 //! - DNS：UDP dport 53 短路到 `UnifiedDns`，响应写回 TUN。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{
@@ -34,8 +34,8 @@ use nexus_projection::dns::{DEFAULT_DNS_CACHE_ENTRIES, DnsCache};
 use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
 use nexus_projection::routing::IpCidr;
 use nexus_projection::tcp::{
-    FourTuple, RelayEvent, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats,
-    TcpTerminator, decode_stream_frame, encode_stream_frame, encode_syn_payload,
+    FourTuple, MAX_TCP_CONNS, RelayEvent, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpRelay,
+    TcpTermStats, TcpTerminator, decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
 use nexus_projection::transparent::direct::{DirectEgressConfig, DirectTcpEvent, DirectTcpRelay};
 use nexus_projection::transparent::runtime::{TransparentFailureKind, TransparentPipeline};
@@ -80,6 +80,12 @@ pub trait N1EgressRelay: Send {
         payload: &[u8],
         from_peer: &str,
     ) -> Result<Vec<RelayEvent>, N1RelayError>;
+
+    /// 驱动 egress 侧（连接完成 / 本地 socket 可读）并返回回程事件。
+    ///
+    /// `Dataplane::n1_egress_poll` 在 dataplane 主循环每轮调用一次
+    /// （spec §5.5/§5.7：egress relay 跑在 dataplane 线程，不另起忙等线程）。
+    fn poll(&mut self) -> Vec<RelayEvent>;
 }
 
 /// egress relay 的失败分类（spec §6.2；不新增 wire 变体）。
@@ -87,6 +93,235 @@ pub trait N1EgressRelay: Send {
 pub enum N1RelayError {
     /// terminator 与 relay 都不认识该 stream（`tcp.rs` unknown 分支）。
     UnknownStream,
+}
+
+/// egress `TcpRelay` 的生产适配器（spec §5.5 Q-EGRESS-IMPL = additive 接线）。
+///
+/// 机制本体（`crates/nexus-projection/src/tcp.rs`）**零改动**：本适配器只做
+/// ①所有权判定（`TcpRelay::has`，不拥有 → [`N1RelayError::UnknownStream`]）；
+/// ②`egress.*` 计数（机制侧已有计数器取差值 + 适配器可观测的事件）；
+/// ③§8.2 日志。回程帧的编码/发送仍由 dispatch 侧 `send_reply` 负责（WP4 §4.2）。
+///
+/// 所有权口径有两个**机制语义要求的例外**（否则会丢 §6.2 规定的回 RST）：
+/// - SYN 被表满拒绝：`handle_frame` 返回 `Closed{reset:true}` 但不会把流放进表，
+///   调用后 `has=false`；事件非空 → 仍按 relay 消费处理。
+/// - 短/非法 SYN（`SynDecode`）：机制只计 `short_syn_dropped`、按既有语义不回 RST；
+///   它确实被 relay 消费，不冒充 `unknown_stream`。
+///
+/// `egress.*` 的可观测边界（冻结机制面所限，实现不猜机制内部状态）：
+/// - `connect_ok` 只能在本地 socket 首次产出证据时观测（读到字节或 EOF）：机制
+///   的 connect 成功没有事件、`TcpRelayStats` 也没有该计数；连上后一直静默到
+///   进程退出的流不会被计入（**只会少计，不会多计**）。
+/// - `bytes_to_local` 按 relay 接受的 DATA 载荷计数；机制 API 不暴露
+///   `write_pending` 余量，故「已进入非阻塞写路径」与「已写入内核 socket」在
+///   部分写时不可区分（正常 socket 缓冲区足够时二者相等）。
+pub struct TcpRelayEgress {
+    relay: TcpRelay,
+    stats: Arc<crate::n1_runtime::N1Stats>,
+    /// 已发 SYN、尚未观测到本地连接成功证据的 `(peer, stream_id)`。
+    ///
+    /// 只用于把「connect 成功 / 失败」归类；上界是 relay 表大小（≤1024），
+    /// 每次 poll 后按 `has()` 剪枝（表里没有的键不再等待）。
+    awaiting: HashSet<(String, u32)>,
+    /// 机制侧计数器差值基线（`table_full` / `connect_failed` 只在机制内部递增）。
+    seen_table_full: u64,
+    seen_connect_failed: u64,
+}
+
+impl TcpRelayEgress {
+    pub fn new(stats: Arc<crate::n1_runtime::N1Stats>) -> Self {
+        Self {
+            relay: TcpRelay::new(),
+            stats,
+            awaiting: HashSet::new(),
+            seen_table_full: 0,
+            seen_connect_failed: 0,
+        }
+    }
+
+    /// 把机制侧计数器的增量转成 `egress.*`（每个增量只记一次）。
+    ///
+    /// 返回 `(table_full_delta, connect_failed_delta)` 供日志按流标注。
+    fn sync_mechanism_counters(&mut self) -> (u64, u64) {
+        let stats = self.relay.stats();
+        let table_full = stats.table_full.saturating_sub(self.seen_table_full);
+        let connect_failed = stats
+            .connect_failed
+            .saturating_sub(self.seen_connect_failed);
+        self.seen_table_full = stats.table_full;
+        self.seen_connect_failed = stats.connect_failed;
+        for _ in 0..table_full {
+            self.stats
+                .record_egress(crate::n1_runtime::N1EgressEvent::TableFull);
+        }
+        for _ in 0..connect_failed {
+            self.stats
+                .record_egress(crate::n1_runtime::N1EgressEvent::ConnectFailed);
+        }
+        (table_full, connect_failed)
+    }
+}
+
+impl N1EgressRelay for TcpRelayEgress {
+    fn handle_frame(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        from_peer: &str,
+    ) -> Result<Vec<RelayEvent>, N1RelayError> {
+        let is_syn = flags & STREAM_SYN != 0;
+        if is_syn {
+            self.stats
+                .record_egress(crate::n1_runtime::N1EgressEvent::Syn);
+            eprintln!(
+                "[n1-egress] syn peer={} stream={stream_id} target={}",
+                hex16(from_peer),
+                syn_target_display(payload)
+            );
+        }
+        // 所有权口径：调用前后任一时刻拥有该流即算 relay 消费。
+        // RST/FIN 会让机制在 `handle_frame` 内移除连接（调用后 `has=false`），
+        // 但该帧仍属于 relay 的流，不能误计 `dispatch.unknown_stream`。
+        let owned_before = self.relay.has(from_peer, stream_id);
+        let events = self
+            .relay
+            .handle_frame(stream_id, flags, payload, from_peer);
+        let owned = self.relay.has(from_peer, stream_id);
+        let (table_full, _) = self.sync_mechanism_counters();
+        if table_full > 0 {
+            eprintln!(
+                "[n1-egress] WARN: table full peer={} stream={stream_id} limit={MAX_TCP_CONNS}",
+                hex16(from_peer)
+            );
+        }
+
+        let key = (from_peer.to_string(), stream_id);
+        if is_syn {
+            if owned && events.is_empty() {
+                // SYN 已被接受，connect 在 worker 线程里进行（§6.2 异步语义）。
+                self.awaiting.insert(key);
+            } else {
+                self.awaiting.remove(&key);
+            }
+        } else if !owned {
+            // relay 已丢弃该流（RST/写失败/连接失败），不再等待成功证据。
+            self.awaiting.remove(&key);
+        }
+
+        let is_data = flags & (STREAM_SYN | STREAM_FIN | STREAM_RST) == 0;
+        if is_data && !payload.is_empty() && owned && events.is_empty() {
+            self.stats
+                .record_egress(crate::n1_runtime::N1EgressEvent::BytesToLocal(
+                    payload.len(),
+                ));
+        }
+
+        if owned || owned_before || !events.is_empty() {
+            Ok(events)
+        } else if is_syn {
+            // 短/非法 SYN：机制侧已计 `short_syn_dropped` 并按既有语义不回 RST
+            // （§6.2 SynDecode）。它确实被 relay 消费，不冒充 unknown stream。
+            Ok(events)
+        } else {
+            Err(N1RelayError::UnknownStream)
+        }
+    }
+
+    fn poll(&mut self) -> Vec<RelayEvent> {
+        let events = self.relay.poll();
+        let (_, connect_failed) = self.sync_mechanism_counters();
+        let mut failures_left = connect_failed;
+        for event in &events {
+            let (peer, stream_id) = match event {
+                RelayEvent::Data {
+                    stream_id, peer, ..
+                }
+                | RelayEvent::Closed {
+                    stream_id, peer, ..
+                } => (peer, *stream_id),
+            };
+            let first_evidence = self.awaiting.remove(&(peer.clone(), stream_id));
+            match event {
+                RelayEvent::Data { bytes, .. } => {
+                    if first_evidence {
+                        self.record_connect_ok(peer, stream_id);
+                    }
+                    self.stats
+                        .record_egress(crate::n1_runtime::N1EgressEvent::BytesFromLocal(
+                            bytes.len(),
+                        ));
+                }
+                RelayEvent::Closed { reset: false, .. } => {
+                    if first_evidence {
+                        self.record_connect_ok(peer, stream_id);
+                    }
+                }
+                RelayEvent::Closed { reset: true, .. } => {
+                    if first_evidence && failures_left > 0 {
+                        failures_left -= 1;
+                        // 机制侧 connect worker 丢弃了 `io::ErrorKind`（tcp.rs 的
+                        // `TcpStream::connect_timeout(...).ok()`），故只能给 `Other`；
+                        // 失败**本身**由 `egress.connect_failed` 精确计数。
+                        eprintln!(
+                            "[n1-egress] connect peer={} stream={stream_id} result=failed kind=Other",
+                            hex16(peer)
+                        );
+                    }
+                }
+            }
+        }
+        let relay = &self.relay;
+        self.awaiting.retain(|(peer, id)| relay.has(peer, *id));
+        events
+    }
+}
+
+impl TcpRelayEgress {
+    fn record_connect_ok(&self, peer: &str, stream_id: u32) {
+        self.stats
+            .record_egress(crate::n1_runtime::N1EgressEvent::ConnectOk);
+        eprintln!(
+            "[n1-egress] connect peer={} stream={stream_id} result=ok",
+            hex16(peer)
+        );
+    }
+}
+
+/// SYN 载荷目标的**日志展示**（§8.2 `target=<ip:port>`）。
+///
+/// 只读展示，不参与任何判定；格式与 `nexus_projection::tcp::encode_syn_payload`
+/// 的冻结线格式一致（该解码器是机制 crate 私有面，nexusd 不复制其解析语义）。
+fn syn_target_display(payload: &[u8]) -> String {
+    if payload.len() == 6 {
+        let ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+        let port = u16::from_be_bytes([payload[4], payload[5]]);
+        return format!("{ip}:{port}");
+    }
+    match payload.first() {
+        Some(0x01) if payload.len() >= 7 => {
+            let ip = Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]);
+            let port = u16::from_be_bytes([payload[5], payload[6]]);
+            format!("{ip}:{port}")
+        }
+        Some(0x02) if payload.len() >= 19 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&payload[1..17]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([payload[17], payload[18]]);
+            format!("[{ip}]:{port}")
+        }
+        Some(0x03) if payload.len() >= 4 => {
+            let len = payload[1] as usize;
+            if payload.len() < len + 4 {
+                return "-".to_string();
+            }
+            let host = String::from_utf8_lossy(&payload[2..2 + len]);
+            let port = u16::from_be_bytes([payload[2 + len], payload[3 + len]]);
+            format!("{host}:{port}")
+        }
+        _ => "-".to_string(),
+    }
 }
 
 /// TPROXY 跨线程消息（spec §9.14）。
@@ -743,6 +978,48 @@ impl Dataplane {
             }
         }
         self.n1_inbound_rx = Some(rx);
+    }
+
+    /// Drive the egress relay once per dataplane loop iteration (spec §5.5/§5.7).
+    ///
+    /// The relay lives on the dataplane thread; this never spawns a thread or
+    /// busy-waits. `RelayEvent`s are encoded as STREAM frames and sent over the
+    /// peer's N1 conn (`n1_peer_conns`, §7). Missing conns are counted as
+    /// `tx.errors` and logged — never silently dropped.
+    pub fn n1_egress_poll(&mut self) {
+        let Some(mut relay) = self.n1_relay.take() else {
+            return;
+        };
+        let events = relay.poll();
+        self.n1_relay = Some(relay);
+        for event in events {
+            let (peer, reply) = match event {
+                RelayEvent::Data {
+                    stream_id,
+                    peer,
+                    bytes,
+                } => (peer, encode_stream_frame(stream_id, 0x00, &bytes)),
+                RelayEvent::Closed {
+                    stream_id,
+                    peer,
+                    reset,
+                } => {
+                    let flags = if reset { STREAM_RST } else { STREAM_FIN };
+                    (peer, encode_stream_frame(stream_id, flags, &[]))
+                }
+            };
+            self.send_egress_reply(&peer, &reply);
+        }
+    }
+
+    /// Send one egress reply frame to `peer_hex` over its N1 conn (§5.5 第 3 步)。
+    fn send_egress_reply(&mut self, peer_hex: &str, frame: &[u8]) {
+        match self.n1_peer_conns.get(peer_hex).cloned() {
+            Some(conn) => {
+                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f));
+            }
+            None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
+        }
     }
 
     /// Unified inbound STREAM dispatch (spec §5.5)：originator 判定用
@@ -7339,6 +7616,12 @@ outbounds:
                 RelayMode::Unknown => Err(N1RelayError::UnknownStream),
             }
         }
+
+        fn poll(&mut self) -> Vec<RelayEvent> {
+            // 分派走向替身：poll 不属于本替身的观察面（WP5 egress 四态用真实
+            // `TcpRelayEgress` 覆盖）。
+            Vec::new()
+        }
     }
 
     /// 测试替身：direct sink 的 `send_chunk` 只记录 chunk。
@@ -7728,5 +8011,352 @@ outbounds:
         dp.set_n1_inbound_rx(rx);
         dp.pump_n1_inbound();
         assert_eq!(stats.snapshot(), N1StatsSnapshot::default());
+    }
+
+    // ---- WP5：egress `TcpRelay` 接线（spec §5.5/§5.6/§6.2） ----
+
+    /// 装配式 egress harness：**只经 `Dataplane` 公开面**驱动
+    /// （`set_n1_relay` / `pump_n1_inbound` / `n1_egress_poll`），
+    /// 不直调 `TcpRelay::handle_frame` 充当接线证据。
+    struct EgressHarness {
+        dp: Dataplane,
+        stats: Arc<N1Stats>,
+        conn: Arc<TestConn>,
+        tx: std::sync::mpsc::SyncSender<N1Inbound>,
+        peer: N1PeerId,
+    }
+
+    impl EgressHarness {
+        fn new() -> Self {
+            let (mut dp, _mock) = test_dataplane();
+            let stats = Arc::new(N1Stats::default());
+            dp.set_n1_stats(Arc::clone(&stats));
+            dp.set_n1_relay(Box::new(TcpRelayEgress::new(Arc::clone(&stats))));
+            let peer = N1PeerId([0x71; 32]);
+            let conn = Arc::new(TestConn::new(peer));
+            let (tx, rx) = std::sync::mpsc::sync_channel(2048);
+            dp.set_n1_inbound_rx(rx);
+            tx.try_send(N1Inbound::ConnUp {
+                peer,
+                conn: Arc::clone(&conn) as Arc<dyn N1Connection>,
+            })
+            .expect("conn up");
+            dp.pump_n1_inbound();
+            Self {
+                dp,
+                stats,
+                conn,
+                tx,
+                peer,
+            }
+        }
+
+        fn send_frame(&self, stream_id: u32, flags: u8, payload: &[u8]) {
+            self.tx
+                .try_send(N1Inbound::Stream {
+                    peer: self.peer,
+                    conn: Arc::clone(&self.conn) as Arc<dyn N1Connection>,
+                    frame: encode_stream_frame(stream_id, flags, payload),
+                })
+                .expect("queue has room");
+        }
+
+        fn pump(&mut self) {
+            self.dp.pump_n1_inbound();
+        }
+
+        fn conn_down(&self) {
+            self.tx
+                .try_send(N1Inbound::ConnDown { peer: self.peer })
+                .expect("conn down");
+        }
+
+        fn poll(&mut self) {
+            self.dp.n1_egress_poll();
+        }
+
+        fn sent(&self) -> Vec<(u32, u8, Vec<u8>)> {
+            self.conn
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|raw| {
+                    let (sid, flags, payload) = decode_stream_frame(raw).expect("reply frame");
+                    (sid, flags, payload.to_vec())
+                })
+                .collect()
+        }
+
+        fn wait_for(&mut self, mut pred: impl FnMut(&[(u32, u8, Vec<u8>)]) -> bool) {
+            for _ in 0..400 {
+                self.poll();
+                if pred(&self.sent()) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("egress reply did not arrive: {:?}", self.sent());
+        }
+    }
+
+    fn syn_payload_for(addr: std::net::SocketAddr) -> Vec<u8> {
+        let std::net::SocketAddr::V4(v4) = addr else {
+            panic!("test only uses IPv4 targets");
+        };
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(&v4.ip().octets());
+        payload.extend_from_slice(&v4.port().to_be_bytes());
+        payload
+    }
+
+    /// 本地 echo 服务：accept 一条连接并回显到 EOF（连接关闭即退出）。
+    fn spawn_echo_server() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind echo");
+        let addr = listener.local_addr().expect("echo addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut buf = [0u8; 4096];
+                loop {
+                    match io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if io::Write::write_all(&mut stream, &buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// 已关闭的本地端口：connect 必然失败（用于 connect 失败 / 表满态）。
+    fn closed_port() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closed");
+        let addr = listener.local_addr().expect("closed addr");
+        drop(listener);
+        addr
+    }
+
+    /// 四态①：SYN → connect 成功 → DATA 转发到本地 socket；回程字节编码为
+    /// STREAM DATA 经同一 N1 conn 发出，`egress.*` 按 §5.6 推进。
+    #[test]
+    fn egress_relay_connects_forwards_and_replies_over_n1() {
+        let (addr, echo) = spawn_echo_server();
+        let mut h = EgressHarness::new();
+        let sid = 0x51;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        h.send_frame(sid, 0x00, b"hello");
+        h.pump();
+
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid && *f == 0x00 && p == b"hello")
+        });
+
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.egress_syn, 1, "one SYN handed to the relay");
+        assert_eq!(snap.egress_connect_ok, 1, "connect success observed");
+        assert_eq!(snap.egress_connect_failed, 0);
+        assert_eq!(snap.egress_table_full, 0);
+        assert_eq!(
+            snap.egress_bytes_to_local, 5,
+            "DATA payload written to the local socket"
+        );
+        assert_eq!(
+            snap.egress_bytes_from_local, 5,
+            "echoed bytes handed back to N1"
+        );
+        assert!(snap.tx_frames >= 1);
+        assert_eq!(snap.tx_errors, 0);
+        assert_eq!(snap.dispatch_to_relay, 2, "SYN + DATA consumed by relay");
+        assert_eq!(snap.dispatch_unknown_stream, 0);
+
+        drop(h);
+        echo.join().expect("echo thread");
+    }
+
+    /// 四态②：connect 失败 → 回 RST + `egress.connect_failed` + `tx.frames`；
+    /// 不 panic、不静默（失败的流随后按 unknown 处理）。
+    #[test]
+    fn egress_relay_connect_failure_replies_rst_and_counts() {
+        let addr = closed_port();
+        let mut h = EgressHarness::new();
+        let sid = 0x61;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid && *f == STREAM_RST && p.is_empty())
+        });
+
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.egress_syn, 1);
+        assert_eq!(snap.egress_connect_failed, 1);
+        assert_eq!(snap.egress_connect_ok, 0);
+        assert_eq!(snap.egress_table_full, 0);
+        assert_eq!(snap.dispatch_to_relay, 1);
+        assert_eq!(snap.tx_frames, 1, "RST is the only reply");
+        assert_eq!(snap.tx_errors, 0);
+
+        // 失败的流已被 relay 移出表：后续 DATA 诚实计 unknown_stream。
+        h.send_frame(sid, 0x00, b"late");
+        h.pump();
+        assert_eq!(h.stats.snapshot().dispatch_unknown_stream, 1);
+    }
+
+    /// 四态③：连接表满（`MAX_TCP_CONNS = 1024`）→ 回 RST + `table_full`。
+    ///
+    /// 1024 条 SYN 在一次 pump 内进入 pending（connect 结果只在 `poll` 的
+    /// `drain_connects` 里回收），第 1025 条即触发机制侧表满分支。
+    #[test]
+    fn egress_relay_table_full_replies_rst_and_counts() {
+        let addr = closed_port();
+        let mut h = EgressHarness::new();
+        for i in 0..nexus_projection::tcp::MAX_TCP_CONNS as u32 {
+            h.send_frame(i + 1, STREAM_SYN, &syn_payload_for(addr));
+        }
+        h.pump();
+        assert!(h.sent().is_empty(), "SYN 不产生回程帧");
+
+        let overflow_sid = 0x0FFF_FFFF;
+        h.send_frame(overflow_sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+
+        let frames = h.sent();
+        assert_eq!(frames.len(), 1, "only the table-full SYN gets a reply");
+        assert_eq!(frames[0].0, overflow_sid);
+        assert_eq!(frames[0].1, STREAM_RST);
+        assert!(frames[0].2.is_empty());
+
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.egress_syn, 1025);
+        assert_eq!(snap.egress_table_full, 1);
+        assert_eq!(snap.egress_connect_failed, 0);
+        assert_eq!(snap.dispatch_to_relay, 1025);
+        assert_eq!(snap.tx_frames, 1);
+    }
+
+    /// 四态④：FIN 收尾回 FIN（EOF），RST 收尾不回帧并从表中移除。
+    #[test]
+    fn egress_relay_fin_and_rst_teardown() {
+        let (addr_a, echo_a) = spawn_echo_server();
+        let mut h = EgressHarness::new();
+        let sid = 0x71;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr_a));
+        h.pump();
+        h.send_frame(sid, 0x00, b"fin-me");
+        h.pump();
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid && *f == 0x00 && p == b"fin-me")
+        });
+
+        // 本端 FIN → relay shutdown(Write) → 对端 EOF → 回程 FIN。
+        h.send_frame(sid, STREAM_FIN, &[]);
+        h.pump();
+        h.wait_for(|frames| frames.iter().any(|(s, f, _)| *s == sid && *f == STREAM_FIN));
+        echo_a.join().expect("echo a");
+
+        // RST 收尾：relay 移除连接、不回帧；后续 DATA 变成 unknown。
+        let (addr_b, echo_b) = spawn_echo_server();
+        let sid_b = 0x72;
+        h.send_frame(sid_b, STREAM_SYN, &syn_payload_for(addr_b));
+        h.pump();
+        h.send_frame(sid_b, 0x00, b"x");
+        h.pump();
+        h.wait_for(|frames| {
+            frames
+                .iter()
+                .any(|(s, f, p)| *s == sid_b && *f == 0x00 && p == b"x")
+        });
+        let before = h.stats.snapshot();
+        h.send_frame(sid_b, STREAM_RST, &[]);
+        h.pump();
+        assert_eq!(
+            h.stats.snapshot().tx_frames,
+            before.tx_frames,
+            "originator RST must not trigger a reply"
+        );
+
+        h.send_frame(sid_b, 0x00, b"after-rst");
+        h.pump();
+        assert_eq!(h.stats.snapshot().dispatch_unknown_stream, 1);
+        drop(h);
+        echo_b.join().expect("echo b");
+    }
+
+    /// 装配收口（WP4 §5.8 交接）：同一条「非 originator SYN」在无 relay 的
+    /// 装配下计 `dispatch.unknown_stream`，装入真实 relay 后计 `to_relay`。
+    #[test]
+    fn egress_relay_takes_over_the_unknown_stream_path() {
+        let addr = closed_port();
+        let frame = encode_stream_frame(0x7A, STREAM_SYN, &syn_payload_for(addr));
+
+        // 形态一：无 relay（WP4 现状）。
+        let (mut bare, _mock, bare_stats) = n1_test_dataplane();
+        let peer = N1PeerId([0x72; 32]);
+        let conn = Arc::new(TestConn::new(peer));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        bare.set_n1_inbound_rx(rx);
+        tx.try_send(N1Inbound::Stream {
+            peer,
+            conn: conn as Arc<dyn N1Connection>,
+            frame,
+        })
+        .expect("frame");
+        bare.pump_n1_inbound();
+        assert_eq!(bare_stats.snapshot().dispatch_unknown_stream, 1);
+        assert_eq!(bare_stats.snapshot().dispatch_to_relay, 0);
+
+        // 形态二：装入真实 `TcpRelay` 适配器。
+        let mut h = EgressHarness::new();
+        h.send_frame(0x7A, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        let snap = h.stats.snapshot();
+        assert_eq!(snap.dispatch_to_relay, 1);
+        assert_eq!(snap.dispatch_unknown_stream, 0);
+        assert_eq!(snap.egress_syn, 1);
+    }
+
+    /// §6.2 `TxError`：回程时 peer 的 N1 conn 已下线 → `tx.errors` + WARN；
+    /// 回程字节不静默消失。
+    #[test]
+    fn egress_relay_reply_without_a_peer_conn_counts_tx_errors() {
+        let (addr, echo) = spawn_echo_server();
+        let mut h = EgressHarness::new();
+        let sid = 0x81;
+        h.send_frame(sid, STREAM_SYN, &syn_payload_for(addr));
+        h.pump();
+        h.send_frame(sid, 0x00, b"hi");
+        h.pump();
+        h.conn_down();
+        h.pump();
+
+        for _ in 0..400 {
+            h.poll();
+            if h.stats.snapshot().tx_errors > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let snap = h.stats.snapshot();
+        assert_eq!(
+            snap.tx_errors, 1,
+            "missing peer conn is counted, not swallowed"
+        );
+        assert_eq!(snap.tx_frames, 0);
+        assert_eq!(snap.egress_bytes_from_local, 2);
+        assert_eq!(snap.egress_connect_ok, 1);
+
+        drop(h);
+        echo.join().expect("echo thread");
     }
 }
