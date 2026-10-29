@@ -454,5 +454,13 @@
     "module": "apps/nexusd",
     "category": "implementation-pattern",
     "summary": "每请求入口完整校验一次已确认 prefix，同请求复核只查绑定，提交摘要由入口 Sha256Stream 续算；字节预算须列出幂等重试比较路径。"
+  },
+  {
+    "id": "trojan-credential-probe-deadlines",
+    "file": "entries/2026-10-29-trojan-credential-probe-deadlines.md",
+    "date": "2026-10-29",
+    "module": "apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "探测按截止时刻驱动 rustls（socket 超时是每次调用的）；TLS 错误之前已解密的 fallback 字节必须判 rejected（否则 fail-open）；终结器在三次握手后才发 Syn；断言「不改变既有行为」用开/关对照。"
   }
 ]

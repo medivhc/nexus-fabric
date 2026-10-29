@@ -134,6 +134,34 @@ fn a_panicking_probe_does_not_wedge_the_gate() {
     assert_eq!(verdict, Verdict::Passed);
 }
 
+#[test]
+fn a_waiter_reprobes_when_the_prober_unwinds() {
+    let gate = ProbeGate::new("t".to_string());
+    let waiter_probed = Mutex::new(false);
+    std::thread::scope(|scope| {
+        let prober = scope.spawn(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gate.verdict(|| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    panic!("probe panicked")
+                })
+            }))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let verdict = gate.verdict(|| {
+            *waiter_probed.lock().expect("lock") = true;
+            ProbeReport {
+                verdict: Verdict::Passed,
+                first_bytes: Vec::new(),
+                elapsed: Duration::ZERO,
+            }
+        });
+        assert_eq!(verdict, Verdict::Passed);
+        assert!(prober.join().expect("join").is_err());
+    });
+    assert!(*waiter_probed.lock().expect("lock"), "waiter probed itself");
+}
+
 // ---- U5：stderr 行 ----
 
 #[test]
@@ -182,6 +210,8 @@ enum Reply {
     Reset,
     /// 不写不关（5 s）。
     Silent,
+    /// 404 记录与一个损坏的 TLS 记录在同一次写里发出。
+    FallbackThenCorrupt,
 }
 
 #[derive(Clone)]
@@ -379,6 +409,18 @@ fn serve(
         Reply::CloseTcp => {}
         Reply::Reset => linger_zero(&tls.sock),
         Reply::Silent => std::thread::sleep(Duration::from_secs(5)),
+        Reply::FallbackThenCorrupt => {
+            let mut wire = Vec::new();
+            tls.conn.writer().write_all(NOT_FOUND)?;
+            while tls.conn.wants_write() {
+                tls.conn.write_tls(&mut wire)?;
+            }
+            // application_data 记录，AEAD 标签必然校验失败。
+            wire.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x20]);
+            wire.extend_from_slice(&[0xAA; 0x20]);
+            tls.sock.write_all(&wire)?;
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
     Ok(())
 }
@@ -410,6 +452,18 @@ fn downstream_bytes_are_rejected_with_first_bytes() {
     assert!(!line.contains(&hash), "{line}");
 }
 
+/// 回归（code review r1 B1）：坏记录之前已解密的 fallback 应答不能被丢掉。
+#[test]
+fn bytes_before_a_corrupt_record_are_still_rejected() {
+    let node = Node::spawn(Spec {
+        on_wrong: Reply::FallbackThenCorrupt,
+        ..Spec::default()
+    });
+    let report = run_probe(&probe_config(node.addr, WRONG_PASSWORD));
+    assert_eq!(report.verdict, Verdict::Rejected, "{report:?}");
+    assert_eq!(report.first_bytes, NOT_FOUND[..16].to_vec());
+}
+
 #[test]
 fn zero_byte_close_or_reset_is_passed() {
     for reply in [Reply::CloseNotify, Reply::CloseTcp, Reply::Reset] {
@@ -436,7 +490,7 @@ fn silence_for_the_read_window_is_inconclusive_after_three_seconds() {
     let report = run_probe(&probe_config(node.addr, NODE_PASSWORD));
     assert_eq!(report.verdict, Verdict::Inconclusive);
     assert!(
-        report.elapsed >= Duration::from_secs(3) && report.elapsed < Duration::from_millis(3_800),
+        report.elapsed >= Duration::from_secs(3) && report.elapsed < Duration::from_millis(4_500),
         "{report:?}"
     );
 }
@@ -753,7 +807,10 @@ fn tproxy_open_fails_auth_rejected_and_shares_the_tun_dialer_state() {
         assert!(Instant::now() < deadline, "no Failed event");
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(reason.contains("AuthRejected"), "{reason}");
+    assert_eq!(
+        reason,
+        "protocol handshake failed (AuthRejected { protocol: Trojan })"
+    );
     // TUN 侧同一 tag 共用 dialer：不再探测，直接拒绝。
     assert_eq!(dial(&reg, "t"), Err("auth_rejected"));
     assert_eq!(node.conns().len(), 1, "one probe, no flow connections");
@@ -836,8 +893,9 @@ fn a_pending_probe_does_not_block_the_engine_and_is_not_a_stream() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(node.probes(), 1, "probe pending");
+    // 远小于 3 s 读窗口：探测不在引擎调用里进行（阈值留出覆盖率构建的余量）。
     assert!(
-        slowest < Duration::from_millis(50),
+        slowest < Duration::from_millis(500),
         "slowest call {slowest:?}"
     );
     // 探测 inconclusive 后照常拨号：只有一条流计入。

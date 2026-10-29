@@ -7,7 +7,8 @@
 //!   与一个 HTTP GET，然后只读，最多 3 s。
 //!
 //! 探测在发起拨号的 worker 线程内同步执行：不新建线程，不阻塞 dataplane `tick()`。
-//! 各阶段按截止时刻（而不是每次 socket 调用的超时）计时，单次探测 ≤ 5 + 5 + 3 = 13 s。
+//! 各阶段按截止时刻（而不是每次 socket 调用的超时）计时，单次探测 ≤ 5 + 5 + 3 = 13 s
+//! （建连阶段含信任根加载）；等待同一结果的拨号等到该探测结束为止。
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -21,17 +22,15 @@ use rustls::pki_types::ServerName;
 use super::tls::{self, TlsStream};
 
 /// 探测目标：RFC 6761 保留域，密码正确时节点解析失败而关闭。
-pub(crate) const PROBE_HOST: &str = "credential-probe.nexus.invalid";
+const PROBE_HOST: &str = "credential-probe.nexus.invalid";
 /// 探测目标端口（discard）。
-pub(crate) const PROBE_PORT: u16 = 9;
-/// TCP 建连上限。
+const PROBE_PORT: u16 = 9;
+/// TCP 建连上限（含 TLS 客户端配置 / 信任根加载）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// TLS 握手与写请求合计上限。
 const HANDSHAKE_AND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 写完请求后的读窗口。
 const READ_WINDOW: Duration = Duration::from_secs(3);
-/// 单次探测上限；等待同一结果的拨号最多等这么久。
-const PROBE_BOUND: Duration = Duration::from_secs(13);
 /// `passed` 的有效期（自探测结束）。
 const PASSED_TTL: Duration = Duration::from_secs(600);
 /// `rejected` 的有效期（自探测结束）。
@@ -43,7 +42,7 @@ const FIRST_BYTES_MAX: usize = 16;
 
 /// 一次探测（或一次拨号采用）的判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verdict {
+pub(super) enum Verdict {
     /// 密码被接受，或节点没有 fallback：照常拨号。
     Passed,
     /// 读窗口内收到下行字节：只能来自 fallback，拨号以 `auth_rejected` 失败。
@@ -64,11 +63,11 @@ impl Verdict {
 
 /// 一次探测的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProbeReport {
-    pub(crate) verdict: Verdict,
+pub(super) struct ProbeReport {
+    verdict: Verdict,
     /// 读窗口内收到的前若干下行字节（只在 `Rejected` 时非空）。
-    pub(crate) first_bytes: Vec<u8>,
-    pub(crate) elapsed: Duration,
+    first_bytes: Vec<u8>,
+    elapsed: Duration,
 }
 
 /// 一次拨号该怎么做。
@@ -137,14 +136,14 @@ impl GateState {
 }
 
 /// 一个 trojan 出站的探测闸门（MODULE P6）。
-pub(crate) struct ProbeGate {
+pub(super) struct ProbeGate {
     tag: String,
     state: Mutex<GateState>,
     finished: Condvar,
 }
 
 impl ProbeGate {
-    pub(crate) fn new(tag: String) -> Self {
+    pub(super) fn new(tag: String) -> Self {
         Self {
             tag,
             state: Mutex::new(GateState::default()),
@@ -153,25 +152,20 @@ impl ProbeGate {
     }
 
     /// 本次拨号采用的判定；需要时调用 `probe` 探测（同一时刻至多一个探测，其余等待其结果）。
+    /// 等待者等到该探测结束为止（探测自身有界；探测方 unwind 时由 [`InFlight`] 唤醒）。
     /// 每次探测结束打印一行 stderr（[`log_line`]）。
-    pub(crate) fn verdict(&self, probe: impl FnOnce() -> ProbeReport) -> Verdict {
+    pub(super) fn verdict(&self, probe: impl FnOnce() -> ProbeReport) -> Verdict {
         let mut state = self.lock();
         loop {
             match state.decide(Instant::now()) {
                 Decision::Use(verdict) => return verdict,
                 Decision::Wait => {
                     let ticket = state.completed;
-                    let deadline = Instant::now() + PROBE_BOUND;
                     while state.in_flight && state.completed == ticket {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            return Verdict::Inconclusive;
-                        }
                         state = self
                             .finished
-                            .wait_timeout(state, remaining)
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .0;
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
                     }
                     if state.completed != ticket {
                         return state.last.unwrap_or(Verdict::Inconclusive);
@@ -217,7 +211,7 @@ impl Drop for InFlight<'_> {
 }
 
 /// 探测结束的 stderr 行（PRODUCT §11.9.5「可观察」）；不含密码及其哈希。
-pub(crate) fn log_line(tag: &str, report: &ProbeReport) -> String {
+fn log_line(tag: &str, report: &ProbeReport) -> String {
     let (warn, first_bytes_hex) = match report.verdict {
         Verdict::Rejected => (
             "WARN ",
@@ -248,7 +242,7 @@ fn probe_request(password: &str, sni: &str) -> Vec<u8> {
 }
 
 /// 对 `config` 描述的节点执行一次探测。
-pub(crate) fn run_probe(config: &TrojanTlsConfig) -> ProbeReport {
+pub(super) fn run_probe(config: &TrojanTlsConfig) -> ProbeReport {
     let started = Instant::now();
     let (verdict, first_bytes) = match open_and_send(config) {
         Ok(mut stream) => read_verdict(&mut stream, READ_WINDOW),
@@ -263,13 +257,14 @@ pub(crate) fn run_probe(config: &TrojanTlsConfig) -> ProbeReport {
 
 /// 建连、TLS 握手、写请求；任一阶段失败（含写入时被 reset）→ `Err`（判 inconclusive）。
 fn open_and_send(config: &TrojanTlsConfig) -> io::Result<TlsStream> {
+    let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
     let client = tls::build_client_config(config.skip_cert_verify, &config.alpn)
         .map_err(|_| io::Error::other("TLS client config"))?;
     let server_name = ServerName::try_from(config.sni.clone())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SNI"))?;
     let connection =
         rustls::ClientConnection::new(Arc::new(client), server_name).map_err(io::Error::other)?;
-    let socket = TcpStream::connect_timeout(&config.server, CONNECT_TIMEOUT)?;
+    let socket = TcpStream::connect_timeout(&config.server, remaining_until(connect_deadline)?)?;
     let mut stream = rustls::StreamOwned::new(connection, socket);
     let deadline = Instant::now() + HANDSHAKE_AND_WRITE_TIMEOUT;
     // 握手完成前写入的明文由 rustls 缓存，握手完成后随首批应用数据发出。
@@ -306,7 +301,8 @@ fn remaining_until(deadline: Instant) -> io::Result<Duration> {
 
 /// 读窗口内的判定：任意下行字节 → rejected；零字节 EOF（含无 close_notify）/ reset →
 /// passed；窗口耗尽仍无字节 → inconclusive。其他读错误（TLS 告警、解码失败等）不在
-/// §11.9.5 的列举内，按无法判定处理（照常拨号、不缓存）。
+/// §11.9.5 的列举内：错误之前已解密的字节照样判 rejected，否则按无法判定处理（照常拨号、
+/// 不缓存）。
 fn read_verdict(stream: &mut TlsStream, window: Duration) -> (Verdict, Vec<u8>) {
     let deadline = Instant::now() + window;
     let mut buf = [0u8; FIRST_BYTES_MAX];
@@ -329,7 +325,12 @@ fn read_verdict(stream: &mut TlsStream, window: Duration) -> (Verdict, Vec<u8>) 
         match stream.conn.read_tls(&mut stream.sock) {
             Ok(_) => {
                 if stream.conn.process_new_packets().is_err() {
-                    return (Verdict::Inconclusive, Vec::new());
+                    // 同一次读里，坏记录之前的完整记录已解密：不能因后续错误丢掉
+                    // fallback 的应答（否则 fail-open）。
+                    return match stream.conn.reader().read(&mut buf) {
+                        Ok(n) if n > 0 => (Verdict::Rejected, buf[..n].to_vec()),
+                        _ => (Verdict::Inconclusive, Vec::new()),
+                    };
                 }
             }
             Err(error)

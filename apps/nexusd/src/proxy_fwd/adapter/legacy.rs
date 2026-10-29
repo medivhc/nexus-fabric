@@ -168,7 +168,9 @@ impl OutboundDialer for TrojanProxyTransportDialer {
     }
 
     fn dial_tcp(&self, target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError> {
-        if let Some(gate) = &self.probe
+        // IPv6 目标由 `trojan_tls_connect` 在触网前拒绝：不为注定失败的拨号探测。
+        if target.is_ipv4()
+            && let Some(gate) = &self.probe
             && gate.verdict(|| trojan_probe::run_probe(&self.config)) == Verdict::Rejected
         {
             return Err(OutboundError::ProtocolHandshake(
