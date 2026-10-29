@@ -126,10 +126,11 @@ impl N1Stats {
         self.rx_stream_frames.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `rx.queue_full` 且 `rx.rejected{queue_full}`（§6.1 QueueFull 行）。
+    /// `rx.queue_full`：入站队列满事件（含 ConnUp/ConnDown 重投；是否同时
+    /// 计 `rx.rejected{queue_full}` 由调用方按 §6.1 决定——只有被丢弃的
+    /// **数据报**才算 rejected）。
     pub fn record_rx_queue_full(&self) {
         self.rx_queue_full.fetch_add(1, Ordering::Relaxed);
-        self.rx_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// `rx.ambiguous`（`rx.rejected` 由 `record_rx_rejected` 单独累计）。

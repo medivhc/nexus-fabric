@@ -314,7 +314,12 @@ fn reader_loop(
                 };
                 match try_enqueue(&tx, msg) {
                     Enqueued::Sent => {}
-                    Enqueued::QueueFull => stats.record_rx_queue_full(),
+                    Enqueued::QueueFull => {
+                        // 满：丢该 datagram（不阻塞 reader），计
+                        // `rx.queue_full` + `rx.rejected{queue_full}`（§6.1）。
+                        stats.record_rx_queue_full();
+                        stats.record_rx_rejected(N1InboundReject::QueueFull);
+                    }
                     // dataplane 侧已退出：没有消费者，reader 收工并撤下回程 conn。
                     Enqueued::Disconnected => {
                         eprintln!(
@@ -336,11 +341,16 @@ fn reader_loop(
             }
         }
     }
-    if matches!(
-        try_enqueue(&tx, N1Inbound::ConnDown { peer }),
-        Enqueued::QueueFull
-    ) {
-        stats.record_rx_queue_full();
+    match try_enqueue(&tx, N1Inbound::ConnDown { peer }) {
+        Enqueued::Sent | Enqueued::Disconnected => {}
+        Enqueued::QueueFull => {
+            // 不是数据报，不计 rejected；但必须可观测（不得静默丢）。
+            stats.record_rx_queue_full();
+            eprintln!(
+                "[n1-rx] peer={} conn_down dropped reason=queue_full",
+                peer_hex8(&peer)
+            );
+        }
     }
 }
 
