@@ -419,7 +419,7 @@ feature_scope = "ring+std only; aws-lc-rs/tls12 explicitly off (QUIC requires TL
 license = "Apache-2.0 OR ISC OR MIT (allowlisted; same version already in tree via quinn-proto/nexus-fabric)"
 security = "no known advisories; re-check at push time via harness dependency-governance gate"
 portability = "pure Rust + ring cc build (already accepted in tree); crate marked portable = false"
-supply_chain = "0.23.45 pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+supply_chain = "0.23.46 pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto. 2026-10-27: 0.23.45 -> 0.23.46 and rustls-webpki 0.103.15 -> 0.103.16 (patch bumps) for RUSTSEC-2026-0346/0347/0348/0349/0382"
 os_transitive_deps = "none"
 approved = true
 approved_date = "2026-10-04"
@@ -535,7 +535,7 @@ features = ["rust-crypto"]
 architecture_layer = "delivery (web gateway); node-side WebRTC endpoint (SDP/ICE/DTLS/SCTP DataChannel); sans-IO, no async runtime, repo stays std-only"
 feature_scope = "rust-crypto feature only; default aws-lc-rs/examples features disabled"
 license = "MIT OR Apache-2.0 (allowlisted)"
-security = "no known advisories; str0m is the WebRTC stack used by LiveKit; RustSec checked via harness gate"
+security = "RUSTSEC-2026-0387 (crypto-bigint 0.5.5 timing, via dimpl 0.7 -> elliptic-curve 0.13) accepted in policies/deny.toml ignore on 2026-10-27: no compatible fix while str0m 0.24.1 pins dimpl ^0.7; revisit on str0m upgrade. str0m is the WebRTC stack used by LiveKit"
 portability = "pure Rust with rust-crypto backend (RustCrypto, no C build); crate marked portable = false (DTLS crypto)"
 supply_chain = "0.24.1 pinned by Cargo.lock; deps are str0m-proto/is/dimpl/RustCrypto crates (all MIT/Apache-2.0)"
 os_transitive_deps = "none"
