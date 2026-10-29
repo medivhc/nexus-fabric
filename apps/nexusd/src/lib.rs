@@ -19,6 +19,8 @@ pub mod dns_upstream;
 /// 热路径日志限频（per `(tag, cause)`；PRODUCT hot-path 契约）。
 mod log_throttle;
 pub mod mesh_peer_map;
+/// N1 入站 mTLS listener 适配（spec §5.2，WP1）。
+pub mod n1_listener;
 pub mod nat_chunk_recv;
 pub mod nat_chunk_stats;
 pub mod nat_consumer;
