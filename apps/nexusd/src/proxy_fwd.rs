@@ -546,7 +546,7 @@ impl ProxyEngine {
 
     /// 自上次调用以来 UDP 代理流（VLESS / AnyTLS）实际写出的数据报数：入队时不计转发，
     /// 写出时才计（`proxy_forwarded` 只计真实转发）。由 dataplane 的唯一同步点读取。
-    pub fn take_udp_stream_writes(&mut self) -> u64 {
+    pub(crate) fn take_udp_stream_writes(&mut self) -> u64 {
         self.udp
             .values_mut()
             .map(udp_relay::UdpForwarder::take_stream_writes)

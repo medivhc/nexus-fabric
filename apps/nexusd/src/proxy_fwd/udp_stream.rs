@@ -45,8 +45,8 @@ const OPEN_RETRY_SPACING: Duration = Duration::from_secs(1);
 const OPEN_FAILED_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// worker 读超时 = 两次检查写命令之间的最长间隔，即上行数据报的额外延迟上限。最近
 /// `ACTIVE_WINDOW` 内有流量时用短间隔，空闲时用长间隔（少唤醒）。内核把 socket 读超时
-/// 向上取整到时钟节拍，真实 socket 上的短间隔约为一个节拍（HZ=250 约 4 ms，HZ=100 为
-/// 10 ms）；代价是活跃流每秒数百次唤醒（实测 1024 条活跃流约多 0.65 核，debug 构建）。
+/// 向上取整到时钟节拍，真实 socket 上的短间隔约为一到两个节拍（HZ=250 约 4–8 ms，HZ=100
+/// 约 10–20 ms）；代价是活跃流每秒数百次唤醒（实测 1024 条活跃流约多 0.65 核，debug 构建）。
 /// 读写同线程是这里需要轮询的原因，读写分离是后续改进方向。
 const ACTIVE_POLL: Duration = Duration::from_millis(2);
 const IDLE_POLL: Duration = Duration::from_millis(20);

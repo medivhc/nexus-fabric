@@ -252,7 +252,9 @@ fn open_runs_off_the_dataplane_thread() {
         t0,
         &mut stats
     ));
-    assert!(call.elapsed() < Duration::from_millis(50), "send blocked");
+    // 建流在 send 里进行的话，这次调用会一直阻塞（闸门不放行）；1 s 的上限只留出并行测试
+    // （上千条流的上限测试）造成的调度抖动余量。
+    assert!(call.elapsed() < Duration::from_secs(1), "send blocked");
     // 第二个流键在第一个建流仍阻塞时照常建流、写出、收回包。
     assert!(table.send(addr(SRC_A, 5000), dst(2), b"free".to_vec(), t0, &mut stats));
     let opened = wait_opened(&dialer, 1);
