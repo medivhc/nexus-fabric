@@ -677,6 +677,7 @@ mod tests {
             obfs_password: None,
             fallback_guard: None,
             ready_window_ms: None,
+            credential_probe: None,
         }
     }
 

@@ -6807,6 +6807,7 @@ mod udp_associate_serve_tests {
             obfs_password: None,
             fallback_guard: None,
             ready_window_ms: None,
+            credential_probe: None,
         };
         let outbound = build_product_udp_outbound(&config).expect("vless udp supported");
         let UdpCapability::Supported(mode) = outbound.capability() else {
