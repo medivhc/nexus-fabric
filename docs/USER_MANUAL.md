@@ -624,6 +624,30 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
   对端发起的流交 egress relay 连本地目标）。整节省略 = **禁用**（默认行为与
   未引入本功能时一致：不 bind、不起 accept/rx 线程）。
 
+  **能力状态：preview / 待诊断**（诊断 follow-up：`n1-mid-stream-send-failure-diagnosis`）。
+  在诊断 run 关闭前，任何「N1 可用 / 稳定」的对外说法都不成立。
+
+* **诚实边界**（必须随任何对外说明复述）：
+
+  * N1 走**不可靠的 QUIC datagram** 承载：没有跨节点重传、没有重排、没有 ack。
+    上层不能假定这条路径上的字节流是完整的。
+  * 2026-10-29 唯一一次真实公网 [R] 窗口实测：应用 `sendall` 发出 **10,485,760 字节
+    （10 MiB）**，接收端只收到 **145,400 字节（1.39%）** 后正常结束，SHA-256
+    `a587b106…` ≠ `bfa85711…`。**根因未定性**（最强候选是发送端 conn 生命周期，
+    交 `n1-mid-stream-send-failure-diagnosis` 诊断）。
+  * 这次失败**不是**「已发出但丢在路上」：接收端收到了发送端几乎全部帧
+    （`rx.stream_frames +237`），发送端的失败是 `send_to_mesh` 持续报错
+    （`fallback_errors` 27→8,366，**+8,339**）。因此按 spec §12.3 的 `FAIL(loss)`
+    口径**不适用**——不要把它描述成丢包。
+  * **失败时两端应用都可能看不到错误**：发送端 `send`/`sendall` 返回成功，接收端
+    得到的是**干净 EOF**（`reset=false`，不是 RST）。也就是说
+    **应用层 connect/send 成功 ≠ 送达**。依赖完整性的场景（文件传输、备份、镜像
+    拉取等）**必须**自己做端到端校验（如 SHA-256），并把校验失败按数据损坏处理。
+  * **大流 / 长连接当前不要依赖 N1**。本 run 没有可宣称的安全阈值：不要对小流说
+    「没事」（1 MiB loopback 只是 [P] 进程内证据，不是公网保证）。
+  * 影响面不止「新监听」：这条 N1 fallback 也是 P0 chunk 路径在 direct 门未开时的
+    回退通道，排障/公告时不要把它说成「只影响新功能」。
+
 * **配置（`daemon.toml`，全部可选）**：
 
 | 键 | 默认 | 说明 |
@@ -631,11 +655,32 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
 | `[network.n1].enabled` | `false` | 总开关；`listen_addr` 显式出现且 `enabled` 缺省时按 `true` 处理 |
 | `[network.n1].listen_addr` | 缺省 = 禁用 | `ip:port`（如 `0.0.0.0:9000`）；缺省时静默降级为禁用（日志 `reason=no_listen_addr`，**不退出**） |
 | `[network.identity].seed_file` | listen 启用时必填 | 缺失/不可读/与 `peer_id` 不匹配 → fail-closed，exit 1（`[n1-listener] ERROR: identity unavailable`） |
-| `network.toml [[peers]]` | 既有 | listener 的 allowlist；空 `[[peers]]` 时拒绝所有入站（纯拨号节点仍可出站） |
+| `network.toml [[peers]]` | 既有 | 同时是 listener 的 allowlist 和本端拨号的目标列表（`addrs[0]`，见下）；空 `[[peers]]` 时拒绝所有入站（纯拨号节点仍可出站） |
 
   配置错误行为：`listen_addr` 仅格式非法 → `CONFIG_INVALID [network.n1].listen_addr` + exit 1；
-  端口占用 → `bind_failed` + WARN，进程继续。注意 `[[peers]].addrs[0]`（对端拨号地址）
-  必须等于本端 `listen_addr` 的 `ip:port`，否则对端 dial 只会超时。
+  端口占用 → `bind_failed` + WARN，进程继续。
+
+  **四条容易配错的点（必须一起看）**：
+
+  1. **`[[peers]].addrs[0]` 填的是「对端」的 `listen_addr`，不是自己的。** 它表示
+     「本端拨号去连对端」的目标地址（实现只用 `peer.addrs[0]` 拨号）。所以：
+     本端 `network.toml` 里描述**对端**的那条 `[[peers]]`，`addrs[0]` = **对端**的
+     `[network.n1].listen_addr`；对端 `network.toml` 里描述**本节点**的那条
+     `addrs[0]` = 本端的 `listen_addr`。**两端互填对方地址**——按「填本端」理解会
+     把自己拨到自己身上，对端永远收不到。
+  2. **会话 tie-break：小 `peer_id` 侧只拨号，大 `peer_id` 侧只监听**（双向拨号会
+     互相 close）。因此这对节点之间**至少大 `peer_id` 侧必须开启 `[network.n1]`
+     监听**（两端都开最省心）。只在小 id 侧开监听 = 大 id 侧既不拨也不听，小 id
+     拨过去只会超时，永远没有会话。
+  3. **前置条件：`network.toml` 必须存在**，且 `[network.identity].seed_file` 可读并与
+     `peer_id` 匹配。缺 `network.toml` 或 identity 不可用时，启用 N1 会打印
+     `[n1-listener] ERROR: identity unavailable; refusing to listen` 并 **exit 1**
+     ——不是「只要 `daemon.toml` 配好就行」。
+  4. **`[network.n1]` 的变更需要重启 daemon 才生效**（配置变更被分类为 `NeedsRestart`，
+     热加载不会重建 mTLS listener）。
+
+  **监听只管入站**：出站拨号的目标来自 `network.toml` 的 `[[peers]]` 地址，与本端是否
+  开 `[network.n1]` 无关。纯发送侧不开监听也能发（经既有路径），代价是无法被对端拨入。
 
 * **启动日志**：
 
@@ -671,21 +716,81 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
   `listener.state` 取值 `listening` / `bind_failed` / `disabled`；`runtime="enabled"`
   当且仅当 `state != "disabled"`（`bind_failed` 时 `addr` 为空串）。
 
+* **验证路径（可复制）**：
+
+  1. **取 token**：默认在 `<配置目录>/localapi.token`（与 `daemon.toml` / `network.toml`
+     同目录；daemon 首次启动自动生成 64 位 hex、权限 `0600`）。也可用环境变量
+     `NEXUS_LOCALAPI_TOKEN_FILE=<path>` 指向别的文件。
+  2. **查 stats**：`nexusd <配置目录>` 形态的 LocalAPI 默认 `127.0.0.1:18080`
+     （由 `daemon.toml` 的 `localapi_addr` 决定）；若用 `nexusd serve`（默认 unix
+     socket），需加 `--addr 127.0.0.1:18080` 才能用下面这条 curl。
+
+     ```bash
+     curl -sS -H "Authorization: Bearer $(cat <配置目录>/localapi.token)" \
+       http://127.0.0.1:18080/localapi/v0/n1/stats
+     ```
+
+  3. **期望输出要点**：
+     * **disabled**（未启用 / 未配 `listen_addr`）：HTTP 200，`"runtime":"disabled"`、
+       `"listener":{"state":"disabled","addr":""}`，所有计数为 0；不返回 404/500。
+     * **enabled**：`"runtime":"enabled"`、`"listener":{"state":"listening","addr":"<listen_addr>"}`。
+       若为 `"state":"bind_failed"`，`addr` 是空串，原因只在 stderr
+       （`[n1-listener] WARN: bind failed …`），JSON 里没有 `reason` 字段。
+  4. **先确认会话，再传数据**：在日志里看到小 id 侧的
+     `[n1-dial] peer=<hex16> attempt=<n> result=ok` 或大 id 侧的
+     `[n1-rx] conn peer=<hex16> conn=<n> started` 之后，才开始灌数据。
+     看不到这两行 = 会话根本没建立，此时传数据只会走 fallback 或被丢，
+     排查配置而不是怀疑数据面。
+
+* **stats 判读（它不是健康检查）**：
+
+  * `verdict="PASS"` 是固定值，**只表示这次查询成功**（路由返回了 JSON），
+    不是 N1 健康判据。别用 `verdict` 判断能不能传数据。
+  * `tx.frames` / `tx.errors` **只覆盖回程** STREAM 帧（本节点把数据回写给对端）。
+    **前向**（本节点发出的 Mesh 数据）的发送失败不计在这里：看
+    `/localapi/v0/nat/chunks` 的 `chunks.fallback_errors` 与
+    `/localapi/v0/dataplane/stats` 的 `dataplane.mesh_dropped_no_n1`（r2 窗口两者同步
+    **+8,339**）。所以 `tx` 是 0/0 **不代表**没发失败过。
+  * `runtime="enabled"` **不等于正在监听**：`bind_failed` 时 `runtime` 仍是 `enabled`，
+    要看 `listener.state` / `addr`（空串）与 stderr。
+  * `runtime="disabled"` 时日志的 `reason=no_listen_addr` **不区分**「显式
+    `enabled=false`」与「根本没配 `listen_addr`」（当前实现两者同一句、stats 也不带
+    reason）；判断是哪种请回看自己的 `daemon.toml`。
+  * 当前**没有「活跃 peer 数 / 会话是否活着」字段**；唯一可看的是 stderr 里成对的
+    `[n1-rx] conn … started` / `… closed`。
+
 * **计数口径（必须随对外说明复述）**：
 
   * `rx.datagrams/bytes` 是 reader 从 `recv_datagram` 读到的；`rx.stream_frames` /
-    `rx.raw_ip` 是 demux 分类后的；`rx.rejected` 只计被丢弃的数据报（reason 见日志）。
+    `rx.raw_ip` 是 demux 分类后的；`rx.queue_full` 是入站队列满丢包的计数，
+    同时也会计入 `rx.rejected`。
   * `egress.connect_ok` 只计**本地 socket 已产出证据**的连接（读到字节或 EOF）；
     连上后一直静默到退出的流不会被计入——**只少计、不多计**，不要读作“全部连接成功数”。
   * `egress.bytes_to_local` 计 DATA 载荷**进入 relay 写路径**的字节；正常 socket
     缓冲下等于写入本地 socket，但部分写时两者不可区分，不是逐字节严格语义。
-  * `rx.rejected` 里也包含 **TLS 握手完成前死亡**的入站连接（含客户端中途断开、
-    网络抖动等非对抗原因；每连接至多计一次），且该部分只在 `accept_timeout`
-    超时轮询时并入——持续成功 accept 时会**延迟**呈现（不丢失）。不要把它
-    读作攻击/恶意连接计数。
+  * `rx.rejected` **不是「只计被丢弃的数据报」**，它由两类组成，日志 `reason=` 可区分：
+    ① demux 丢弃的数据报（`reason=empty` / `ambiguous` / `queue_full` / `bad_frame`）；
+    ② TLS 握手完成前死亡 / 未通过准入的入站连接（`[n1-listen] tls handshake rejected …`
+    或 `[n1-listener] rejected … reason=admission`；含客户端中途断开、网络抖动等
+    **非对抗原因**，每连接至多计一次）。第 ② 类只在 `accept_timeout` 超时轮询时并入
+    ——持续成功 accept 时会**延迟**呈现（不丢失）。不要把它读作攻击/恶意连接计数。
+    `reason=duplicate` 的重复连接拒绝**不计入** `rx.rejected`。
   * **`recv_chunks == 0` 不表示没有数据到达**：`recv_chunks` 是 direct-conn chunk
     接收端专用（语义未变）。N1 投递看 `n1.rx.stream_frames` 与
     `n1.egress.bytes_to_local`，不要用 `recv_chunks` 证明 N1 送达。
+
+* **症状 → 看哪里**：
+
+| 症状 | 先看哪里 | 说明 |
+|---|---|---|
+| 小 id 侧反复重试、始终没有会话 | `[n1-dial] peer=<hex16> attempt=<n> result=err kind=Timeout`（1s→30s 退避） | 三种原因：对端没开监听 / `addrs[0]` 地址填错 / 本端不在对端 `[[peers]]` allowlist。**拨号端无法区分这三者**，必须去对端看日志 |
+| 对端报握手被拒 | 对端 `[n1-listen] tls handshake rejected (peer unauthenticated or protocol error)` | 前缀就是 `n1-listen`（不是 `n1-listener`），且该行**不带 peer hex**——无法从日志定位是哪个 peer，只能结合对端 `[[peers]]` 与拨号侧 `[n1-dial] peer=` 前缀人工比对 |
+| 连上又被关掉 | `[n1-listener] rejected peer=<hex16> reason=admission` / `reason=duplicate` | `admission` = allowlist 深度复核拒绝；`duplicate` = 该 peer 已有会话，新 conn 被会话层关闭（机制既有语义，不是错误） |
+| 会话建立 / 断开 | `[n1-rx] conn peer=<hex16> conn=<n> started` / `… closed` | 当前唯一能看「有几个 peer 活着」的地方（stats 无此字段）；`closed` 与 `rx` 的连接关闭计数 1:1 |
+| 收到但被丢弃 | `[n1-rx] rejected peer=<hex16> reason=empty` / `ambiguous` / `queue_full` / `bad_frame` | 依次对应：空数据报、kind 歧义、入站队列满、帧解码失败；日志按 reason 限频，被抑制的行数看 `suppressed=` |
+| 本地目标连不上 | `[n1-egress] connect peer=<hex16> stream=<n> result=failed kind=Other` + `egress.connect_failed` | 机制侧丢弃了 `io::ErrorKind`，日志只能给 `Other`；失败**本身**由 `egress.connect_failed` 精确计数 |
+| 前向帧发不出去（r2 断裂形态） | `[nat-chunk] n1 send failed dst=<ip> kind=<…> len=<…>`；计数看 `/localapi/v0/nat/chunks` 的 `chunks.fallback_errors` 与 `/localapi/v0/dataplane/stats` 的 `dataplane.mesh_dropped_no_n1` | `/n1/stats` 的 `tx.*` **看不到**前向丢弃；应用层此时可能仍显示成功（见本节诚实边界） |
+| 应用层「成功」但数据不对 | 两端各自做端到端校验（SHA-256） | 发送端 send 成功 + 接收端干净 EOF 就是 r2 实测到的失败形态；不要用 N1 计数或 `verdict` 代替校验 |
 
 ### 4.2 Service
 
@@ -1153,6 +1258,7 @@ whitespace、format、check、clippy、architecture-policy（fast 侧 delta）�
 | 传输层 crate                               | stub        | `nexus-platform-{linux,macos,android,ios}` 为骨架（`nexus-delivery`、`nexus-diagnostics`、`nexus-proto` 已于 2026-10-26 删除）                            |
 | fuzz 门禁                                 | 需 nightly   | `cargo +nightly fuzz check`（stable 下 libfuzzer -Z 选项失败）                                                                              |
 | NAT 打洞真实 STUN 集成测试                      | 待完善         | 单元测试 + example 已覆盖，真实 STUN 服务器集成测试待补充                                                                                                |
+| N1 入站监听（`[network.n1]`）                 | **preview / 待诊断** | 走**不可靠 QUIC datagram**，无跨节点重传/重排。2026-10-29 公网 [R] 实测 10 MiB（10,485,760 B）在 **145,400 B（1.39%）** 处中断、SHA-256 不一致，**根因未定性**，且**不是** `FAIL(loss)`（接收端收到几乎全部帧、发送端 `fallback_errors` **+8,339**）。失败时两端应用都可能看不到错误（发送端 send 成功、接收端干净 EOF）——**connect/send 成功 ≠ 送达**，依赖完整性的场景必须做端到端校验（如 SHA-256）；**大流/长连接当前不要依赖 N1**。诊断 follow-up：`n1-mid-stream-send-failure-diagnosis`（见 §4.1.14） |
 | 磁盘注意                                    | 本机          | 构建产物优先放 D:（C:/E: 高水位告警）                                                                                                              |
 
 ### 6.2 修复记录（2026-09-20：requirement-change + bugfix，HEAD 6ff5fb1 校验发现）
