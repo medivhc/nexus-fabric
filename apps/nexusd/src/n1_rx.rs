@@ -19,8 +19,8 @@ use nexus_network::n1::session::N1SessionManager;
 use nexus_network::n1::{N1Connection, N1Error, N1PeerId};
 
 use crate::log_throttle::KeyedLogThrottle;
-
-pub use crate::n1_runtime::{N1Inbound, N1InboundReject, N1Stats};
+use crate::n1_runtime::N1Inbound;
+use crate::n1_stats::{N1InboundReject, N1Stats};
 /// originator 侧 24-bit stream id 上界（唯一定义点在
 /// `nexus_projection::tcp`；此处重导出以满足 spec §7 的 `n1_rx` 路径）。
 pub use nexus_projection::tcp::N1_STREAM_ID_MASK;

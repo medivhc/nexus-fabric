@@ -562,7 +562,7 @@ fn run_dataplane(
     nat_inbound_rx: std::sync::mpsc::Receiver<nexusd::nat_chunk_recv::NatInboundChunk>,
     chunk_stats: Arc<nexusd::nat_chunk_stats::ChunkStats>,
     n1_inbound_rx: std::sync::mpsc::Receiver<nexusd::n1_runtime::N1Inbound>,
-    n1_stats: Arc<nexusd::n1_runtime::N1Stats>,
+    n1_stats: Arc<nexusd::n1_stats::N1Stats>,
 ) {
     use nexus_projection::TunDevice;
     // D1：TUN 模式创建单个 TUN；纯 TPROXY 模式使用 InertTun（不伪造数据面）。
@@ -2197,7 +2197,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         None => {
             let (tx, rx) = std::sync::mpsc::sync_channel(nexusd::n1_runtime::N1_INBOUND_QUEUE_CAP);
             drop(tx);
-            (rx, Arc::new(nexusd::n1_runtime::N1Stats::default()))
+            (rx, Arc::new(nexusd::n1_stats::N1Stats::default()))
         }
     };
 

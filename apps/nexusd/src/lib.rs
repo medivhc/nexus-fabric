@@ -25,6 +25,8 @@ pub mod n1_listener;
 pub mod n1_runtime;
 /// N1 入站泵（spec §5.3/§5.4，WP3）：rx supervisor + reader + demux。
 pub mod n1_rx;
+/// N1 计数面（spec §5.6/§7，WP6）：`N1Stats` + `/localapi/v0/n1/stats` JSON。
+pub mod n1_stats;
 pub mod nat_chunk_recv;
 pub mod nat_chunk_stats;
 pub mod nat_consumer;

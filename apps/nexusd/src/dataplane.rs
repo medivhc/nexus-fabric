@@ -117,7 +117,7 @@ pub enum N1RelayError {
 ///   部分写时不可区分（正常 socket 缓冲区足够时二者相等）。
 pub struct TcpRelayEgress {
     relay: TcpRelay,
-    stats: Arc<crate::n1_runtime::N1Stats>,
+    stats: Arc<crate::n1_stats::N1Stats>,
     /// 已发 SYN、尚未观测到本地连接成功证据的 `(peer, stream_id)`。
     ///
     /// 只用于把「connect 成功 / 失败」归类；上界是 relay 表大小（≤1024），
@@ -129,7 +129,7 @@ pub struct TcpRelayEgress {
 }
 
 impl TcpRelayEgress {
-    pub fn new(stats: Arc<crate::n1_runtime::N1Stats>) -> Self {
+    pub fn new(stats: Arc<crate::n1_stats::N1Stats>) -> Self {
         Self {
             relay: TcpRelay::new(),
             stats,
@@ -152,11 +152,11 @@ impl TcpRelayEgress {
         self.seen_connect_failed = stats.connect_failed;
         for _ in 0..table_full {
             self.stats
-                .record_egress(crate::n1_runtime::N1EgressEvent::TableFull);
+                .record_egress(crate::n1_stats::N1EgressEvent::TableFull);
         }
         for _ in 0..connect_failed {
             self.stats
-                .record_egress(crate::n1_runtime::N1EgressEvent::ConnectFailed);
+                .record_egress(crate::n1_stats::N1EgressEvent::ConnectFailed);
         }
         (table_full, connect_failed)
     }
@@ -173,7 +173,7 @@ impl N1EgressRelay for TcpRelayEgress {
         let is_syn = flags & STREAM_SYN != 0;
         if is_syn {
             self.stats
-                .record_egress(crate::n1_runtime::N1EgressEvent::Syn);
+                .record_egress(crate::n1_stats::N1EgressEvent::Syn);
             eprintln!(
                 "[n1-egress] syn peer={} stream={stream_id} target={}",
                 hex16(from_peer),
@@ -212,9 +212,7 @@ impl N1EgressRelay for TcpRelayEgress {
         let is_data = flags & (STREAM_SYN | STREAM_FIN | STREAM_RST) == 0;
         if is_data && !payload.is_empty() && owned && events.is_empty() {
             self.stats
-                .record_egress(crate::n1_runtime::N1EgressEvent::BytesToLocal(
-                    payload.len(),
-                ));
+                .record_egress(crate::n1_stats::N1EgressEvent::BytesToLocal(payload.len()));
         }
 
         if owned || owned_before || !events.is_empty() {
@@ -248,9 +246,7 @@ impl N1EgressRelay for TcpRelayEgress {
                         self.record_connect_ok(peer, stream_id);
                     }
                     self.stats
-                        .record_egress(crate::n1_runtime::N1EgressEvent::BytesFromLocal(
-                            bytes.len(),
-                        ));
+                        .record_egress(crate::n1_stats::N1EgressEvent::BytesFromLocal(bytes.len()));
                 }
                 RelayEvent::Closed { reset: false, .. } => {
                     if first_evidence {
@@ -280,7 +276,7 @@ impl N1EgressRelay for TcpRelayEgress {
 impl TcpRelayEgress {
     fn record_connect_ok(&self, peer: &str, stream_id: u32) {
         self.stats
-            .record_egress(crate::n1_runtime::N1EgressEvent::ConnectOk);
+            .record_egress(crate::n1_stats::N1EgressEvent::ConnectOk);
         eprintln!(
             "[n1-egress] connect peer={} stream={stream_id} result=ok",
             hex16(peer)
@@ -689,7 +685,7 @@ pub struct Dataplane {
     /// WP4 N1 入站队列（`ConnUp/ConnDown/RawIp/Stream`；spec §5.5）。
     n1_inbound_rx: Option<std::sync::mpsc::Receiver<crate::n1_runtime::N1Inbound>>,
     /// N1 计数（rx 侧由 WP3 写；dispatch/tx 由本段写）。
-    n1_stats: Arc<crate::n1_runtime::N1Stats>,
+    n1_stats: Arc<crate::n1_stats::N1Stats>,
     /// egress relay 分派接口（真实 `TcpRelay` 由 WP5 装入）。
     n1_relay: Option<Box<dyn N1EgressRelay>>,
     /// peer hex → N1 conn（direct 回程的 fallback；spec §5.5）。
@@ -854,7 +850,7 @@ impl Dataplane {
             chunk_stats: Arc::new(crate::nat_chunk_stats::ChunkStats::default()),
             nat_inbound_rx: None,
             n1_inbound_rx: None,
-            n1_stats: Arc::new(crate::n1_runtime::N1Stats::default()),
+            n1_stats: Arc::new(crate::n1_stats::N1Stats::default()),
             n1_relay: None,
             n1_peer_conns: HashMap::new(),
             n1_dispatch_log: crate::log_throttle::KeyedLogThrottle::new(),
@@ -940,7 +936,7 @@ impl Dataplane {
 
     /// Share the composition root's N1 counters (`rx` written by WP3,
     /// dispatch/tx written here).
-    pub fn set_n1_stats(&mut self, stats: Arc<crate::n1_runtime::N1Stats>) {
+    pub fn set_n1_stats(&mut self, stats: Arc<crate::n1_stats::N1Stats>) {
         self.n1_stats = stats;
     }
 
@@ -1033,7 +1029,7 @@ impl Dataplane {
 
         if self.tcp.peer_for(stream_id).is_some() {
             self.n1_stats
-                .record_dispatch(crate::n1_runtime::N1DispatchTarget::Terminator);
+                .record_dispatch(crate::n1_stats::N1DispatchTarget::Terminator);
             // 既有注入函数（spec §5.5；不通过 relay 的 originator 回程）。
             self.inject_stream_frame_from_n1(peer_hex, frame);
             return;
@@ -1043,7 +1039,7 @@ impl Dataplane {
             // WP5 之前没有 egress relay：该流既不是本节点的 originator，
             // 也没有 relay 能消费 → 计入 unknown_stream（不静默吞掉）。
             self.n1_stats
-                .record_dispatch(crate::n1_runtime::N1DispatchTarget::Unknown);
+                .record_dispatch(crate::n1_stats::N1DispatchTarget::Unknown);
             self.log_n1_dispatch_throttled("unknown_stream", peer_hex, stream_id, frame.len());
             return;
         };
@@ -1051,7 +1047,7 @@ impl Dataplane {
         match relay.handle_frame(stream_id, flags, payload, peer_hex) {
             Ok(events) => {
                 self.n1_stats
-                    .record_dispatch(crate::n1_runtime::N1DispatchTarget::Relay);
+                    .record_dispatch(crate::n1_stats::N1DispatchTarget::Relay);
                 for event in events {
                     let reply = match event {
                         RelayEvent::Data {
@@ -1069,7 +1065,7 @@ impl Dataplane {
             }
             Err(N1RelayError::UnknownStream) => {
                 self.n1_stats
-                    .record_dispatch(crate::n1_runtime::N1DispatchTarget::Unknown);
+                    .record_dispatch(crate::n1_stats::N1DispatchTarget::Unknown);
                 self.log_n1_dispatch_throttled("unknown_stream", peer_hex, stream_id, frame.len());
             }
         }
@@ -7526,7 +7522,8 @@ outbounds:
     // WP4：N1 入站消费 + 统一 dispatch（spec §5.5/§5.6/§7）
     // -----------------------------------------------------------------
 
-    use crate::n1_runtime::{N1Inbound, N1Stats, N1StatsSnapshot};
+    use crate::n1_runtime::N1Inbound;
+    use crate::n1_stats::{N1Stats, N1StatsSnapshot};
     use crate::nat_chunk_recv::{CHUNK_KIND_TUN_STREAM, NatInboundChunk};
     use crate::nat_consumer::{NatActiveConn, NatHandleSlot, NatPathProvider};
     use crate::nat_switch::ChunkPath;

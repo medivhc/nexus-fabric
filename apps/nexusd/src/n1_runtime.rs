@@ -9,7 +9,7 @@
 //! dataplane 注入（WP4）、`/n1/stats`（WP6）在后续 WP 增补。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, sync_channel};
 
 use nexus_fabric::FabricIdentity;
@@ -17,6 +17,7 @@ use nexus_network::n1::{N1Connection, N1PeerId};
 
 use crate::config::N1Section;
 use crate::n1_listener::FabricN1Listener;
+use crate::n1_stats::{N1ListenerState, N1Stats, publish_n1_listener_state, publish_n1_stats};
 
 /// 入站队列容量（spec §8.1 `N1_INBOUND_QUEUE_CAP`）。
 pub const N1_INBOUND_QUEUE_CAP: usize = 4096;
@@ -41,237 +42,6 @@ pub enum N1Inbound {
     },
 }
 
-/// 入站拒绝分类（spec §6.1；本段只落计数所需子集，WP3/WP4 增补消费者）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum N1InboundReject {
-    EmptyDatagram,
-    AmbiguousKind { first: u8 },
-    QueueFull,
-    BadFrame { len: usize },
-    UnknownStream { stream_id: u32 },
-    AdmissionDenied { peer: N1PeerId },
-    DuplicatePeer { peer: N1PeerId },
-    ConnClosed,
-}
-
-/// egress relay 计数事件（spec §5.6/§7 `egress.*`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum N1EgressEvent {
-    /// SYN 帧交给 relay（含重复 SYN / 短 SYN；机制侧另有 `short_syn_dropped`）。
-    Syn,
-    /// 已观测到本地连接建立成功的证据（本地 socket 读出字节或 FIN）。
-    ConnectOk,
-    /// relay 的 connect worker 报告失败（机制侧 `TcpRelayStats::connect_failed`）。
-    ConnectFailed,
-    /// 成功交给本地 socket 写路径的字节（§5.6 口径）。
-    BytesToLocal(usize),
-    /// 从本地 socket 读出并交给回程的字节（§5.6 口径）。
-    BytesFromLocal(usize),
-    /// `conns + pending >= MAX_TCP_CONNS`（1024）；该 SYN 已回 RST。
-    TableFull,
-}
-
-/// 消费侧分派目标（spec §5.6/§7）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum N1DispatchTarget {
-    /// 本节点发起的流：回程帧注入 TCP 终结器。
-    Terminator,
-    /// 对端发起的流：本节点是 egress，交 relay。
-    Relay,
-    /// terminator 与 relay 都不认识该流。
-    Unknown,
-}
-
-/// N1 计数（spec §5.6/§7）。WP1 落 rejected 大类，WP3 增补 rx 侧字段，
-/// WP4 增补 dispatch/tx 消费侧字段；WP6 增补 egress 与
-/// `/localapi/v0/n1/stats` 序列化。
-#[derive(Debug, Default)]
-pub struct N1Stats {
-    rx_datagrams: AtomicU64,
-    rx_bytes: AtomicU64,
-    rx_raw_ip: AtomicU64,
-    rx_stream_frames: AtomicU64,
-    rx_rejected: AtomicU64,
-    rx_rejected_admission: AtomicU64,
-    rx_queue_full: AtomicU64,
-    rx_ambiguous: AtomicU64,
-    rx_conn_closed: AtomicU64,
-    rx_transient_errors: AtomicU64,
-    dispatch_to_terminator: AtomicU64,
-    dispatch_to_relay: AtomicU64,
-    dispatch_bad_frame: AtomicU64,
-    dispatch_unknown_stream: AtomicU64,
-    egress_syn: AtomicU64,
-    egress_connect_ok: AtomicU64,
-    egress_connect_failed: AtomicU64,
-    egress_bytes_to_local: AtomicU64,
-    egress_bytes_from_local: AtomicU64,
-    egress_table_full: AtomicU64,
-    tx_frames: AtomicU64,
-    tx_errors: AtomicU64,
-}
-
-/// `N1Stats` 的快照（字段名与 §5.6 的 rx 侧点路径对齐）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct N1StatsSnapshot {
-    pub rx_datagrams: u64,
-    pub rx_bytes: u64,
-    pub rx_raw_ip: u64,
-    pub rx_stream_frames: u64,
-    pub rx_rejected: u64,
-    pub rx_rejected_admission: u64,
-    pub rx_queue_full: u64,
-    pub rx_ambiguous: u64,
-    pub rx_conn_closed: u64,
-    pub rx_transient_errors: u64,
-    pub dispatch_to_terminator: u64,
-    pub dispatch_to_relay: u64,
-    pub dispatch_bad_frame: u64,
-    pub dispatch_unknown_stream: u64,
-    pub egress_syn: u64,
-    pub egress_connect_ok: u64,
-    pub egress_connect_failed: u64,
-    pub egress_bytes_to_local: u64,
-    pub egress_bytes_from_local: u64,
-    pub egress_table_full: u64,
-    pub tx_frames: u64,
-    pub tx_errors: u64,
-}
-
-impl N1Stats {
-    pub fn snapshot(&self) -> N1StatsSnapshot {
-        N1StatsSnapshot {
-            rx_datagrams: self.rx_datagrams.load(Ordering::Relaxed),
-            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
-            rx_raw_ip: self.rx_raw_ip.load(Ordering::Relaxed),
-            rx_stream_frames: self.rx_stream_frames.load(Ordering::Relaxed),
-            rx_rejected: self.rx_rejected.load(Ordering::Relaxed),
-            rx_rejected_admission: self.rx_rejected_admission.load(Ordering::Relaxed),
-            rx_queue_full: self.rx_queue_full.load(Ordering::Relaxed),
-            rx_ambiguous: self.rx_ambiguous.load(Ordering::Relaxed),
-            rx_conn_closed: self.rx_conn_closed.load(Ordering::Relaxed),
-            rx_transient_errors: self.rx_transient_errors.load(Ordering::Relaxed),
-            dispatch_to_terminator: self.dispatch_to_terminator.load(Ordering::Relaxed),
-            dispatch_to_relay: self.dispatch_to_relay.load(Ordering::Relaxed),
-            dispatch_bad_frame: self.dispatch_bad_frame.load(Ordering::Relaxed),
-            dispatch_unknown_stream: self.dispatch_unknown_stream.load(Ordering::Relaxed),
-            egress_syn: self.egress_syn.load(Ordering::Relaxed),
-            egress_connect_ok: self.egress_connect_ok.load(Ordering::Relaxed),
-            egress_connect_failed: self.egress_connect_failed.load(Ordering::Relaxed),
-            egress_bytes_to_local: self.egress_bytes_to_local.load(Ordering::Relaxed),
-            egress_bytes_from_local: self.egress_bytes_from_local.load(Ordering::Relaxed),
-            egress_table_full: self.egress_table_full.load(Ordering::Relaxed),
-            tx_frames: self.tx_frames.load(Ordering::Relaxed),
-            tx_errors: self.tx_errors.load(Ordering::Relaxed),
-        }
-    }
-
-    /// 计入 `rx.rejected{reason}`（reason 进日志；计数只分大类，spec §5.6）。
-    pub fn record_rx_rejected(&self, reason: N1InboundReject) {
-        self.rx_rejected.fetch_add(1, Ordering::Relaxed);
-        if matches!(reason, N1InboundReject::AdmissionDenied { .. }) {
-            self.rx_rejected_admission.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// `rx.datagrams` + `rx.bytes`：reader 从 `recv_datagram` 读到的（§5.6）。
-    pub fn record_rx_datagram(&self, len: usize) {
-        self.rx_datagrams.fetch_add(1, Ordering::Relaxed);
-        self.rx_bytes
-            .fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
-    }
-
-    /// `rx.raw_ip`：demux 判为 raw IPv4/IPv6。
-    pub fn record_rx_raw_ip(&self) {
-        self.rx_raw_ip.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `rx.stream_frames`：demux 判为 STREAM 帧。
-    pub fn record_rx_stream_frame(&self) {
-        self.rx_stream_frames.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `rx.queue_full`：入站队列满事件（含 ConnUp/ConnDown 重投；是否同时
-    /// 计 `rx.rejected{queue_full}` 由调用方按 §6.1 决定——只有被丢弃的
-    /// **数据报**才算 rejected）。
-    pub fn record_rx_queue_full(&self) {
-        self.rx_queue_full.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `rx.ambiguous`（`rx.rejected` 由 `record_rx_rejected` 单独累计）。
-    pub fn record_rx_ambiguous(&self) {
-        self.rx_ambiguous.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `rx.conn_closed`：不算 rejected（§6.1 ConnClosed 行）。
-    pub fn record_rx_conn_closed(&self) {
-        self.rx_conn_closed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// reader 侧 transient 读取错误（10ms 续读，不算 rejected）。
-    pub fn record_rx_transient_error(&self) {
-        self.rx_transient_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `dispatch.to_terminator / to_relay / unknown_stream`（§5.6 消费侧）。
-    pub fn record_dispatch(&self, target: N1DispatchTarget) {
-        let counter = match target {
-            N1DispatchTarget::Terminator => &self.dispatch_to_terminator,
-            N1DispatchTarget::Relay => &self.dispatch_to_relay,
-            N1DispatchTarget::Unknown => &self.dispatch_unknown_stream,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `dispatch.bad_frame`：`decode_stream_frame` 失败（§6.1 `BadFrame`）。
-    ///
-    /// 与 `dispatch.to_*` 互斥：坏帧不进任何一路，也不计 `rx.rejected`
-    ///（§6.1 只要求 `dispatch.bad_frame`）。
-    pub fn record_dispatch_bad_frame(&self) {
-        self.dispatch_bad_frame.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `egress.*`：egress relay 计数（spec §5.6/§7）。
-    pub fn record_egress(&self, ev: N1EgressEvent) {
-        let counter = match ev {
-            N1EgressEvent::Syn => &self.egress_syn,
-            N1EgressEvent::ConnectOk => &self.egress_connect_ok,
-            N1EgressEvent::ConnectFailed => &self.egress_connect_failed,
-            N1EgressEvent::BytesToLocal(_) => &self.egress_bytes_to_local,
-            N1EgressEvent::BytesFromLocal(_) => &self.egress_bytes_from_local,
-            N1EgressEvent::TableFull => &self.egress_table_full,
-        };
-        match ev {
-            N1EgressEvent::BytesToLocal(n) | N1EgressEvent::BytesFromLocal(n) => {
-                counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
-            }
-            _ => {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// `tx.frames / tx.errors`：回程 STREAM 帧（§5.6）。
-    ///
-    /// `bytes` 只作日志/未来扩展用；§5.6 不定义 `tx.bytes` 字段。
-    pub fn record_tx(&self, bytes: usize, ok: bool) {
-        let _ = bytes;
-        if ok {
-            self.tx_frames.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.tx_errors.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// listener 运行状态（spec §7）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum N1ListenerState {
-    Disabled { reason: &'static str },
-    BindFailed { reason: String },
-    Listening { addr: std::net::SocketAddr },
-}
-
 /// `assemble_n1_runtime` 的返回值（spec §7）。
 pub struct N1RuntimeHandles {
     pub accept: Option<std::thread::JoinHandle<()>>,
@@ -288,6 +58,10 @@ fn handles(
     inbound_rx: Receiver<N1Inbound>,
     stats: Arc<N1Stats>,
 ) -> N1RuntimeHandles {
+    // WP6（§5.6）：`/localapi/v0/n1/stats` 读的是进程级发布面；生产装配
+    // （`run_daemon`）与组合路径测试共用本函数，故发布点只此一处。
+    publish_n1_stats(Arc::clone(&stats));
+    publish_n1_listener_state(listener_state.clone());
     N1RuntimeHandles {
         accept,
         rx,
@@ -438,7 +212,10 @@ pub fn assemble_n1_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+
+    use crate::n1_stats::N1StatsSnapshot;
 
     use nexus_fabric::{ConnConfig, FabricConn, FabricIdentity};
 

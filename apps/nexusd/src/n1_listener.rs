@@ -20,7 +20,7 @@ use nexus_network::n1::{
 };
 
 use crate::log_throttle::KeyedLogThrottle;
-use crate::n1_runtime::{N1InboundReject, N1Stats};
+use crate::n1_stats::{N1InboundReject, N1Stats};
 
 /// `accept_timeout` 轮询粒度（spec §8.1 `N1_ACCEPT_POLL_MS`）。
 pub const N1_ACCEPT_POLL_MS: u64 = 500;
@@ -269,7 +269,7 @@ fn map_fabric_err(e: FabricError) -> N1Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::n1_runtime::N1StatsSnapshot;
+    use crate::n1_stats::N1StatsSnapshot;
     use nexus_fabric::ConnConfig;
     use std::time::Instant;
 
