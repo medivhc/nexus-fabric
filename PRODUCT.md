@@ -577,8 +577,9 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
 ### 11.9 Trojan 出站 adapter（TLS + SHA-224 请求头，P1，2026-09-18） {#11-trojan}
 
 > **当前互操作结论**：Trojan `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（对照 sing-box 1.13.16，
-> 仅 TCP 产品路径）；产品级 UDP 未实现（入口拒绝 UDP ASSOCIATE、出站无 UDP 帧路径，归
-> `fixes-6`）；success 之后到达的 fallback 不可判定（承诺边界）。权威口径见
+> 仅 TCP 产品路径）；产品 SOCKS5 入口已接受 UDP ASSOCIATE（VLESS（flow=None）/AnyTLS 出站 UDP 已实现；flow≠None 的 VLESS 未实现）；
+> Trojan 出站仍无 UDP 帧路径、按 fail-closed 丢弃（后续归 `fixes-6` Phase 2）；
+> success 之后到达的 fallback 不可判定（承诺边界）。权威口径见
 > `docs/USER_MANUAL.md` §4.1.10 与 `docs/protocols/interop/MATRIX.md`。
 
 在同一 `OutboundAdapter` 接缝上新增第五个真实出站实现 Trojan。Deletion Test（AGENTS.md §12）

@@ -27,7 +27,7 @@ mod manager;
 
 pub use buffer::UdpBuffer;
 pub use chain::{ChainDeps, ChainError, ChainOutcome, run_first_packet_chain};
-pub use flow::{FlowDecision, FlowEntry, FlowKey, FlowPhase, FlowTable, IpProto};
+pub use flow::{FlowDecision, FlowEntry, FlowKey, FlowParseError, FlowPhase, FlowTable, IpProto};
 pub use manager::{
     ConnectivityEstablisher, EstablishEvent, FlowSignal, SessionManager, SessionManagerConfig,
 };

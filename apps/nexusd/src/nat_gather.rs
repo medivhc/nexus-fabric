@@ -29,21 +29,17 @@
 //!    Default is `Unknown`, which is fail-closed: it never copies.
 //! 2. `gather()` takes `samples: &mut Vec<PortSample>` but this round does
 //!    not append or filter: sample collection stays with the caller's STUN
-//!    path (filtering here would empty production samples, whose STUN
-//!    transport is a separate socket — see below). The `&mut` is
-//!    spec-structural; a future refresh step may append here.
+//!    path, whose samples are collected by the caller's STUN path. The
+//!    `&mut` is spec-structural; a future refresh step may append here.
 //!
-//! # Production scope note (pre-existing, not changed by this fix)
+//! # Production scope note (Wave B)
 //!
-//! The daemon worker's STUN prober still uses a separate `UdpStunTransport`
-//! socket, not the punch driver's socket (the `DriverStunTransport` tap
-//! exists and is unit-tested, but the worker does not use it). That means
-//! production STUN-derived `srflx` is not same-socket evidence today, and
-//! production `turn_same_socket` is `false` (the `TurnManager` owns its own
-//! socket). The gatherer therefore yields diagnostic-only `srflx_turn` in
-//! production today — which is the spec-correct outcome for those inputs,
-//! not a gap: the copy path activates automatically if/when TURN shares
-//! the punch socket, and it is proven by the quadrant tests below.
+//! The daemon worker's STUN prober uses `DriverStunTransport` — the punch
+//! driver's own UDP socket — so production STUN samples share the punch
+//! socket. `turn_same_socket` is still `false` (the `TurnManager` owns its
+//! own socket), so production `srflx_turn` remains diagnostic-only: the copy
+//! path activates only if/when TURN and punch share a socket, and it is
+//! proven by the quadrant tests below.
 
 use std::net::SocketAddr;
 

@@ -6,7 +6,7 @@
 
 nexusd TUN 数据面的"流→会话映射"领域：把 TUN 逐包流映射到 §10 资源使用 Session。
 
-- 维护 5 元组流表（`FlowKey`/`FlowEntry`），O(1) 精确匹配。
+- 维护 5 元组流表（`FlowKey`/`FlowEntry`），O(1) 精确匹配；地址为 `IpAddr`（双栈共用一张表，R3 C17）。
 - 新流首包：构造 `FlowContext`（origin=PacketCapture）→ 调 Policy → 调 Core Planner → 经 `SessionManager`（Owner）创建 `nexus-session::SessionOwner`。
 - 建连异步化：后台线程执行 Establish Connectivity，`process_one()` 永不阻塞；流表项 `Allocating→Active` 经 channel 回填。
 - 已建流快路径：后续包直接按绑定 session 转发，不再调 Planner。
@@ -20,6 +20,20 @@ nexusd TUN 数据面的"流→会话映射"领域：把 TUN 逐包流映射到 �
 - 不持有平台 TUN 句柄（Portable Core 纪律；TUN 句柄在 Composition Root）。
 - 不实现 smoltcp TCP 终结语义（那是传输终结层；本层只做"流→会话"映射）。
 
+## FlowKey 双栈与解析（R3 C17）
+
+- `FlowKey { src_ip: IpAddr, dst_ip: IpAddr, src_port, dst_port, proto }`；TCP/UDP 共用。
+- `FlowKey::parse(&[u8]) -> Result<FlowKey, FlowParseError>`：v4 固定头 + IHL 偏移；
+  v6 固定头 + 扩展头链（`0`/`43`/`60`/`44`，上限 8 个）。**`parse_ipv4` 已删除**
+  （原子迁移：dataplane 与 examples 同一 commit 切换）。
+- `FlowParseError` 七变体：`Truncated`、`BadVersion(u8)`、`TooManyExtensionHeaders`、
+  `UnsupportedExtension(u8)`、`NonFirstFragment`、`UnsupportedTransport(u8)`、
+  `BadChecksum`（与 `nexus_projection::ip::IpParseError` 同表；流表不校验校验和，
+  `parse` 不返回该变体，保留为契约同源项）。
+- v6 非首片/未知扩展头**不建 flow**：调用方按目的地址分类（spec §4.7.3），本层
+  只回错误变体，绝不静默插表。
+- v4 分片语义保持不变（仍按 L4 偏移解析，不改既有判据）。
+
 ## 概念澄清（R3：两层"会话"）
 
 ```text
@@ -32,7 +46,7 @@ smoltcp 会话的生命周期从属于 §10 Session（Session 进 Draining/Dispo
 
 ## Inputs
 
-- TUN 上行 IPv4 包字节（由 dataplane 调用，不持有 TUN）。
+- TUN 上行 IPv4/IPv6 包字节（由 dataplane 调用，不持有 TUN）。
 - `FlowContext`（本层构造，origin=PacketCapture，destination=5 元组中立表达）。
 - Policy/Planner 的同步纯函数调用。
 - 后台建连线程的事件回填（channel）。

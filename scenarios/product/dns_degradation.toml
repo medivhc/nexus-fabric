@@ -1,0 +1,55 @@
+schema_version = 1
+id = "product.dns-degradation"
+title = "DNS 降级矩阵：上游全挂/池耗尽/TCP RST/禁用/AC8b（AC5/AC13）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
+
+[given]
+# 生产装配路径；上游全死 → SERVFAIL + upstream.state=failed；
+# fake-ip /30 池耗尽 → SERVFAIL + fake_ip.exhausted；TCP/53 → RST；
+# dns.toml 缺失 → enabled=false 且不拦截；非法 dns.toml 的 no-tun/tun 双子进程。
+
+[when]
+command = "cargo run --quiet -p nexusd --example dns_production_e4 -- --json --suite degradation"
+
+[[expect]]
+field = "ac13.all_dead_ok"
+equals = true
+
+# AC12 可观测性：上游全不可达后聚合 last_error 必须非空（以真实快照计算）。
+[[expect]]
+field = "ac13.last_error_nonempty"
+equals = true
+
+[[expect]]
+field = "ac13.upstream_state"
+equals = "failed"
+
+[[expect]]
+field = "ac13.dns_servfail"
+equals = 3
+
+[[expect]]
+field = "ac13.tcp_refused"
+equals = true
+
+[[expect]]
+field = "ac13.dns_tcp_refused"
+equals = 1
+
+[[expect]]
+field = "ac13.pool_exhausted"
+equals = true
+
+[[expect]]
+field = "ac13.dns_enabled_off"
+equals = true
+
+[[expect]]
+field = "ac8b.ok"
+equals = true
+
+[[expect]]
+field = "verdict"
+equals = "PASS"

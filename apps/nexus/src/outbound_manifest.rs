@@ -988,8 +988,9 @@ mod tests {
         assert_eq!(parsed.label_for("shadowsocks"), Label::Partial);
     }
 
-    /// PR2R1-01/09/13：用户可见文案必须与步骤 4 后事实一致（SS 告警区分 TCP/UDP），
-    /// 且不得再出现内部 run id / 组件名（`本 run` / `fixes-*` / `ss_std` 等）。
+    /// PR2R1-01/09/13：用户可见文案必须与步骤 4 后事实一致（SS 告警区分 nexusd/TUN 与
+    /// 产品 SOCKS5 两个表面），且不得再出现内部 run id / 组件名（`本 run` / `fixes-*` /
+    /// `ss_std` 等）。
     #[test]
     fn manifest_messages_are_user_judgeable_and_tcp_udp_scoped() {
         let parsed = manifest().unwrap();
@@ -1027,11 +1028,20 @@ mod tests {
         let derive = parsed
             .message("SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT")
             .unwrap();
-        assert!(derive.text.contains("UDP"), "{}", derive.text);
-        assert!(derive.text.contains("TCP"), "{}", derive.text);
+        // fixes-6 fix-D：文案改成按表面限定，TUN 面缺陷与产品面合规各一句；
+        // 此处钉两个表面名，语义守卫不变。
+        assert!(derive.text.contains("nexusd/TUN"), "{}", derive.text);
+        assert!(derive.text.contains("产品 SOCKS5 表面"), "{}", derive.text);
         assert!(
             !derive.text.contains("与标准 SS 服务端不可互通"),
-            "the blanket incompatibility claim is false for TCP: {}",
+            "the blanket incompatibility claim is false for the product surface: {}",
+            derive.text
+        );
+        // fixes-6 r3 F-1：旧 KDF 只存在于 TUN 的 UDP 一侧（TCP 已切到 crate 的
+        // SIP004 实现），UDP 限定一旦丢失，该句对 TUN TCP 就是反向误导。
+        assert!(
+            derive.text.contains("UDP"),
+            "the derive warning must keep its UDP qualifier: {}",
             derive.text
         );
         let interop = parsed.message("SHADOWSOCKS_NO_INTEROP_EVIDENCE").unwrap();

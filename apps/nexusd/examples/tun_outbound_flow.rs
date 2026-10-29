@@ -121,7 +121,7 @@ fn run() -> Result<serde_json::Value, String> {
         proxy_configured: true,
         ..Default::default()
     };
-    let mut dataplane = Dataplane::new(Box::new(tun), config)
+    let mut dataplane = Dataplane::new(Box::new(tun), config, None)
         .map_err(|error| format!("dataplane init: {error}"))?;
     dataplane.set_proxy_engine(engine);
     // 生产装配同源：`Dataplane::new` 初始规则为空（fail-closed），必须注入与

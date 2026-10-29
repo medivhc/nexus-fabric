@@ -60,7 +60,7 @@ fn run() -> serde_json::Value {
     }
 
     // 5. 生产数据面（apps/nexusd/src/dataplane.rs）。
-    let mut dp = match Dataplane::new(Box::new(tun), cfg) {
+    let mut dp = match Dataplane::new(Box::new(tun), cfg, None) {
         Ok(dp) => dp,
         Err(e) => return fail(&format!("Dataplane::new: {e}")),
     };

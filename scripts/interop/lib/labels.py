@@ -18,6 +18,7 @@ CELL = {
     "TcpSmall": "tcp-small",
     "TcpThroughput": "tcp-throughput",
     "UdpEcho": "udp-echo",
+    "UdpEchoCrate": "udp-echo-crate",
     "BadCredential": "bad-credential",
     "BadConfig": "bad-config",
     "LongLived": "long-lived",

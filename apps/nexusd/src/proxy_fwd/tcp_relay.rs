@@ -258,7 +258,7 @@ impl TcpForwarder {
     ) {
         match event {
             TcpEvent::Syn { stream_id, dst, .. } => {
-                let target = SocketAddr::V4(dst);
+                let target = dst;
                 self.stats.tcp_streams += 1;
                 let syn_tag = self.current_tag.clone().unwrap_or_default();
                 let syn_kind = self
@@ -495,32 +495,54 @@ fn spawn_relay(
 /// dial 失败时终结器偶尔不产出可写回的 RST（socket 已随 RST 移除 → fixup 查不到
 /// 连接）；此时用本函数兜底，保证 `tcp_dials_failed` 与线上 RST 一致（§5.8）。
 fn craft_rst(four: &nexus_projection::tcp::FourTuple) -> Vec<u8> {
+    use nexus_projection::ip::tcp_udp_checksum_v6;
     use nexus_projection::tcp::{ip_checksum, tcp_checksum};
-    let src_ip = four.dst_ip;
-    let dst_ip = four.src_ip;
-    let mut pkt = vec![0u8; 40];
-    pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
-    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-    pkt[8] = 64;
-    pkt[9] = 6;
-    pkt[12..16].copy_from_slice(&src_ip);
-    pkt[16..20].copy_from_slice(&dst_ip);
-    pkt[20..22].copy_from_slice(&four.dst_port.to_be_bytes());
-    pkt[22..24].copy_from_slice(&four.src_port.to_be_bytes());
-    pkt[32] = 0x50;
-    pkt[33] = 0x14; // RST | ACK
-    pkt[34..36].copy_from_slice(&8192u16.to_be_bytes());
-    let c = ip_checksum(&pkt[..20]);
-    pkt[10..12].copy_from_slice(&c.to_be_bytes());
-    let tc = tcp_checksum(src_ip, dst_ip, &pkt[20..]);
-    pkt[36..38].copy_from_slice(&tc.to_be_bytes());
-    pkt
+    match (four.dst_ip, four.src_ip) {
+        (std::net::IpAddr::V4(src_ip), std::net::IpAddr::V4(dst_ip)) => {
+            let mut pkt = vec![0u8; 40];
+            pkt[0] = 0x45;
+            pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+            pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+            pkt[8] = 64;
+            pkt[9] = 6;
+            pkt[12..16].copy_from_slice(&src_ip.octets());
+            pkt[16..20].copy_from_slice(&dst_ip.octets());
+            pkt[20..22].copy_from_slice(&four.dst_port.to_be_bytes());
+            pkt[22..24].copy_from_slice(&four.src_port.to_be_bytes());
+            pkt[32] = 0x50;
+            pkt[33] = 0x14; // RST | ACK
+            pkt[34..36].copy_from_slice(&8192u16.to_be_bytes());
+            let c = ip_checksum(&pkt[..20]);
+            pkt[10..12].copy_from_slice(&c.to_be_bytes());
+            let tc = tcp_checksum(src_ip.octets(), dst_ip.octets(), &pkt[20..]);
+            pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+            pkt
+        }
+        (std::net::IpAddr::V6(src_ip), std::net::IpAddr::V6(dst_ip)) => {
+            let mut pkt = vec![0u8; 60]; // 40 IPv6 + 20 TCP
+            pkt[0] = 0x60;
+            pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+            pkt[6] = 6;
+            pkt[7] = 64;
+            pkt[8..24].copy_from_slice(&src_ip.octets());
+            pkt[24..40].copy_from_slice(&dst_ip.octets());
+            pkt[40..42].copy_from_slice(&four.dst_port.to_be_bytes());
+            pkt[42..44].copy_from_slice(&four.src_port.to_be_bytes());
+            pkt[52] = 0x50;
+            pkt[53] = 0x14; // RST | ACK
+            pkt[54..56].copy_from_slice(&8192u16.to_be_bytes());
+            let tc = tcp_udp_checksum_v6(src_ip, dst_ip, 6, &pkt[40..]);
+            pkt[56..58].copy_from_slice(&tc.to_be_bytes());
+            pkt
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn has_rst(pkts: &[Vec<u8>]) -> bool {
-    pkts.iter()
-        .any(|p| p.len() > 33 && p[9] == 6 && p[33] & 0x04 != 0)
+    pkts.iter().any(|p| {
+        nexus_projection::tcp::parse_tcp(p).is_some_and(|(_, _, _, _, flags, _)| flags & 0x04 != 0)
+    })
 }
 
 #[cfg(test)]
@@ -624,7 +646,7 @@ mod tests {
             term,
             TcpEvent::Syn {
                 stream_id: STREAM,
-                dst: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+                dst: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
                 peer: "proxy".to_string(),
             },
             &mut out,

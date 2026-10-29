@@ -1,0 +1,139 @@
+schema_version = 1
+id = "product.cac1-proxy-v6-echo"
+title = "CAC-1（合并门补跑）：v6 TCP 经代理出站端到端回显 + v6 拒例"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+carrier = "n1-fabric"
+
+[given]
+# CAC-1（冻结件 rev3 §7.3，plan §6.1）：AC9 的条件部分，develop 期 NOT-JUDGED、
+# 归合并门补跑。断言边界与 AC9 分开（plan 写死）：AC9 断言回显**不得**出现
+# （SS 拒 v6 目标 → RST），CAC-1 正例断言回显**必须**出现。
+# 装配链与 AC9 同：ConfigDir → config::load → assembly::build_dataplane_config
+# → Dataplane::new(SharedTun(MockTun), cfg, None) + ProxyEngine（生产组合根）。
+# 正例三方言（socks5 / VLESS / AnyTLS）：TUN 注入 v6 SYN，目的 = 本机全局 v6
+# 地址上的真实 echo 服务（`::1` 属数据面 v6 bypass 默认集 → Direct 分类，
+# 不入 Proxy；全局单播不在 bypass/路由内 → Proxy 分类且真实可达）。
+# adapter 拨号到进程内最小 server（socks5 手写 / VLESS、AnyTLS 用各自 crate
+# 的 server 侧 API），server 记录其收到的 v6 目标后真实 dial echo 并双向中继。
+# 拒例两方言（Trojan / SS）：方言不能编码 v6 目标 → dial 失败 → RST、零回显。
+
+[when]
+command = "cargo run --quiet -p nexusd --example ipv6_tcp_termination_e4 -- --json --cac1"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "cac1.ok"
+equals = true
+
+# socks5 正例：终结 + ATYP=0x04 目标到达 server + 双向回显 + 计数。
+[[expect]]
+field = "cac1.socks5.synack_ok"
+equals = true
+
+[[expect]]
+field = "cac1.socks5.echo_ok"
+equals = true
+
+[[expect]]
+field = "cac1.socks5.target_ok"
+equals = true
+
+[[expect]]
+field = "cac1.socks5.proxy_tcp_streams_ok"
+equals = 1
+
+[[expect]]
+field = "cac1.socks5.proxy_tcp_bytes_down"
+equals = 12
+
+[[expect]]
+field = "cac1.socks5.ipv6_proxy_dropped"
+equals = 0
+
+# VLESS 正例（同上断言面）。
+[[expect]]
+field = "cac1.vless.synack_ok"
+equals = true
+
+[[expect]]
+field = "cac1.vless.echo_ok"
+equals = true
+
+[[expect]]
+field = "cac1.vless.target_ok"
+equals = true
+
+[[expect]]
+field = "cac1.vless.proxy_tcp_streams_ok"
+equals = 1
+
+[[expect]]
+field = "cac1.vless.proxy_tcp_bytes_down"
+equals = 12
+
+[[expect]]
+field = "cac1.vless.ipv6_proxy_dropped"
+equals = 0
+
+# AnyTLS 正例（同上断言面）。
+[[expect]]
+field = "cac1.anytls.synack_ok"
+equals = true
+
+[[expect]]
+field = "cac1.anytls.echo_ok"
+equals = true
+
+[[expect]]
+field = "cac1.anytls.target_ok"
+equals = true
+
+[[expect]]
+field = "cac1.anytls.proxy_tcp_streams_ok"
+equals = 1
+
+[[expect]]
+field = "cac1.anytls.proxy_tcp_bytes_down"
+equals = 12
+
+[[expect]]
+field = "cac1.anytls.ipv6_proxy_dropped"
+equals = 0
+
+# Trojan 拒例：终结成立、RST 可见、零成功流、proxy_dropped 不增。
+[[expect]]
+field = "cac1.trojan.synack_ok"
+equals = true
+
+[[expect]]
+field = "cac1.trojan.rst_seen"
+equals = true
+
+[[expect]]
+field = "cac1.trojan.proxy_tcp_streams_ok"
+equals = 0
+
+[[expect]]
+field = "cac1.trojan.ipv6_proxy_dropped"
+equals = 0
+
+# SS 拒例（同上断言面）。
+[[expect]]
+field = "cac1.ss.synack_ok"
+equals = true
+
+[[expect]]
+field = "cac1.ss.rst_seen"
+equals = true
+
+[[expect]]
+field = "cac1.ss.proxy_tcp_streams_ok"
+equals = 0
+
+[[expect]]
+field = "cac1.ss.ipv6_proxy_dropped"
+equals = 0

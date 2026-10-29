@@ -575,13 +575,14 @@ fn parent_run(veth_b: &str) -> Result<String, String> {
         && dial_elapsed_ms >= 5000;
 
     Ok(format!(
-        "{{\"verdict\":\"{}\",\"winner_kind\":\"{}\",\"proxy_relayed_bytes\":{},\"echo_ok\":{},\"dial_elapsed_ms\":{},\"direct_elapsed_ms\":5000,\"proxy_elapsed_ms\":{},\"detail\":\"child={child_json}\"}}",
+        "{{\"verdict\":\"{}\",\"winner_kind\":\"{}\",\"proxy_relayed_bytes\":{},\"echo_ok\":{},\"dial_elapsed_ms\":{},\"direct_elapsed_ms\":5000,\"proxy_elapsed_ms\":{},\"detail\":\"child={}\"}}",
         if pass { "PASS" } else { "FAIL" },
         winner_kind,
         relayed_bytes,
         echo_ok,
         dial_elapsed_ms,
-        dial_elapsed_ms.saturating_sub(5000)
+        dial_elapsed_ms.saturating_sub(5000),
+        esc(&child_json)
     ))
 }
 

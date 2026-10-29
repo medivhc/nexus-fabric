@@ -392,7 +392,7 @@ fn tun_round(kind: &str, echoes: [SocketAddr; 2]) -> Value {
             proxy_configured: true,
             ..Default::default()
         };
-        let mut dp = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config)
+        let mut dp = Dataplane::new(Box::new(SharedTun(Arc::clone(&mock))), config, None)
             .map_err(|e| format!("dataplane init: {e}"))?;
         let engine = match ProxyEngine::new(Some(&yaml)) {
             Ok(Some(engine)) => engine,

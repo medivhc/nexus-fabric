@@ -226,10 +226,7 @@ impl SessionManager {
         let flow = FlowContext {
             origin: FlowOrigin::VirtualPacketInterface,
             resource: ResourceId("internet-access".into()),
-            destination: format!(
-                "{}.{}.{}.{}:{}",
-                key.dst_ip[0], key.dst_ip[1], key.dst_ip[2], key.dst_ip[3], key.dst_port
-            ),
+            destination: std::net::SocketAddr::new(key.dst_ip, key.dst_port).to_string(),
             profile: "Balanced".into(),
             egress_hint: egress_hint.map(str::to_string),
         };
@@ -530,9 +527,9 @@ mod tests {
 
     fn tcp_key() -> FlowKey {
         FlowKey {
-            src_ip: [192, 168, 1, 2],
+            src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 2)),
             src_port: 54321,
-            dst_ip: [93, 184, 216, 34],
+            dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
             dst_port: 443,
             proto: IpProto::Tcp,
         }

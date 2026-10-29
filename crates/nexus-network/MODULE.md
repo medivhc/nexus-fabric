@@ -120,8 +120,8 @@ cargo clippy -p nexus-network --all-targets -- -D warnings
 
 ### M1 范围
 
-首期只做 VirtualPacketInterface 单播 IP 互通（节点间）。
-Out of scope：广播/组播、DNS 劫持、系统代理（后置，不在本契约验收内）。
+首期只做 VirtualPacketInterface 单播 IP 互通（节点间），地址族含 IPv4 与 IPv6。
+Out of scope：广播/组播、IPv6 NAT、DNS 劫持、系统代理（后置，不在本契约验收内）。
 
 ### M2 承载
 
@@ -214,6 +214,13 @@ N1 装配新增：
     `inbound` 走 `FabricListener`。
   - Link 观测器：keepalive 心跳超时（主）/ 流错误（辅）→ `rebind`；失败事件结构化上报
     （携带 `connection_id`/`peer_id`，不以日志文本代替错误类型）。
+  - 地址族与路由（R3，`n1/pump.rs` + `n1/bridge.rs`）：`Ipv6Net`/`Ipv6Route` 与既有
+    `Ipv4Net`/`Ipv4Route` 同构（parse/contains/network_addr/prefix_len/Display）；
+    `N1VpiConfig` 增 `address6: Option<Ipv6Addr>` 与 `routes6: Vec<Ipv6Route>`
+    （`network.toml` 的 `[vpi].address6` / `[[vpi.routes6]]`，前缀 1..=128、peer 必须在
+    `[[peers]]`、有 `routes6` 时 `address6` 必填）；`N1MeshBridge` 持有 v4+v6 两张路由表，
+    `N1Sender::send_to_mesh(dst: IpAddr)` 按地址族做最长前缀匹配（v4 语义不变）。
+    `[[peers]].addrs` 保持 `Vec<SocketAddr>`，v6 字面量本就合法（仅说明/示例）。
 - 冻结语义：`rebind()` 不改变 `ConnectionId`（沿用 nexus-fabric S2/S3）；建连失败事件必须保留可诊断原因，
   支持 `Retry`/`Fallback`/`Abort`/`Escalate` 四类处置判定。
 

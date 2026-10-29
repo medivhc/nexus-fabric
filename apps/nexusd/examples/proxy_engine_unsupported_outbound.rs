@@ -268,7 +268,7 @@ fn runtime_invalid_case() -> Value {
         proxy_configured: true,
         ..Default::default()
     };
-    let mut dp = match Dataplane::new(Box::new(Shared(Arc::clone(&mock))), config) {
+    let mut dp = match Dataplane::new(Box::new(Shared(Arc::clone(&mock))), config, None) {
         Ok(dp) => dp,
         Err(error) => return json!({"error": format!("dataplane: {error}")}),
     };
@@ -370,7 +370,7 @@ fn no_engine_rst_emitted() -> bool {
         proxy_configured: true,
         ..Default::default()
     };
-    let Ok(mut dp) = Dataplane::new(Box::new(Shared(Arc::clone(&mock))), config) else {
+    let Ok(mut dp) = Dataplane::new(Box::new(Shared(Arc::clone(&mock))), config, None) else {
         return false;
     };
     // 规则指向 proxy 类出站（tag=ok），但不注入 engine → 必须走 D2 的 NoEngine RST。
