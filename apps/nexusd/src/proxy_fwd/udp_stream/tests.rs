@@ -67,6 +67,10 @@ impl UdpStream for FakeStream {
     fn shutdown(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    fn established(&self) -> bool {
+        true
+    }
 }
 
 /// 一条已打开的假流（测试侧句柄）。
@@ -769,16 +773,20 @@ fn failed_opens_never_send_directly_to_the_destination() {
     let registry = OutboundRegistry::build(Some(&yaml))
         .expect("registry")
         .expect("some");
-    let dialer = Arc::clone(registry.dialer("v").expect("dialer"));
-    let mut forwarder = UdpForwarder::new(dialer);
+    // 生产 VLESS dialer 外加建流闸门：3 个数据报确定地进入建流队列后才放行建流
+    // （否则拒绝连接可能先于第 2、3 个数据报完成，后者落入重试间隔）。
+    let gated = Arc::new(GatedDialer::new(Arc::clone(
+        registry.dialer("v").expect("dialer"),
+    )));
+    let mut forwarder = UdpForwarder::new(Arc::clone(&gated) as Arc<dyn OutboundDialer>);
     let local = addr(SRC_A, 5000);
     for i in 0..3u8 {
-        assert!(
-            forwarder
-                .handle_packet(&ipv4_udp(local, destination, &[i]))
-                .accepted()
+        assert_eq!(
+            forwarder.handle_packet(&ipv4_udp(local, destination, &[i])),
+            UdpSend::Queued
         );
     }
+    gated.release();
     let deadline = Instant::now() + Duration::from_secs(5);
     while forwarder.stats().udp_send_failed < 3 {
         assert!(forwarder.drain_replies().is_empty(), "no fabricated reply");
@@ -801,6 +809,55 @@ fn failed_opens_never_send_directly_to_the_destination() {
         0,
         "nothing reached the destination"
     );
+}
+
+/// 给生产 dialer 的 `open_udp` 加一道闸门（`release` 之前阻塞），其余方法原样委托。
+struct GatedDialer {
+    inner: Arc<dyn OutboundDialer>,
+    released: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl GatedDialer {
+    fn new(inner: Arc<dyn OutboundDialer>) -> Self {
+        Self {
+            inner,
+            released: Mutex::new(false),
+            opened: Condvar::new(),
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("lock") = true;
+        self.opened.notify_all();
+    }
+}
+
+impl OutboundDialer for GatedDialer {
+    fn kind(&self) -> OutboundKind {
+        self.inner.kind()
+    }
+
+    fn tag(&self) -> &str {
+        self.inner.tag()
+    }
+
+    fn dial_tcp(&self, target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError> {
+        self.inner.dial_tcp(target)
+    }
+
+    fn udp_capability(&self) -> UdpCapability {
+        self.inner.udp_capability()
+    }
+
+    fn open_udp(&self, target: SocketAddr) -> Result<Box<dyn UdpStream>, OutboundError> {
+        let mut released = self.released.lock().expect("lock");
+        while !*released {
+            released = self.opened.wait(released).expect("wait");
+        }
+        drop(released);
+        self.inner.open_udp(target)
+    }
 }
 
 // ---- 代码评审 r1 的回归 ----
@@ -946,6 +1003,27 @@ fn unwritten_bytes_after_open_are_bounded() {
     wait_written(&opened[0], 17);
 }
 
+/// 写背压按「载荷 + 每数据报 64 B」计：零长数据报也会在上限处被拒（不会无限缓存）。
+#[test]
+fn zero_length_datagrams_after_open_are_bounded_too() {
+    let dialer = FakeDialer::new();
+    let mut table = table(&dialer);
+    let mut stats = ProxyFwdStats::default();
+    let t0 = Instant::now();
+    assert!(table.send(addr(SRC_A, 5000), dst(1), Vec::new(), t0, &mut stats));
+    let opened = wait_opened(&dialer, 1);
+    wait_written(&opened[0], 1);
+    poll_until(&mut table, t0, &mut stats, |_, s, _| s.udp_sent == 1);
+    dialer.stall_writes(true);
+    let accepted = (0..16_400)
+        .filter(|_| table.send(addr(SRC_A, 5000), dst(1), Vec::new(), t0, &mut stats))
+        .count();
+    assert_eq!(accepted, 16_384, "1 MiB / 64 B per datagram");
+    assert_eq!(stats.udp_send_failed, 16);
+    dialer.stall_writes(false);
+    wait_written(&opened[0], 1 + 16_384);
+}
+
 /// N3：`proxy_forwarded` 只计写出到代理流的数据报；入队后因建流失败丢弃的不计。
 #[test]
 fn dataplane_counts_stream_datagrams_as_forwarded_only_when_written() {
@@ -987,7 +1065,7 @@ fn dataplane_counts_stream_datagrams_as_forwarded_only_when_written() {
     let closed = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .expect("port");
-    for (node, forwarded, dropped) in [(closed, 0, 1), (live, 1, 0)] {
+    for (node, packets, forwarded, dropped) in [(closed, 1, 0, 1), (live, 2, 2, 0)] {
         let yaml = format!(
             "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: v\noutbounds:\n  - tag: v\n    kind: vless\n    locator: {node}\n    uuid: 11111111-1111-1111-1111-111111111111\n"
         );
@@ -1008,32 +1086,35 @@ fn dataplane_counts_stream_datagrams_as_forwarded_only_when_written() {
         ));
         let epoch = Instant::now();
         let now = || u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        mock.lock()
-            .expect("lock")
-            .inject(ipv4_udp(addr(SRC_A, 5000), dst(53), b"q"));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let _ = dp.tick(now());
-            let stats = dp.stats();
-            if stats.proxy_forwarded + stats.proxy_dropped_no_proxy > 0 {
-                // 再跑几轮，确认不会两边都计。
-                for _ in 0..20 {
-                    let _ = dp.tick(now());
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+        // 每个包等它被记账后再发下一个（第二个包落在已建流的流上）。
+        for (sent, payload) in (1..=packets).zip([b"q1", b"q2"]) {
+            mock.lock()
+                .expect("lock")
+                .inject(ipv4_udp(addr(SRC_A, 5000), dst(53), payload));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let _ = dp.tick(now());
                 let stats = dp.stats();
-                assert_eq!(
-                    (stats.proxy_forwarded, stats.proxy_dropped_no_proxy),
-                    (forwarded, dropped),
-                    "{node}"
+                if stats.proxy_forwarded + stats.proxy_dropped_no_proxy >= sent {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{node}: datagram {sent} never accounted"
                 );
-                break;
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(
-                Instant::now() < deadline,
-                "{node}: datagram never accounted"
-            );
+        }
+        // 再跑几轮，确认不会两边都计。
+        for _ in 0..20 {
+            let _ = dp.tick(now());
             std::thread::sleep(Duration::from_millis(5));
         }
+        let stats = dp.stats();
+        assert_eq!(
+            (stats.proxy_forwarded, stats.proxy_dropped_no_proxy),
+            (forwarded, dropped),
+            "{node}"
+        );
     }
 }

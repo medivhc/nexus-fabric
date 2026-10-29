@@ -5,8 +5,9 @@
 //! - 每条流一个 worker 线程：在 dataplane 线程之外建流（`OutboundDialer::open_udp`），
 //!   之后循环「排空写命令 → 带短超时读回包」；建流结果、写出、回包与关闭都以事件回到流表。
 //! - 流表在 dataplane 线程上记账（时间由调用方传入）：
-//!   - 建流期间每条流最多排队 64 个数据报（契约的建流队列）；建流之后未写出的字节以 1 MiB
-//!     为上限（写背压，防止节点不读时无限缓存）。超出的丢弃并计 `udp_send_failed`；
+//!   - 建流期间每条流最多排队 64 个数据报（契约的建流队列）；建流之后未写出的数据以 1 MiB
+//!     为上限（写背压，防止节点不读时无限缓存；每个数据报另计 64 B 开销，零长数据报也受限）。
+//!     超出的丢弃并计 `udp_send_failed`；
 //!   - 建流失败（含节点在确认之前就结束流，如 VLESS 未回响应头即断开）→ 未写出的数据报
 //!     每个计一次 `udp_send_failed`，打限频日志 `event=udp_stream_open_failed`
 //!     （每 `(tag, cause)` 10 s），同键 1 s 内不重试；
@@ -32,6 +33,8 @@ use crate::log_throttle::KeyedLogThrottle;
 const MAX_QUEUED_DURING_OPEN: u64 = 64;
 /// 建流之后每条流未写出的字节上限（写背压）。
 const MAX_PENDING_BYTES_AFTER_OPEN: u64 = 1024 * 1024;
+/// 写背压里每个数据报的固定开销（缓冲与命令的内存），使零长 / 极小数据报同样受限。
+const PER_DATAGRAM_OVERHEAD: u64 = 64;
 /// 同时存在的流上限（既有 `MAX_UDP_FLOWS`）。
 pub(super) const MAX_STREAMS: usize = 1024;
 /// 空闲回收（既有 `UDP_FLOW_TIMEOUT`）。
@@ -41,7 +44,10 @@ const OPEN_RETRY_SPACING: Duration = Duration::from_secs(1);
 /// 建流失败日志的限频间隔（与 `event=udp_unsupported` 相同）。
 const OPEN_FAILED_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// worker 读超时 = 两次检查写命令之间的最长间隔，即上行数据报的额外延迟上限。最近
-/// `ACTIVE_WINDOW` 内有流量时用短间隔，空闲时用长间隔（少唤醒）。
+/// `ACTIVE_WINDOW` 内有流量时用短间隔，空闲时用长间隔（少唤醒）。内核把 socket 读超时
+/// 向上取整到时钟节拍，真实 socket 上的短间隔约为一个节拍（HZ=250 约 4 ms，HZ=100 为
+/// 10 ms）；代价是活跃流每秒数百次唤醒（实测 1024 条活跃流约多 0.65 核，debug 构建）。
+/// 读写同线程是这里需要轮询的原因，读写分离是后续改进方向。
 const ACTIVE_POLL: Duration = Duration::from_millis(2);
 const IDLE_POLL: Duration = Duration::from_millis(20);
 const ACTIVE_WINDOW: Duration = Duration::from_secs(1);
@@ -115,11 +121,16 @@ impl Stream {
     /// 本数据报是否超出当前上限。
     fn full(&self, len: u64) -> bool {
         if self.opened {
-            self.enqueued_bytes - self.sent_bytes + len > MAX_PENDING_BYTES_AFTER_OPEN
+            self.enqueued_bytes - self.sent_bytes + charge(len) > MAX_PENDING_BYTES_AFTER_OPEN
         } else {
             self.enqueued >= MAX_QUEUED_DURING_OPEN
         }
     }
+}
+
+/// 一个数据报在写背压里占用的量。
+fn charge(len: u64) -> u64 {
+    len + PER_DATAGRAM_OVERHEAD
 }
 
 /// 一个出站的 UDP 代理流表（dataplane 线程拥有）。
@@ -181,7 +192,7 @@ impl StreamTable {
                 return false;
             }
             stream.enqueued += 1;
-            stream.enqueued_bytes += len;
+            stream.enqueued_bytes += charge(len);
             stream.last_activity = now;
             return true;
         }
@@ -244,7 +255,7 @@ impl StreamTable {
             cmd_tx,
             opened: false,
             enqueued: 1,
-            enqueued_bytes: first_len,
+            enqueued_bytes: charge(first_len),
             sent: 0,
             sent_bytes: 0,
             last_activity: now,
@@ -264,7 +275,7 @@ impl StreamTable {
                     stats.udp_sent += 1;
                     if let Some(stream) = self.current(key, id) {
                         stream.sent += 1;
-                        stream.sent_bytes += bytes;
+                        stream.sent_bytes += charge(bytes);
                     }
                 }
                 StreamEvent::Reply { key, id, payload } => {

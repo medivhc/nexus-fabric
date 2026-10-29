@@ -245,6 +245,11 @@ struct AnytlsUdpStream {
 }
 
 impl UdpStream for AnytlsUdpStream {
+    fn established(&self) -> bool {
+        // `open_udp` 返回前已收到无错误文本的 SynAck。
+        true
+    }
+
     fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<()> {
         let len = u16::try_from(datagram.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "anytls uot datagram"))?;

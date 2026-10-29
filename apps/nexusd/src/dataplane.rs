@@ -1100,8 +1100,8 @@ impl Dataplane {
 
     /// 把 ProxyEngine 的增量同步到 DataplaneStats。
     fn sync_proxy_stats(&mut self) {
-        let eng_stats = match self.proxy_engine.as_ref() {
-            Some(engine) => engine.stats(),
+        let (eng_stats, udp_stream_writes) = match self.proxy_engine.as_mut() {
+            Some(engine) => (engine.stats(), engine.take_udp_stream_writes()),
             None => return,
         };
         let ok_delta = eng_stats
@@ -1162,7 +1162,8 @@ impl Dataplane {
         self.last_proxy_udp_unsupported_suppressed = eng_stats.udp_unsupported_log_suppressed;
         self.with_stats(|s| {
             s.proxy_tcp_streams += stream_delta;
-            s.proxy_forwarded += ok_delta;
+            // TCP：dial 成功；UDP 代理流：写出（数据报中继在处理包时已计）。
+            s.proxy_forwarded += ok_delta + udp_stream_writes;
             s.proxy_dropped_no_proxy += fail_delta + udp_fail_delta;
             s.upstream_failed += fail_delta;
             s.proxy_dial_buffer_dropped_bytes += dial_buf_drop_delta;
@@ -1423,9 +1424,6 @@ impl Dataplane {
         let wrote = !result.tun_packets.is_empty();
         self.write_proxy_tun_packets(result.tun_packets);
         self.record_proxy_stream_failures(result.stream_events);
-        if result.udp_forwarded > 0 {
-            self.with_stats(|s| s.proxy_forwarded += result.udp_forwarded);
-        }
         // C6：唯一同步点（每 tick 一次，含 WouldBlock 轮）。
         self.sync_proxy_stats();
         wrote
@@ -1883,9 +1881,6 @@ impl Dataplane {
                             .unwrap_or_default();
                         self.write_proxy_tun_packets(more.tun_packets);
                         self.record_proxy_stream_failures(more.stream_events);
-                        if more.udp_forwarded > 0 {
-                            self.with_stats(|s| s.proxy_forwarded += more.udp_forwarded);
-                        }
                         if packet.get(9) == Some(&17) && result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }

@@ -360,9 +360,6 @@ pub struct ProxyPollResult {
     pub tun_packets: Vec<Vec<u8>>,
     /// 异步流事件。
     pub stream_events: Vec<ProxyStreamEvent>,
-    /// 自上次 poll 以来 UDP 代理流（VLESS / AnyTLS）实际写出的数据报数：入队时不计
-    /// 转发，写出时才计（`proxy_forwarded` 只计真实转发）。
-    pub udp_forwarded: u64,
 }
 
 /// Proxy 转发引擎（dataplane 拥有）。
@@ -505,10 +502,8 @@ impl ProxyEngine {
         let mut out = ProxyPollResult {
             tun_packets,
             stream_events,
-            udp_forwarded: 0,
         };
         for forwarder in self.udp.values_mut() {
-            out.udp_forwarded += forwarder.take_stream_writes();
             for reply in forwarder.drain_replies() {
                 if let Some(pkt) = build_udp_reply(reply.local, reply.remote, &reply.payload) {
                     out.tun_packets.push(pkt);
@@ -547,6 +542,15 @@ impl ProxyEngine {
             }
         }
         (ready, dropped)
+    }
+
+    /// 自上次调用以来 UDP 代理流（VLESS / AnyTLS）实际写出的数据报数：入队时不计转发，
+    /// 写出时才计（`proxy_forwarded` 只计真实转发）。由 dataplane 的唯一同步点读取。
+    pub fn take_udp_stream_writes(&mut self) -> u64 {
+        self.udp
+            .values_mut()
+            .map(udp_relay::UdpForwarder::take_stream_writes)
+            .sum()
     }
 
     /// 合并统计（15 字段）。

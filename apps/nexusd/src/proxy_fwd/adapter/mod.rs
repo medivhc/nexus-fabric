@@ -81,9 +81,8 @@ pub trait UdpStream: Send {
     fn shutdown(&mut self) -> io::Result<()>;
     /// 节点是否已确认这条流（VLESS：已读到响应头；AnyTLS 在 `open_udp` 内等到 SynAck）。
     /// 未确认就结束的流按建流失败处理（拒绝 / 不支持 UDP 的节点不会被逐包重连）。
-    fn established(&self) -> bool {
-        true
-    }
+    /// 无默认实现：每种传输必须说明自己的确认语义。
+    fn established(&self) -> bool;
 }
 
 /// 单个出站配置错误（spec §2.6）。错误消息不得包含密码/UUID/hash/obfs_key。
