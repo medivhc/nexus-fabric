@@ -405,6 +405,19 @@ pub struct Dataplane {
     transparent: Option<TransparentPipeline>,
     /// owner → listener 的 UDP 回包通道（`send_from` 在 listener 线程）。
     transparent_udp_reply_tx: Option<std::sync::mpsc::Sender<TransparentOutput>>,
+    /// P0 NAT chunk consumer seam; `None` = wiring absent (all chunks N1).
+    nat_path: Option<crate::nat_consumer::NatHandleSlot>,
+    /// Mesh destination → peer map (from `[[vpi.routes]]`).
+    mesh_peers: Option<Arc<dyn crate::mesh_peer_map::MeshPeerResolver>>,
+    /// Direct quiet gate shared with the receiver.
+    direct_gate: Option<Arc<crate::nat_chunk_recv::DirectGate>>,
+    /// Shared chunk path counters.
+    chunk_stats: Arc<crate::nat_chunk_stats::ChunkStats>,
+    /// Inbound direct chunks produced by the receiver thread.
+    nat_inbound_rx: Option<std::sync::mpsc::Receiver<crate::nat_chunk_recv::NatInboundChunk>>,
+    /// AC-H-1 `[P]`: the one-time `[nat-consumer] handle not attached` notice
+    /// has been emitted (spec §13.2).
+    nat_not_attached_logged: AtomicBool,
 }
 
 /// 流会话可见状态（spec §9.16 / §11.3）。
@@ -554,12 +567,72 @@ impl Dataplane {
             ipv6_log: crate::log_throttle::KeyedLogThrottle::new(),
             transparent: None,
             transparent_udp_reply_tx: None,
+            nat_path: None,
+            mesh_peers: None,
+            direct_gate: None,
+            chunk_stats: Arc::new(crate::nat_chunk_stats::ChunkStats::default()),
+            nat_inbound_rx: None,
+            nat_not_attached_logged: AtomicBool::new(false),
         })
     }
 
     /// 注入规则引擎（组合根：有 `proxy.yaml` → `DomainRuleEngine`）。
     pub fn set_rule_engine(&mut self, rules: Box<dyn nexus_domain::RuleEngine>) {
         self.rules = rules;
+    }
+
+    // ---- P0 NAT chunk consumer (setter injection; `new` signature unchanged) ----
+
+    /// Inject the NAT provider handle slot (may be empty until NAT starts).
+    pub fn set_nat_path_slot(&mut self, slot: crate::nat_consumer::NatHandleSlot) {
+        self.nat_path = Some(slot);
+    }
+
+    /// Inject the mesh destination → peer resolver.
+    pub fn set_mesh_peer_resolver(
+        &mut self,
+        resolver: Arc<dyn crate::mesh_peer_map::MeshPeerResolver>,
+    ) {
+        self.mesh_peers = Some(resolver);
+    }
+
+    /// Inject the shared direct quiet gate.
+    pub fn set_direct_gate(&mut self, gate: Arc<crate::nat_chunk_recv::DirectGate>) {
+        self.direct_gate = Some(gate);
+    }
+
+    /// Inject the inbox of direct chunks accepted by the receiver thread.
+    pub fn set_nat_inbound_rx(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<crate::nat_chunk_recv::NatInboundChunk>,
+    ) {
+        self.nat_inbound_rx = Some(rx);
+    }
+
+    /// Share the composition root's chunk counters.
+    pub fn set_chunk_stats(&mut self, stats: Arc<crate::nat_chunk_stats::ChunkStats>) {
+        self.chunk_stats = stats;
+    }
+
+    /// Drain direct chunks into the TCP terminator. Called once per dataplane
+    /// loop iteration (never inside `process_one`, so the proxy branch is
+    /// untouched). Malformed frames are counted by the existing `dropped`
+    /// counter; this never panics.
+    pub fn pump_nat_inbound(&mut self) {
+        let Some(rx) = self.nat_inbound_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    let peer = crate::nat_consumer::peer_hex(&chunk.peer);
+                    self.inject_stream_frame_from_n1(&peer, &chunk.stream_frame);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        self.nat_inbound_rx = Some(rx);
     }
 
     /// 显式注入无代理配置默认引擎（`SimpleRuleEngine`，全部流量交 `proxy` 标签）。
@@ -2352,10 +2425,11 @@ impl Dataplane {
     fn forward_tcp_data(&mut self, stream_id: u32, bytes: &[u8]) {
         match self.tcp_streams.get(&stream_id).copied() {
             Some(info) if !info.proxy => {
-                // S5-Mesh：STREAM DATA 帧经 N1 发送。
+                // S5-Mesh：DATA 帧优先走 active direct conn，否则走既有 N1。
+                // SYN/FIN/RST 仍由 `dispatch_tcp_events` 直接走 N1（不是 chunk）。
                 let frame = encode_stream_frame(stream_id, 0x00, bytes);
                 let n = bytes.len() as u64;
-                if self.send_mesh_tcp_frame(info.dst.ip(), &frame) {
+                if self.send_mesh_data_frame(info.dst.ip(), &frame) {
                     self.with_stats(|s| s.mesh_tcp_bytes += n);
                 }
             }
@@ -2366,6 +2440,127 @@ impl Dataplane {
             None => {
                 // 防御：未知流的数据（不应发生）。
                 self.with_stats(|s| s.dropped += 1);
+            }
+        }
+    }
+
+    /// Mesh DATA dispatch (P0). Returns `true` iff the frame was handed to N1
+    /// successfully.
+    ///
+    /// The fallback closure **ignores its argument** and sends the captured
+    /// original `frame`: `send_chunk` passes the `KIND || FRAME` chunk, and
+    /// forwarding that would inject a KIND byte into N1 (breaks the
+    /// byte-for-byte invariant).
+    fn send_mesh_data_frame(&mut self, dst: IpAddr, frame: &[u8]) -> bool {
+        use crate::nat_chunk_stats::FallbackReason;
+
+        // AC-H-1 `[P]` / spec §13.2: with no attached provider (no
+        // `[network.turn]`, or NAT has not started yet) the degraded mode is
+        // announced exactly once; every chunk then falls back to N1.
+        if self.nat_path.as_ref().and_then(|slot| slot.get()).is_none() {
+            crate::nat_consumer::note_handle_not_attached(&self.nat_not_attached_logged);
+        }
+
+        let stats = Arc::clone(&self.chunk_stats);
+
+        let peer = match dst {
+            IpAddr::V4(v4) => self.mesh_peers.as_ref().and_then(|m| m.peer_for(v4)),
+            IpAddr::V6(_) => None,
+        };
+        let Some(peer) = peer else {
+            stats.record_fallback(frame.len(), FallbackReason::NoPeer);
+            eprintln!(
+                "[nat-chunk] fallback peer=- bytes={} reason=no_peer",
+                frame.len()
+            );
+            if self.send_mesh_tcp_frame(dst, frame) {
+                return true;
+            }
+            stats.record_fallback_error(frame.len());
+            return false;
+        };
+        let peer_name = crate::nat_consumer::peer_hex(&peer);
+        let peer16 = &peer_name[..peer_name.len().min(16)];
+
+        let Some(provider) = self.nat_path.as_ref().and_then(|slot| slot.get()) else {
+            stats.record_fallback(frame.len(), FallbackReason::NoPath);
+            eprintln!(
+                "[nat-chunk] fallback peer={peer16} bytes={} reason=no_path",
+                frame.len()
+            );
+            if self.send_mesh_tcp_frame(dst, frame) {
+                return true;
+            }
+            stats.record_fallback_error(frame.len());
+            return false;
+        };
+
+        let gate_open = self
+            .direct_gate
+            .as_ref()
+            .is_some_and(|gate| gate.sender_allowed(provider.as_ref(), &peer));
+        if !gate_open {
+            stats.record_fallback(frame.len(), FallbackReason::QuietGate);
+            eprintln!(
+                "[nat-chunk] fallback peer={peer16} bytes={} reason=quiet_gate",
+                frame.len()
+            );
+            if self.send_mesh_tcp_frame(dst, frame) {
+                return true;
+            }
+            stats.record_fallback_error(frame.len());
+            return false;
+        }
+
+        let mut chunk = Vec::with_capacity(1 + frame.len());
+        chunk.push(crate::nat_chunk_recv::CHUNK_KIND_TUN_STREAM);
+        chunk.extend_from_slice(frame);
+
+        let fallback_failed = std::cell::Cell::new(false);
+        let result = {
+            let this: &Self = &*self;
+            let fallback = |_ignored: &[u8]| -> std::io::Result<()> {
+                if this.send_mesh_tcp_frame(dst, frame) {
+                    Ok(())
+                } else {
+                    fallback_failed.set(true);
+                    Err(std::io::Error::other("n1 send failed"))
+                }
+            };
+            provider.send_chunk(peer, &fallback, &chunk)
+        };
+
+        match result {
+            Ok(crate::nat_switch::ChunkPath::Direct) => {
+                stats.record_direct_attempt(chunk.len());
+                eprintln!(
+                    "[nat-chunk] direct attempt peer={peer16} bytes={} result=ok",
+                    chunk.len()
+                );
+                false
+            }
+            Ok(crate::nat_switch::ChunkPath::Fallback) => {
+                stats.record_fallback(frame.len(), FallbackReason::NoDirect);
+                eprintln!(
+                    "[nat-chunk] fallback peer={peer16} bytes={} reason=no_direct",
+                    frame.len()
+                );
+                true
+            }
+            Err(e) => {
+                if fallback_failed.get() {
+                    stats.record_fallback(frame.len(), FallbackReason::NoDirect);
+                    stats.record_fallback_error(frame.len());
+                } else {
+                    stats.record_direct_error(chunk.len());
+                    eprintln!(
+                        "[nat-chunk] direct attempt peer={peer16} bytes={} result=err kind={:?}",
+                        chunk.len(),
+                        e.kind()
+                    );
+                    eprintln!("[nat-chunk] direct error peer={peer16} kind={:?}", e.kind());
+                }
+                false
             }
         }
     }
@@ -2776,7 +2971,7 @@ impl Dataplane {
     ///
     /// 成功 → `mesh_tcp_frames += 1`；失败（无 sender/无路由/发送错）→
     /// `mesh_dropped_no_n1 += 1`（W1 语义复用）。
-    fn send_mesh_tcp_frame(&mut self, dst: IpAddr, frame: &[u8]) -> bool {
+    fn send_mesh_tcp_frame(&self, dst: IpAddr, frame: &[u8]) -> bool {
         let sent = match &self.n1_sender {
             Some(sender) => sender.send_to_mesh(dst, frame).is_ok(),
             None => false,
@@ -3930,6 +4125,30 @@ mod tests {
         // 显式注入无配置默认引擎（新装配不再静默回落到它）。
         dp.set_default_simple_engine().expect("default engine");
         (dp, mock)
+    }
+
+    /// AC-H-1 `[P]`: driving Mesh TCP DATA with no attached NAT provider logs
+    /// the spec §13.2 degraded notice exactly once (and keeps falling back).
+    #[test]
+    fn no_nat_provider_logs_not_attached_once() {
+        let (mut dp, _mock) = test_dataplane();
+        let peer = nexus_fabric::PeerId([0x44; 32]);
+        let routes = vec![nexus_network::n1::pump::Ipv4Route {
+            subnet: nexus_network::n1::pump::Ipv4Net::parse("10.200.0.0/24").expect("subnet"),
+            peer: nexus_network::n1::N1PeerId(peer.0),
+        }];
+        dp.set_mesh_peer_resolver(Arc::new(
+            crate::mesh_peer_map::StaticMeshPeerMap::from_routes(&routes),
+        ));
+        assert!(!dp.nat_not_attached_logged.load(Ordering::Relaxed));
+
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5));
+        let frame = b"\x00\x00\x00\x00\x00hi";
+        let _ = dp.send_mesh_data_frame(dst, frame);
+        assert!(dp.nat_not_attached_logged.load(Ordering::Relaxed));
+        // A second chunk must not emit again (the flag is already latched).
+        let _ = dp.send_mesh_data_frame(dst, frame);
+        assert!(dp.nat_not_attached_logged.load(Ordering::Relaxed));
     }
 
     /// 装配回归：未注入引擎的 Dataplane 必须 fail-closed（Drop），

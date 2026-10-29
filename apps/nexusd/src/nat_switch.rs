@@ -31,7 +31,7 @@
 //! E4（`crates/nexus-nat-wireup/examples/e4_prod_switch.rs`）用真实
 //! TURN + NAT 模拟证明整条链路。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -40,7 +40,7 @@ use nexus_domain::nat::NatType;
 use nexus_fabric::{ConnShared, Driver, PeerId as FabricPeerId};
 use nexus_nat_quality::{MeasuredPath, PathEventSink, ProbeRole, QualityMonitor};
 use nexus_nat_traversal::{LocalCandidates, PortSample, PunchConfig, PunchResult};
-use nexus_nat_wireup::PunchManager;
+use nexus_nat_wireup::{PunchManager, TunnelProto};
 use nexus_path::{PathConfig, PathEvent, PathKind, PathManager};
 use nexus_projection::PathLink;
 use nexus_projection::path_link::ActiveConn;
@@ -86,6 +86,9 @@ pub struct NatSwitching {
     /// `&Arc<Self>`); it is set by `new` via `Arc::new_cyclic`.
     relay_provider: Mutex<Option<Arc<dyn RelayConnProvider>>>,
     relay_lost: Mutex<HashSet<[u8; 32]>>,
+    /// `PathEvent` only carries a `CandidatePath` (no `PeerId`); the
+    /// [`LinkSink`] reverse-looks the peer up by remote address.
+    peer_addrs: Mutex<HashMap<SocketAddr, FabricPeerId>>,
     self_weak: Weak<NatSwitching>,
 }
 
@@ -101,6 +104,10 @@ impl PathEventSink for LinkSink {
     fn on_path_event(&self, event: PathEvent) {
         let Some(sw) = self.inner.upgrade() else {
             return;
+        };
+        let (addr, kind) = match &event {
+            PathEvent::Switched { to, .. } => (to.remote_addr, to.kind),
+            PathEvent::Adopted { to } => (to.remote_addr, to.kind),
         };
         // T1 (2026-10-03): `PathEvent::Adopted` (nexus-path D4) added; the
         // adoption has no previous path to demote. Minimal compile-safe
@@ -122,7 +129,13 @@ impl PathEventSink for LinkSink {
                 sw.monitor.set_role(&to.remote_addr, ProbeRole::Active);
             }
         }
+        // The temporary link guard is released at the end of this statement;
+        // only then do we take the punch status lock (lock order: link ->
+        // status is never nested).
         sw.link.lock().unwrap().handle_event(event);
+        if let Some(peer) = sw.peer_of_addr(addr) {
+            sw.note_active_path(peer, kind);
+        }
     }
 }
 
@@ -169,6 +182,7 @@ impl NatSwitching {
                 monitor,
                 relay_provider: Mutex::new(None),
                 relay_lost: Mutex::new(HashSet::new()),
+                peer_addrs: Mutex::new(HashMap::new()),
                 self_weak: weak.clone(),
             }
         });
@@ -180,6 +194,32 @@ impl NatSwitching {
     /// Update local candidates / STUN samples (e.g. after re-sampling).
     pub fn set_local(&self, local: LocalCandidates, samples: Vec<PortSample>) {
         self.punch.set_local(local, samples);
+    }
+
+    /// Remember the peer that owns `addr` so `PathEvent`s (which carry only a
+    /// `CandidatePath`) can be projected back onto the punch status.
+    fn remember_peer_addr(&self, addr: SocketAddr, peer: FabricPeerId) {
+        if let Ok(mut map) = self.peer_addrs.lock() {
+            map.insert(addr, peer);
+        }
+    }
+
+    fn peer_of_addr(&self, addr: SocketAddr) -> Option<FabricPeerId> {
+        self.peer_addrs.lock().ok()?.get(&addr).copied()
+    }
+
+    /// Write the active path's proto into the peer's status row.
+    ///
+    /// `Proxy` never reaches this stack; it is a no-op rather than a silent
+    /// wrong value.
+    fn note_active_path(&self, peer: FabricPeerId, kind: PathKind) {
+        let proto = match kind {
+            PathKind::Direct => TunnelProto::Direct,
+            PathKind::Turn => TunnelProto::Turn,
+            PathKind::Mesh => TunnelProto::PeerRelay,
+            PathKind::Proxy => return,
+        };
+        self.punch.set_tunnel_proto(peer, proto);
     }
 
     /// D5 (spec section 14.3 / B16): attach the production relay provider.
@@ -280,12 +320,13 @@ impl NatSwitching {
             "relay kind must be Turn or Mesh"
         );
         let name = peer_name(&peer);
+        // PathEvent reverse-lookup is decoupled from conn registration: record
+        // the remote address before anything can panic/return.
+        self.remember_peer_addr(remote, peer);
         // A successful relay clears the "lost" state and makes the peer visible
         // in `GET /connectivity/nat` with turn/turn as its state evidence
         // (spec §4.5, AC3). Path decisions are unchanged.
         self.relay_lost.lock().unwrap().remove(&peer.0);
-        self.punch
-            .set_tunnel_proto(peer, nexus_nat_wireup::TunnelProto::Turn);
         self.punch
             .set_relay_source(peer, Some(nexus_nat_wireup::RelaySource::Turn));
         self.punch.register_relay(&relay, peer);
@@ -303,6 +344,15 @@ impl NatSwitching {
             forward: None,
         });
         eprintln!("[nat-switch] relay registered for peer {name} ({kind:?})");
+        // B2 (spec §6.4): a single proto write point after the link guard has
+        // been released and the relay has been logged. Turn keeps its value;
+        // Mesh gets PeerRelay instead of the old unconditional Turn.
+        let proto = match kind {
+            PathKind::Turn => TunnelProto::Turn,
+            PathKind::Mesh => TunnelProto::PeerRelay,
+            _ => unreachable!("relay kind must be Turn or Mesh"),
+        };
+        self.punch.set_tunnel_proto(peer, proto);
 
         if !auto_punch {
             return; // responder side: the responder loop answers offers.
@@ -347,6 +397,9 @@ impl NatSwitching {
     /// [`Self::on_relay_connected`]): only the larger PeerId initiates,
     /// so duplicate simultaneous punches do not occur by construction.
     fn on_direct_ready(&self, peer: FabricPeerId, name: &str, addr: SocketAddr) {
+        // Record the mapping before the conn lookup so a defensive early
+        // return still leaves `addr -> peer` resolvable for later PathEvents.
+        self.remember_peer_addr(addr, peer);
         let Some(direct) = self.punch.direct_conn(&peer) else {
             eprintln!("[nat-switch] WARN: Migrated but no direct conn for peer {name}");
             return;
@@ -404,6 +457,18 @@ impl NatSwitching {
                 nexus_nat_wireup::channel::STREAM_TYPE_WORKSPACE_SYNC,
                 chunk,
             )?;
+            // N-1 (MSR-p0-n1-ruling-20261026, spec §19.3): FIN this per-chunk
+            // stream so quinn replenishes MAX_STREAMS. Body only.
+            {
+                let mut st = stream
+                    .state
+                    .lock()
+                    .map_err(|_| std::io::Error::other("stream lock poisoned"))?;
+                st.send_fin = true;
+            }
+            let _ = stream.tx.send(nexus_fabric::Cmd::Pump {
+                conn: stream.conn_id,
+            });
             return Ok(ChunkPath::Direct);
         }
         fallback(chunk)?;
@@ -694,5 +759,175 @@ mod gap_tests {
         assert!(should_initiate(&a, &b), "smaller PeerId still initiates");
         assert!(should_initiate(&b, &a), "larger PeerId initiates");
         assert!(!should_initiate(&a, &a), "never punch self");
+    }
+
+    // ---- Wave B (P5 / B2 / WB-ADD-1) -------------------------------------
+
+    struct RelayFixture {
+        sw: Arc<NatSwitching>,
+        peer: FabricPeerId,
+        conn: Arc<ConnShared>,
+        local: SocketAddr,
+        remote: SocketAddr,
+        // Keep both ends alive for the duration of the test.
+        _server: Arc<Driver>,
+        _client: Arc<Driver>,
+    }
+
+    fn relay_fixture() -> RelayFixture {
+        let server = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind server");
+        let peer = server.shared().peer_id.expect("server identity");
+        let remote = *server.shared().local_addr.lock().unwrap();
+        let acceptor = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || server.accept_conn())
+        };
+        let client = Driver::new_client().expect("bind client");
+        let local = *client.shared().local_addr.lock().unwrap();
+        let conn = client
+            .connect(peer, remote, Duration::from_secs(5))
+            .expect("connect");
+        let _ = acceptor.join().expect("accept thread").expect("accept");
+
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let candidates = LocalCandidates {
+            host: gather_host_candidates(&driver),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        };
+        let sw = NatSwitching::new(
+            driver,
+            FabricPeerId([0x33; 32]),
+            candidates,
+            Vec::new(),
+            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+        );
+        RelayFixture {
+            sw,
+            peer,
+            conn,
+            local,
+            remote,
+            _server: server,
+            _client: client,
+        }
+    }
+
+    impl RelayFixture {
+        fn connect_relay(&self, kind: PathKind) {
+            self.sw.on_relay_connected(RelayInfo {
+                peer: self.peer,
+                relay: Arc::clone(&self.conn),
+                kind,
+                local: self.local,
+                remote: self.remote,
+                remote_nat: NatType::Unknown,
+                auto_punch: false,
+            });
+        }
+
+        fn proto(&self) -> TunnelProto {
+            self.sw
+                .punch
+                .status(&self.peer)
+                .expect("peer status")
+                .tunnel_proto
+        }
+
+        fn sink(&self) -> LinkSink {
+            LinkSink {
+                inner: Arc::downgrade(&self.sw),
+            }
+        }
+
+        fn candidate(&self, kind: PathKind, addr: SocketAddr) -> nexus_path::CandidatePath {
+            nexus_path::CandidatePath {
+                kind,
+                local_addr: self.local,
+                remote_addr: addr,
+                cost: 0.0,
+            }
+        }
+    }
+
+    /// B2: the single post-registration write point maps Mesh to PeerRelay.
+    #[test]
+    fn p5_relay_sets_peer_relay() {
+        let f = relay_fixture();
+        f.connect_relay(PathKind::Mesh);
+        assert_eq!(f.proto(), TunnelProto::PeerRelay);
+        f.sw.shutdown();
+    }
+
+    /// Switch half (WB-ADD-1 write point): a production `LinkSink` observes
+    /// `Switched{to: Direct}` and writes `TunnelProto::Direct`; switching back
+    /// to the relay address restores Turn.
+    #[test]
+    fn p5_sink_switch_sets_direct_and_back() {
+        let f = relay_fixture();
+        f.connect_relay(PathKind::Turn);
+        let direct_addr: SocketAddr = "127.0.0.1:61000".parse().unwrap();
+        // Without the reverse mapping the sink cannot resolve the peer and
+        // would not write at all (spec §5.2 needs the addr->peer map).
+        f.sw.remember_peer_addr(direct_addr, f.peer);
+        f.sw.punch.set_tunnel_proto(f.peer, TunnelProto::PeerRelay);
+
+        f.sink().on_path_event(PathEvent::Switched {
+            from: f.candidate(PathKind::Turn, f.remote),
+            to: f.candidate(PathKind::Direct, direct_addr),
+            reason: nexus_path::SwitchReason::BetterScore,
+        });
+        assert_eq!(f.proto(), TunnelProto::Direct, "sink must write Direct");
+
+        f.sw.punch.set_tunnel_proto(f.peer, TunnelProto::PeerRelay);
+        f.sink().on_path_event(PathEvent::Switched {
+            from: f.candidate(PathKind::Direct, direct_addr),
+            to: f.candidate(PathKind::Turn, f.remote),
+            reason: nexus_path::SwitchReason::PathFailed,
+        });
+        assert_eq!(f.proto(), TunnelProto::Turn, "relay switch must write Turn");
+        f.sw.shutdown();
+    }
+
+    #[test]
+    fn p5_adopted_relay_sets_turn() {
+        let f = relay_fixture();
+        f.connect_relay(PathKind::Turn);
+        f.sw.punch.set_tunnel_proto(f.peer, TunnelProto::Direct);
+        f.sink().on_path_event(PathEvent::Adopted {
+            to: f.candidate(PathKind::Turn, f.remote),
+        });
+        assert_eq!(f.proto(), TunnelProto::Turn);
+        f.sw.shutdown();
+    }
+
+    #[test]
+    fn p5_peer_addr_map_resolves_relay_and_direct() {
+        let f = relay_fixture();
+        f.connect_relay(PathKind::Turn);
+        assert_eq!(f.sw.peer_of_addr(f.remote), Some(f.peer));
+        let direct_addr: SocketAddr = "127.0.0.1:61001".parse().unwrap();
+        // No direct conn exists: this is the defensive early-return path; the
+        // mapping must still be recorded.
+        f.sw.on_direct_ready(f.peer, &peer_name(&f.peer), direct_addr);
+        assert_eq!(f.sw.peer_of_addr(direct_addr), Some(f.peer));
+        f.sw.shutdown();
+    }
+
+    /// Migrated / direct-ready alone must never write Direct (P5-AC3).
+    #[test]
+    fn p5_migrated_without_switch_stays_turn() {
+        let f = relay_fixture();
+        f.connect_relay(PathKind::Turn);
+        assert_eq!(f.proto(), TunnelProto::Turn);
+        f.sw.on_direct_ready(
+            f.peer,
+            &peer_name(&f.peer),
+            "127.0.0.1:61002".parse().unwrap(),
+        );
+        assert_eq!(f.proto(), TunnelProto::Turn);
+        f.sw.shutdown();
     }
 }

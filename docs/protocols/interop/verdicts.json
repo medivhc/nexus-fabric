@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "generated_from_revision": "6ede7ece97495cbbc315d642c06b3f7f2b3778bf",
+  "generated_from_revision": "e1bb2770074b533bbe6ddba7dd37f5a1426d312f",
   "generated_at": "2026-10-26T01:32:24Z",
   "run_id": "protocol-interop-fixes-1",
-  "inputs_sha256": "6791f145464407652c26f40937a6c7e5b4fc0cfa2874bb12a19ef7cacc1a6603",
+  "inputs_sha256": "7dbe473ec145f9500e9532f8587675cf63a0e046f5e50d8d45d336964d40f921",
   "protocols": {
     "anytls": {
       "origin": "matrix",
@@ -17,9 +17,9 @@
     },
     "hysteria2": {
       "origin": "matrix",
-      "verdict": "VERIFIED",
-      "scope": "FULL",
-      "claim": "USABLE",
+      "verdict": "PARTIAL",
+      "scope": "PROTOCOL_SUBSET",
+      "claim": "USABLE_WITH_GAPS",
       "boundaries": [
         "PROTOCOL_NOT_WIRED"
       ],
@@ -86,7 +86,7 @@
     },
     "PRODUCT_UDP_NOT_IMPLEMENTED": {
       "severity": "warn",
-      "text": "产品级 UDP 未接线；UDP 流量将被丢弃。"
+      "text": "产品级 UDP 按表面区分：nexusd/TUN 表面未实现，UDP 将被丢弃；nexus proxy 的 SOCKS5 入口已实现 VLESS（flow=None）/AnyTLS 的 UDP 转发，其余协议（含 flow≠None 的 VLESS）仍未实现、将被丢弃。"
     },
     "TROJAN_FALLBACK_FAIL_OPEN": {
       "severity": "security",
@@ -102,19 +102,19 @@
     },
     "SHADOWSOCKS_STD_DERIVE_NONCOMPLIANT": {
       "severity": "warn",
-      "text": "Shadowsocks 的 UDP 路径仍用旧实现的密钥派生：省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通；TCP 路径不受影响。"
+      "text": "nexusd/TUN 表面的 Shadowsocks UDP 实现仍用旧密钥派生（省略 EVP_BytesToKey，不合 SIP004，与标准 SS 服务端不互通）；TUN 与产品 SOCKS5 表面的 TCP 线格式已合 SIP004。"
     },
     "SHADOWSOCKS_NO_INTEROP_EVIDENCE": {
       "severity": "warn",
-      "text": "Shadowsocks 的 UDP 路径未做参照端互操作验证；TCP 路径已有参照端互操作证据。"
+      "text": "Shadowsocks 产品级 UDP 未实现，故无产品级 UDP 互操作证据；TCP 路径已有参照端互操作证据。"
     },
     "SHADOWSOCKS_UDP_LEGACY_NONCOMPLIANT": {
       "severity": "warn",
-      "text": "Shadowsocks 的 UDP 路径仍是旧的 legacy 实现，产品级 UDP 未实现；UDP 流量不可依赖。"
+      "text": "Shadowsocks 的产品级 UDP 未实现，UDP 流量将被丢弃；nexusd/TUN 表面不在本结论覆盖内。"
     },
     "PROTOCOL_NOT_WIRED": {
       "severity": "warn",
-      "text": "该协议在当前版本尚未接线；不能作为生产出口。"
+      "text": "该协议在 nexusd/TUN 表面尚未接线，不能作为 TUN 出口；在未接线协议中，产品 SOCKS5 表面仅 Hysteria2 已接线 TCP（其 UDP 未实现），其余未接线协议在产品表面同样不能作为生产出口。"
     },
     "VERDICT_MISSING": {
       "severity": "warn",

@@ -83,7 +83,7 @@ pub enum Socks5Error {
     AuthFailed,
     /// 请求段版本不是 0x05。
     BadRequestVersion { got: u8 },
-    /// 命令不受支持（本状态机仅 CONNECT；BIND/UDP ASSOCIATE 显式拒绝）。
+    /// 命令不受支持（本状态机支持 CONNECT/UDP ASSOCIATE；仅 BIND/未知命令显式拒绝）。
     UnsupportedCommand { cmd: u8 },
     /// 地址类型不受支持（仅 ATYP 1/3/4）。
     UnsupportedAddressType { atyp: u8 },
@@ -116,6 +116,108 @@ impl core::fmt::Display for Socks5Error {
 }
 
 impl std::error::Error for Socks5Error {}
+
+/// SOCKS5 目标/绑定地址（RFC 1928 ATYP 三型）。
+///
+/// 用数组/String 表示，不依赖 `std::net`，保持 portable（WASI 可检查）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Socks5Address {
+    /// ATYP=0x01：IPv4 + 端口。
+    Ipv4 { addr: [u8; 4], port: u16 },
+    /// ATYP=0x03：域名 + 端口。
+    Domain { host: String, port: u16 },
+    /// ATYP=0x04：IPv6 + 端口。
+    Ipv6 { addr: [u8; 16], port: u16 },
+}
+
+impl Socks5Address {
+    /// 端口。
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Ipv4 { port, .. } | Self::Domain { port, .. } | Self::Ipv6 { port, .. } => *port,
+        }
+    }
+
+    /// 既有 `FlowContext` destination 格式：`host:port` / `1.2.3.4:port` / `[v6]:port`。
+    #[must_use]
+    pub fn to_destination_string(&self) -> String {
+        match self {
+            Self::Ipv4 { addr, port } => {
+                format!("{}.{}.{}.{}:{}", addr[0], addr[1], addr[2], addr[3], port)
+            }
+            Self::Domain { host, port } => format!("{host}:{port}"),
+            Self::Ipv6 { addr, port } => format!("{}:{}", format_ipv6(addr), port),
+        }
+    }
+
+    /// 是否为 unspecified（`0.0.0.0:0` / `[::]:0`）。
+    #[must_use]
+    pub fn is_unspecified(&self) -> bool {
+        match self {
+            Self::Ipv4 { addr, port } => addr == &[0, 0, 0, 0] && *port == 0,
+            Self::Ipv6 { addr, port } => addr == &[0u8; 16] && *port == 0,
+            Self::Domain { .. } => false,
+        }
+    }
+}
+
+/// 握手完成后解析出的 SOCKS5 命令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Socks5Command {
+    /// CMD=0x01：连接目标。
+    Connect { target: Socks5Address },
+    /// CMD=0x03：UDP 关联；`client_endpoint` 为请求里的 DST（unspecified → None）。
+    UdpAssociate {
+        client_endpoint: Option<Socks5Address>,
+    },
+}
+
+/// 解析后的 SOCKS5 UDP 数据报（RSV RSV FRAG ATYP ADDR PORT DATA）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Socks5UdpDatagram {
+    /// FRAG 字段；本状态机只做解析，非 0 由上层策略丢弃（不做重组）。
+    pub fragment: u8,
+    /// 请求方向为 DST.ADDR/DST.PORT；回包方向为源地址。
+    pub address: Socks5Address,
+    /// 载荷。
+    pub payload: Vec<u8>,
+}
+
+/// SOCKS5 UDP 数据报编解码错误（结构化，非文本日志）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Socks5UdpError {
+    /// 长度不足（无法容纳固定头 / 地址 / 端口）。
+    TooShort { len: usize },
+    /// RSV 非 0。
+    BadReserved { rsv: u8 },
+    /// ATYP 非 0x01/0x03/0x04。
+    UnsupportedAddressType { atyp: u8 },
+    /// 域名为空或超过 255 字节。
+    InvalidAddress,
+    /// 编码后超过上限（IPv4 UDP 最大载荷 65507）。
+    DatagramTooLarge { len: usize, limit: usize },
+}
+
+impl core::fmt::Display for Socks5UdpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooShort { len } => write!(f, "socks5 udp datagram too short ({len} bytes)"),
+            Self::BadReserved { rsv } => {
+                write!(f, "socks5 udp reserved bytes not zero ({rsv:#04x})")
+            }
+            Self::UnsupportedAddressType { atyp } => {
+                write!(f, "socks5 udp unsupported address type {atyp:#04x}")
+            }
+            Self::InvalidAddress => write!(f, "socks5 udp invalid address"),
+            Self::DatagramTooLarge { len, limit } => {
+                write!(f, "socks5 udp datagram too large ({len} > {limit})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Socks5UdpError {}
 
 /// SOCKS5 握手阶段（有状态 enum 状态机）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +254,8 @@ pub struct Socks5Step {
 pub struct Socks5Handshake {
     state: Socks5State,
     buf: Vec<u8>,
+    /// `Established` 时解析出的命令（调用方用 `command()` 区分 CONNECT / UDP ASSOCIATE）。
+    command: Option<Socks5Command>,
 }
 
 /// 内部解析结果：需要更多输入 / 完成（消费长度+载荷） / 协议错误。
@@ -168,6 +272,7 @@ impl Socks5Handshake {
         Self {
             state: Socks5State::Greeting,
             buf: Vec::new(),
+            command: None,
         }
     }
 
@@ -175,6 +280,14 @@ impl Socks5Handshake {
     #[must_use]
     pub fn state(&self) -> &Socks5State {
         &self.state
+    }
+
+    /// 已 `Established` 时返回解析出的命令；未完成 → `None`。
+    ///
+    /// `Established` 同时用于 CONNECT 与 UDP ASSOCIATE，调用方必须用本方法区分。
+    #[must_use]
+    pub fn command(&self) -> Option<&Socks5Command> {
+        self.command.as_ref()
     }
 
     /// 取出握手完成后剩余的数据面字节（仅在 `Established` 后有意义）。
@@ -233,17 +346,34 @@ impl Socks5Handshake {
                         self.state = Socks5State::Failed(e);
                         break;
                     }
-                    Parse::Done(consumed, (cmd, destination)) => {
+                    Parse::Done(consumed, (cmd, address)) => {
                         self.buf.drain(..consumed);
                         match cmd {
                             // CONNECT：建立成功响应（BND.ADDR=0.0.0.0:0）。
                             0x01 => {
                                 response =
                                     [SOCKS5_VERSION, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0].to_vec();
-                                flow = Some(classify(FlowOrigin::Socks5, &destination, ""));
+                                flow = Some(classify(
+                                    FlowOrigin::Socks5,
+                                    &address.to_destination_string(),
+                                    "",
+                                ));
+                                self.command = Some(Socks5Command::Connect { target: address });
                                 self.state = Socks5State::Established;
                             }
-                            // BIND / UDP ASSOCIATE：显式 command-not-supported。
+                            // UDP ASSOCIATE：状态机不知道实际 bind 地址，响应留空；
+                            // 调用方必须用 `encode_udp_associate_reply` 发送真实 BND。
+                            0x03 => {
+                                self.command = Some(Socks5Command::UdpAssociate {
+                                    client_endpoint: if address.is_unspecified() {
+                                        None
+                                    } else {
+                                        Some(address)
+                                    },
+                                });
+                                self.state = Socks5State::Established;
+                            }
+                            // BIND / 未知命令：显式 command-not-supported。
                             _ => {
                                 response = [SOCKS5_VERSION, 0x07, 0x00].to_vec();
                                 self.state =
@@ -331,8 +461,8 @@ fn parse_user_pass(buf: &[u8]) -> Parse<()> {
     Parse::Done(2 + usize::from(ulen) + 1 + usize::from(plen), ())
 }
 
-/// 解析请求段：VER CMD RSV ATYP DST.ADDR DST.PORT。返回 (cmd, destination)。
-fn parse_request(buf: &[u8]) -> Parse<(u8, String)> {
+/// 解析请求段：VER CMD RSV ATYP DST.ADDR DST.PORT。返回 (cmd, address)。
+fn parse_request(buf: &[u8]) -> Parse<(u8, Socks5Address)> {
     if buf.len() < 4 {
         return Parse::NeedMore;
     }
@@ -342,12 +472,15 @@ fn parse_request(buf: &[u8]) -> Parse<(u8, String)> {
     if version != SOCKS5_VERSION {
         return Parse::Err(Socks5Error::BadRequestVersion { got: version });
     }
-    let (host, addr_len) = match atyp {
+    let (address, addr_len) = match atyp {
         0x01 => {
             if buf.len() < 4 + 4 + 2 {
                 return Parse::NeedMore;
             }
-            (format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]), 4)
+            let mut addr = [0u8; 4];
+            addr.copy_from_slice(&buf[4..8]);
+            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            (Socks5Address::Ipv4 { addr, port }, 4)
         }
         0x03 => {
             if buf.len() < 5 {
@@ -360,9 +493,9 @@ fn parse_request(buf: &[u8]) -> Parse<(u8, String)> {
             if buf.len() < 5 + name_len + 2 {
                 return Parse::NeedMore;
             }
-            let name = &buf[5..5 + name_len];
-            let host = String::from_utf8_lossy(name).into_owned();
-            (host, name_len + 1)
+            let host = String::from_utf8_lossy(&buf[5..5 + name_len]).into_owned();
+            let port = u16::from_be_bytes([buf[5 + name_len], buf[5 + name_len + 1]]);
+            (Socks5Address::Domain { host, port }, name_len + 1)
         }
         0x04 => {
             if buf.len() < 4 + 16 + 2 {
@@ -370,12 +503,143 @@ fn parse_request(buf: &[u8]) -> Parse<(u8, String)> {
             }
             let mut addr = [0u8; 16];
             addr.copy_from_slice(&buf[4..20]);
-            (format_ipv6(&addr), 16)
+            let port = u16::from_be_bytes([buf[20], buf[21]]);
+            (Socks5Address::Ipv6 { addr, port }, 16)
         }
         _ => return Parse::Err(Socks5Error::UnsupportedAddressType { atyp }),
     };
-    let port = u16::from_be_bytes([buf[4 + addr_len], buf[4 + addr_len + 1]]);
-    Parse::Done(4 + addr_len + 2, (cmd, format!("{host}:{port}")))
+    Parse::Done(4 + addr_len + 2, (cmd, address))
+}
+
+/// 编码一个 SOCKS5 地址（ATYP + ADDR + PORT）。
+///
+/// 域名长度由调用方校验（1..=255）；本函数只负责字节布局。
+fn encode_address(out: &mut Vec<u8>, address: &Socks5Address) {
+    match address {
+        Socks5Address::Ipv4 { addr, port } => {
+            out.push(0x01);
+            out.extend_from_slice(addr);
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+        Socks5Address::Domain { host, port } => {
+            out.push(0x03);
+            out.push(host.len() as u8);
+            out.extend_from_slice(host.as_bytes());
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+        Socks5Address::Ipv6 { addr, port } => {
+            out.push(0x04);
+            out.extend_from_slice(addr);
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+}
+
+/// 构造任意命令应答：`VER=5 | REP | RSV=0 | ATYP | BND.ADDR | BND.PORT`。
+#[must_use]
+pub fn encode_command_reply(rep: u8, bind: &Socks5Address) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 19);
+    out.extend_from_slice(&[SOCKS5_VERSION, rep, 0x00]);
+    encode_address(&mut out, bind);
+    out
+}
+
+/// 构造 UDP ASSOCIATE 成功应答（`VER=5, REP=0, RSV=0` + BND.ADDR/PORT）。
+#[must_use]
+pub fn encode_udp_associate_reply(bind: &Socks5Address) -> Vec<u8> {
+    encode_command_reply(0x00, bind)
+}
+
+/// 解析 SOCKS5 UDP 数据报：`RSV(2B=0) | FRAG | ATYP | ADDR | PORT | DATA`。
+///
+/// `TooShort` 只在不足固定头（4B）或按 ATYP 声明长度不足时报出；IPv4/IPv6 的最小
+/// 合法长度分别为 10/22 字节，域名型按声明长度判定（短域名 + 空载荷合法）。
+///
+/// # Errors
+///
+/// 见 [`Socks5UdpError`]；FRAG != 0 不是结构错误（由上层策略丢弃）。
+pub fn decode_udp_datagram(buf: &[u8]) -> Result<Socks5UdpDatagram, Socks5UdpError> {
+    if buf.len() < 4 {
+        return Err(Socks5UdpError::TooShort { len: buf.len() });
+    }
+    if buf[0] != 0 {
+        return Err(Socks5UdpError::BadReserved { rsv: buf[0] });
+    }
+    if buf[1] != 0 {
+        return Err(Socks5UdpError::BadReserved { rsv: buf[1] });
+    }
+    let fragment = buf[2];
+    let atyp = buf[3];
+    let (address, header_len) = match atyp {
+        0x01 => {
+            if buf.len() < 4 + 4 + 2 {
+                return Err(Socks5UdpError::TooShort { len: buf.len() });
+            }
+            let mut addr = [0u8; 4];
+            addr.copy_from_slice(&buf[4..8]);
+            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            (Socks5Address::Ipv4 { addr, port }, 10)
+        }
+        0x03 => {
+            if buf.len() < 5 {
+                return Err(Socks5UdpError::TooShort { len: buf.len() });
+            }
+            let name_len = usize::from(buf[4]);
+            if name_len == 0 {
+                return Err(Socks5UdpError::InvalidAddress);
+            }
+            if buf.len() < 5 + name_len + 2 {
+                return Err(Socks5UdpError::TooShort { len: buf.len() });
+            }
+            let host = String::from_utf8_lossy(&buf[5..5 + name_len]).into_owned();
+            let port = u16::from_be_bytes([buf[5 + name_len], buf[5 + name_len + 1]]);
+            (Socks5Address::Domain { host, port }, 5 + name_len + 2)
+        }
+        0x04 => {
+            if buf.len() < 4 + 16 + 2 {
+                return Err(Socks5UdpError::TooShort { len: buf.len() });
+            }
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&buf[4..20]);
+            let port = u16::from_be_bytes([buf[20], buf[21]]);
+            (Socks5Address::Ipv6 { addr, port }, 22)
+        }
+        _ => return Err(Socks5UdpError::UnsupportedAddressType { atyp }),
+    };
+    Ok(Socks5UdpDatagram {
+        fragment,
+        address,
+        payload: buf[header_len..].to_vec(),
+    })
+}
+
+/// 编码 SOCKS5 UDP 数据报（`RSV=0, FRAG=0`）。
+///
+/// # Errors
+///
+/// 域名为空/超过 255 字节 → [`Socks5UdpError::InvalidAddress`]；
+/// 编码后超过 65507 字节 → [`Socks5UdpError::DatagramTooLarge`]。
+pub fn encode_udp_datagram(
+    address: &Socks5Address,
+    payload: &[u8],
+) -> Result<Vec<u8>, Socks5UdpError> {
+    const MAX_UDP_DATAGRAM_BYTES: usize = 65507;
+    if let Socks5Address::Domain { host, .. } = address
+        && (host.is_empty() || host.len() > 255)
+    {
+        return Err(Socks5UdpError::InvalidAddress);
+    }
+    let mut out = Vec::with_capacity(4 + 19 + payload.len());
+    out.extend_from_slice(&[0x00, 0x00, 0x00]);
+    encode_address(&mut out, address);
+    out.extend_from_slice(payload);
+    if out.len() > MAX_UDP_DATAGRAM_BYTES {
+        return Err(Socks5UdpError::DatagramTooLarge {
+            len: out.len(),
+            limit: MAX_UDP_DATAGRAM_BYTES,
+        });
+    }
+    Ok(out)
 }
 
 /// 16 字节 IPv6 → 未压缩十六进制段格式（portable，无 std::net 依赖）。
@@ -930,6 +1194,323 @@ mod tests {
         hs.feed(&[0x05, 0x01, 0x00]);
         let step = hs.feed(&[0x05, 0x01, 0x00, 0x03, 0x00, 0x00, 0x50]);
         assert_eq!(step.state, Socks5State::Failed(Socks5Error::InvalidAddress));
+    }
+
+    // ---------- SOCKS5 UDP ASSOCIATE（§3.7） ----------
+
+    #[test]
+    fn command_is_none_before_established() {
+        let mut hs = Socks5Handshake::new();
+        hs.feed(&[0x05, 0x01, 0x00]);
+        assert!(hs.command().is_none());
+    }
+
+    #[test]
+    fn connect_exposes_target_command() {
+        let mut hs = Socks5Handshake::new();
+        let mut bytes = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x0b];
+        bytes.extend_from_slice(b"example.com");
+        bytes.extend_from_slice(&[0x01, 0xbb]);
+        let step = hs.feed(&bytes);
+        assert_eq!(step.state, Socks5State::Established);
+        assert_eq!(
+            hs.command(),
+            Some(&Socks5Command::Connect {
+                target: Socks5Address::Domain {
+                    host: "example.com".into(),
+                    port: 443,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn udp_associate_unspecified_endpoint_establishes_without_response() {
+        let mut hs = Socks5Handshake::new();
+        hs.feed(&[0x05, 0x01, 0x00]);
+        let step = hs.feed(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(step.state, Socks5State::Established);
+        // 状态机不知道真实 bind 地址：响应必须为空，由调用方 encode_udp_associate_reply。
+        assert!(step.response.is_empty());
+        assert!(step.flow.is_none());
+        assert!(!step.needs_more);
+        assert_eq!(
+            hs.command(),
+            Some(&Socks5Command::UdpAssociate {
+                client_endpoint: None
+            })
+        );
+        assert!(hs.take_data().is_empty());
+    }
+
+    #[test]
+    fn udp_associate_concrete_endpoint_is_kept_as_hint() {
+        let mut hs = Socks5Handshake::new();
+        hs.feed(&[0x05, 0x01, 0x00]);
+        let step = hs.feed(&[0x05, 0x03, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]);
+        assert_eq!(step.state, Socks5State::Established);
+        assert_eq!(
+            hs.command(),
+            Some(&Socks5Command::UdpAssociate {
+                client_endpoint: Some(Socks5Address::Ipv4 {
+                    addr: [127, 0, 0, 1],
+                    port: 8080,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn udp_associate_domain_endpoint_and_zero_port_is_not_unspecified() {
+        let mut hs = Socks5Handshake::new();
+        hs.feed(&[0x05, 0x01, 0x00]);
+        let mut req = vec![0x05, 0x03, 0x00, 0x03, 0x03];
+        req.extend_from_slice(b"abc");
+        req.extend_from_slice(&[0x00, 0x00]);
+        let step = hs.feed(&req);
+        assert_eq!(step.state, Socks5State::Established);
+        assert_eq!(
+            hs.command(),
+            Some(&Socks5Command::UdpAssociate {
+                client_endpoint: Some(Socks5Address::Domain {
+                    host: "abc".into(),
+                    port: 0,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn bind_is_still_command_not_supported() {
+        let mut hs = Socks5Handshake::new();
+        hs.feed(&[0x05, 0x01, 0x00]);
+        let step = hs.feed(&[0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80]);
+        assert_eq!(
+            step.state,
+            Socks5State::Failed(Socks5Error::UnsupportedCommand { cmd: 0x02 })
+        );
+        assert_eq!(step.response, [0x05, 0x07, 0x00]);
+        assert!(hs.command().is_none());
+    }
+
+    #[test]
+    fn udp_associate_unknown_command_still_rejected() {
+        let mut hs = Socks5Handshake::new();
+        hs.feed(&[0x05, 0x01, 0x00]);
+        let step = hs.feed(&[0x05, 0x09, 0x00, 0x01, 127, 0, 0, 1, 0, 80]);
+        assert_eq!(
+            step.state,
+            Socks5State::Failed(Socks5Error::UnsupportedCommand { cmd: 0x09 })
+        );
+        assert_eq!(step.response, [0x05, 0x07, 0x00]);
+    }
+
+    #[test]
+    fn address_helpers_destination_and_unspecified() {
+        let v4 = Socks5Address::Ipv4 {
+            addr: [8, 8, 8, 8],
+            port: 53,
+        };
+        assert_eq!(v4.port(), 53);
+        assert_eq!(v4.to_destination_string(), "8.8.8.8:53");
+        assert!(!v4.is_unspecified());
+
+        let domain = Socks5Address::Domain {
+            host: "example.com".into(),
+            port: 443,
+        };
+        assert_eq!(domain.to_destination_string(), "example.com:443");
+        assert!(!domain.is_unspecified());
+
+        let v6 = Socks5Address::Ipv6 {
+            addr: [
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2a,
+            ],
+            port: 53,
+        };
+        assert_eq!(v6.to_destination_string(), "[2001:db8:0:0:0:0:0:2a]:53");
+        assert!(!v6.is_unspecified());
+
+        assert!(
+            Socks5Address::Ipv4 {
+                addr: [0, 0, 0, 0],
+                port: 0
+            }
+            .is_unspecified()
+        );
+        assert!(
+            Socks5Address::Ipv6 {
+                addr: [0; 16],
+                port: 0
+            }
+            .is_unspecified()
+        );
+        // 未指定地址但端口非 0：不是 unspecified（端口锁定 hint 有意义）。
+        assert!(
+            !Socks5Address::Ipv4 {
+                addr: [0, 0, 0, 0],
+                port: 9000
+            }
+            .is_unspecified()
+        );
+    }
+
+    #[test]
+    fn encode_udp_associate_reply_uses_bind_address() {
+        let bind = Socks5Address::Ipv4 {
+            addr: [127, 0, 0, 1],
+            port: 31,
+        };
+        let reply = encode_udp_associate_reply(&bind);
+        assert_eq!(reply, [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x1f]);
+        assert_eq!(reply.len(), 10);
+
+        let v6 = Socks5Address::Ipv6 {
+            addr: [0; 16],
+            port: 1080,
+        };
+        let reply = encode_command_reply(0x01, &v6);
+        assert_eq!(reply.len(), 22);
+        assert_eq!(&reply[..4], &[0x05, 0x01, 0x00, 0x04]);
+        assert_eq!(&reply[20..], &1080u16.to_be_bytes());
+    }
+
+    #[test]
+    fn udp_datagram_roundtrip_ipv4() {
+        let address = Socks5Address::Ipv4 {
+            addr: [127, 0, 0, 1],
+            port: 5353,
+        };
+        let bytes = encode_udp_datagram(&address, b"hello").expect("encode");
+        assert_eq!(&bytes[..4], &[0x00, 0x00, 0x00, 0x01]);
+        let datagram = decode_udp_datagram(&bytes).expect("decode");
+        assert_eq!(datagram.fragment, 0);
+        assert_eq!(datagram.address, address);
+        assert_eq!(datagram.payload, b"hello");
+    }
+
+    #[test]
+    fn udp_datagram_roundtrip_domain_and_ipv6() {
+        let domain = Socks5Address::Domain {
+            host: "example.com".into(),
+            port: 443,
+        };
+        let bytes = encode_udp_datagram(&domain, b"x").expect("encode");
+        let datagram = decode_udp_datagram(&bytes).expect("decode");
+        assert_eq!(datagram.address, domain);
+        assert_eq!(datagram.payload, b"x");
+
+        let v6 = Socks5Address::Ipv6 {
+            addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            port: 53,
+        };
+        let bytes = encode_udp_datagram(&v6, b"dns").expect("encode");
+        let datagram = decode_udp_datagram(&bytes).expect("decode");
+        assert_eq!(datagram.address, v6);
+        assert_eq!(datagram.payload, b"dns");
+    }
+
+    #[test]
+    fn udp_datagram_short_domain_with_empty_payload_is_accepted() {
+        // 域名为 1 字节、空载荷：编码后 8 字节（< IPv4 最小 10B）。
+        let domain = Socks5Address::Domain {
+            host: "a".into(),
+            port: 7,
+        };
+        let bytes = encode_udp_datagram(&domain, b"").expect("encode");
+        assert_eq!(bytes.len(), 8);
+        let datagram = decode_udp_datagram(&bytes).expect("decode");
+        assert_eq!(datagram.address, domain);
+        assert!(datagram.payload.is_empty());
+    }
+
+    #[test]
+    fn udp_datagram_fragment_is_preserved_not_rejected() {
+        let address = Socks5Address::Ipv4 {
+            addr: [1, 2, 3, 4],
+            port: 9,
+        };
+        let mut bytes = encode_udp_datagram(&address, b"p").expect("encode");
+        bytes[2] = 1; // FRAG=1
+        let datagram = decode_udp_datagram(&bytes).expect("decode");
+        assert_eq!(datagram.fragment, 1);
+    }
+
+    #[test]
+    fn udp_datagram_rejects_malformed_headers() {
+        // 固定头不足。
+        assert_eq!(
+            decode_udp_datagram(&[0x00, 0x00, 0x00]),
+            Err(Socks5UdpError::TooShort { len: 3 })
+        );
+        // RSV 非 0。
+        assert_eq!(
+            decode_udp_datagram(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
+            Err(Socks5UdpError::BadReserved { rsv: 0x01 })
+        );
+        // ATYP 非 1/3/4。
+        assert_eq!(
+            decode_udp_datagram(&[0x00, 0x00, 0x00, 0x09, 0, 0, 0, 0, 0, 0]),
+            Err(Socks5UdpError::UnsupportedAddressType { atyp: 0x09 })
+        );
+        // 域名为空。
+        assert_eq!(
+            decode_udp_datagram(&[0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x50]),
+            Err(Socks5UdpError::InvalidAddress)
+        );
+        // 域名声明长度超出缓冲。
+        assert_eq!(
+            decode_udp_datagram(&[0x00, 0x00, 0x00, 0x03, 0x05, b'a']),
+            Err(Socks5UdpError::TooShort { len: 6 })
+        );
+        // IPv4 少 1 字节。
+        assert_eq!(
+            decode_udp_datagram(&[0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0]),
+            Err(Socks5UdpError::TooShort { len: 9 })
+        );
+    }
+
+    #[test]
+    fn encode_udp_datagram_enforces_size_and_domain_limits() {
+        let address = Socks5Address::Ipv4 {
+            addr: [1, 2, 3, 4],
+            port: 9,
+        };
+        // 4 + 6 + 65497 = 65507：恰好允许。
+        let payload = vec![0u8; 65497];
+        assert_eq!(
+            encode_udp_datagram(&address, &payload)
+                .expect("encode")
+                .len(),
+            65507
+        );
+        // 多 1 字节 → 超限。
+        let payload = vec![0u8; 65498];
+        assert_eq!(
+            encode_udp_datagram(&address, &payload),
+            Err(Socks5UdpError::DatagramTooLarge {
+                len: 65508,
+                limit: 65507,
+            })
+        );
+        // 空域名。
+        let bad_domain = Socks5Address::Domain {
+            host: String::new(),
+            port: 1,
+        };
+        assert_eq!(
+            encode_udp_datagram(&bad_domain, b""),
+            Err(Socks5UdpError::InvalidAddress)
+        );
+        // 超长域名。
+        let bad_domain = Socks5Address::Domain {
+            host: "a".repeat(256),
+            port: 1,
+        };
+        assert_eq!(
+            encode_udp_datagram(&bad_domain, b""),
+            Err(Socks5UdpError::InvalidAddress)
+        );
     }
 
     // ---------- HTTP 代理有状态握手状态机（§11.19） ----------

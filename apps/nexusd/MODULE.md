@@ -414,6 +414,16 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 
+### NAT chunk 消费（P0）
+
+生产 TUN 的 Mesh TCP DATA 帧经 `NatPathProvider::send_chunk` 消费 NAT 层选定的 active conn：direct 活跃且发送门开启时每 chunk 新开一条 bi-stream（`WORKSPACE_SYNC` 帧，payload 为 `KIND=0x01 || STREAM_FRAME`），否则走既有 N1 fallback 并发送**原始 STREAM_FRAME**（不带 KIND）。SYN/FIN/RST 仍走 N1，不计入 chunk。
+
+- 句柄：组合根创建 `NatHandleSlot` 并在 dataplane 线程启动前注入；NAT runtime 起来后 `slot.set`。slot 为空 = 全部 fallback（`runtime="disabled"`），不是错误。
+- 门：`DIRECT_ACCEPT_QUIET_MS=30000`（接收）、`DIRECT_SEND_GUARD_MS=32000`（发送）；两端共享同一个单调 `PunchClock`，判据是 `PunchState::Succeeded` + `last_success_ms` 差值。不使用 `direct_conn_id`。
+- 接收端：只 accept active 为 `Direct` 的 conn；读到一帧后继续 drain 到 EOF 并关闭己方发送方向（quinn 双半释放后才补发 `MAX_STREAMS`）；帧读失败只关闭发送方向。队列满丢该 chunk，不阻塞 accept。
+- 状态面：只读路由 `GET /localapi/v0/nat/chunks`（新文件 `nat_chunk_stats.rs` 构建 JSON）；`/localapi/v0/connectivity/nat` 与 `/localapi/v0/dataplane/stats` 的既有字段零改动。计数字段用 `direct_attempts` 语义：只表示发送尝试，不表示送达。
+- 诚实边界：本段不引入 seq/ack/重排/重试，不声称 chunk 级顺序、送达或“不中断”；跨 conn 不迁移在途 stream；fabric driver 的流条目在 conn 关闭前不回收（既有 L-1）。
+
 ## Verification
 
 ### N3 装配契约增补（待实现）
