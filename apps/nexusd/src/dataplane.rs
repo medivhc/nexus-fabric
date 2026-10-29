@@ -329,6 +329,50 @@ fn n1_send_failure_line(dst: IpAddr, kind: &str, len: usize) -> String {
     format!("[nat-chunk] n1 send failed dst={dst} kind={kind} len={len}")
 }
 
+/// N1 datagram 上限（fabric S5 pre-PMTUD 的 1200B，与
+/// `nexus_network::n1::pump::DATAGRAM_CAP` 同值；本层只镜像，不改上限）。
+const N1_DATAGRAM_CAP: usize = 1200;
+
+/// STREAM 帧头长度（`stream_id: u32 BE ‖ flags: u8`）。
+const STREAM_FRAME_HEADER_LEN: usize = 5;
+
+/// 单个分片的 DATA 载荷上限：整帧（头 + 载荷）不得超过 [`N1_DATAGRAM_CAP`]。
+const N1_STREAM_PAYLOAD_CAP: usize = N1_DATAGRAM_CAP - STREAM_FRAME_HEADER_LEN;
+
+/// 发送一个 STREAM 帧；超限的纯 DATA 帧在发送侧切片后逐片顺序发出。
+///
+/// 接收侧对 DATA 的唯一语义是「按到达序追加到该流的字节流」，因此同
+/// `stream_id`/`flags` 的连续切片与未切分整帧逐字节等价（帧头无 offset/seq）。
+///
+/// 规则：
+/// - `frame.len() <= 1200` → 原样发送一次（既有路径零改动）；
+/// - 超限且 `flags == 0`（纯 DATA）→ 每片载荷 ≤1195B，顺序发送；任一片
+///   失败即返回该错误（已发出的前片使流出现空洞，由调用方的断流处理接管）；
+/// - 超限但 `flags != 0`（控制帧）或解码失败 → 原样发送，保留既有的
+///   `OversizeDatagram` 失败语义（今天不存在此形态，不静默切坏控制帧）。
+fn send_stream_frame_fragmented(
+    frame: &[u8],
+    mut send: impl FnMut(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
+) -> Result<(), nexus_network::n1::N1Error> {
+    if frame.len() <= N1_DATAGRAM_CAP {
+        return send(frame);
+    }
+    let Some((stream_id, flags, payload)) = decode_stream_frame(frame) else {
+        return send(frame);
+    };
+    if flags != 0 {
+        return send(frame);
+    }
+    let mut off = 0;
+    while off < payload.len() {
+        let end = (off + N1_STREAM_PAYLOAD_CAP).min(payload.len());
+        let piece = encode_stream_frame(stream_id, flags, &payload[off..end]);
+        send(&piece)?;
+        off = end;
+    }
+    Ok(())
+}
+
 /// TPROXY 跨线程消息（spec §9.14）。
 #[derive(Debug)]
 pub enum TransparentInbound {
@@ -1143,7 +1187,10 @@ impl Dataplane {
         frame: &[u8],
         send: impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
     ) {
-        match send(frame) {
+        // Q-1（回程同根）：egress→originator 方向的 DATA 帧同样受 1200B
+        // datagram 上限约束（`TcpRelay::poll` 的 8192B 读缓冲可达 8197B 帧）。
+        // 与正向共用同一分片助手；`record_tx` 仍按逻辑帧计数一次。
+        match send_stream_frame_fragmented(frame, send) {
             Ok(()) => self.n1_stats.record_tx(frame.len(), true),
             Err(e) => {
                 self.record_tx_error(peer_hex, frame, &format!("{e:?}"));
@@ -3525,7 +3572,8 @@ impl Dataplane {
 
     /// S4/S5/S6-Mesh：STREAM 帧经 N1 发送；返回是否成功。
     ///
-    /// 成功 → `mesh_tcp_frames += 1`；失败（无 sender/无路由/发送错）→
+    /// 成功 → `mesh_tcp_frames += 1`（按**逻辑帧**计数：超限 DATA 帧的全部
+    /// 分片都发出才算 1 帧）；失败（无 sender/无路由/发送错）→
     /// `mesh_dropped_no_n1 += 1`（W1 语义复用）。
     ///
     /// C-3：失败分支同时记录 `N1Error` 种类（`[nat-chunk]` 既有风格）。
@@ -3535,22 +3583,27 @@ impl Dataplane {
     /// （严格 1:1），因此本函数是 `send_mesh_data_frame` 全部 fallback 失败
     /// 分支（NoPeer/NoPath/QuietGate/NoDirect）与 DATA/FIN/RST 发送失败的
     /// 唯一发射点。
+    ///
+    /// H2：超限 DATA 帧在此按 ≤1195B/片切分（[`send_stream_frame_fragmented`]），
+    /// 控制帧与 ≤1200B 的帧原样发送。
     fn send_mesh_tcp_frame(&self, dst: IpAddr, frame: &[u8]) -> bool {
         match &self.n1_sender {
-            Some(sender) => match sender.send_to_mesh(dst, frame) {
-                Ok(()) => {
-                    self.with_stats(|s| s.mesh_tcp_frames += 1);
-                    true
+            Some(sender) => {
+                match send_stream_frame_fragmented(frame, |f| sender.send_to_mesh(dst, f)) {
+                    Ok(()) => {
+                        self.with_stats(|s| s.mesh_tcp_frames += 1);
+                        true
+                    }
+                    Err(error) => {
+                        self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                        eprintln!(
+                            "{}",
+                            n1_send_failure_line(dst, &format!("{error:?}"), frame.len())
+                        );
+                        false
+                    }
                 }
-                Err(error) => {
-                    self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
-                    eprintln!(
-                        "{}",
-                        n1_send_failure_line(dst, &format!("{error:?}"), frame.len())
-                    );
-                    false
-                }
-            },
+            }
             None => {
                 // 装配未注入 N1 sender：没有 `N1Error` 可记，用哨兵 kind。
                 self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
@@ -8414,6 +8467,158 @@ outbounds:
         assert!(!dp.send_mesh_tcp_frame(dst, &encode_stream_frame(1, 0x00, b"x")));
         assert_eq!(dp.stats().mesh_dropped_no_n1, 1);
         assert_eq!(dp.stats().mesh_tcp_frames, 0);
+    }
+
+    /// 记录一次发送调用；`fail_at` 为 Some(i) 时第 i 次调用返回错误。
+    fn recording_send(
+        sent: &std::cell::RefCell<Vec<Vec<u8>>>,
+        fail_at: Option<usize>,
+    ) -> impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error> + '_ {
+        move |frame: &[u8]| {
+            let idx = sent.borrow().len();
+            sent.borrow_mut().push(frame.to_vec());
+            if Some(idx) == fail_at {
+                return Err(nexus_network::n1::N1Error::Transport(format!(
+                    "injected failure at piece {idx}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// H2 边界组：帧长 1195/1196/1200/1201/1245/8197 的 DATA 帧 →
+    /// 每片 ≤1200B、片数 = ceil(payload/1195)、按序拼回与原 payload 逐字节一致。
+    #[test]
+    fn stream_frame_fragmentation_boundaries() {
+        // (payload 长度, 期望分片数)；帧长 = payload + 5B 头。
+        let cases: [(usize, usize); 6] = [
+            (1190, 1), // frame 1195
+            (1191, 1), // frame 1196
+            (1195, 1), // frame 1200
+            (1196, 2), // frame 1201
+            (1240, 2), // frame 1245
+            (8192, 7), // frame 8197
+        ];
+        for (payload_len, expected_pieces) in cases {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+            let frame = encode_stream_frame(7, 0x00, &payload);
+            assert_eq!(frame.len(), payload_len + 5, "frame length sanity");
+            let sent = std::cell::RefCell::new(Vec::new());
+            {
+                let mut send = recording_send(&sent, None);
+                send_stream_frame_fragmented(&frame, &mut send).expect("fragmented send");
+            }
+            let sent = sent.into_inner();
+            assert_eq!(
+                sent.len(),
+                expected_pieces,
+                "payload {payload_len}: wrong piece count"
+            );
+            let mut rebuilt = Vec::new();
+            for piece in &sent {
+                assert!(
+                    piece.len() <= N1_DATAGRAM_CAP,
+                    "payload {payload_len}: piece of {} bytes exceeds the cap",
+                    piece.len()
+                );
+                let (sid, flags, body) = decode_stream_frame(piece).expect("piece decodes");
+                assert_eq!(sid, 7, "stream id must be preserved");
+                assert_eq!(flags, 0x00, "DATA flag must be preserved");
+                rebuilt.extend_from_slice(body);
+            }
+            assert_eq!(rebuilt, payload, "payload {payload_len}: bytes differ");
+        }
+    }
+
+    /// 中间片失败 → 整体返回错误（前片已发出，后续不再发）。
+    #[test]
+    fn stream_frame_fragmentation_middle_piece_failure() {
+        let payload = vec![0xabu8; 3000]; // 3 片：1195 + 1195 + 610
+        let frame = encode_stream_frame(9, 0x00, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = {
+            let mut send = recording_send(&sent, Some(2));
+            send_stream_frame_fragmented(&frame, &mut send)
+        };
+        assert!(
+            matches!(
+                result,
+                Err(nexus_network::n1::N1Error::Transport(ref e))
+                    if e.contains("injected failure at piece 2")
+            ),
+            "expected the injected error, got {result:?}"
+        );
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 3, "stop after the failing piece");
+        assert!(sent.iter().all(|p| p.len() <= N1_DATAGRAM_CAP));
+    }
+
+    /// 防御性规定：超限控制帧（flags != 0）不切分，照旧整帧交给发送端
+    /// （今天不存在此形态；由 adapter 返回 `OversizeDatagram`，语义不变）。
+    #[test]
+    fn oversize_control_frame_is_not_fragmented() {
+        let payload = vec![0u8; 1300];
+        let frame = encode_stream_frame(11, STREAM_SYN, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = {
+            let mut send = recording_send(&sent, None);
+            send_stream_frame_fragmented(&frame, &mut send)
+        };
+        assert!(result.is_ok());
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1, "control frames must never be split");
+        assert_eq!(sent[0], frame, "control frame must be sent verbatim");
+    }
+
+    /// H2 正向接线：`send_mesh_tcp_frame` 对 8197B DATA 帧发 7 个 ≤1200B 的
+    /// datagram，且 `mesh_tcp_frames` 按逻辑帧只 +1。
+    #[test]
+    fn mesh_send_fragments_oversize_data_frame() {
+        let (dp, _mock, frames) = mesh_dataplane_with_sender();
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        let payload = vec![0x5au8; 8192];
+        let frame = encode_stream_frame(21, 0x00, &payload);
+        assert!(dp.send_mesh_tcp_frame(dst, &frame));
+        let captured = frames.lock().unwrap();
+        assert_eq!(captured.len(), 7, "8197B frame → 7 datagrams");
+        let mut rebuilt = Vec::new();
+        for (got_dst, piece) in captured.iter() {
+            assert_eq!(*got_dst, dst);
+            assert!(piece.len() <= N1_DATAGRAM_CAP);
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (21, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        assert_eq!(dp.stats().mesh_tcp_frames, 1, "count per logical frame");
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 0);
+    }
+
+    /// Q-1 回程接线：`send_reply_over_n1` 与正向共用切分助手；`tx.frames`
+    /// 仍按逻辑帧只计一次。
+    #[test]
+    fn reply_over_n1_fragments_oversize_data_frame() {
+        let (mut dp, _mock) = test_dataplane();
+        let payload = vec![0x33u8; 8192];
+        let frame = encode_stream_frame(31, 0x00, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        {
+            let send = recording_send(&sent, None);
+            dp.send_reply_over_n1("peer-hex", &frame, &send);
+        }
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 7);
+        let mut rebuilt = Vec::new();
+        for piece in &sent {
+            assert!(piece.len() <= N1_DATAGRAM_CAP);
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (31, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        let snap = dp.n1_stats.snapshot();
+        assert_eq!(snap.tx_frames, 1, "tx counted per logical frame");
+        assert_eq!(snap.tx_errors, 0);
     }
 
     /// C-4：`/localapi/v0/dataplane/stats` 的 `dataplane` 对象暴露
