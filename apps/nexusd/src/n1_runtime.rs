@@ -470,6 +470,56 @@ mod tests {
     }
 
     #[test]
+    fn listening_runtime_wires_rx_supervisor_into_the_inbound_queue() {
+        // WP3 接线证据：生产装配函数在 listening 路径上起 supervisor，
+        // 真实 mTLS 入向连接经 reader 以 ConnUp 形式出现在 inbound 队列。
+        let server = identity(49);
+        let server_id = server.peer_id();
+        let client = identity(50);
+        let client_peer = N1PeerId(client.peer_id().0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let asm = assembly(&server, &client, Arc::clone(&shutdown));
+        let section = N1Section {
+            enabled: true,
+            listen_addr: Some("127.0.0.1:0".to_string()),
+        };
+        let handles = assemble_n1_runtime(&asm, &section, Some(server), Arc::clone(&shutdown));
+        let N1ListenerState::Listening { addr } = handles.listener_state else {
+            panic!("expected listening, got {:?}", handles.listener_state);
+        };
+        assert!(
+            handles.rx.is_some(),
+            "listening runtime must spawn the rx supervisor"
+        );
+
+        let cfg = ConnConfig {
+            addrs: vec![addr],
+            handshake_timeout: Duration::from_millis(700),
+        };
+        let dialer = FabricConn::connect_mtls(server_id, &client, &cfg).unwrap();
+        match handles
+            .inbound_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("ConnUp must reach the inbound queue")
+        {
+            N1Inbound::ConnUp { peer, conn } => {
+                assert_eq!(peer, client_peer);
+                assert!(conn.connection_id() > 0);
+            }
+            _ => panic!("expected ConnUp as the first inbound message"),
+        }
+
+        dialer.close(0, b"done");
+        shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = handles.accept {
+            handle.join().expect("accept thread joins");
+        }
+        if let Some(handle) = handles.rx {
+            handle.join().expect("rx supervisor joins");
+        }
+    }
+
+    #[test]
     fn larger_id_listens_and_smaller_id_dials_over_mtls() {
         // 生成一对身份，确保 listener 是大 id、dialer 是小 id（tie-break 所有权）。
         let mut listener_seed = 0x71u8;
