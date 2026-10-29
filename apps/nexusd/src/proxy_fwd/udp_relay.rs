@@ -4,12 +4,14 @@
 //! - `UdpForwarder` 持有 per-protocol 中继会话（惰性初始化）；
 //! - 出站：解析 IP/UDP 头 → 按 `dialer.udp_capability()` 分派 → 发送；
 //! - 入站：后台线程收回包 → 解包 → 经 mpsc 发给 dataplane → 重构 IP 包写回 TUN；
-//! - 流表 `(remote → (local, last_seen))`，60s 回收（P5）。
+//! - 数据报中继的流表 `(remote → (local, last_seen))`，60s 回收（P5）。
 //!
-//! 本 run 的 UDP 实现不变（spec §1.3）：
+//! 分派：
 //! - SOCKS5：UDP ASSOCIATE（RFC 1928 §7）；
 //! - ss：AEAD UDP（`ss_std::SsUdp`；派生非 SIP004，见步骤 1.5 证据
 //!   `.evidence/outbound-adapter-wiring/ss-std-sip004/`）；
+//! - VLESS / AnyTLS：每个（本地源，目的地址）一条代理流（`udp_stream::StreamTable`，
+//!   PRODUCT §11.18.1），回包按流键回到本地源；
 //! - Trojan：不建 relay，统一 `Unsupported { TlsVariantNotSupported }`（§3.5）。
 
 use std::collections::HashMap;
@@ -23,6 +25,8 @@ use nexus_proxy_config::OutboundKind;
 
 use super::ProxyFwdStats;
 use super::adapter::{OutboundDialer, UdpCapability, UdpMode, UdpUnsupportedReason};
+use super::udp_stream::StreamTable;
+pub use super::udp_stream::UdpReply;
 // TODO(deletion-gate: fixes-6): SS UDP 仍走 `ss_std::SsUdp`（crate 无标准 UDP
 // 包 API，spec §3.3 / §4.5）。删除触发条件 = fixes-6 或 crate 提供标准 UDP API，
 // 且同一 PR 内把 `UdpMode::ShadowsocksAead` 切换到 crate 实现。
@@ -51,8 +55,10 @@ pub struct UdpForwarder {
     /// 选中出站的 kind/tag（仅日志用；spec §6.5）。
     kind: OutboundKind,
     tag: String,
-    /// 惰性初始化的中继会话。
+    /// 惰性初始化的中继会话（SOCKS5 / SS）。
     relay: Option<UdpRelay>,
+    /// 惰性初始化的代理流表（VLESS / AnyTLS）。
+    streams: Option<StreamTable>,
     inbound_rx: Receiver<UdpInbound>,
     inbound_tx: Sender<UdpInbound>,
     /// remote → (local, last_seen)。
@@ -78,6 +84,7 @@ impl UdpForwarder {
             kind,
             tag,
             relay: None,
+            streams: None,
             inbound_rx,
             inbound_tx,
             flows: HashMap::new(),
@@ -87,17 +94,32 @@ impl UdpForwarder {
     }
 
     /// 处理一个 proxy 分类的 UDP 包（完整 IP 包）。
-    /// 成功发送返回 true；失败返回 false（调用方计数）。
+    /// 写出或进入代理流队列返回 true；在本次调用内被丢弃返回 false。
     pub fn handle_packet(&mut self, packet: &[u8]) -> bool {
-        // 排空入站（实际写 TUN 由调用方通过 drain_inbound 完成）。
+        self.handle_packet_at(packet, Instant::now())
+    }
+
+    fn handle_packet_at(&mut self, packet: &[u8], now: Instant) -> bool {
+        // 排空入站（实际写 TUN 由调用方通过 drain_replies 完成）。
         self.reap();
         let (local, remote, payload) = match parse_udp_packet(packet) {
             Some(t) => t,
             None => return false,
         };
+        if let Some(streams) = self.streams.as_mut() {
+            return streams.send(local, remote, payload, now, &mut self.stats);
+        }
         // 确保中继已建立。
         if self.relay.is_none() {
             match self.dialer.udp_capability() {
+                UdpCapability::Supported(
+                    UdpMode::VlessOverTcp { .. } | UdpMode::AnytlsUot { .. },
+                ) => {
+                    let streams = self
+                        .streams
+                        .insert(StreamTable::new(Arc::clone(&self.dialer)));
+                    return streams.send(local, remote, payload, now, &mut self.stats);
+                }
                 UdpCapability::Supported(mode) => match self.establish(mode) {
                     Ok(r) => self.relay = Some(r),
                     Err(e) => {
@@ -138,8 +160,32 @@ impl UdpForwarder {
         }
     }
 
-    /// 排空入站回包（调用方负责重构 IP 包写 TUN）。
-    pub fn drain_inbound(&mut self) -> Vec<UdpInbound> {
+    /// 排空回包（调用方负责重构 IP 包写 TUN / 交给 TPROXY 前端），并驱动代理流的
+    /// 事件、空闲回收与 worker 回收（每个 dataplane / egress 周期调用）。
+    pub fn drain_replies(&mut self) -> Vec<UdpReply> {
+        self.drain_replies_at(Instant::now())
+    }
+
+    fn drain_replies_at(&mut self, now: Instant) -> Vec<UdpReply> {
+        let mut replies: Vec<UdpReply> = self
+            .drain_inbound()
+            .into_iter()
+            .filter_map(|inbound| {
+                self.lookup_local(&inbound.remote).map(|local| UdpReply {
+                    local,
+                    remote: inbound.remote,
+                    payload: inbound.payload,
+                })
+            })
+            .collect();
+        if let Some(streams) = self.streams.as_mut() {
+            replies.extend(streams.poll(now, &mut self.stats));
+        }
+        replies
+    }
+
+    /// 排空数据报中继的入站回包。
+    fn drain_inbound(&mut self) -> Vec<UdpInbound> {
         let mut out = Vec::new();
         while let Ok(pkt) = self.inbound_rx.try_recv() {
             // 更新流活跃时间。
@@ -151,8 +197,8 @@ impl UdpForwarder {
         out
     }
 
-    /// 查找回包对应的本地源。
-    pub fn lookup_local(&self, remote: &SocketAddr) -> Option<SocketAddr> {
+    /// 查找数据报中继回包对应的本地源。
+    fn lookup_local(&self, remote: &SocketAddr) -> Option<SocketAddr> {
         self.flows.get(remote).map(|(local, _)| *local)
     }
 

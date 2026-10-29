@@ -14,6 +14,7 @@ pub mod ss_std;
 pub(crate) mod adapter;
 pub(crate) mod tcp_relay;
 pub(crate) mod udp_relay;
+mod udp_stream;
 
 pub use udp_relay::build_udp_reply;
 
@@ -503,11 +504,9 @@ impl ProxyEngine {
             stream_events,
         };
         for forwarder in self.udp.values_mut() {
-            for inbound in forwarder.drain_inbound() {
-                if let Some(local) = forwarder.lookup_local(&inbound.remote) {
-                    if let Some(pkt) = build_udp_reply(local, inbound.remote, &inbound.payload) {
-                        out.tun_packets.push(pkt);
-                    }
+            for reply in forwarder.drain_replies() {
+                if let Some(pkt) = build_udp_reply(reply.local, reply.remote, &reply.payload) {
+                    out.tun_packets.push(pkt);
                 }
             }
         }

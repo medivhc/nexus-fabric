@@ -248,19 +248,18 @@ impl ProxyFlowEgress for StreamProxyEgress {
             }
         }
         for forwarder in self.udp.values_mut() {
-            for inbound in forwarder.drain_inbound() {
-                let Some(local) = forwarder.lookup_local(&inbound.remote) else {
-                    continue;
-                };
-                let Some((peer, orig_dst)) =
-                    self.udp_peers.get(&key_of(local, inbound.remote)).copied()
+            for reply in forwarder.drain_replies() {
+                let Some((peer, orig_dst)) = self
+                    .udp_peers
+                    .get(&key_of(reply.local, reply.remote))
+                    .copied()
                 else {
                     continue;
                 };
                 let key = flow_key(peer, orig_dst);
                 out.push(ProxyEgressEvent::UdpReply {
                     key,
-                    payload: inbound.payload,
+                    payload: reply.payload,
                 });
             }
         }
