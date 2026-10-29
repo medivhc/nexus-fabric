@@ -3317,6 +3317,12 @@ fn handle_localapi_request(
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
+    if path == "/localapi/v0/n1/stats" {
+        // WP6（spec §5.6）：N1 计数面独立路由；`[network.n1] disabled` 时
+        // 返回全 0 + HTTP 200（不 404/500，与 `/nat/chunks` 同口径）。
+        write_http_json(stream, 200, &nexusd::n1_stats::n1_status()).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     let result: Result<Value, (String, String)> = match path {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
