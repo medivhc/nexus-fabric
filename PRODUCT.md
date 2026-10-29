@@ -363,8 +363,9 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
 
 - 真实加密代理协议栈（Vmess / Trojan / Hysteria2；Shadowsocks AEAD 见 §11.6）；
 - TUN / TPROXY 透明入站：已按 §11.18 落地（TUN 生产链 + Linux TPROXY 前端；
-  E4 离线闭环 + E5 netns 验收已执行（S1–S10：除 S2 外均通过；S2 的 UDP 回包源端口项
-  因冻结 spec §9.1/§9.4 冲突裁决挂起，修复走 follow-up run tproxy-udp-reply-origdst）。
+  E4 离线闭环 + E5 netns 验收已执行（S1–S10；S2 的 UDP 回包源端口项曾因冻结 spec
+  §9.1/§9.4 冲突挂起，已由 tproxy-udp-reply-origdst 按 §11.18「UDP 回包源地址」修复，
+  2026-10-27 E5 S2 PASS）。
   Windows/macOS TPROXY、IPv6 透明代理、DoH/DoT
   仍为后续项（见 §11.18 末条）；
 - Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；
@@ -1109,7 +1110,7 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   -> 有界 channel（1024）-> Dataplane owner 线程
   -> TransparentPipeline（nexus-projection::transparent，core 不读时钟/不做系统调用）
   -> Direct：DirectEgress；Proxy：ProxyFlowEgress（真实代理字节流 / UDP 中继）
-  -> UDP 回包经 sendmsg + IP_PKTINFO 以 orig_dst 为源地址发出
+  -> UDP 回包以 orig_dst（IP 与端口）为源地址发出
 ```
 
 - **规则与决策（G2/G3）**：`apps/nexusd` 直接构造 `nexus_proxy::DomainRuleEngine`
@@ -1124,8 +1125,16 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   `direct_dropped_unsupported`，不伪装成功。
 - **会话层（G4）**：`auto` 在 `proxy.yaml` 派生 Provider 非空时启用，否则
   `disabled/no_providers`；`enabled=true` 且无 provider 源时 Proxy 流显式 RST（不静默直连）。
+- **UDP 回包源地址（requirement-change 2026-10-27，E5 S2）**：客户端收到的回包源
+  地址必须恰为它发出时的原始目的地 `orig_dst`（IP **与端口**），否则使用 connected UDP
+  socket 的应用（DNS、游戏、QUIC）会丢弃回包。回包经按 `orig_dst` 复用的
+  `IP_TRANSPARENT` 回包 socket（bind `orig_dst` 后 `sendto` 客户端）发出；回包 socket
+  数量有界（LRU 淘汰），随 TPROXY UDP 前端一起关闭。为某个 `orig_dst` 建立回包 socket
+  失败（如该地址端口已被本机其它 socket 独占）时丢弃该回包并计 `udp_reply_failed`，
+  按失败类别每 10 s 至多一条 stderr `[nexusd] WARN tproxy event=udp_reply_failed orig_dst=<ip:port> cause=<code> detail="…" suppressed=<n>`，
+  **不得**以监听端口或其它源端口冒充发出。
 - **平台边界（ARCHITECTURE §10/§11）**：`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` /
-  `IP_PKTINFO` 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core
+  透明回包 socket 与全部 unsafe 只存在于 `nexus-platform-linux::tproxy`；portable core
   （`nexus-projection` / `nexus-domain` / `nexus-proxy`）不直接调用平台 API、不取系统时间。
 - **IPv4-only / fake-IP**：本 run 仅 IPv4；`ipv6: true` 在 `tun`/`tproxy` 配置中直接
   `CONFIG_INVALID`。fake-IP 未启用（`fake_ip: true` 为配置错误），198.18/15 按普通 IP 走规则。

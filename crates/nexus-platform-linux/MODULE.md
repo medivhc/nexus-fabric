@@ -4,7 +4,7 @@
 
 实现 Linux 平台 Capability Adapter，包括 TUN、Linux TPROXY capture adapter（`tproxy`：`IP_TRANSPARENT` TCP listener / `IP_RECVORIGDSTADDR` UDP socket / iptables+nftables+external 捕获规则）、Mount/Filesystem、Service/Privilege 等宿主桥接。
 
-`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` / `IP_PKTINFO` 不得出现在该目录之外。
+`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` 不得出现在该目录之外。TPROXY UDP 回包 socket 绑定在 `orig_dst` 上，因此捕获规则不得加入 `socket`/DIVERT 类按已存在 socket 投递的规则：那会把客户端后续数据报投给只发不收的回包 socket，绕开监听 socket。
 
 ## Non-Responsibilities
 
@@ -54,6 +54,12 @@
 
 - 仅允许 Responsibility 所需且在架构层中明确归属的副作用。
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
+- TPROXY UDP 回包 socket（PRODUCT §11.18）在宿主上 bind `orig_dst` 的 IP 与端口
+  （`SO_REUSEADDR` + `IP_TRANSPARENT`），直到 LRU 淘汰（上限 `max_reply_sockets`，默认 256）或
+  前端关闭才释放；不按空闲时间过期。持有期间，本机随后以**不带** `SO_REUSEADDR` 的方式 bind
+  `0.0.0.0:P`（或该 `orig_dst`）的程序会得到 `EADDRINUSE`；反过来，已独占该端口的本机 socket
+  （含 nexusd 自身不带 `SO_REUSEADDR` 的 TPROXY 监听端口）使所有发往端口 P 的透明 UDP 流回包
+  失败（计 `udp_reply_failed`）。回包 socket 只发不收（从不读取）。
 
 ## Public API
 
@@ -82,6 +88,18 @@
 cargo check -p nexus-platform-linux
 cargo clippy -p nexus-platform-linux --all-targets -- -D warnings
 ```
+
+TPROXY UDP 回包（PRODUCT §11.18）的单测需要 `CAP_NET_ADMIN`：无权限时打印
+`SKIP <test>` 并返回（非特权 CI 不因此变红，但也不构成覆盖）。作为 Evidence 引用的
+运行必须带 `NEXUS_REQUIRE_PRIVILEGED_TESTS=1` 以特权执行，此时无权限即 FAIL：
+
+```text
+sudo -E env NEXUS_REQUIRE_PRIVILEGED_TESTS=1 cargo test -p nexus-platform-linux --lib tproxy_udp
+```
+
+产品级观察为 E5 `scripts/acceptance/tproxy/run.sh s2`：回包源为 `orig_dst`（IP 与端口）；
+router netns 独占持有某个 `orig_dst` 时该回包被丢弃（客户端收不到任何源的回包）并计
+`udp_reply_failed`。
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 

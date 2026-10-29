@@ -4406,6 +4406,50 @@ pub fn record_inbound_queue_full(counters: &Arc<Mutex<TproxyCounters>>) {
     }
 }
 
+/// TPROXY 回包失败的记录器（listener 线程持有一份）：计 `udp_reply_failed`，并按失败
+/// 类别（错误码前缀）每 10 s 至多一条 `event=udp_reply_failed` WARN 行（首次立即发射，
+/// 之后带 `suppressed=<n>`）。按类别而非 `orig_dst` 限频：键集合有界。
+#[derive(Debug, Default)]
+pub struct UdpReplyFailureLog {
+    throttle: crate::log_throttle::KeyedLogThrottle,
+}
+
+impl UdpReplyFailureLog {
+    /// 空记录器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次 `send_from` 失败；返回本次是否打印了日志行。
+    pub fn record(
+        &mut self,
+        counters: &Arc<Mutex<TproxyCounters>>,
+        orig_dst: SocketAddrV4,
+        error: &TransparentIngressError,
+        now: std::time::Instant,
+    ) -> bool {
+        if let Ok(mut guard) = counters.lock() {
+            guard.udp_reply_failed += 1;
+        }
+        let detail = error.to_string();
+        let cause = detail.split(':').next().unwrap_or("unknown");
+        let decision = self.throttle.decide(
+            "udp_reply",
+            cause,
+            now,
+            crate::log_throttle::UDP_REPLY_FAILED_LOG_INTERVAL,
+        );
+        if decision.emit {
+            eprintln!(
+                "[nexusd] WARN tproxy event=udp_reply_failed orig_dst={orig_dst} cause={cause} detail=\"{detail}\" suppressed={}",
+                decision.suppressed
+            );
+        }
+        decision.emit
+    }
+}
+
 static RUNTIME_STATUS: OnceLock<Mutex<RuntimeStatus>> = OnceLock::new();
 
 fn runtime_slot() -> &'static Mutex<RuntimeStatus> {
@@ -4605,6 +4649,47 @@ fn decision_from_classification(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn udp_reply_failure_log_counts_every_failure_and_throttles_lines() {
+        let counters = Arc::new(Mutex::new(TproxyCounters::default()));
+        let mut log = UdpReplyFailureLog::new();
+        let orig_dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 53);
+        let busy = TransparentIngressError::BindFailed {
+            addr: orig_dst.to_string(),
+            errno: 98,
+        };
+        let t0 = std::time::Instant::now();
+        assert!(
+            log.record(&counters, orig_dst, &busy, t0),
+            "first failure is logged"
+        );
+        assert!(!log.record(
+            &counters,
+            orig_dst,
+            &busy,
+            t0 + std::time::Duration::from_secs(1)
+        ));
+        let other = TransparentIngressError::Io {
+            operation: "sendto",
+            message: "x".to_string(),
+        };
+        assert!(
+            log.record(&counters, orig_dst, &other, t0),
+            "another cause has its own window"
+        );
+        assert!(log.record(
+            &counters,
+            orig_dst,
+            &busy,
+            t0 + std::time::Duration::from_secs(10)
+        ));
+        assert_eq!(
+            counters.lock().unwrap().udp_reply_failed,
+            4,
+            "every failure is counted"
+        );
+    }
+
     use super::*;
     use nexus_projection::tcp::{ip_checksum, tcp_checksum};
     use std::collections::VecDeque;
