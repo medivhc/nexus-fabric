@@ -3,6 +3,7 @@ id = "product.tproxy-capture-failure"
 title = "TPROXY 捕获失败：degraded/privilege/enforcement 不静默（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example tproxy_capture_failure --json）：真实 bind 失败/权限不足，

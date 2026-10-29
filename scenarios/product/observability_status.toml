@@ -3,6 +3,7 @@ id = "product.observability-status"
 title = "§9 可观察性：nexusd status 总览（DNS 快照 + 建连链路 + 规划决策 + 平台能力）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "n1-fabric"
 
 [given]
 command = "status"

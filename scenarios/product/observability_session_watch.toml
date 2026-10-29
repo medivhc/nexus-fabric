@@ -3,6 +3,7 @@ id = "product.observability-session-watch"
 title = "§9 可观察性：session watch 输出 Session 双轨状态（phase/outcome/committed）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "n1-fabric"
 
 [given]
 dual_track = "LifecyclePhase + TerminalOutcome"

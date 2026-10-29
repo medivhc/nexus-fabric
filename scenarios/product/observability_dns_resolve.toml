@@ -3,6 +3,7 @@ id = "product.observability-dns-resolve"
 title = "§9 可观察性：nexus CLI thin-client 下 dns resolve 无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
+carrier = "v9-connectivity"
 
 [given]
 domain_state = "dns runtime ready (demo resolver, example.com v6+v4)"

@@ -3,6 +3,7 @@ id = "product.proxy-urltest-group"
 title = "urltest 组按离线确定性 measurement 选延迟最低候选并断言选中 tag"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 group_kind = "urltest"

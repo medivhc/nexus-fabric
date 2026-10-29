@@ -3,6 +3,7 @@ id = "product.connectivity-evaluation"
 title = "Connectivity Evaluation（v9 §8.1）：规划期低成本连通性评估接入 Planner"
 evidence_strength = "E4"
 requirement = "v9 §8.1 Connectivity Evaluation"
+carrier = "v9-connectivity"
 
 [given]
 description = "纯函数评估（零 I/O、不建立业务 Link、确定性）；输出作为 Core Planner 的 Connectivity Feasibility 输入：无可行路径的候选被 Filter 门控拒绝，DecisionTrace 记录评估贡献"

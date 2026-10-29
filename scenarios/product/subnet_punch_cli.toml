@@ -3,6 +3,7 @@ id = "product.subnet-punch-cli"
 title = "CLI 层真实 UDP 打洞接线：resp 回 pa + CLI subnet punch → Connected + 事件链"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-punch-cli"
+carrier = "v9-connectivity"
 
 [given]
 delivery = "real-udp-loopback"

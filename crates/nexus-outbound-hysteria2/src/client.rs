@@ -194,6 +194,33 @@ impl Hysteria2Client {
         Ok(TcpResponse { ok, message })
     }
 
+    /// fast-open 首读守卫：一次性剥离该 stream 的 `TCPResponse`。
+    ///
+    /// `fast_open=true` 时 `open_tcp` 只把 stream 标记为「读侧待剥离响应」；
+    /// 本方法让调用方在不把响应字节当载荷的前提下显式等待并校验该响应。
+    /// 若该 stream 的响应已被剥离（标记已消费），直接返回 `Ok(())`。
+    /// `stream_read` 的既有语义不变。
+    ///
+    /// # Errors
+    ///
+    /// 超时 → [`Hysteria2Error::Timeout`]；服务端拒绝 →
+    /// [`Hysteria2Error::TcpRejected`]；帧非法 → [`Hysteria2Error::InvalidFrame`]。
+    pub fn await_tcp_response(
+        &mut self,
+        id: StreamId,
+        timeout: Duration,
+    ) -> Result<(), Hysteria2Error> {
+        if !self.response_pending.remove(&id) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        let resp = self.read_tcp_response(id, deadline)?;
+        if !resp.ok {
+            return Err(Hysteria2Error::TcpRejected(resp.message));
+        }
+        Ok(())
+    }
+
     /// 在代理 stream 上写数据。
     ///
     /// # Errors

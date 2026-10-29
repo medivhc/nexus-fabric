@@ -1251,88 +1251,6 @@ fn parse_port_list(v: &toml::Value) -> Result<Vec<u16>, String> {
     ))
 }
 
-/// 解析 `dns.toml` 为 `DnsUnifiedConfig`（R3）。
-///
-/// 字段从 `[dns]` 小节读取；小节缺失时读根级键；全缺失时取默认值。
-/// 字段：
-/// - `upstream`：字符串数组（默认空）；
-/// - `fake_ip_enabled`：bool（默认 true）；
-/// - `fake_ip_range`：CIDR 字符串（默认 `198.18.0.0/15`）；
-/// - `mesh_suffix`：字符串（默认 `"mesh"`）；
-/// - `fake_ip_ttl_secs`：整数秒（默认 300）；
-/// - `hosts`：表，域名 → IP 字符串。
-///
-/// # Errors
-/// - TOML 语法错误；
-/// - `fake_ip_range` 非法 CIDR；
-/// - `hosts` 中 IP 非法。
-///
-/// 调用方按 §13.6 处理：解析失败 → daemon 启动失败 exit 1。
-pub fn parse_dns_toml(text: &str) -> Result<nexus_dns::DnsUnifiedConfig, String> {
-    use nexus_dns::{DEFAULT_FAKE_IP_RANGE, DEFAULT_MESH_SUFFIX, DnsUnifiedConfig};
-
-    let v: toml::Value = toml::from_str(text).map_err(|e| format!("{}: {e}", DNS_TOML))?;
-    // [dns] 小节优先，否则读根级。
-    let t = v.get("dns").unwrap_or(&v);
-
-    let upstream: Vec<String> = t
-        .get("upstream")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|i| i.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let fake_ip_enabled = t
-        .get("fake_ip_enabled")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(true);
-
-    let fake_ip_range = t
-        .get("fake_ip_range")
-        .and_then(|x| x.as_str())
-        .unwrap_or(DEFAULT_FAKE_IP_RANGE);
-    let (fake_ip_network, fake_ip_prefix) =
-        parse_cidr_v4(fake_ip_range).map_err(|e| format!("{DNS_TOML}: bad fake_ip_range: {e}"))?;
-
-    let mesh_suffix = t
-        .get("mesh_suffix")
-        .and_then(|x| x.as_str())
-        .unwrap_or(DEFAULT_MESH_SUFFIX)
-        .to_string();
-
-    let fake_ip_ttl_secs = t
-        .get("fake_ip_ttl_secs")
-        .and_then(|x| x.as_integer())
-        .and_then(|i| u64::try_from(i).ok())
-        .unwrap_or(300);
-
-    let mut hosts = Vec::new();
-    if let Some(table) = t.get("hosts").and_then(|x| x.as_table()) {
-        for (name, ip_v) in table {
-            let ip_s = ip_v
-                .as_str()
-                .ok_or_else(|| format!("{DNS_TOML}: hosts.{name} must be an IP string"))?;
-            let ip: std::net::IpAddr = ip_s
-                .parse()
-                .map_err(|_| format!("{DNS_TOML}: hosts.{name} bad IP '{ip_s}'"))?;
-            hosts.push((name.clone(), ip));
-        }
-    }
-
-    Ok(DnsUnifiedConfig {
-        upstream,
-        fake_ip_enabled,
-        fake_ip_network,
-        fake_ip_prefix,
-        mesh_suffix,
-        fake_ip_ttl_secs,
-        hosts,
-    })
-}
-
 /// 解析 IPv4 CIDR（`"A.B.C.D/N"`）→ `(网络地址 u32, 前缀长度)`。
 fn parse_cidr_v4(s: &str) -> Result<(u32, u8), String> {
     let (addr_s, prefix_s) = s
@@ -1353,6 +1271,641 @@ fn parse_cidr_v4(s: &str) -> Result<(u32, u8), String> {
         u32::MAX << (32 - prefix)
     };
     Ok((u32::from(addr) & mask, prefix))
+}
+
+// ---------------------------------------------------------------------------
+// R3 strict dns.toml schema (§4.6.1) — additive; production switches in C11.
+// ---------------------------------------------------------------------------
+
+pub use crate::dns_status::{UnevaluablePolicy, UnmatchedPolicy};
+
+/// Upstream engine knobs, flat under `[dns]` (§4.6.1 / §4.2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamConfig {
+    /// `IP[:port]` / `[v6]:port`, deduplicated in declaration order, 1..=8.
+    pub servers: Vec<std::net::SocketAddr>,
+    /// Single-send wait (default 500).
+    pub attempt_timeout_ms: u64,
+    /// Sends per server including the first (default 2, 1..=4).
+    pub attempts_per_server: u8,
+    /// Whole-query budget from submit (default 4000, >= attempt_timeout_ms).
+    pub total_budget_ms: u64,
+    /// EDNS UDP payload size; `0` disables OPT (default 1232).
+    pub edns_udp_size: u16,
+    /// Retry over TCP on TC=1 (default true).
+    pub tcp_fallback: bool,
+    /// TCP fallback timeout (default 2000, 100..=10000).
+    pub tcp_timeout_ms: u64,
+    /// Total positive+negative cache entries (default 1024; 0 disables).
+    pub cache_max_entries: usize,
+    /// Positive TTL clamp upper bound (default 3600).
+    pub cache_max_ttl_secs: u32,
+    /// Negative cache TTL (default 60; 0 disables negative caching).
+    pub negative_ttl_secs: u32,
+    /// In-flight upstream queries (default 64, 1..=1024).
+    pub max_inflight: usize,
+}
+
+/// DNS proxy policy (`[dns].unmatched` / `[dns].unevaluable`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsProxyPolicy {
+    /// No rule matched.
+    pub unmatched: UnmatchedPolicy,
+    /// Rule needs unloaded data (`geosite` / `rule_set`).
+    pub unevaluable: UnevaluablePolicy,
+}
+
+/// Fully validated `dns.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsFileConfig {
+    /// Classification inputs consumed by `UnifiedDns`.
+    pub unified: nexus_dns::DnsUnifiedConfig,
+    /// `[dns.mesh.hosts]` entries (lowercase FQDN → address).
+    pub mesh_hosts: Vec<(String, std::net::IpAddr)>,
+    /// Proxy policy.
+    pub proxy: DnsProxyPolicy,
+    /// Upstream engine knobs.
+    pub upstream: UpstreamConfig,
+}
+
+/// Strict `dns.toml` validation error (§5.3; exactly nine variants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsConfigError {
+    /// Unknown key, or a root-level key that must move under `[dns]`.
+    UnknownKey(String),
+    /// `dns.toml` exists but `[dns].upstream` is missing/empty.
+    EmptyUpstream,
+    /// More than eight unique upstream servers.
+    TooManyUpstream,
+    /// Upstream address/port cannot be parsed.
+    BadUpstreamAddr(String),
+    /// Wrong type, range, enum value, or TOML syntax.
+    BadValue {
+        /// Key path without the `dns.` prefix.
+        key: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// Mesh key is not lowercase, lacks the mesh suffix, or is too long.
+    MeshNameInvalid(String),
+    /// Mesh value is not a unicast address or is outside the mesh routes.
+    MeshAddrInvalid(String),
+    /// Mesh hosts exist but `network.toml` has no route for that family.
+    MeshWithoutRoutes,
+    /// `unmatched=proxied` without any usable outbound.
+    ProxyPolicyConflict,
+}
+
+impl std::fmt::Display for DnsConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownKey(key) => write!(
+                f,
+                "{DNS_TOML}: unknown key '{key}' (all keys must live under [dns])"
+            ),
+            Self::EmptyUpstream => write!(f, "{DNS_TOML}: dns.upstream must not be empty"),
+            Self::TooManyUpstream => {
+                write!(f, "{DNS_TOML}: dns.upstream accepts at most 8 servers")
+            }
+            Self::BadUpstreamAddr(addr) => {
+                write!(f, "{DNS_TOML}: dns.upstream bad address '{addr}'")
+            }
+            Self::BadValue { key, reason } => write!(f, "{DNS_TOML}: {key}: {reason}"),
+            Self::MeshNameInvalid(name) => {
+                write!(f, "{DNS_TOML}: dns.mesh.hosts invalid name '{name}'")
+            }
+            Self::MeshAddrInvalid(detail) => {
+                write!(f, "{DNS_TOML}: dns.mesh.hosts invalid address: {detail}")
+            }
+            Self::MeshWithoutRoutes => write!(
+                f,
+                "{DNS_TOML}: dns.mesh.hosts requires [[vpi.routes]]/[[vpi.routes6]] in network.toml"
+            ),
+            Self::ProxyPolicyConflict => write!(
+                f,
+                "{DNS_TOML}: dns.unmatched=proxied requires a usable outbound"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DnsConfigError {}
+
+impl UnmatchedPolicy {
+    /// Parse `[dns].unmatched`.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "proxied" => Some(Self::Proxied),
+            "upstream" => Some(Self::Upstream),
+            _ => None,
+        }
+    }
+}
+
+impl UnevaluablePolicy {
+    /// Parse `[dns].unevaluable`.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "proxied" => Some(Self::Proxied),
+            "upstream" => Some(Self::Upstream),
+            _ => None,
+        }
+    }
+}
+
+const DNS_KEYS: &[&str] = &[
+    "upstream",
+    "fake_ip_enabled",
+    "fake_ip_range",
+    "mesh_suffix",
+    "fake_ip_ttl_secs",
+    "hosts",
+    "ip_preference",
+    "unmatched",
+    "unevaluable",
+    "attempt_timeout_ms",
+    "attempts_per_server",
+    "total_budget_ms",
+    "edns_udp_size",
+    "tcp_fallback",
+    "tcp_timeout_ms",
+    "cache_max_entries",
+    "cache_max_ttl_secs",
+    "negative_ttl_secs",
+    "max_inflight",
+    "mesh",
+];
+
+fn dns_bad(key: &str, reason: impl Into<String>) -> DnsConfigError {
+    DnsConfigError::BadValue {
+        key: format!("dns.{key}"),
+        reason: reason.into(),
+    }
+}
+
+fn dns_bool(table: &toml::value::Table, key: &str, default: bool) -> Result<bool, DnsConfigError> {
+    match table.get(key) {
+        None => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| dns_bad(key, "expected a bool")),
+    }
+}
+
+fn dns_str<'a>(
+    table: &'a toml::value::Table,
+    key: &str,
+    default: &'a str,
+) -> Result<&'a str, DnsConfigError> {
+    match table.get(key) {
+        None => Ok(default),
+        Some(v) => v.as_str().ok_or_else(|| dns_bad(key, "expected a string")),
+    }
+}
+
+fn dns_u64(table: &toml::value::Table, key: &str, default: u64) -> Result<u64, DnsConfigError> {
+    match table.get(key) {
+        None => Ok(default),
+        Some(v) => {
+            let n = v
+                .as_integer()
+                .ok_or_else(|| dns_bad(key, "expected an integer"))?;
+            u64::try_from(n).map_err(|_| dns_bad(key, "must be >= 0"))
+        }
+    }
+}
+
+fn dns_usize(
+    table: &toml::value::Table,
+    key: &str,
+    default: usize,
+) -> Result<usize, DnsConfigError> {
+    let n = dns_u64(table, key, default as u64)?;
+    usize::try_from(n).map_err(|_| dns_bad(key, "value out of range"))
+}
+
+fn dns_u16(table: &toml::value::Table, key: &str, default: u16) -> Result<u16, DnsConfigError> {
+    let n = dns_u64(table, key, u64::from(default))?;
+    u16::try_from(n).map_err(|_| dns_bad(key, "value out of range"))
+}
+
+fn dns_u32(table: &toml::value::Table, key: &str, default: u32) -> Result<u32, DnsConfigError> {
+    let n = dns_u64(table, key, u64::from(default))?;
+    u32::try_from(n).map_err(|_| dns_bad(key, "value out of range"))
+}
+
+fn dns_u8(table: &toml::value::Table, key: &str, default: u8) -> Result<u8, DnsConfigError> {
+    let n = dns_u64(table, key, u64::from(default))?;
+    u8::try_from(n).map_err(|_| dns_bad(key, "value out of range"))
+}
+
+fn range_err(key: &str, allowed: &str) -> DnsConfigError {
+    dns_bad(key, format!("must be {allowed}"))
+}
+
+/// Parse `A.B.C.D[:port]` / `[v6]:port` / bare IPv6 (port 53).
+fn parse_upstream_addr(raw: &str) -> Result<std::net::SocketAddr, DnsConfigError> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(DnsConfigError::BadUpstreamAddr(raw.to_string()));
+    }
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            return Err(DnsConfigError::BadUpstreamAddr(raw.to_string()));
+        }
+        return Ok(addr);
+    }
+    if let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        let v6: Ipv6Addr = inner
+            .parse()
+            .map_err(|_| DnsConfigError::BadUpstreamAddr(raw.to_string()))?;
+        return Ok(SocketAddr::new(v6.into(), 53));
+    }
+    let colons = s.matches(':').count();
+    let (host, port) = match colons {
+        0 => (s, 53),
+        1 => {
+            let (h, p) = s
+                .split_once(':')
+                .ok_or_else(|| DnsConfigError::BadUpstreamAddr(raw.to_string()))?;
+            let port: u16 = p
+                .parse()
+                .map_err(|_| DnsConfigError::BadUpstreamAddr(raw.to_string()))?;
+            (h, port)
+        }
+        _ => (s, 53),
+    };
+    if port == 0 {
+        return Err(DnsConfigError::BadUpstreamAddr(raw.to_string()));
+    }
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return Ok(SocketAddr::new(v4.into(), port));
+    }
+    let v6: Ipv6Addr = host
+        .parse()
+        .map_err(|_| DnsConfigError::BadUpstreamAddr(raw.to_string()))?;
+    Ok(SocketAddr::new(v6.into(), port))
+}
+
+/// Minimal `network.toml` view needed for mesh route validation. Returns `None`
+/// when the document is unreadable; callers turn that into `MeshWithoutRoutes`.
+struct MeshNetworks {
+    v4: Vec<(u32, u8)>,
+    v6: Vec<(u128, u8)>,
+}
+
+fn parse_mesh_networks(text: Option<&str>) -> Option<MeshNetworks> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let value: toml::Value = toml::from_str(text?).ok()?;
+    let vpi = value.get("vpi")?.as_table()?;
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    if let Some(routes) = vpi.get("routes").and_then(|v| v.as_array()) {
+        for route in routes {
+            let Some(subnet) = route.get("subnet").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some((addr, prefix)) = subnet.split_once('/') {
+                let (Ok(addr), Ok(prefix)) = (addr.parse::<Ipv4Addr>(), prefix.parse::<u8>())
+                else {
+                    continue;
+                };
+                if prefix <= 32 {
+                    v4.push((u32::from(addr) & mask_v4(prefix), prefix));
+                }
+            }
+        }
+    }
+    if let Some(routes) = vpi.get("routes6").and_then(|v| v.as_array()) {
+        for route in routes {
+            let Some(subnet) = route.get("subnet").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some((addr, prefix)) = subnet.split_once('/') {
+                let (Ok(addr), Ok(prefix)) = (addr.parse::<Ipv6Addr>(), prefix.parse::<u8>())
+                else {
+                    continue;
+                };
+                if prefix <= 128 {
+                    v6.push((u128::from(addr) & mask_v6(prefix), prefix));
+                }
+            }
+        }
+    }
+    Some(MeshNetworks { v4, v6 })
+}
+
+fn mask_v4(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn mask_v6(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+impl MeshNetworks {
+    fn contains(&self, ip: std::net::IpAddr) -> Result<bool, DnsConfigError> {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if self.v4.is_empty() {
+                    return Err(DnsConfigError::MeshWithoutRoutes);
+                }
+                let raw = u32::from(v4);
+                Ok(self
+                    .v4
+                    .iter()
+                    .any(|(net, prefix)| raw & mask_v4(*prefix) == *net))
+            }
+            std::net::IpAddr::V6(v6) => {
+                if self.v6.is_empty() {
+                    return Err(DnsConfigError::MeshWithoutRoutes);
+                }
+                let raw = u128::from(v6);
+                Ok(self
+                    .v6
+                    .iter()
+                    .any(|(net, prefix)| raw & mask_v6(*prefix) == *net))
+            }
+        }
+    }
+}
+
+/// Strictly parse `dns.toml` (§4.6.1), validating mesh ownership against the
+/// raw `network.toml` text and the `unmatched=proxied` policy against the
+/// outbound layer.
+///
+/// `has_usable_outbound` must be derived from
+/// `nexus::outbound_manifest::select_index` (F1 / §6.2), never re-implemented.
+///
+/// The strict parser replaced the loose one in C11; the three-argument shape
+/// is required because mesh ownership and `unmatched=proxied` need context.
+///
+/// # Errors
+///
+/// Any of the nine [`DnsConfigError`] variants.
+pub fn parse_dns_toml(
+    text: &str,
+    network_toml: Option<&str>,
+    has_usable_outbound: bool,
+) -> Result<DnsFileConfig, DnsConfigError> {
+    use nexus_dns::{DEFAULT_FAKE_IP_RANGE, DEFAULT_MESH_SUFFIX, DnsUnifiedConfig, IpPreference};
+
+    let value: toml::Value = toml::from_str(text).map_err(|e| DnsConfigError::BadValue {
+        key: DNS_TOML.to_string(),
+        reason: format!("invalid TOML: {e}"),
+    })?;
+    let root = value.as_table().ok_or_else(|| DnsConfigError::BadValue {
+        key: DNS_TOML.to_string(),
+        reason: "root must be a table".to_string(),
+    })?;
+    for key in root.keys() {
+        if key != "dns" {
+            return Err(DnsConfigError::UnknownKey(key.clone()));
+        }
+    }
+    let Some(dns_value) = root.get("dns") else {
+        return Err(DnsConfigError::EmptyUpstream);
+    };
+    let table = dns_value
+        .as_table()
+        .ok_or_else(|| DnsConfigError::BadValue {
+            key: DNS_TOML.to_string(),
+            reason: "[dns] must be a table".to_string(),
+        })?;
+    for key in table.keys() {
+        if !DNS_KEYS.contains(&key.as_str()) {
+            return Err(DnsConfigError::UnknownKey(key.clone()));
+        }
+    }
+
+    // upstream: required, non-empty, deduped in order, at most 8.
+    let upstream_value = table.get("upstream").ok_or(DnsConfigError::EmptyUpstream)?;
+    let upstream_items = upstream_value
+        .as_array()
+        .ok_or_else(|| dns_bad("upstream", "expected an array of strings"))?;
+    if upstream_items.is_empty() {
+        return Err(DnsConfigError::EmptyUpstream);
+    }
+    let mut servers: Vec<std::net::SocketAddr> = Vec::new();
+    for item in upstream_items {
+        let raw = item
+            .as_str()
+            .ok_or_else(|| dns_bad("upstream", "expected an array of strings"))?;
+        let addr = parse_upstream_addr(raw)?;
+        if !servers.contains(&addr) {
+            servers.push(addr);
+        }
+    }
+    if servers.len() > 8 {
+        return Err(DnsConfigError::TooManyUpstream);
+    }
+
+    let fake_ip_enabled = dns_bool(table, "fake_ip_enabled", true)?;
+    let fake_ip_range = dns_str(table, "fake_ip_range", DEFAULT_FAKE_IP_RANGE)?;
+    let (fake_ip_network, fake_ip_prefix) =
+        parse_cidr_v4(fake_ip_range).map_err(|e| dns_bad("fake_ip_range", e))?;
+    if fake_ip_prefix > 30 {
+        return Err(range_err(
+            "fake_ip_range",
+            "an IPv4 CIDR with prefix <= 30 (at least two hosts)",
+        ));
+    }
+
+    let mesh_suffix = dns_str(table, "mesh_suffix", DEFAULT_MESH_SUFFIX)?.to_ascii_lowercase();
+    if mesh_suffix.is_empty() || mesh_suffix.chars().count() > 63 || mesh_suffix.contains('.') {
+        return Err(range_err("mesh_suffix", "1..=63 characters without '.'"));
+    }
+
+    let fake_ip_ttl_secs = dns_u64(table, "fake_ip_ttl_secs", 300)?;
+    if fake_ip_ttl_secs == 0 {
+        return Err(range_err("fake_ip_ttl_secs", ">= 1"));
+    }
+
+    let mut hosts = Vec::new();
+    if let Some(hosts_value) = table.get("hosts") {
+        let hosts_table = hosts_value
+            .as_table()
+            .ok_or_else(|| dns_bad("hosts", "expected a table of name -> IP"))?;
+        for (name, value) in hosts_table {
+            let ip_str = value
+                .as_str()
+                .ok_or_else(|| dns_bad("hosts", format!("hosts.{name} must be an IP string")))?;
+            let ip: std::net::IpAddr = ip_str
+                .parse()
+                .map_err(|_| dns_bad("hosts", format!("hosts.{name} bad IP '{ip_str}'")))?;
+            let normalized = name.to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Err(dns_bad("hosts", "empty host name"));
+            }
+            if hosts
+                .iter()
+                .any(|(n, _): &(String, std::net::IpAddr)| *n == normalized)
+            {
+                return Err(dns_bad("hosts", format!("duplicate host '{normalized}'")));
+            }
+            hosts.push((normalized, ip));
+        }
+    }
+
+    let preference = dns_str(table, "ip_preference", "prefer_v4")?;
+    let ip_preference = match preference {
+        "v4_only" => IpPreference::V4Only,
+        "v6_only" => IpPreference::V6Only,
+        "prefer_v4" => IpPreference::PreferV4,
+        "prefer_v6" => IpPreference::PreferV6,
+        other => {
+            return Err(dns_bad(
+                "ip_preference",
+                format!("unknown value '{other}' (v4_only|v6_only|prefer_v4|prefer_v6)"),
+            ));
+        }
+    };
+
+    let unmatched_raw = dns_str(table, "unmatched", "auto")?;
+    let unmatched = UnmatchedPolicy::parse(unmatched_raw).ok_or_else(|| {
+        dns_bad(
+            "unmatched",
+            format!("unknown value '{unmatched_raw}' (auto|proxied|upstream)"),
+        )
+    })?;
+    let unevaluable_raw = dns_str(table, "unevaluable", "proxied")?;
+    let unevaluable = UnevaluablePolicy::parse(unevaluable_raw).ok_or_else(|| {
+        dns_bad(
+            "unevaluable",
+            format!("unknown value '{unevaluable_raw}' (proxied|upstream)"),
+        )
+    })?;
+
+    let attempt_timeout_ms = dns_u64(table, "attempt_timeout_ms", 500)?;
+    if !(50..=5000).contains(&attempt_timeout_ms) {
+        return Err(range_err("attempt_timeout_ms", "in 50..=5000"));
+    }
+    let attempts_per_server = dns_u8(table, "attempts_per_server", 2)?;
+    if !(1..=4).contains(&attempts_per_server) {
+        return Err(range_err("attempts_per_server", "in 1..=4"));
+    }
+    let total_budget_ms = dns_u64(table, "total_budget_ms", 4000)?;
+    if total_budget_ms < attempt_timeout_ms || total_budget_ms > 30_000 {
+        return Err(range_err(
+            "total_budget_ms",
+            ">= attempt_timeout_ms and <= 30000",
+        ));
+    }
+    let edns_udp_size = dns_u16(table, "edns_udp_size", 1232)?;
+    if edns_udp_size != 0 && !(512..=4096).contains(&edns_udp_size) {
+        return Err(range_err("edns_udp_size", "0 (disabled) or in 512..=4096"));
+    }
+    let tcp_fallback = dns_bool(table, "tcp_fallback", true)?;
+    let tcp_timeout_ms = dns_u64(table, "tcp_timeout_ms", 2000)?;
+    if !(100..=10_000).contains(&tcp_timeout_ms) {
+        return Err(range_err("tcp_timeout_ms", "in 100..=10000"));
+    }
+    let cache_max_entries = dns_usize(table, "cache_max_entries", 1024)?;
+    let cache_max_ttl_secs = dns_u32(table, "cache_max_ttl_secs", 3600)?;
+    if cache_max_ttl_secs == 0 {
+        return Err(range_err("cache_max_ttl_secs", ">= 1"));
+    }
+    let negative_ttl_secs = dns_u32(table, "negative_ttl_secs", 60)?;
+    let max_inflight = dns_usize(table, "max_inflight", 64)?;
+    if !(1..=1024).contains(&max_inflight) {
+        return Err(range_err("max_inflight", "in 1..=1024"));
+    }
+
+    // [dns.mesh] may only contain `hosts`.
+    let mut mesh_hosts = Vec::new();
+    if let Some(mesh_value) = table.get("mesh") {
+        let mesh_table = mesh_value
+            .as_table()
+            .ok_or_else(|| dns_bad("mesh", "expected a table"))?;
+        for key in mesh_table.keys() {
+            if key != "hosts" {
+                return Err(DnsConfigError::UnknownKey(format!("mesh.{key}")));
+            }
+        }
+        if let Some(hosts_value) = mesh_table.get("hosts") {
+            let mesh_table = hosts_value
+                .as_table()
+                .ok_or_else(|| dns_bad("mesh.hosts", "expected a table of name -> IP"))?;
+            for (name, value) in mesh_table {
+                let lower = name.to_ascii_lowercase();
+                let suffix = format!(".{mesh_suffix}");
+                if &lower != name
+                    || name.len() > 253
+                    || !name.ends_with(&suffix)
+                    || name.split('.').any(str::is_empty)
+                {
+                    return Err(DnsConfigError::MeshNameInvalid(name.clone()));
+                }
+                let ip_str = value.as_str().ok_or_else(|| {
+                    DnsConfigError::MeshAddrInvalid(format!("{name}: expected an IP string"))
+                })?;
+                let ip: std::net::IpAddr = ip_str
+                    .parse()
+                    .map_err(|_| DnsConfigError::MeshAddrInvalid(format!("{name}={ip_str}")))?;
+                // SU-3: loopback rejected, link-local accepted, non-unicast rejected.
+                nexus_dns::StaticMeshResolver::new([(name.clone(), ip)]).map_err(|e| {
+                    DnsConfigError::MeshAddrInvalid(format!("{name}={ip_str}: {e}"))
+                })?;
+                mesh_hosts.push((name.clone(), ip));
+            }
+        }
+    }
+
+    if !mesh_hosts.is_empty() {
+        let networks =
+            parse_mesh_networks(network_toml).ok_or(DnsConfigError::MeshWithoutRoutes)?;
+        for (name, ip) in &mesh_hosts {
+            if !networks.contains(*ip)? {
+                return Err(DnsConfigError::MeshAddrInvalid(format!(
+                    "{name}={ip} is outside the configured mesh routes"
+                )));
+            }
+        }
+    }
+
+    if unmatched == UnmatchedPolicy::Proxied && !has_usable_outbound {
+        return Err(DnsConfigError::ProxyPolicyConflict);
+    }
+
+    Ok(DnsFileConfig {
+        unified: DnsUnifiedConfig {
+            fake_ip_enabled,
+            fake_ip_network,
+            fake_ip_prefix,
+            mesh_suffix,
+            fake_ip_ttl_secs,
+            hosts,
+            ip_preference,
+        },
+        mesh_hosts,
+        proxy: DnsProxyPolicy {
+            unmatched,
+            unevaluable,
+        },
+        upstream: UpstreamConfig {
+            servers,
+            attempt_timeout_ms,
+            attempts_per_server,
+            total_budget_ms,
+            edns_udp_size,
+            tcp_fallback,
+            tcp_timeout_ms,
+            cache_max_entries,
+            cache_max_ttl_secs,
+            negative_ttl_secs,
+            max_inflight,
+        },
+    })
 }
 
 /// 热加载变更分类。
@@ -1394,7 +1947,7 @@ fn inbound_signatures(yaml: Option<&str>) -> Option<Vec<InboundSignature>> {
 ///
 /// 保守策略：目前仅做文件级判断——
 /// - `proxy.yaml` 内容变更 → Hot（规则类数据）
-/// - `dns.toml` 内容变更 → Hot（上游变更热生效，R5）
+/// - `dns.toml` 内容变更 → NeedsRestart（DNS 服务持有 socket/缓存，R5/Q8）
 /// - `network.toml` 内容变更 → NeedsRestart（mesh CIDR 属重启类，R5/§13.6）
 /// - `daemon.toml` 的 `localapi_addr` 变更 → NeedsRestart
 /// - `daemon.toml` 的 `[qos]` 小节变更 → NeedsRestart（子系统启停/重配）
@@ -1429,6 +1982,11 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if old.daemon.proxy != new.daemon.proxy {
         return ChangeKind::NeedsRestart;
     }
+    // Q-7=B（spec §7.6.1）：proxy.yaml **内容变更** → NeedsRestart（engine 只在
+    // 启动构造；不允许再谎报 hot-reloaded）。
+    if old.proxy_yaml != new.proxy_yaml {
+        return ChangeKind::NeedsRestart;
+    }
     // R5：network.toml 内容变更 → NeedsRestart（mesh CIDR 可能变化）。
     if old.network_toml != new.network_toml {
         return ChangeKind::NeedsRestart;
@@ -1438,10 +1996,15 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
         return ChangeKind::NeedsRestart;
     }
     // proxy.yaml 的 tun/tproxy 入站增删或参数（端口/设备/MTU/默认路由）变化 →
-    // NeedsRestart；规则/组/出站仍按 Hot 处理（spec §10.8）。
+    // NeedsRestart。Q-7=B 之后本特判已被上方的「内容变更 → NeedsRestart」覆盖，
+    // 保留无害（防御未来把内容变更改回 Hot 的回归）。
     if inbound_signatures(old.proxy_yaml.as_deref())
         != inbound_signatures(new.proxy_yaml.as_deref())
     {
+        return ChangeKind::NeedsRestart;
+    }
+    // R5 / Q8（C13）：dns.toml 内容变更 → NeedsRestart（DNS 服务持有 socket 与缓存）。
+    if old.dns_toml != new.dns_toml {
         return ChangeKind::NeedsRestart;
     }
     // 任一文件的增删 → 需重启（子系统启停）
@@ -1850,10 +2413,12 @@ mod tests {
         write(&d, PROXY_YAML, yaml_v1);
         let dir = ConfigDir::new(&d).unwrap();
         let old = load(&dir).unwrap();
-        // proxy.yaml 内容变更 → Hot
+        // proxy.yaml 内容变更 → NeedsRestart（Q-7=B：engine 只在启动构造）
         write(&d, PROXY_YAML, yaml_v2);
         let new = load(&dir).unwrap();
-        assert_eq!(classify_change(&old, &new), ChangeKind::Hot);
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        // 「只有规则/出站变化」也不再是 Hot（同一判据，术语保留以便审计）
+        assert_ne!(classify_change(&old, &new), ChangeKind::Hot);
         // daemon addr 变更 → NeedsRestart
         write(&d, DAEMON_TOML, "[localapi]\naddr = \"127.0.0.1:19999\"\n");
         let new2 = load(&dir).unwrap();
@@ -1940,34 +2505,47 @@ mod tests {
     }
 
     #[test]
-    fn dns_toml_empty_uses_defaults() {
-        let cfg = parse_dns_toml("").unwrap();
-        assert_eq!(cfg.mesh_suffix.as_str(), "mesh");
-        assert!(cfg.upstream.is_empty());
-        assert!(cfg.hosts.is_empty());
+    fn dns_toml_empty_is_rejected() {
+        // C11: the strict schema requires [dns].upstream.
+        assert!(parse_dns_toml("", None, false).is_err());
     }
 
     #[test]
     fn dns_toml_section_and_root_level() {
         // [dns] 节。
-        let cfg = parse_dns_toml("[dns]\nmesh_suffix = \"lan\"\n").unwrap();
-        assert_eq!(cfg.mesh_suffix.as_str(), "lan");
-        // 根级字段。
-        let cfg = parse_dns_toml("upstream = [\"9.9.9.9\"]\n").unwrap();
-        assert_eq!(cfg.upstream, vec!["9.9.9.9"]);
+        let cfg = parse_dns_toml(
+            "[dns]\nupstream = [\"9.9.9.9\"]\nmesh_suffix = \"lan\"\n",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.unified.mesh_suffix.as_str(), "lan");
+        // 根级字段不再被接受（strict schema）。
+        assert!(parse_dns_toml("upstream = [\"9.9.9.9\"]\n", None, false).is_err());
     }
 
     #[test]
     fn dns_toml_hosts_parsed() {
-        let cfg = parse_dns_toml("[dns.hosts]\nprinter = \"192.168.1.50\"\n").unwrap();
-        assert_eq!(cfg.hosts.len(), 1);
+        let cfg = parse_dns_toml(
+            "[dns]\nupstream = [\"9.9.9.9\"]\n[dns.hosts]\nprinter = \"192.168.1.50\"\n",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.unified.hosts.len(), 1);
     }
 
     #[test]
     fn dns_toml_bad_rejected() {
-        assert!(parse_dns_toml("not toml [[[").is_err());
-        assert!(parse_dns_toml("[dns]\nfake_ip_range = \"999.1.1.0/24\"\n").is_err());
-        assert!(parse_dns_toml("[dns.hosts]\nbad = \"not-an-ip\"\n").is_err());
+        assert!(parse_dns_toml("not toml [[[", None, false).is_err());
+        assert!(
+            parse_dns_toml(
+                "[dns]\nupstream = [\"9.9.9.9\"]\nfake_ip_range = \"999.1.1.0/24\"\n",
+                None,
+                false
+            )
+            .is_err()
+        );
     }
 
     // ---------- [network.turn] 小节（NAT switching daemon activation，AC2） ----------
@@ -2511,12 +3089,13 @@ password=\"p\"\n\
     }
 
     #[test]
-    fn classify_change_outbound_only_is_hot() {
+    fn classify_change_outbound_only_is_needs_restart() {
         let old_yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         let new_yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d2\noutbounds:\n  - tag: d2\n    kind: direct\n";
+        // Q-7=B（§7.6.1）：proxy.yaml 内容变更 = NeedsRestart（engine 只在启动构造）。
         assert_eq!(
             classify_pair("nexusd-cfg-test-classify-outbound-hot", old_yaml, new_yaml),
-            ChangeKind::Hot
+            ChangeKind::NeedsRestart
         );
     }
 
@@ -2734,5 +3313,391 @@ mod punch_gap_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod dns_config_tests {
+    use super::*;
+
+    const BASE: &str = "[dns]\nupstream = [\"1.1.1.1\"]\n";
+
+    fn parse(text: &str) -> Result<DnsFileConfig, DnsConfigError> {
+        parse_dns_toml(text, None, false)
+    }
+
+    fn ok(text: &str) -> DnsFileConfig {
+        parse(text).expect("dns.toml must parse")
+    }
+
+    fn err(text: &str) -> DnsConfigError {
+        parse(text).expect_err("dns.toml must be rejected")
+    }
+
+    fn addr(s: &str) -> std::net::SocketAddr {
+        s.parse().expect("test address")
+    }
+
+    const MESH_NET: &str = r#"
+[vpi]
+address6 = "fd00::1"
+[[vpi.routes]]
+subnet = "10.144.144.0/24"
+peer = "00"
+[[vpi.routes6]]
+subnet = "fd00:144::/64"
+peer = "00"
+[[vpi.routes6]]
+subnet = "fe80::/64"
+peer = "00"
+"#;
+
+    #[test]
+    fn defaults_match_frozen_schema() {
+        let c = ok(BASE);
+        assert_eq!(c.upstream.servers, vec![addr("1.1.1.1:53")]);
+        assert_eq!(c.upstream.attempt_timeout_ms, 500);
+        assert_eq!(c.upstream.attempts_per_server, 2);
+        assert_eq!(c.upstream.total_budget_ms, 4000);
+        assert_eq!(c.upstream.edns_udp_size, 1232);
+        assert!(c.upstream.tcp_fallback);
+        assert_eq!(c.upstream.tcp_timeout_ms, 2000);
+        assert_eq!(c.upstream.cache_max_entries, 1024);
+        assert_eq!(c.upstream.cache_max_ttl_secs, 3600);
+        assert_eq!(c.upstream.negative_ttl_secs, 60);
+        assert_eq!(c.upstream.max_inflight, 64);
+        assert_eq!(c.proxy.unmatched, UnmatchedPolicy::Auto);
+        assert_eq!(c.proxy.unevaluable, UnevaluablePolicy::Proxied);
+        assert!(c.unified.fake_ip_enabled);
+        assert_eq!(c.unified.fake_ip_prefix, 15);
+        assert_eq!(c.unified.mesh_suffix, "mesh");
+        assert_eq!(c.unified.fake_ip_ttl_secs, 300);
+        assert_eq!(c.unified.ip_preference, nexus_dns::IpPreference::PreferV4);
+        assert!(c.unified.hosts.is_empty());
+        assert!(c.mesh_hosts.is_empty());
+    }
+
+    #[test]
+    fn every_key_accepts_an_override() {
+        let text = r#"
+[dns]
+upstream = ["8.8.8.8", "1.1.1.1:5353", "[2001:db8::53]:53", "8.8.8.8"]
+fake_ip_enabled = false
+fake_ip_range = "198.19.0.0/16"
+mesh_suffix = "MESH"
+fake_ip_ttl_secs = 600
+ip_preference = "v6_only"
+unmatched = "upstream"
+unevaluable = "upstream"
+attempt_timeout_ms = 1000
+attempts_per_server = 3
+total_budget_ms = 8000
+edns_udp_size = 0
+tcp_fallback = false
+tcp_timeout_ms = 500
+cache_max_entries = 0
+cache_max_ttl_secs = 60
+negative_ttl_secs = 0
+max_inflight = 16
+
+[dns.hosts]
+"Host.Example" = "10.0.0.1"
+
+[dns.mesh.hosts]
+"xc.mesh" = "10.144.144.6"
+"ll.mesh" = "fe80::1"
+"#;
+        let c = parse_dns_toml(text, Some(MESH_NET), true).expect("full schema parses");
+        // Deduplicated in declaration order (8.8.8.8 appears once).
+        assert_eq!(
+            c.upstream.servers,
+            vec![
+                addr("8.8.8.8:53"),
+                addr("1.1.1.1:5353"),
+                addr("[2001:db8::53]:53")
+            ]
+        );
+        assert!(!c.unified.fake_ip_enabled);
+        assert_eq!(c.unified.fake_ip_prefix, 16);
+        assert_eq!(c.unified.mesh_suffix, "mesh");
+        assert_eq!(c.unified.fake_ip_ttl_secs, 600);
+        assert_eq!(c.unified.ip_preference, nexus_dns::IpPreference::V6Only);
+        assert_eq!(
+            c.unified.hosts,
+            vec![("host.example".to_string(), "10.0.0.1".parse().unwrap())]
+        );
+        assert_eq!(c.proxy.unmatched, UnmatchedPolicy::Upstream);
+        assert_eq!(c.proxy.unevaluable, UnevaluablePolicy::Upstream);
+        assert_eq!(c.upstream.attempt_timeout_ms, 1000);
+        assert_eq!(c.upstream.attempts_per_server, 3);
+        assert_eq!(c.upstream.total_budget_ms, 8000);
+        assert_eq!(c.upstream.edns_udp_size, 0);
+        assert!(!c.upstream.tcp_fallback);
+        assert_eq!(c.upstream.tcp_timeout_ms, 500);
+        assert_eq!(c.upstream.cache_max_entries, 0);
+        assert_eq!(c.upstream.cache_max_ttl_secs, 60);
+        assert_eq!(c.upstream.negative_ttl_secs, 0);
+        assert_eq!(c.upstream.max_inflight, 16);
+        assert_eq!(c.mesh_hosts.len(), 2);
+        assert!(
+            c.mesh_hosts
+                .contains(&("xc.mesh".to_string(), "10.144.144.6".parse().unwrap()))
+        );
+        assert!(
+            c.mesh_hosts
+                .contains(&("ll.mesh".to_string(), "fe80::1".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn upstream_accepts_bare_v6_and_defaults_to_port_53() {
+        let c = ok("[dns]\nupstream = [\"2001:db8::1\"]\n");
+        assert_eq!(c.upstream.servers, vec![addr("[2001:db8::1]:53")]);
+    }
+
+    #[test]
+    fn nine_error_variants_are_reachable() {
+        // UnknownKey: unknown key.
+        assert!(matches!(
+            err("[dns]\nupstream = [\"1.1.1.1\"]\nshiny = true\n"),
+            DnsConfigError::UnknownKey(key) if key == "shiny"
+        ));
+        // UnknownKey: root-level key (R3 migration).
+        assert!(matches!(
+            err("upstream = [\"1.1.1.1\"]\n"),
+            DnsConfigError::UnknownKey(key) if key == "upstream"
+        ));
+        // EmptyUpstream: missing and empty.
+        assert_eq!(
+            err("[dns]\nfake_ip_enabled = true\n"),
+            DnsConfigError::EmptyUpstream
+        );
+        assert_eq!(err("[dns]\nupstream = []\n"), DnsConfigError::EmptyUpstream);
+        // TooManyUpstream.
+        let nine = (1..=9)
+            .map(|i| format!("\"10.0.0.{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            err(&format!("[dns]\nupstream = [{nine}]\n")),
+            DnsConfigError::TooManyUpstream
+        );
+        // BadUpstreamAddr.
+        assert!(matches!(
+            err("[dns]\nupstream = [\"not-an-ip\"]\n"),
+            DnsConfigError::BadUpstreamAddr(_)
+        ));
+        assert!(matches!(
+            err("[dns]\nupstream = [\"1.1.1.1:0\"]\n"),
+            DnsConfigError::BadUpstreamAddr(_)
+        ));
+        // BadValue.
+        assert!(matches!(
+            err("[dns]\nupstream = [\"1.1.1.1\"]\nattempt_timeout_ms = \"fast\"\n"),
+            DnsConfigError::BadValue { .. }
+        ));
+        // MeshNameInvalid.
+        assert!(matches!(
+            err(
+                "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"XC.MESH\" = \"10.144.144.6\"\n"
+            ),
+            DnsConfigError::MeshNameInvalid(_)
+        ));
+        assert!(matches!(
+            err(
+                "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.other\" = \"10.144.144.6\"\n"
+            ),
+            DnsConfigError::MeshNameInvalid(_)
+        ));
+        // MeshAddrInvalid: loopback (SU-3 #1) and multicast.
+        assert!(matches!(
+            parse_dns_toml(
+                "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"loop.mesh\" = \"127.0.0.1\"\n",
+                Some(MESH_NET),
+                false
+            ),
+            Err(DnsConfigError::MeshAddrInvalid(_))
+        ));
+        assert!(matches!(
+            parse_dns_toml(
+                "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"mc.mesh\" = \"ff02::1\"\n",
+                Some(MESH_NET),
+                false
+            ),
+            Err(DnsConfigError::MeshAddrInvalid(_))
+        ));
+        // MeshWithoutRoutes: mesh hosts without network.toml.
+        assert_eq!(
+            parse_dns_toml(
+                "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.mesh\" = \"10.144.144.6\"\n",
+                None,
+                false
+            ),
+            Err(DnsConfigError::MeshWithoutRoutes)
+        );
+        // ProxyPolicyConflict.
+        assert_eq!(
+            parse_dns_toml(
+                "[dns]\nupstream = [\"1.1.1.1\"]\nunmatched = \"proxied\"\n",
+                None,
+                false
+            ),
+            Err(DnsConfigError::ProxyPolicyConflict)
+        );
+    }
+
+    #[test]
+    fn ranges_are_enforced_at_the_boundaries() {
+        let cases: &[(&str, &str)] = &[
+            ("attempt_timeout_ms = 49", "attempt_timeout_ms"),
+            ("attempt_timeout_ms = 5001", "attempt_timeout_ms"),
+            ("attempts_per_server = 0", "attempts_per_server"),
+            ("attempts_per_server = 5", "attempts_per_server"),
+            ("total_budget_ms = 100", "total_budget_ms"),
+            ("total_budget_ms = 30001", "total_budget_ms"),
+            ("edns_udp_size = 1", "edns_udp_size"),
+            ("edns_udp_size = 511", "edns_udp_size"),
+            ("edns_udp_size = 4097", "edns_udp_size"),
+            ("tcp_timeout_ms = 99", "tcp_timeout_ms"),
+            ("tcp_timeout_ms = 10001", "tcp_timeout_ms"),
+            ("cache_max_ttl_secs = 0", "cache_max_ttl_secs"),
+            ("max_inflight = 0", "max_inflight"),
+            ("max_inflight = 1025", "max_inflight"),
+            ("fake_ip_ttl_secs = 0", "fake_ip_ttl_secs"),
+            ("fake_ip_range = \"198.18.0.0/31\"", "fake_ip_range"),
+            ("mesh_suffix = \"\"", "mesh_suffix"),
+            ("mesh_suffix = \"a.b\"", "mesh_suffix"),
+            ("ip_preference = \"v4\"", "ip_preference"),
+            ("unmatched = \"never\"", "unmatched"),
+            ("unevaluable = \"auto\"", "unevaluable"),
+        ];
+        for (line, key) in cases {
+            let text = format!("{BASE}{line}\n");
+            let error = err(&text);
+            assert!(
+                matches!(error, DnsConfigError::BadValue { .. }),
+                "{line} -> {error:?}"
+            );
+            assert!(
+                error.to_string().contains(key),
+                "{line} message must mention {key}: {error}"
+            );
+        }
+        // total_budget_ms must stay >= attempt_timeout_ms.
+        assert!(matches!(
+            err(
+                "[dns]\nupstream = [\"1.1.1.1\"]\nattempt_timeout_ms = 1000\ntotal_budget_ms = 999\n"
+            ),
+            DnsConfigError::BadValue { .. }
+        ));
+        // edns 0/512/4096 are accepted.
+        for size in [0u16, 512, 4096] {
+            assert_eq!(
+                ok(&format!("{BASE}edns_udp_size = {size}\n"))
+                    .upstream
+                    .edns_udp_size,
+                size
+            );
+        }
+    }
+
+    #[test]
+    fn su3_three_examples_are_covered() {
+        // 1. loopback mesh values are rejected (::1 and 127.0.0.1).
+        for value in ["::1", "127.0.0.1"] {
+            let text = format!(
+                "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"loop.mesh\" = \"{value}\"\n"
+            );
+            assert!(matches!(
+                parse_dns_toml(&text, Some(MESH_NET), false),
+                Err(DnsConfigError::MeshAddrInvalid(_))
+            ));
+        }
+        // 2. fe80:: link-local is accepted when routes6 covers it.
+        let text = "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"ll.mesh\" = \"fe80::1\"\n";
+        let net = "[vpi]\naddress6 = \"fd00::1\"\n[[vpi.routes6]]\nsubnet = \"fe80::/64\"\npeer = \"00\"\n";
+        let c = parse_dns_toml(text, Some(net), false).expect("link-local mesh accepted");
+        assert_eq!(
+            c.mesh_hosts,
+            vec![("ll.mesh".to_string(), "fe80::1".parse().unwrap())]
+        );
+        // 3. [vpi].address6 without [[vpi.routes6]] is accepted (§4.6.2 SU-3).
+        let c = parse_dns_toml(BASE, Some("[vpi]\naddress6 = \"fd00::1\"\n"), false)
+            .expect("address6 alone is allowed");
+        assert!(c.mesh_hosts.is_empty());
+    }
+
+    #[test]
+    fn mesh_address_must_be_inside_a_route() {
+        let net = "[vpi]\n[[vpi.routes]]\nsubnet = \"10.144.144.0/24\"\npeer = \"00\"\n";
+        let outside =
+            "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.mesh\" = \"10.9.9.9\"\n";
+        assert!(matches!(
+            parse_dns_toml(outside, Some(net), false),
+            Err(DnsConfigError::MeshAddrInvalid(_))
+        ));
+        let inside =
+            "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"xc.mesh\" = \"10.144.144.6\"\n";
+        assert!(parse_dns_toml(inside, Some(net), false).is_ok());
+        // A v6 mesh host without routes6 is MeshWithoutRoutes even if address6 exists.
+        let v6 = "[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh.hosts]\n\"v6.mesh\" = \"fd00::9\"\n";
+        assert_eq!(
+            parse_dns_toml(v6, Some("[vpi]\naddress6 = \"fd00::1\"\n"), false),
+            Err(DnsConfigError::MeshWithoutRoutes)
+        );
+    }
+
+    #[test]
+    fn unknown_mesh_subkey_is_rejected() {
+        assert_eq!(
+            err("[dns]\nupstream = [\"1.1.1.1\"]\n[dns.mesh]\nother = 1\n"),
+            DnsConfigError::UnknownKey("mesh.other".to_string())
+        );
+    }
+
+    #[test]
+    fn unmatched_proxied_requires_a_usable_outbound() {
+        let text = "[dns]\nupstream = [\"1.1.1.1\"]\nunmatched = \"proxied\"\n";
+        assert_eq!(
+            parse_dns_toml(text, None, false),
+            Err(DnsConfigError::ProxyPolicyConflict)
+        );
+        let c = parse_dns_toml(text, None, true).expect("usable outbound satisfies proxied");
+        assert_eq!(c.proxy.unmatched, UnmatchedPolicy::Proxied);
+    }
+
+    #[test]
+    fn policy_enums_round_trip() {
+        assert_eq!(UnmatchedPolicy::parse("auto"), Some(UnmatchedPolicy::Auto));
+        assert_eq!(
+            UnmatchedPolicy::parse("proxied"),
+            Some(UnmatchedPolicy::Proxied)
+        );
+        assert_eq!(
+            UnmatchedPolicy::parse("upstream"),
+            Some(UnmatchedPolicy::Upstream)
+        );
+        assert_eq!(UnmatchedPolicy::parse("nope"), None);
+        assert_eq!(
+            UnevaluablePolicy::parse("proxied"),
+            Some(UnevaluablePolicy::Proxied)
+        );
+        assert_eq!(
+            UnevaluablePolicy::parse("upstream"),
+            Some(UnevaluablePolicy::Upstream)
+        );
+        assert_eq!(UnevaluablePolicy::parse("auto"), None);
+    }
+
+    #[test]
+    fn error_display_carries_actionable_detail() {
+        let e = DnsConfigError::UnknownKey("shiny".to_string());
+        assert!(e.to_string().contains("shiny"));
+        let e = DnsConfigError::BadValue {
+            key: "dns.max_inflight".to_string(),
+            reason: "must be in 1..=1024".to_string(),
+        };
+        assert!(e.to_string().contains("dns.max_inflight"));
+        assert!(e.to_string().contains("1..=1024"));
     }
 }

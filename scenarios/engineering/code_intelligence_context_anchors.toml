@@ -8,6 +8,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#15-suggested-implemen
 # 启动只加载 3 个源文件 ⇒ 本场景的命中集合与耗时都是确定的。成员目录（如
 # engineering/nexus-harness）走的是另一条承诺：unsupported_scope，见
 # code_intelligence_context_scope_guard.toml。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

@@ -3,6 +3,7 @@ id = "platform.workspace-projection-channels"
 title = "NativeApi 与 MaterializedDirectory 投影通道完整读写提交闭环"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#workspace"
+carrier = "n1-fabric"
 
 [given]
 native_mount = false

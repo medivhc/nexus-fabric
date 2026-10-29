@@ -3,6 +3,7 @@ id = "product.n2-use-probe-honesty"
 title = "use 宣告访问入口前真实探测：不可达时 reachable=false + warning（如实回报）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#16-n2-resource-access"
+carrier = "v9-connectivity"
 
 [given]
 # N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。

@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use common::{FakeChannel, FakeSocket, ManualPunchClock};
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::{
     CandidateKind, DefaultPredictor, LocalCandidates, PortSample, Predictability, PunchAnswer,
     PunchCandidate, PunchConfig, PunchPredictor, PunchSession, SprayPlan,

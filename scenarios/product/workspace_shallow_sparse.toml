@@ -3,6 +3,7 @@ id = "product.workspace-shallow-sparse"
 title = "Workspace 存储治理（v9 §20）：Shallow Sync + Sparse Replica + On-demand Deepening"
 evidence_strength = "E4"
 requirement = "v9 §20 Shallow Metadata Sync / Sparse Replica / On-demand Deepening"
+carrier = "n1-fabric"
 
 [given]
 description = "远端 5 个提交 → shallow clone（depth=2）只取最近 2 代 → 按需 deepening 拉取老提交对象 → sparse clone 只取 docs/ 路径"

@@ -9,6 +9,7 @@ requirement = "engineering/nexus-harness/MODULE.md#public-api"
 # equals / one_of / non_empty 三种算子，没有子串断言（独立盲评指出：今天的兜底消息不含
 # daemon，而 `message non_empty` 为绿，等于核心性质 0 覆盖）。该断言已移到
 # daemon selftest 的 commands_surface_lists_daemon 值探针，由 lifecycle 场景钉住。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

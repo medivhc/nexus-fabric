@@ -62,6 +62,8 @@ fn run() -> Result<String, Outcome> {
         up: None,
         down: None,
         obfs_password: None,
+        fallback_guard: None,
+        ready_window_ms: None,
     };
     let obfs = cfg.obfs.as_deref();
     let params = ObfsParams {

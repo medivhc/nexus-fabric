@@ -36,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_fabric::{ConnShared, Driver, PeerId as FabricPeerId};
 use nexus_nat_quality::{MeasuredPath, PathEventSink, ProbeRole, QualityMonitor};
 use nexus_nat_traversal::{LocalCandidates, PortSample, PunchConfig, PunchResult};
@@ -404,6 +404,18 @@ impl NatSwitching {
                 nexus_nat_wireup::channel::STREAM_TYPE_WORKSPACE_SYNC,
                 chunk,
             )?;
+            // N-1 (MSR-p0-n1-ruling-20261026, spec §19.3): FIN this per-chunk
+            // stream so quinn replenishes MAX_STREAMS. Body only.
+            {
+                let mut st = stream
+                    .state
+                    .lock()
+                    .map_err(|_| std::io::Error::other("stream lock poisoned"))?;
+                st.send_fin = true;
+            }
+            let _ = stream.tx.send(nexus_fabric::Cmd::Pump {
+                conn: stream.conn_id,
+            });
             return Ok(ChunkPath::Direct);
         }
         fallback(chunk)?;

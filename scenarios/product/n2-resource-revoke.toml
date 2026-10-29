@@ -3,6 +3,7 @@ id = "product.n2-resource-revoke"
 title = "nexus resource revoke：撤销资源发布（撤销后目录不可见）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#16-n2-resource-access"
+carrier = "v9-connectivity"
 
 [given]
 # P0-0 契约冻结（2026-10-03）：`nexus resource revoke` 在 P0-2/P0-4 实现，

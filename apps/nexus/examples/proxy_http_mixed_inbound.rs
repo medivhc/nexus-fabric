@@ -1,6 +1,9 @@
 //! HTTP/混合代理入站 E4（PRODUCT §11.19）：本地 HTTP origin + Nexus 混合入站，
-//! 同端口按首字节分流三种客户端：(i) HTTP 绝对形式 GET；(ii) CONNECT 隧道；
-//! (iii) SOCKS5 握手。三种均经代理真实访问 loopback origin 并获得 HTTP 200。
+//! 同端口按首字节分流四种客户端：(i) HTTP 绝对形式 GET；(ii) CONNECT 隧道；
+//! (iii) SOCKS5 握手；(iv) CONNECT 经 trojan 出站失败（fail-closed 502）。
+//! 前三者经代理真实访问 loopback origin 并获得 HTTP 200（既有断言零放宽）；
+//! 第四者只命中该失败会话的规则，trojan 出站 locator 指向已关闭的 loopback 端口，
+//! 断言 `HTTP/1.1 502 Bad Gateway` 且 502 后的隧道字节 = 0（spec AC-11.2/11.3）。
 //!
 //! 输出单个 JSON 对象（场景求值器要求）。
 
@@ -52,15 +55,61 @@ fn main() {
         }
     });
 
+    // 第四条会话的目标端口：先占位再释放 => 已关闭的 loopback 端口。
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closed");
+    let fail_target_port = closed_listener.local_addr().expect("closed addr").port();
+    drop(closed_listener);
+    // trojan 出站的 locator 指向另一个同样已关闭的端口（TunnelConnectFailed）。
+    let dead_node_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead node");
+    let dead_node_port = dead_node_listener.local_addr().expect("dead addr").port();
+    drop(dead_node_listener);
+    // 仅命中失败会话目标端口的规则 => 该端口走 trojan 出站，其余保持 direct。
+    let trojan_fail_config = format!(
+        concat!(
+            "schema_version: 1\n",
+            "inbounds:\n",
+            "  - tag: socks5-in\n",
+            "    kind: socks5\n",
+            "    listen: 127.0.0.1:0\n",
+            "rules:\n",
+            "  - tag: trojan-fail\n",
+            "    kind: dst_port\n",
+            "    match: \"{0}\"\n",
+            "    action:\n",
+            "      - kind: select_outbound\n",
+            "        tag: trojan-fail\n",
+            "  - tag: rule-match\n",
+            "    kind: match\n",
+            "    match: \"\"\n",
+            "    action:\n",
+            "      - kind: select_outbound\n",
+            "        tag: direct\n",
+            "outbounds:\n",
+            "  - tag: trojan-fail\n",
+            "    kind: trojan\n",
+            "    locator: \"127.0.0.1:{1}\"\n",
+            "    password: mixed-inbound-fail-password\n",
+            "    skip_cert_verify: true\n",
+            "  - tag: direct\n",
+            "    kind: direct\n",
+        ),
+        fail_target_port, dead_node_port
+    );
+
     // 混合入站监听（同一端口，按首字节分流）。
     let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind proxy");
     let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
     let proxy_clone = proxy_listener.try_clone().expect("clone listener");
-    // 代理线程：依次 accept 3 个会话（forward GET / CONNECT 隧道 / SOCKS5）。
+    // 代理线程：依次 accept 4 个会话（forward GET / CONNECT 隧道 / SOCKS5 / 失败 CONNECT）。
     let proxy = std::thread::spawn(move || {
         let mut jsons = Vec::new();
-        for _ in 0..3 {
-            jsons.push(proxy_serve_once(&proxy_clone, nexus::DEFAULT_PROXY_CONFIG));
+        for i in 0..4 {
+            let cfg = if i == 3 {
+                trojan_fail_config.as_str()
+            } else {
+                nexus::DEFAULT_PROXY_CONFIG
+            };
+            jsons.push(proxy_serve_once(&proxy_clone, cfg));
         }
         jsons
     });
@@ -128,6 +177,52 @@ fn main() {
         && socks_text.contains("hello");
     drop(c3);
 
+    // ---- (iv) 同端口 CONNECT 经 trojan 出站失败：502 + 零隧道字节（AC-11）----
+    let mut c4 = std::net::TcpStream::connect(proxy_addr).expect("c4 connect");
+    c4.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("c4 timeout");
+    let fail_target = format!("127.0.0.1:{fail_target_port}");
+    c4.write_all(
+        format!("CONNECT {fail_target} HTTP/1.1\r\nHost: {fail_target}\r\n\r\n").as_bytes(),
+    )
+    .expect("c4 write connect");
+    let mut fail_resp = Vec::new();
+    let mut again = [0u8; 1024];
+    loop {
+        match c4.read(&mut again) {
+            Ok(0) => break,
+            Ok(n) => {
+                fail_resp.extend_from_slice(&again[..n]);
+                if fail_resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let fail_reply = String::from_utf8_lossy(&fail_resp)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // 502 之后的隧道字节必须为 0，且连接应在 500ms 内 EOF。
+    c4.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .expect("c4 drain timeout");
+    let mut fail_tunnel_bytes = 0usize;
+    let mut fail_eof = false;
+    loop {
+        let mut buf = [0u8; 4096];
+        match c4.read(&mut buf) {
+            Ok(0) => {
+                fail_eof = true;
+                break;
+            }
+            Ok(n) => fail_tunnel_bytes += n,
+            Err(_) => break,
+        }
+    }
+    drop(c4);
+
     let jsons = proxy.join().expect("join proxy");
     // 最后一个会话（SOCKS5）的 routing/session 作为基准断言。
     let last = jsons[2].as_ref().expect("third session ok").clone();
@@ -141,9 +236,18 @@ fn main() {
                 "http_connect_reply": connect_reply,
                 "http_connect_tunnel_ok": http_connect_tunnel_ok,
                 "socks5_ok": socks5_ok,
+                "http_connect_failure_reply": fail_reply,
+                "http_connect_failure_tunnel_bytes": fail_tunnel_bytes,
+                "http_connect_failure_eof": fail_eof,
             }),
         );
-        if !(http_forward_ok && http_connect_tunnel_ok && socks5_ok) {
+        if !(http_forward_ok
+            && http_connect_tunnel_ok
+            && socks5_ok
+            && fail_reply == "HTTP/1.1 502 Bad Gateway"
+            && fail_tunnel_bytes == 0
+            && fail_eof)
+        {
             obj.insert("verdict".into(), serde_json::json!("FAIL"));
         }
     }

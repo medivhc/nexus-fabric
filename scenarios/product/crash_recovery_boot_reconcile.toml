@@ -12,6 +12,7 @@ requirement = "v9 §15.2/§15.3"
 # - 所有 reconcile 必须幂等：第二次启动不再重复分类。
 # - 干净关闭（SIGTERM）必须清除 run marker；下次启动 crashed_before=false。
 # - 范围：只覆盖 Session + Connectivity；Workspace/Compute 的恢复是 Phase 2/3，不在本场景。
+carrier = "n1-fabric"
 
 [given]
 victim = "crash_probe：向 <config-dir>/state 写 1 条 Active/Unfinished session 记录 + 1 条 established link marker + run marker，然后 sleep（模拟运行中的 daemon）"

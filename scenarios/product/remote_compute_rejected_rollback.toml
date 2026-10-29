@@ -3,6 +3,7 @@ id = "product.remote-compute-rejected-rollback"
 title = "远程计算作业被提供方拒绝时按逆序幂等回滚"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 node_a = "requester"

@@ -3,6 +3,7 @@ id = "product.workspace-sync-shallow-sparse"
 title = "shallow/sparse sync：按 depth 截断 + 按路径过滤"
 evidence_strength = "E4"
 requirement = "v9 §20 + C2-P4（HEADS 携带 replica policy/depth/sparse filter；WANT-COMMITS 按 depth 截断 BFS；sparse 只拉指定路径对象）"
+carrier = "n1-fabric"
 
 [given]
 description = "A 有 10 层提交历史；B 以 depth=3 发起 shallow sync；C 以 sparse_paths=[docs/] 发起 sparse sync"

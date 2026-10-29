@@ -9,6 +9,7 @@ requirement = "engineering/nexus-harness/MODULE.md#public-api"
 # 参数，同一类漂移最可能再次发生的地方就是这里。命令面与是否已有 daemon 无关，所以这条
 # 不受环境里有没有人起过进程影响。参数**被真实兑现**（--idle-secs 90 ⇒ idle_secs=90）由
 # selftest 的 defaults_* 与 idle_self_exit_observed 值探针钉住。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

@@ -6,22 +6,42 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use nexus_network::n1::N1Error;
 use nexus_network::n1::bridge::N1Sender;
-use nexus_projection::MockTun;
+use nexus_projection::{MockTun, TunDevice};
 use nexus_proxy::domain_engine::DomainRuleEngine;
+use nexusd::config::{DnsFileConfig, DnsProxyPolicy, UpstreamConfig};
 use nexusd::dataplane::{Dataplane, DataplaneConfig};
+use nexusd::dns_service::DnsService;
+use nexusd::dns_status::{DnsStatus, DnsStatusSnapshot, UnmatchedPolicy};
 use serde_json::json;
+
+/// `MockTun` 读回范式（N-11）：`Dataplane` 持有 writer 句柄，测试保留 reader。
+struct SharedTun(Arc<Mutex<MockTun>>);
+
+impl TunDevice for SharedTun {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().read(buf)
+    }
+
+    fn write(&mut self, packet: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(packet)
+    }
+
+    fn name(&self) -> &str {
+        "mocktun0"
+    }
+}
 
 /// 测试用 N1 发送器：全部接受（W1 语义：mesh_forwarded 只计 N1 真发成功）。
 struct AcceptAllN1Sender;
 
 impl N1Sender for AcceptAllN1Sender {
-    fn send_to_mesh(&self, _dst: Ipv4Addr, _packet: &[u8]) -> Result<(), N1Error> {
+    fn send_to_mesh(&self, _dst: IpAddr, _packet: &[u8]) -> Result<(), N1Error> {
         Ok(())
     }
 }
@@ -69,11 +89,13 @@ fn run() -> serde_json::Value {
     ));
 
     // 2. 数据面（mesh 10.0.0.0/8，bypass 192.168.0.0/16，DNS 启用，QoS 禁用）。
+    // 2. Mock TUN（保留 reader 句柄读回 DNS 响应）。
+    let mock = Arc::new(Mutex::new(tun));
     let config = DataplaneConfig {
         mesh_cidrs: vec!["10.0.0.0/8".to_string()],
         bypass_cidrs: vec!["192.168.0.0/16".to_string()],
         dns_enabled: true,
-        dns_config: None,
+        dns_config: Some(local_dns_config()),
         qos_enabled: false,
         qos_config: Default::default(),
         boost_enabled: false,
@@ -81,7 +103,26 @@ fn run() -> serde_json::Value {
         proxy_configured: true,
         ..Default::default()
     };
-    let mut dp = match Dataplane::new(Box::new(tun), config) {
+    // 2a. DNS 服务（真实单 owner 线程；本地 hosts 回答，避免耦合真实上游）。
+    let dns_status = Arc::new(DnsStatus::new(DnsStatusSnapshot::disabled()));
+    let dns_handle = match DnsService::start(
+        config.dns_config.clone().expect("dns config"),
+        None,
+        dns_status,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            return json!({
+                "verdict": "FAIL",
+                "error": format!("dns service start failed: {e}"),
+            });
+        }
+    };
+    let mut dp = match Dataplane::new(
+        Box::new(SharedTun(Arc::clone(&mock))),
+        config,
+        Some(dns_handle),
+    ) {
         Ok(dp) => dp,
         Err(e) => {
             return json!({
@@ -103,8 +144,9 @@ fn run() -> serde_json::Value {
         "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: {}\n",
         socks_addr
     );
-    let proxy_engine =
-        nexusd::proxy_fwd::ProxyEngine::new(&proxy_yaml).expect("proxy engine from stub socks5");
+    let proxy_engine = nexusd::proxy_fwd::ProxyEngine::new(Some(&proxy_yaml))
+        .expect("proxy engine from stub socks5")
+        .expect("engine constructed");
     dp.set_proxy_engine(proxy_engine);
     // P3：`Dataplane::new` 初始规则为空（fail-closed），须显式注入与
     // ProxyEngine 同源的规则引擎，否则 198.18.1.1 会被判 Drop。
@@ -112,12 +154,16 @@ fn run() -> serde_json::Value {
         DomainRuleEngine::from_yaml(&proxy_yaml).expect("dataplane rule engine from stub socks5"),
     ));
 
-    // 3. 处理所有包。
+    // 3. 处理所有包；DNS 响应异步返回，有界 tick 直到 drain 完。
     let mut processed = 0;
-    for _ in 0..10 {
-        match dp.process_one() {
-            Ok(true) => processed += 1,
-            Ok(false) => break,
+    for _ in 0..400 {
+        match dp.tick(now_ticks()) {
+            Ok(true) => {
+                if processed < 5 {
+                    processed += 1;
+                }
+            }
+            Ok(false) => {}
             Err(e) => {
                 return json!({
                     "verdict": "FAIL",
@@ -125,23 +171,84 @@ fn run() -> serde_json::Value {
                 });
             }
         }
+        if processed >= 5 && dp.stats().dns_answered >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 
     let stats = dp.stats();
-    // DNS 响应验证：tun_written 证明响应包确实写入了 TUN（非同义反复）。
+    // DNS 响应验证：从 MockTun 读回实际写出的包，确认源端口 53。
+    let dns_response_received = {
+        let mut guard = mock.lock().unwrap();
+        guard.take_written().iter().any(|packet| {
+            packet.len() >= 28 && packet[9] == 17 && {
+                let ihl = usize::from(packet[0] & 0x0f) * 4;
+                packet.len() >= ihl + 8 && u16::from_be_bytes([packet[ihl], packet[ihl + 1]]) == 53
+            }
+        })
+    };
     json!({
-        "verdict": if processed == 5 { "PASS" } else { "FAIL" },
+        "verdict": if processed == 5 && dns_response_received { "PASS" } else { "FAIL" },
         "dataplane": {
             "mesh_forwarded": stats.mesh_forwarded,
             "proxy_forwarded": stats.proxy_forwarded,
             "direct_forwarded": stats.direct_forwarded,
             "dropped": stats.dropped,
             "dns_answered": stats.dns_answered,
-            "dns_response_received": stats.tun_written == 1,
+            "dns_response_received": dns_response_received,
             "qos_bypassed": dp.qos_bypassed(),
             "processed": processed,
+            // C18：0x86DD 包的归属（MSR-r3-plan-ruling-20261028 Q-1）。
+            "ipv6": {
+                "packets": stats.ipv6.packets,
+                "udp": stats.ipv6.udp,
+                "tcp": stats.ipv6.tcp,
+                "classified_mesh": stats.ipv6.classified_mesh,
+                "classified_direct": stats.ipv6.classified_direct,
+                "classified_proxy": stats.ipv6.classified_proxy,
+                "mesh_forwarded": stats.ipv6.mesh_forwarded,
+                "mesh_no_route": stats.ipv6.mesh_no_route,
+                "proxy_dropped": stats.ipv6.proxy_dropped,
+                "multicast": stats.ipv6.multicast,
+                "dropped_truncated": stats.ipv6.dropped_truncated,
+                "dropped_extension": stats.ipv6.dropped_extension,
+                "fragments": stats.ipv6.fragments,
+            },
         }
     })
+}
+
+/// 本地可判定 DNS 配置（hosts 回答 example.com；不依赖真实上游）。
+fn local_dns_config() -> DnsFileConfig {
+    let unified = nexus_dns::DnsUnifiedConfig {
+        hosts: vec![(
+            "example.com".to_string(),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        )],
+        ..nexus_dns::DnsUnifiedConfig::default()
+    };
+    DnsFileConfig {
+        unified,
+        mesh_hosts: Vec::new(),
+        proxy: DnsProxyPolicy {
+            unmatched: UnmatchedPolicy::Auto,
+            unevaluable: nexusd::dns_status::UnevaluablePolicy::Proxied,
+        },
+        upstream: UpstreamConfig {
+            servers: vec!["127.0.0.1:9".parse().expect("test upstream")],
+            attempt_timeout_ms: 50,
+            attempts_per_server: 1,
+            total_budget_ms: 50,
+            edns_udp_size: 0,
+            tcp_fallback: false,
+            tcp_timeout_ms: 100,
+            cache_max_entries: 0,
+            cache_max_ttl_secs: 1,
+            negative_ttl_secs: 0,
+            max_inflight: 1,
+        },
+    }
 }
 
 /// 构造最小 IPv4/UDP 包（含合法 UDP 头；代理路径的 parse_udp_packet 需要）。
@@ -251,4 +358,12 @@ fn build_dns_query(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, qname: &str, txi
     pkt[20..20 + udp.len()].copy_from_slice(&udp);
     pkt[20 + udp.len()..].copy_from_slice(&dns);
     pkt
+}
+
+/// 单调毫秒时间源（example 内允许直接用 std）。
+fn now_ticks() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

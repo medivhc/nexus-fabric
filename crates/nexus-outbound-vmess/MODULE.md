@@ -1,7 +1,7 @@
 # nexus-outbound-vmess
 
 VMess AEAD 出站 adapter（PRODUCT.md §11.7）：实现
-`nexus-connectivity::OutboundAdapter`，在与 Shadowsocks 同一接缝上新增第四个真实出站。
+`nexus_proxy_config::outbound_seam::OutboundAdapter`，在与 Shadowsocks 同一接缝上新增第四个真实出站。
 
 ## Responsibility
 
@@ -22,15 +22,21 @@ VMess AEAD 出站 adapter（PRODUCT.md §11.7）：实现
 
 - `VmessAdapter`（实现 `OutboundAdapter`）；`encrypt`/`decrypt` 记录帧；结构化错误
   `VmessCipherError`。
+- `OutboundAdapter::handoff` 的错误类型为 `OutboundHandoffError`（当前无生产者，见
+  proxy-config MODULE）。
 
 ## Allowed Dependencies
 
-- `nexus-connectivity`（`OutboundAdapter` / `OutboundHandoff` / `ConnectivityError`）。
+- `nexus-proxy-config`（`OutboundAdapter` / `OutboundHandoff` / `OutboundHandoffError`）。
 - 已评审入仓的 `chacha20poly1305` / `sha2`（RustCrypto，纯 Rust）。
 
 ## Forbidden Dependencies
 
 - 平台 API、其它 outbound crate、registry/planner。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  接缝 ② 已于 2026-10-28（P2）清除：出站身份/交接词汇定义于 `nexus-proxy-config`，
+  本 crate 对 `nexus-connectivity` 的直接边为 0
+  （见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`）。
 
 ## Invariants
 

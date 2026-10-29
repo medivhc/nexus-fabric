@@ -6,11 +6,15 @@
 （入站监听、规则表、策略组、出站定义），并做结构化校验。这是 Nexus 首个配置
 文件入口。
 
+出站身份/离线交接词汇（`outbound_seam`：`OutboundHandoff` / `OutboundAdapter` /
+`OutboundHandoffError`）——自 `nexus-connectivity` 下沉。
+
 ## Non-Responsibilities
 
 - 不执行规则匹配、不选择出站、不发起网络 I/O；
 - 不解析 Clash YAML 配置语法（仅解析 Clash/通用 base64 订阅的「节点 URI 列表」形态，§11.8）；
 - 不持有运行时状态（选中项、measurement 缓存），只负责一次性配置装载与校验。
+- 不选择出站、不发起 I/O、不持有 socket（身份/交接词汇不含数据面）。
 
 ## Inputs
 
@@ -21,6 +25,29 @@
 
 - 结构化 `ProxyConfig`（typed structs）或 `ConfigError`（保留字段路径与原因）。
 - 校验错误必须结构化：`CONFIG_INVALID { field, reason }`，不以日志文本代替。
+
+## Public API（出站 UDP 能力 DTO，spec §7.1 / C14）
+
+- `udp::UdpCapability { Supported(UdpMode) | Unsupported { reason } }`
+- `udp::UdpMode { Socks5Associate, ShadowsocksAead, VlessOverTcp, AnytlsUot,
+  TrojanUdpOverTls, Hysteria2Datagram }` —— **手写 `Debug`**：`ShadowsocksAead.password`
+  渲染为 `***`；禁止回归到 `#[derive(Debug)]`（脱敏硬约束）。
+- `udp::UdpUnsupportedReason { NotWired, TlsVariantNotSupported, NoDatagramMode }`
+  其中 `NoDatagramMode` 与四个 additive `UdpMode` 变体**保留但无生产者**（N4）。
+- 三类型为共享 DTO（CLI/daemon 共用），**不进入** `OutboundConfig`/`OutboundKind`
+  字段集合（AC-CFG-1 不变）；本模块仍零第三方依赖、零 I/O。
+
+## Public API（出站身份/离线交接词汇，接缝 ②）
+
+- 全路径 `outbound_seam::*`（不额外做 crate 根 `pub use`，避免两套路径）：
+  - `outbound_seam::OutboundHandoff { kind, tag, locator }`：离线交接结果 DTO；
+  - `outbound_seam::OutboundAdapter`：`outbound_kind()` / `tag()` /
+    `handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError>`；
+  - `outbound_seam::OutboundHandoffError { InvalidLocator { locator } }`：
+    **保留变体、当前无生产者**（签名预留；6 个实现均不产生错误——离线交接不校验
+    可达性，不做静默删除）。与 `udp::UdpUnsupportedReason::NoDatagramMode` 同口径。
+- 三类型原定义于 `nexus-connectivity`，2026-10-28（P2）下沉至此；由
+  `nexus-connectivity` 以 `pub use` 重导出保持旧路径源码兼容。
 
 ## Allowed Dependencies
 
@@ -49,6 +76,15 @@
   base64 非法字符/长度对齐错误返回 `CONFIG_INVALID`。离线确定性，纯函数。
 - Trojan 出站（§11.9.3）：`kind=trojan` 时 `password`/`locator` 必填；`header_format` 仅允许
   `standard`（默认）或 `singbox`；非法值缺失返回 `CONFIG_INVALID`。
+- Trojan 第一响应守卫字段（spec fixes-5 §8 / AC-16，**有意收紧**）：
+  `fallback_guard: "strict"|"signature"`（缺省 `strict`，不存在 `off`/空值语义）与
+  `ready_window_ms: u64`（`0..=5000`，`None`/`0` = 自适应窗口）。
+  两者都按 **presence-aware** 提取：字段存在但为空串 / 非法枚举 / 越界 / 非整数
+  → `CONFIG_INVALID [outbounds[<tag>].<field>]`，不得静默当作「未配置」。
+  校验顺序 = 先按 trojan 值域校验（对所有 kind），再按 kind 决定是否生效：
+  非 trojan 出站上的**合法值**忽略（不生效、不报错），**非法值**硬失败。
+  这比现状 `header_format`（只在 `kind==trojan` 块内校验，非 trojan 的非法值被静默忽略）
+  更严，属本 run 新增的 fail-closed 裁决。
 
 ## Side Effects
 
@@ -84,7 +120,9 @@
     返回 `CONFIG_INVALID`。
   - Trojan 出站（§11.9.3）：`kind: "trojan"` 时 `locator` 形如 `host:port` 且 `password` 必填非空；
     可选 `alpn: Vec<String>`、`skip_cert_verify: bool`、`header_format: "standard"|"singbox"`
-    （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`。
+    （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`；
+    可选 `fallback_guard: Option<String>`（`"strict"`|`"signature"`）与
+    `ready_window_ms: Option<u64>`（`0..=5000`），校验语义见上节。
   - 混淆插件（§7.3，二期）：任意 TCP 出站（ss/trojan）可选 `obfs: String`（插件名，
     如 `"xor"`；缺省/空 = plain 直通）与 `obfs_key: String`（插件参数 key，如 xor 的
     key 材料）；`obfs` 指向未知插件名 → dial 时直接失败（硬校验，不静默回退明文）。

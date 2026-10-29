@@ -3,6 +3,7 @@ id = "product.proxy-extended-rules"
 title = "新增规则类型 src-port/dst-port/process-name 命中 -> 走指定出站"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "socks5 (dst-port) + 直接构造 FlowTarget (src-port/process-name)"

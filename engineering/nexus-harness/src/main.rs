@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod env;
 mod evidence;
+mod evidence_index;
 mod gates;
 mod run_scenario;
 mod scenario;

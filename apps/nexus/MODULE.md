@@ -58,6 +58,22 @@
   - workspace heads/conflicts 挂 `nexus-workspace` DAG（Head Set 分叉 / 三方合并冲突快照）。
   - compute jobs 挂 `nexus-compute` ComputeJobSession（内存帧通道提交，Active/Closed 阶段快照）。
   - diagnose 聚合各子系统快照输出健康报告（逐项 ready + overall）。
+- 出站互操作标注（`outbound_manifest` 模块，spec §7）：`verdicts.json` 经
+  `include_str!` 嵌入 + 反序列化，**不硬编码 verdict 文案**；`is_proxy_kind` /
+  `is_wired` / `select_index` / `trojan_tls_signal` / `has_unsupported_obfs` 的**唯一定义**
+  （daemon/CLI 复用，N9）；启动面 `startup_surface` / `startup_warnings`、
+  运行快照 `runtime_snapshot` / `runtime_outbound_json`（R2-F12：`update_file_side`
+  成功即清 `file_rejected`）。
+- `nexus config check --dir <dir> [proxy.yaml]`（`outbound_check` 模块，§7.7 载体 2）：
+  单 JSON 到 stdout，exit 0/1/2；**不发 DNS、不建连、不改 schema**；输出固定句
+  `dns_resolution: skipped (performed only at daemon engine construction)`；
+  `static_valid = errors.is_empty() && selected.is_some() && selected_errors == 0`；
+  `DUPLICATE_OUTBOUND_TAG` 只 warning 不改 exit code。
+  - 校验层的 `wired` / `selected` 采用**产品表面判定**（本模块私有派生
+    `is_wired_product_surface` = 共享 `is_wired` 集合 + `Hysteria2`，因 `nexus proxy`
+    的 SOCKS5 入口真实服务其 TCP）；nexusd/TUN 表面仍以 `is_wired` / `select_index`
+    为唯一定义（N9），运行期行为不变。静态校验的 obfs 禁令仍按共享 `is_wired` 集合
+    判定（Hy2 的 Salamander 已实现、不在禁令内）。
   - 领域未就绪命令（connectivity trace 等）返回
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
   - CLI 前端（apps/nexus/src/main.rs + control_service.rs + localapi_client.rs）：thin-client，
@@ -78,8 +94,53 @@
   为 `AuthorizationDenied`，禁止抹成通用建连失败）+ `DIAL` 字节中继回退；
   host 侧支持 service（ECHO 往返）/ internet-access（真实 HTTP GET）/ compute（表达式求值）。
 - 真实 SOCKS5 代理数据面（PRODUCT §11.4）：`proxy_serve_once` /
-  `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake）→ 规则路由（nexus-proxy）
-  → Session 双轨 → 真实出站连接 → 双向字节中继。
+  `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake / HttpProxyHandshake）→ 规则路由
+  （nexus-proxy）→ Session 双轨 → 真实出站连接 → 双向字节中继。
+  **CONNECT 应答暂存**（`deferred_reply::DeferredConnectReply`）：握手循环只立即写出
+  非 `Established` 步的应答（method-selection / 错误应答）；`Established` 步的 success
+  交调用方写出——非 trojan 出站在路由之后、出站建连之前立即写出（字节与既有逻辑点
+  不变，AC-10.1），trojan 出站在「TLS 握手 + 请求头 + seed 全部 flush 完成」后由就绪
+  窗口决定写 success 还是失败应答。
+  **Trojan fail-closed 守卫**（`trojan_guard`，spec fixes-5 §4/§5.3/§6）：
+  - 判定输入 = 目标端口 + 首包（≤16B）+ 是否 EOF + 客户端是否已先载荷 + 策略；
+    判据顺序固定为 §5.3 的 1→6，纯函数、无统计/相似度启发式（AC-7）；
+  - `fallback_guard: strict`（默认）只放行端口绑定 greeting 白名单
+    （22 `SSH-`、21/25/587 `220`、110 `+OK`、143 `* OK`、5900 `RFB `），其余拒绝；
+    `signature` 是**显式安全降级**（只拒 `HTTP/`，非 HTTP fallback 漏报）；
+  - 窗口 `W = clamp(t_connect+50, 50, 600)ms`（或 `ready_window_ms` 覆盖，`min(n,5000)`）：
+    客户端先载荷 → 立即 success（载荷先写节点，零扣压）；白名单 greeting → 立即 success；
+    静默到期 → success；HTTP 状态行 / 非白名单首包 / 首包前 EOF → 失败应答
+    （SOCKS5 `0x01`，节点端口拒绝为 `0x05`；HTTP `502`）+ 有界 drain（≤64KiB/50ms）
+    + FIN，**不 flush `close_notify`、不写额外 TLS 记录**（失败只在本地可观察，AC-6）；
+  - 失败 reason 固定格式：`<prefix>: waited_ms=<u64> first_bytes_hex=<hex≤32> dest_port=<u16>`；
+  - 成功会话 JSON 新增 `socks.reply_sent` / `socks.reply_deferred_ms` 与
+    `tunnel: { readiness, pre_payload_down_bytes, guard, window_ms }`（AC-13）；
+    `ClientAbortedBeforeReady` 返回 `Ok` 会话（`reply_code=null`、readiness=`client_aborted`）。
+- SOCKS5 **UDP ASSOCIATE 产品路径**（fixes-6 Phase 1 / spec §3.2/§3.6/§3.9/§6.3/§7.2）：
+  `proxy_serve_once` 在 SOCKS5 `Established` 后先按 `Socks5Handshake::command()` 分流——
+  CONNECT 保持原路径逐字节不变；`CMD=0x03` 进 UDP 关联，关联生命周期**从属控制连接**
+  （EOF / RST / 控制连接上出现额外协议数据 → 立即终止、关闭 UDP socket、取消全部 session）。
+  - **准入（Q12）**：`listener.local_addr()` 非 loopback 且本产品无显式认证 → `REP=0x01`
+    拒绝（不 bind、不建关联，计 `associations_rejected`）；请求 `DST.ADDR` 为具体 IP 且
+    ≠ 控制连接对端 → 同样拒绝（§3.3，不静默改用学习值）。
+  - **绑定与应答**：先 `UdpSocket::bind(<listen_ip>:0)`，再用
+    `nexus_ingress::encode_udp_associate_reply` 回真实 BND（绑定失败 → `REP=0x01`）。
+  - **能力翻转点（全 run 唯一对外可见）**：VLESS → `Supported(VlessOverTcp)`（仅 `flow=None`）、
+    AnyTLS → `Supported(AnytlsUot)` 首次被生产路径消费（`association` 旁 `udp.modes` 可见）；
+    Trojan / Shadowsocks → `Unsupported`（R-3：`NotWired`，crate 无 UDP 帧 API；与 TUN 侧
+    `TlsVariantNotSupported` 的理由不同——两表面 reason 码不同源于调用栈不同：TUN 走 TLS
+    variant 判定、产品走 capability 表，不是两个独立缺陷）、Hysteria2 → `Unsupported`；
+    Direct / Relay / Vmess / Socks5 出站 → 按 kind 先丢弃（Q11），**绝不直连**。
+  - **fail-closed 计数与日志**：§6.3 逐行计数（`dropped_*`；产品侧同名字段
+    `udp.unsupported_<proto>` / `udp.sent` / `udp.send_failed` 与 §7.3-3 对齐，不改 nexusd）；
+    结构化日志 `[proxy-udp] event=…`（§6.5 行格式，`detail` 走 `redact::sanitize` 128B 截断，
+    限频 10s 并在下一条回填 `suppressed=`）；源校验在解析前完成。
+  - **JSON（K-11）**：只新增 `association` / `udp` 两段；TCP 路径既有字段
+    （`socks.*` / `routing.*` / `bytes.*`）逐字不变。
+  - **并发事实（R-7=(a)）**：保留 `main.rs` 串行 accept 模型，关联在 serve 循环内阻塞至控制
+    连接结束；`MAX_UDP_ASSOCIATIONS=128` 是**进程内**上限（`association.max_associations`
+    如实输出），在串行 accept 下不可达——**单进程有效并发 = 1**
+    （`association.effective_concurrency`）。真实并发需改 main loop，另行立项，本 run 不做。
 - 真实节点测速（PRODUCT §11.10）：TcpLatencyProbe（std::net connect_timeout，非 portable）
   + Http204LatencyProbe（connect 后发单行 GET、等响应首行 204，非 portable）
   + proxy_speedtest_with(probe, candidates, timeout, target_label, probe_kind)（批量测速、RTT 排序 JSON 输出）；结果可经 MeasurementSource 喂 urltest。

@@ -3,6 +3,7 @@ id = "product.provider-derivation"
 title = "Provider 派生：字段级映射 + 四类错误变体（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example provider_derivation --json）：outbounds=direct(d), ss(p1), trojan(p2)。

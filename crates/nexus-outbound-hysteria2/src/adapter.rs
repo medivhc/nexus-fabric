@@ -4,7 +4,7 @@
 //! [`Hysteria2Adapter::connect`]（阻塞：QUIC 握手 + H3 认证）完成，
 //! 由 Composition Root 按需调用。
 
-use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
+use nexus_proxy_config::outbound_seam::{OutboundAdapter, OutboundHandoff, OutboundHandoffError};
 
 use super::Hysteria2Error;
 use super::client::Hysteria2Client;
@@ -60,7 +60,7 @@ impl OutboundAdapter for Hysteria2Adapter {
         &self.tag
     }
 
-    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError> {
+    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError> {
         Ok(OutboundHandoff {
             kind: self.outbound_kind().to_string(),
             tag: self.tag.clone(),
@@ -138,6 +138,35 @@ mod tests {
             .unwrap();
         // 读侧剥离 TCPResponse 后拿到回显。
         assert_eq!(&buf[..n], b"hello");
+        client.stream_write(stream, b"world").unwrap();
+        let n = client
+            .stream_read(stream, &mut buf, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(&buf[..n], b"world");
+        client.stream_finish(stream);
+    }
+
+    #[test]
+    fn await_tcp_response_strips_fast_open_response_once() {
+        let server = TestServer::spawn("correct-password", true).unwrap();
+        let adapter = Hysteria2Adapter::new("hy2", test_target(&server));
+        let mut client = adapter.connect().unwrap();
+        let stream = client.open_tcp("example.com:80").unwrap();
+        // fast-open：open_tcp 未剥离响应。
+        client
+            .await_tcp_response(stream, Duration::from_secs(5))
+            .unwrap();
+        // 剥离成功后读到的就是纯载荷（回显）。
+        client.stream_write(stream, b"hello").unwrap();
+        let mut buf = [0u8; 64];
+        let n = client
+            .stream_read(stream, &mut buf, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        // 幂等：响应已剥离，再次调用不消费载荷。
+        client
+            .await_tcp_response(stream, Duration::from_millis(1))
+            .unwrap();
         client.stream_write(stream, b"world").unwrap();
         let n = client
             .stream_read(stream, &mut buf, Duration::from_secs(5))

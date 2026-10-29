@@ -26,7 +26,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 
 // ---------------------------------------------------------------------------
 // P4 相关类型

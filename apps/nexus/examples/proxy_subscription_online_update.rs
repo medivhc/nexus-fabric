@@ -74,6 +74,8 @@ fn main() {
         up: None,
         down: None,
         obfs_password: None,
+        fallback_guard: None,
+        ready_window_ms: None,
     }];
 
     let source = SubscriptionSourceConfig::new(

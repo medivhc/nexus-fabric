@@ -3,6 +3,7 @@ id = "product.fabric-tun-device"
 title = "真实 TUN 设备：TunRsDevice 创建、读写、关闭"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6.4"
+carrier = "n1-fabric"
 
 [given]
 topology = "single node, real TUN device via tun-rs v2 (Linux, CAP_NET_ADMIN)"

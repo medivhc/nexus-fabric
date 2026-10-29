@@ -3,6 +3,7 @@ id = "product.tun-os-assemble"
 title = "TUN OsAssemble：干跑计划、默认路由与排除项（E4）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-tun-transparent-inbound"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example tun_os_assemble --json）：dry_run=true，零 netlink 写；

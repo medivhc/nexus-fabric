@@ -4,9 +4,13 @@
 
 提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、Assisted/Relay Fallback 与 Link State。
 
+本 crate 是 v9 CLI 产品线的运行时；不为其他产品线提供共享基础层。
+
 ## Non-Responsibilities
 
 不选择业务 Resource Provider，不拥有 Workspace/Compute 业务策略。
+
+不承载新地基栈（N1）的任何演进；不为新栈提供共享类型（跨栈词汇见 nexus-domain / nexus-proxy-config / nexus-qos / nexus-session）。
 
 ## Inputs
 
@@ -23,6 +27,8 @@
 - `nexus-platform`
 - `nexus-domain`（仅 `evaluation` 模块：`ConnectivityEvaluation` DTO 输出词汇）
 - `nexus-measurement`（仅 `evaluation` 模块：`LinkMeasurement` 事实输入）
+- `nexus-proxy-config`（出站身份/交接词汇；定义已下沉，本 crate 仅重导出）
+- `nexus-qos`（**共享叶**：包调度与令牌桶；定义已下沉，本 crate 仅以 `pub use` 消费）
 
 ## Forbidden Dependencies
 
@@ -30,6 +36,31 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- 任何 N1 运行时 crate 对本 crate 的反向依赖（方向性禁令，机器判据见 policies/architecture.toml [dual_stack]，P5 落地）。
+
+## Lifecycle
+
+**状态**：frozen（2026-10-26 划界，C 案；裁决 MSR-dualstack-path-20261026，细化 Q4）。
+
+**允许的变更**（判据 F1–F7，全部满足）
+- 缺陷修复：有 Red Evidence 证明现有行为违反已冻结契约/场景；不改 expectation。
+- 安全修复：panic / 越界 / 凭证泄露 / 权限绕过。
+- 崩溃一致性修复：可达性/持久化违反 §15（含 links.json / 会话状态）。
+- 依赖安全升级：不改公开 API 语义，通过 dependency-governance。
+
+**禁止的变更**
+- 新功能、新模块、新 pub API、新协议/线格式/持久化字段。
+- 任何新的入边（依赖本 crate 的新包或新 crate）。
+- 以“修复”为名修改冻结场景 expectation 或降低门禁强度。
+
+**机械锚点**
+- 依赖边：`cargo metadata --no-deps` 的直接依赖方集合 ==
+  `policies/architecture.toml [dual_stack] allowed_dependents ∪ allow.crate`（gate 判）。
+- 源码：允许依赖方之外的任何包 `src/**/*.rs` 中 `nexus_connectivity` 命中数 = 0。
+- 场景：`carrier = "v9-connectivity"` 的场景集合只减不增（索引 gate 判）。
+- 证据：改动必须带 Red Evidence（E2/E4）+ 独立 Review（AGENTS §19.1）。
+
+> `[dual_stack]` gate 与 carrier 索引由 P5/P4 交付；在此之前以 `policies/architecture.toml` 的 allowed 列表 + 独立 Review 人工核对。
 
 ## Invariants
 
@@ -80,17 +111,17 @@
 `activate` 是确定性策略编排（探测结果来自注入的 `LinkProbe`，不自行发起网络 I/O）；
 NAT/中继场景的物理建连（组合根 transport::connect）发生在激活决策之后。
 
-### 冻结契约（OutboundAdapter 接缝，PRODUCT §11.6）
+### 已下沉契约（OutboundAdapter 接缝，PRODUCT §11.6）
 
-- `trait OutboundAdapter`：一种真实出站协议实现（Direct / Relay / Shadowsocks）的领域中立接缝：
-  - `fn outbound_kind(&self) -> &'static str`（"direct" / "relay" / "shadowsocks"）；
-  - `fn tag(&self) -> &str`；
-  - `fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError>`（离线交接，零真实网络）。
-- `OutboundHandoff { kind, tag, locator }`：离线交接结果 DTO。
-- Deletion Test（AGENTS.md §12）成立：Shadowsocks 是首个带真实 AEAD 加解密的出站，与仅做
-  可达性探测的 Direct/Relay 构成独立变化维度；DirectAdapter / RelayAdapter 复用既有
-  `LinkProbe` 语义，`LinkActivator` / `LinkKind` / `LinkProbe` / `LinkSelection` 既有行为不变。
-- trait 保持领域中立、可移植；具体 AEAD 加密实现位于 `nexus-outbound-shadowsocks`（portable=false）。
+- **定义已下沉**：`OutboundHandoff` / `OutboundAdapter` / `OutboundHandoffError` 现定义于
+  `nexus-proxy-config::outbound_seam`（2026-10-28，接缝 ② P2）；本 crate 只做
+  `pub use` 重导出，旧路径 `nexus_connectivity::OutboundAdapter` 等源码兼容。
+- `handoff` 的错误类型为 `OutboundHandoffError`；`ConnectivityError` 不再出现在该签名。
+- 本 crate 不新增出站语义；`LinkActivator` / `LinkKind` / `LinkProbe` / `LinkSelection`
+  既有行为不变（Direct/Relay 的 adapter 形态不由本 crate 提供）。
+- Deletion Test（AGENTS.md §12）判定保留：Shadowsocks 是首个带真实 AEAD 加解密的出站，
+  与仅做可达性探测的 Direct/Relay 构成独立变化维度。
+- 具体 AEAD 加密实现位于 `nexus-outbound-shadowsocks`（portable=false）。
 
 ### 冻结契约（VirtualSubnet 静态路由 P1，PRODUCT §12.5）
 
@@ -158,7 +189,7 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 
 ### 冻结契约（tunnel 级双向打洞状态机 P4.2，PRODUCT §12.9.3）
 
-> 退役记录（2026-10-18，#1 运行时所有权归一）：本节提及的 `HolePuncher::punch` 已删除；tunnel 级打洞状态机本身（`VirtualSubnetTunnel` + `VirtualSubnetEvent::HolePunch*`）仍在生产使用，未受影响。
+> 退役记录（2026-10-18，#1 运行时所有权归一）：本节提及的 `HolePuncher::punch` 已删除；tunnel 级打洞状态机本身（`VirtualSubnetTunnel` + `VirtualSubnetEvent::HolePunch*`）仍在生产使用，未受影响。（2026-10-26 复核：`HolePuncher::punch` 已删除，非 deprecated；10-06 审计快照该行按过时登记，见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md`）
 
 - `HolePunchConfig { max_attempts: u32 = 10, attempt_timeout: Duration = 500ms,
   magic: [u8;4] = b"NXHP" }`（默认总预算 ~5s，与 `HolePuncher::punch` 对齐）。
@@ -192,6 +223,8 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 ### 冻结契约（NAT 类型驱动的路径选择 P4.2，PRODUCT §12.9.4）
 
 > 退役记录（2026-10-18，#1 运行时所有权归一）：本节记载的 `nat_path_decision` / `PathDecision` / `StunClient::detect_nat_type` 已删除；NAT 类型驱动的路径决策现由 `nexusd` 的 `should_punch`（`nat_stun.rs`）与 `nexus-nat-traversal` 承担，`nat.rs` 仅保留 `NatType` 等词汇。
+>
+> 归属更新（2026-10-26，P1 接缝①）：`NatType` / `StunMapping` 归属 `nexus-domain::nat`；本 crate 以 `pub use` 保旧路径 `nexus_connectivity::nat::{NatType, StunMapping}`（Allowed Dependencies 不变）。
 
 - `nexus-connectivity::nat` 新增纯函数决策表：
   `nat_path_decision(nat_type: NatType) -> PathDecision { Direct | Relay }`：
@@ -384,13 +417,15 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 本模块保持 portable、零真实网络、无 `unsafe`。
 ### 冻结契约（带宽控制 / QoS 令牌桶，scenarios/product/bandwidth_qos.toml）
 
-- `BandwidthLimit { max_bytes_per_sec: u64, burst_size: u64 }`：
+- `BandwidthLimit { max_bytes_per_sec: u64, burst_size: u64 }`（定义已下沉
+  `nexus-qos::bucket`，本 crate 经 `pub use` 重导出）：
   `new(max_bytes_per_sec, burst_size) -> Result<Self, QosError>`（速率必须 > 0、
   burst 必须 >= 1，否则 `QosError::InvalidLimit`）；`rate()` / `burst()` 只读。
 - `trait QosClock { fn now(&self) -> Duration }`：单调时钟抽象（可注入）；
   `MonotonicClock::new()` 基于 `std::time::Instant`，返回构造点起算的单调时长；
   测试 / E4 用显式 `Duration` 假时钟推进。
-- `TokenBucket`：`new(&BandwidthLimit)`（初始满桶 = burst_size）；
+- `TokenBucket`（定义已下沉 `nexus-qos::bucket`，本 crate 经 `pub use` 重导出）：
+  `new(&BandwidthLimit)`（初始满桶 = burst_size）；
   - `refill(now)`：按 `rate` 字节/秒线性补充，封顶 `burst_size`；时间回退不补充；
   - `try_consume(bytes, now) -> bool`：够令牌则扣减并返回 `true`，不够返回 `false`
     （不阻塞、不 sleep）；
@@ -406,70 +441,19 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
     命中限制返回 `false` 并计 `bytes_dropped`（不计入任何 up/down）；放行计入
     `bytes_allowed` 与该 tag 的 `up_bytes`（egress）/ `down_bytes`（ingress）；
   - `snapshot() -> QosStats` / `egress_tokens_remaining()` / `ingress_tokens_remaining()`。
-- `QosError { InvalidLimit { message } }`：类型化错误面，`Display` + `std::error::Error`。
+- `QosError { InvalidLimit { message } }`（定义已下沉 `nexus-qos::bucket`，本 crate 经
+  `pub use` 重导出）：类型化错误面，`Display` + `std::error::Error`。
 
 冻结语义：纯内存、纯同步、纯函数骨架；不接真实 socket/TUN/内核 tc；不引入 `time` crate，
 仅 std（`std::time::{Duration, Instant}`）；无 `unsafe`、库代码不 panic/unwrap/expect；
 整形排队、优先级/公平排队、per-flow 分流、真实数据面挂接留 TODO。
 
-### 冻结契约（CAKE-like QoS 调度器：DRR 公平队列 + 整形，scenarios/product/qos_cake.toml）
+### 调度器已迁 `nexus-qos`（`cake`，2026-10-28，P3）
 
-用户态 CAKE-like 调度器（MVP）：per-flow DRR 公平队列 + 三级严格优先级 +
-per-egress 令牌桶整形。纯内存、纯同步；不接真实 TUN/socket（留接入点）；
-`qos.rs` 的令牌桶冻结契约保持不动（本模块复用 `BandwidthLimit` / `TokenBucket`）。
-
-- `FiveTuple { src_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, proto: u8 }`：
-  `flow_id() -> FlowId(u64)` 为同进程内确定性哈希（`DefaultHasher`，不持久化）；
-  `proto`：6=TCP / 17=UDP / 1=ICMP。
-- `Priority { High, Medium, Low }`：`Ord` 为 High < Medium < Low（值越小越优先）。
-- `CakeConfig`：
-  - 字段：`quantum: u32`（默认 1514）、`flow_timeout: Duration`（默认 60s）、
-    `max_queue_packets: usize`（默认 64，单流队列上限）、
-    `max_packet_bytes: u64`（默认 65535，超限整包丢弃）、
-    `high_priority_ports: Vec<u16>`（默认 `[22, 53, 3389]`）、
-    `low_priority_ports: Vec<u16>`（默认空）、
-    `rate_limit: Option<BandwidthLimit>`（per-egress 整形；`None` = 不整形）。
-  - `validate() -> Result<(), QosError>`：`quantum` ∈ [64, 65536]、
-    `flow_timeout` > 0、`max_queue_packets` >= 1、
-    `max_packet_bytes` ∈ [1, 16MB]，否则 `QosError::InvalidLimit`；
-    high/low 端口交集非空同样拒绝（复用 `InvalidLimit`，message 说明原因，
-    不新增错误变体以保持冻结错误面）。
-- `CakeScheduler`：
-  - `new(&CakeConfig) -> Result<Self, QosError>`（先 `validate`）。
-  - `enqueue(&FiveTuple, bytes: u64, now: Duration) -> EnqueueDecision`：
-    `Admitted { flow: FlowId, priority: Priority }` /
-    `DroppedQueueFull`（该流队列已达 `max_queue_packets`）/
-    `DroppedOversize`（`bytes > max_packet_bytes`）；dropped 记入统计。
-    新流按端口规则定优先级：`proto == 1`（ICMP）恒 High；源/目的任一端口命中
-    high 列表 → High；命中 low 列表 → Low；否则 Medium。流优先级在流生命周期内不变。
-  - `dequeue(now: Duration) -> Option<(FlowId, u64)>`：类间严格优先级
-    （High 类有 active 流时不看 Medium/Low）；类内 DRR（每流每访问
-    `deficit += quantum`，队首包 `len <= deficit` 则发送并 `deficit -= len`；
-    单包 > quantum 时 deficit 跨轮累积直到能发）；整形门控：发送前
-    `try_consume(len, now)`，令牌不足则**不**出队、**不**扣 deficit、
-    **不**跳过找更小的包，直接返回 `None`（调用方稍后重试）；
-    每次调用最多出一包。
-  - `reap(now: Duration) -> usize`：回收 `now - last_seen >= flow_timeout`
-    的流（队内残包计入 dropped），返回回收流数。
-  - `flow_count() -> usize` / `snapshot() -> CakeStats`。
-  - `CakeStats { packets_enqueued, packets_dequeued, packets_dropped, bytes_dequeued,
-    per_priority_dequeued: [u64; 3], flows_current, flows_reaped }`：
-    `per_priority_dequeued` 下标按 `High=0, Medium=1, Low=2`。
-- 不变量：
-  - 同优先级、持续 backlog 的流，出队字节数之差有界（DRR 公平；quantum 相同）；
-  - High 类有 backlog 时 Medium/Low 不出包（严格优先级）；
-  - 整形开启时，任意 1 秒窗口出队字节 ≤ rate + burst（令牌桶语义）；
-  - `dequeue` 返回 `None` 当且仅当：全部 active 为空，或整形令牌不足；
-  - 纯内存、纯同步；时钟由调用方 `now: Duration` 显式传入；无 `unsafe`；
-    库代码不 panic/unwrap/expect（`new` 失败走 `Result`）。
-- `daemon.toml [qos]` 映射（`apps/nexusd` 解析；热加载分类见该 crate 契约）：
-  `enabled`（默认 false）、`mesh_upload_mbps` / `proxy_upload_mbps`
-  （默认 0 = 不限）、`quantum`（默认 1514）、`high_priority_ports`
-  （默认 `"22,53,3389"`）。`enabled = false` 时调度器不实例化（零开销）。
-
-冻结语义：不接真实 TUN/socket；不做多路径；IPv4/IPv6 五元组均支持（`IpAddr`）；
-TUN 接入点 = 调用方把包映射为 `(FiveTuple, bytes)` 入队、出队后按 `(FlowId, bytes)`
-取回包缓冲（包缓冲所有权在调用方，调度器只处理流 ID 与字节数）。
+调度器（`FiveTuple` / `Priority` / `CakeConfig` / `EnqueueDecision` / `CakeScheduler` /
+`CakeStats`）已整体迁 `nexus-qos`（`cake`），本 crate 仅经 `QosController` 消费其令牌桶，
+并以 `pub use nexus_qos::cake;` 保持旧路径源码兼容；
+（冻结契约全文见 `crates/nexus-qos/MODULE.md`）。
 
 ### 冻结契约（数据面真实挂接 dataplane-pipeline，PRODUCT §12.41，scenarios/product/pipeline_*.toml）
 
@@ -547,11 +531,15 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
 
 v9 §15.2/§15.3（Connectivity link 范围，`feature/crash-recovery`）：
 
-- Durable 状态：`LinkMarker { link_id, kind, locator, established_at_unix, stale }`。
-  文件实现由 Composition Root 注入（`LinkMarkerStore` trait）。
-- 诚实语义：进程死亡 = socket 死亡。冷启动 `reconcile_link_markers` 把未 stale 的
-  marker 标为 stale（触发重建），不许假装链路还活着；已 stale → 跳过；幂等。
-- 本函数只标记不建连；重建是 connectivity 建立路径的职责。
+- 链路 durable marker 已迁 `nexus-session::link_marker`（2026-10-26，P1′ 接缝④）：
+  `LinkMarker` / `LinkMarkerStore` / `LinkReconcileReport` / `reconcile_link_markers`
+  连同 `links.json` 的编解码归属一并移出；**本 crate 不再持久化链路状态**，也不再
+  提供上述 4 个公开项。
+- 诚实语义（不变）：进程死亡 = socket 死亡。冷启动 reconcile 把未 stale 的 marker
+  标为 stale（触发重建），不许假装链路还活着；已 stale → 跳过；幂等；只标记不建连，
+  重建是建连路径（`apps/nexusd` 装配面）的职责。
+- `LinkKind`（运行时链路激活的候选类型）仍留在本 crate，与持久记录的
+  `LinkMarkerKind` 不同层；前者供 CLI / proxy 使用。
 
 ## Platform Constraints
 

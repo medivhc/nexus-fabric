@@ -3,6 +3,7 @@ id = "product.n2-session-watch-not-found"
 title = "session watch 未知 id：结构化 NOT_FOUND（不伪造会话）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#16-n2-resource-access"
+carrier = "v9-connectivity"
 
 [given]
 # N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。

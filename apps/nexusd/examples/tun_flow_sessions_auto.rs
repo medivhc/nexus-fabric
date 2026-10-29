@@ -99,6 +99,7 @@ fn make_dataplane() -> (Dataplane, Arc<Mutex<MockTun>>) {
     let dp = Dataplane::new(
         Box::new(SharedTun(Arc::clone(&mock))),
         DataplaneConfig::default(),
+        None,
     )
     .expect("dataplane");
     (dp, mock)
@@ -151,7 +152,7 @@ fn provider_flow() -> (String, Option<String>, usize, u64, u64, u64, String) {
     dp.process_one().expect("second flow");
     let other_calls = dp.flow_sessions_state().planner_calls;
 
-    let key = nexus_flow_session::FlowKey::parse_ipv4(&first).expect("flow key");
+    let key = nexus_flow_session::FlowKey::parse(&first).expect("flow key");
     let outbound = dp.flow_planned_provider(&key).unwrap_or_default();
     let engine = DomainRuleEngine::from_yaml(YAML_ONE_PROVIDER).expect("explain engine");
     let req = RouteRequest {
@@ -202,6 +203,14 @@ fn enabled_no_provider() -> (String, bool, u64, u64, u64) {
         if !rst {
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+    // D2 后 RST 在 SYN 当场发出，建立失败可能晚于 RST 到达观测点；
+    // 三条冻结期望（rst / session_establish_failed / direct_attempts）不变，
+    // 因此继续有界泵送直到失败计数可见（不改变断言值，只改变采样时机）。
+    let fail_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while dp.flow_establish_failures() == 0 && std::time::Instant::now() < fail_deadline {
+        dp.process_one().expect("pump establish");
+        std::thread::sleep(Duration::from_millis(2));
     }
     let failures = dp.flow_establish_failures();
     let direct_attempts = dp.stats().direct_tcp_dial_ok;

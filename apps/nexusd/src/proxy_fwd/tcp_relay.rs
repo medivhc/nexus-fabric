@@ -1,9 +1,9 @@
-//! TCP 转发：smoltcp 终结 → 代理 dial → 双向中继（P1）。
+//! TCP 转发：smoltcp 终结 → dialer.dial_tcp → 双向中继（P1）。
 //!
 //! 设计：
 //! - `ProxyEngine` 持有 `TcpTerminator`（accounting 层面唯一归属；`TcpForwarder`
 //!   只借用终结器，不再自己持有）；
-//! - `Syn{stream_id, dst}` → worker 线程 dial 代理（不阻塞 dataplane）；
+//! - `Syn{stream_id, dst}` → worker 线程按 tag 取 dialer 并 dial（不阻塞 dataplane）；
 //! - dial 成功 → 中继线程双向泵字节；proxy→TUN 经 mpsc 回 dataplane 线程
 //!   （TUN 所有权仍在 dataplane，D1 不变量）；
 //! - dial/中继失败 → 计数 + RST/关闭，不 panic；
@@ -12,32 +12,56 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use nexus_projection::tcp::{TcpEvent, TcpTerminator};
 
-use super::ss_std::SsTcpClient;
-use super::{ProxyDialConfig, ProxyFwdStats};
+use super::ProxyFwdStats;
+use super::adapter::{OutboundDialer, OutboundError, TunnelStream};
 
-/// dial 失败事件（ProxyEngine 转为 `ProxyStreamEvent::Failed`）。
+/// 中继读超时（用于定期检查关闭）。
+const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// 中继写超时（防止 proxy 侧背压无限阻塞，spec §11）。
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 中继读缓冲（spec §11：8192 B）。
+const RELAY_BUF_LEN: usize = 8192;
+/// dial 窗口期单流缓冲上限（字节）。
+///
+/// 取 64 KiB：smoltcp 终结器的接收窗口为 16 KiB，正常客户端在拨号完成前
+/// 最多只能塞进一个窗口的请求字节；64 KiB 给了重传/多段合并足够余量，
+/// 同时保证单流占用有硬上限。
+const MAX_DIAL_BUFFER_PER_STREAM: usize = 64 * 1024;
+/// dial 窗口期全部待拨号流的缓冲合计上限（字节）。
+///
+/// 单流上限之外再加总量上限，避免「连接表上限 × 单流上限」的乘积占用；
+/// 超出时只终止触发超限的那条流。
+const MAX_DIAL_BUFFER_TOTAL: usize = 1024 * 1024;
+
+/// dial 失败事件（带结构化分类；ProxyEngine 转为 `ProxyStreamEvent::Failed`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpFailure {
     /// stream_id。
     pub stream_id: u32,
-    /// 原因。
-    pub reason: String,
+    /// dialer.kind() 文本。
+    pub kind: String,
+    /// 当前出站 tag。
+    pub tag: String,
+    /// `OutboundError::reason()`。
+    pub error: &'static str,
+    /// 已截断（128B）+ 去控制字符。
+    pub detail: String,
 }
 
 /// 中继线程 → dataplane 线程的事件。
 #[derive(Debug)]
 pub enum TcpFwdEvent {
-    /// dial 完成（成功带流，失败带 stream_id）。
+    /// dial 完成（成功带流，失败带 typed error）。
     DialDone {
         stream_id: u32,
-        result: Result<RelayHandle, String>,
+        result: Result<RelayHandle, OutboundError>,
     },
     /// proxy 侧收到数据 → 注入 smoltcp。
     ProxyData { stream_id: u32, bytes: Vec<u8> },
@@ -61,24 +85,12 @@ enum RelayCmd {
     Close,
 }
 
-/// dial 超时。
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// 中继读超时（用于定期检查关闭）。
-const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
-/// dial 窗口期单流缓冲上限（字节）。
-///
-/// 取 64 KiB：smoltcp 终结器的接收窗口为 16 KiB，正常客户端在拨号完成前
-/// 最多只能塞进一个窗口的请求字节；64 KiB 给了重传/多段合并足够余量，
-/// 同时保证单流占用有硬上限。
-const MAX_DIAL_BUFFER_PER_STREAM: usize = 64 * 1024;
-/// dial 窗口期全部待拨号流的缓冲合计上限（字节）。
-///
-/// 单流上限之外再加总量上限，避免「连接表上限 × 单流上限」的乘积占用；
-/// 超出时只终止触发超限的那条流。
-const MAX_DIAL_BUFFER_TOTAL: usize = 1024 * 1024;
-
-/// 拨号函数（测试可注入；生产用 `dial_through_proxy`）。
-type Dialer = Arc<dyn Fn(&ProxyDialConfig, SocketAddr) -> io::Result<ProxyStream> + Send + Sync>;
+/// 拨号函数（测试可注入；生产 = `dialer.dial_tcp(target)`）。
+type Dialer = Arc<
+    dyn Fn(Arc<dyn OutboundDialer>, SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError>
+        + Send
+        + Sync,
+>;
 
 /// 拨号窗口期内的一条待拨号流。
 #[derive(Debug)]
@@ -89,11 +101,15 @@ struct PendingDial {
     /// （缓冲已丢弃，不再 flush），`Some(false)` 表示 FIN（拨号成功后
     /// flush 完再关闭写端）。
     closed: Option<bool>,
+    /// 该流 Syn 时刻的出站 tag（事件分类用）。
+    tag: String,
+    /// 该流 Syn 时刻的 dialer kind 文本。
+    kind: String,
 }
 
 /// TCP 转发器（dataplane 线程拥有）。
 pub struct TcpForwarder {
-    outbounds: HashMap<String, ProxyDialConfig>,
+    outbounds: HashMap<String, Arc<dyn OutboundDialer>>,
     /// 当前正在喂给终结器的包的出站 tag（Syn 事件消费）。
     current_tag: Option<String>,
     failures: Vec<TcpFailure>,
@@ -112,12 +128,15 @@ pub struct TcpForwarder {
 }
 
 impl TcpForwarder {
-    pub fn new(outbounds: HashMap<String, ProxyDialConfig>) -> Self {
-        Self::with_dialer(outbounds, Arc::new(dial_through_proxy))
+    pub fn new(outbounds: HashMap<String, Arc<dyn OutboundDialer>>) -> Self {
+        Self::with_dialer(
+            outbounds,
+            Arc::new(|dialer: Arc<dyn OutboundDialer>, target: SocketAddr| dialer.dial_tcp(target)),
+        )
     }
 
     /// 构造可注入拨号实现的转发器（单测用于精确控制拨号窗口期）。
-    fn with_dialer(outbounds: HashMap<String, ProxyDialConfig>, dialer: Dialer) -> Self {
+    fn with_dialer(outbounds: HashMap<String, Arc<dyn OutboundDialer>>, dialer: Dialer) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         Self {
             outbounds,
@@ -144,8 +163,7 @@ impl TcpForwarder {
         // 先排空 proxy 事件（dial 完成/数据/关闭）。
         self.drain_events(terminator);
         // P8：drain_events 期间终结器产出的回程包不依赖本次是否还有 TcpEvent，
-        // 必须先于本次新包写回（生产序 == 写回序；否则 pending 的旧包会被本次
-        // 新包反超，r8 抓包的尾段-先于-头段即此形）。
+        // 必须先于本次新包写回（生产序 == 写回序）。
         let mut out = std::mem::take(&mut self.pending_tun);
         self.current_tag = Some(outbound_tag.to_string());
         // 喂给 smoltcp。
@@ -175,20 +193,38 @@ impl TcpForwarder {
             match event {
                 TcpFwdEvent::DialDone { stream_id, result } => match result {
                     Ok(handle) => self.on_dial_ok(stream_id, handle),
-                    Err(e) => {
+                    Err(error) => {
+                        let (tag, kind) = self.pending.get(&stream_id).map_or_else(
+                            || ("-".to_string(), "unknown".to_string()),
+                            |pending| (pending.tag.clone(), pending.kind.clone()),
+                        );
+                        let detail = error.detail();
+                        let reason = error.reason();
                         self.stats.tcp_dials_failed += 1;
                         self.drop_pending(stream_id);
                         self.failures.push(TcpFailure {
                             stream_id,
-                            reason: e.clone(),
+                            kind: kind.clone(),
+                            tag: tag.clone(),
+                            error: reason,
+                            detail: detail.clone(),
                         });
-                        // RST smoltcp 侧。
-                        let pkts = terminator.handle_fabric_rst(stream_id);
+                        // RST smoltcp 侧；终结器不产出可写回 RST 时用 craft 兜底。
+                        let four = terminator.lookup_id(stream_id);
+                        let mut pkts = terminator.handle_fabric_rst(stream_id);
+                        if !has_rst(&pkts)
+                            && let Some(four) = four
+                        {
+                            pkts.push(craft_rst(&four));
+                        }
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
-                        eprintln!("[proxy-fwd] dial failed for stream {stream_id}: {e}");
+                        eprintln!(
+                            "[proxy-fwd] event=dial_failed stream_id={stream_id} kind={kind} tag={tag} error={reason} detail=\"{detail}\""
+                        );
                     }
                 },
                 TcpFwdEvent::ProxyData { stream_id, bytes } => {
+                    self.stats.tcp_bytes_down += bytes.len() as u64;
                     let pkts = terminator.handle_fabric_data(stream_id, &bytes);
                     if !pkts.is_empty() {
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
@@ -207,8 +243,6 @@ impl TcpForwarder {
                 }
                 TcpFwdEvent::TunPackets(pkts) => {
                     // 转发给调用方（由 handle_packet/poll 的调用方写 TUN）。
-                    // 调用入口在 drain_events 返回后立即把本队列泵进输出
-                    // （见 handle_packet/poll），不依赖是否再产出 TcpEvent。
                     self.pending_tun.extend(pkts);
                 }
             }
@@ -224,40 +258,48 @@ impl TcpForwarder {
     ) {
         match event {
             TcpEvent::Syn { stream_id, dst, .. } => {
-                let target = SocketAddr::V4(dst);
+                let target = dst;
                 self.stats.tcp_streams += 1;
+                let syn_tag = self.current_tag.clone().unwrap_or_default();
+                let syn_kind = self
+                    .outbounds
+                    .get(&syn_tag)
+                    .map_or_else(|| "unknown".to_string(), |d| d.kind().as_str().to_string());
                 self.pending.insert(
                     stream_id,
                     PendingDial {
                         buffered: Vec::new(),
                         closed: None,
+                        tag: syn_tag,
+                        kind: syn_kind,
                     },
                 );
-                let Some(config) = self
+                let Some(dialer) = self
                     .current_tag
                     .as_deref()
                     .and_then(|tag| self.outbounds.get(tag))
                     .cloned()
                 else {
+                    let tag = self.current_tag.clone().unwrap_or_default();
                     self.drop_pending(stream_id);
                     self.stats.tcp_dials_failed += 1;
-                    let reason = format!(
-                        "unknown outbound tag '{}'",
-                        self.current_tag.as_deref().unwrap_or("")
-                    );
-                    self.failures.push(TcpFailure { stream_id, reason });
+                    let detail = format!("unknown outbound tag '{tag}'");
+                    self.failures.push(TcpFailure {
+                        stream_id,
+                        kind: "unknown".to_string(),
+                        tag,
+                        error: "config",
+                        detail,
+                    });
                     out.extend(terminator.handle_fabric_rst(stream_id));
                     return;
                 };
                 let tx = self.event_tx.clone();
-                let dialer = Arc::clone(&self.dialer);
+                let dialer_fn = Arc::clone(&self.dialer);
                 std::thread::spawn(move || {
-                    let result = dialer(&config, target)
+                    let result = dialer_fn(dialer, target)
                         .map(|stream| spawn_relay(stream_id, stream, tx.clone()));
-                    let _ = tx.send(TcpFwdEvent::DialDone {
-                        stream_id,
-                        result: result.map_err(|e| e.to_string()),
-                    });
+                    let _ = tx.send(TcpFwdEvent::DialDone { stream_id, result });
                 });
             }
             TcpEvent::Data {
@@ -265,6 +307,7 @@ impl TcpForwarder {
             } => {
                 if let Some(relay) = self.relays.get(&stream_id) {
                     // 非阻塞发送（中继线程可能已退出，忽略错误）。
+                    self.stats.tcp_bytes_up += bytes.len() as u64;
                     let _ = relay.tx.send(RelayCmd::Data(bytes));
                 } else if let Some(entry) = self.pending.get_mut(&stream_id) {
                     if entry.closed.is_some() {
@@ -274,8 +317,6 @@ impl TcpForwarder {
                         || self.pending_buffered_bytes + bytes.len() > MAX_DIAL_BUFFER_TOTAL
                     {
                         // 超限：丢弃本流全部缓冲并 RST 该流（fail-fast）。
-                        // 静默丢一段会让上游收到带洞的字节流（TCP 语义上更糟），
-                        // 所以选择断流，并显式计数丢弃字节与重置流数。
                         let dropped = entry.buffered.len() + bytes.len();
                         self.pending_buffered_bytes = self
                             .pending_buffered_bytes
@@ -301,8 +342,6 @@ impl TcpForwarder {
                     let _ = relay.tx.send(RelayCmd::Close);
                 }
                 // 拨号窗口期内先到的 FIN/RST：记录状态，等 DialDone 收尾。
-                // FIN：保留缓冲，拨号成功后 flush 再关闭写端；
-                // RST：立即丢弃缓冲并计数，拨号成功后只关闭中继。
                 if let Some(entry) = self.pending.get_mut(&stream_id) {
                     if reset {
                         self.pending_buffered_bytes = self
@@ -313,7 +352,6 @@ impl TcpForwarder {
                     }
                     entry.closed = Some(reset);
                 }
-                // smoltcp 侧已关闭，无需额外动作。
                 let _ = reset;
             }
             TcpEvent::TunPacket(pkt) => {
@@ -328,6 +366,7 @@ impl TcpForwarder {
     /// 先到 RST 则只关闭中继。
     fn on_dial_ok(&mut self, stream_id: u32, handle: RelayHandle) {
         self.stats.tcp_dials_ok += 1;
+        self.stats.tcp_streams_ok += 1;
         let Some(entry) = self.pending.remove(&stream_id) else {
             // 流在窗口期内已被 RST/超限清理：关闭中继，不留僵尸条目。
             let _ = handle.tx.send(RelayCmd::Close);
@@ -344,12 +383,14 @@ impl TcpForwarder {
             Some(false) => {
                 // FIN 先到：先把请求字节送上游，再关闭写端。
                 if !entry.buffered.is_empty() {
+                    self.stats.tcp_bytes_up += entry.buffered.len() as u64;
                     let _ = handle.tx.send(RelayCmd::Data(entry.buffered));
                 }
                 let _ = handle.tx.send(RelayCmd::Close);
             }
             None => {
                 if !entry.buffered.is_empty() {
+                    self.stats.tcp_bytes_up += entry.buffered.len() as u64;
                     let _ = handle.tx.send(RelayCmd::Data(entry.buffered));
                 }
                 self.relays.insert(stream_id, handle);
@@ -377,86 +418,36 @@ impl TcpForwarder {
     }
 }
 
-/// 经代理 dial 到目标，返回可读写的字节流。
-fn dial_through_proxy(config: &ProxyDialConfig, target: SocketAddr) -> io::Result<ProxyStream> {
-    match config {
-        ProxyDialConfig::Socks5 { server } => {
-            let cfg = nexus_proxy_transport::Socks5ProxyConfig::new(*server, None);
-            nexus_proxy_transport::socks5_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Trojan { server, password } => {
-            let cfg = nexus_proxy_transport::TrojanProxyConfig::new(*server, password.clone());
-            nexus_proxy_transport::trojan_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::TrojanTls {
-            server,
-            password,
-            sni,
-            skip_verify,
-        } => {
-            let mut cfg =
-                nexus_proxy_transport::TrojanTlsConfig::new(*server, password.clone(), sni.clone());
-            cfg.skip_cert_verify = *skip_verify;
-            nexus_proxy_transport::trojan_tls_connect(&cfg, target)
-                .map(|s| ProxyStream::Tls(Box::new(s)))
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Shadowsocks {
-            server, password, ..
-        } => {
-            // 标准 ss TCP（ss_std），非自定义 SsTransport。
-            SsTcpClient::connect(*server, password, target, DIAL_TIMEOUT)
-                .map(ProxyStream::Ss)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-    }
-}
-
-/// 统一代理字节流。
-enum ProxyStream {
-    Tcp(TcpStream),
-    Tls(Box<nexus_proxy_transport::TlsStream>),
-    Ss(SsTcpClient),
-}
-
-impl ProxyStream {
-    fn set_read_timeout(&mut self, dur: Option<Duration>) -> io::Result<()> {
-        match self {
-            Self::Tcp(s) => s.set_read_timeout(dur),
-            Self::Tls(s) => s.get_mut().set_read_timeout(dur),
-            Self::Ss(_) => {
-                // SsTcpClient 内部管理；本期通过 read 超时模拟。
-                let _ = dur;
-                Ok(())
-            }
-        }
-    }
-}
-
 /// 启动中继线程；返回 dataplane 侧句柄。
-fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>) -> RelayHandle {
+fn spawn_relay(
+    stream_id: u32,
+    mut stream: Box<dyn TunnelStream>,
+    tx: Sender<TcpFwdEvent>,
+) -> RelayHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RelayCmd>();
     std::thread::spawn(move || {
-        // 设置读超时以便定期检查命令。
+        // 读超时用于定期检查命令；写超时防背压无限阻塞。
         let _ = stream.set_read_timeout(Some(RELAY_READ_TIMEOUT));
-        let mut buf = [0u8; 8192];
+        let _ = stream.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
+        let mut buf = [0u8; RELAY_BUF_LEN];
+        let mut up_bytes = 0u64;
+        let mut down_bytes = 0u64;
+        let mut reset = false;
         loop {
             // 先检查关闭命令（非阻塞）。
             match cmd_rx.try_recv() {
                 Ok(RelayCmd::Close) | Err(mpsc::TryRecvError::Disconnected) => break,
                 Ok(RelayCmd::Data(data)) => {
-                    if write_proxy(&mut stream, &data).is_err() {
+                    up_bytes += data.len() as u64;
+                    if stream.write_all(&data).is_err() {
+                        reset = true;
                         break;
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             // 从 proxy 读。
-            match read_proxy(&mut stream, &mut buf) {
+            match stream.read(&mut buf) {
                 Ok(0) => {
                     // EOF：正常关闭。
                     let _ = tx.send(TcpFwdEvent::ProxyClosed {
@@ -466,6 +457,7 @@ fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>)
                     break;
                 }
                 Ok(n) => {
+                    down_bytes += n as u64;
                     let _ = tx.send(TcpFwdEvent::ProxyData {
                         stream_id,
                         bytes: buf[..n].to_vec(),
@@ -478,6 +470,7 @@ fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>)
                     continue;
                 }
                 Err(_) => {
+                    reset = true;
                     let _ = tx.send(TcpFwdEvent::ProxyClosed {
                         stream_id,
                         reset: true,
@@ -486,46 +479,139 @@ fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>)
                 }
             }
         }
+        if !reset {
+            // 客户端正常关闭 → 半关闭写方向（AnyTLS 在此发 Fin 帧）。
+            let _ = stream.shutdown();
+        }
+        eprintln!(
+            "[proxy-fwd] event=relay_closed stream_id={stream_id} reset={reset} up_bytes={up_bytes} down_bytes={down_bytes}"
+        );
     });
     RelayHandle { tx: cmd_tx }
 }
 
-/// 向 proxy 写数据。
-fn write_proxy(stream: &mut ProxyStream, data: &[u8]) -> io::Result<()> {
-    match stream {
-        ProxyStream::Tcp(s) => s.write_all(data),
-        ProxyStream::Tls(s) => s.write_all(data),
-        ProxyStream::Ss(c) => c
-            .write_all(data)
-            .map_err(|e| io::Error::other(e.to_string())),
+/// 构造正确寻址的 TCP RST（src=原始目的，dst=客户端）。
+///
+/// dial 失败时终结器偶尔不产出可写回的 RST（socket 已随 RST 移除 → fixup 查不到
+/// 连接）；此时用本函数兜底，保证 `tcp_dials_failed` 与线上 RST 一致（§5.8）。
+fn craft_rst(four: &nexus_projection::tcp::FourTuple) -> Vec<u8> {
+    use nexus_projection::ip::tcp_udp_checksum_v6;
+    use nexus_projection::tcp::{ip_checksum, tcp_checksum};
+    match (four.dst_ip, four.src_ip) {
+        (std::net::IpAddr::V4(src_ip), std::net::IpAddr::V4(dst_ip)) => {
+            let mut pkt = vec![0u8; 40];
+            pkt[0] = 0x45;
+            pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+            pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+            pkt[8] = 64;
+            pkt[9] = 6;
+            pkt[12..16].copy_from_slice(&src_ip.octets());
+            pkt[16..20].copy_from_slice(&dst_ip.octets());
+            pkt[20..22].copy_from_slice(&four.dst_port.to_be_bytes());
+            pkt[22..24].copy_from_slice(&four.src_port.to_be_bytes());
+            pkt[32] = 0x50;
+            pkt[33] = 0x14; // RST | ACK
+            pkt[34..36].copy_from_slice(&8192u16.to_be_bytes());
+            let c = ip_checksum(&pkt[..20]);
+            pkt[10..12].copy_from_slice(&c.to_be_bytes());
+            let tc = tcp_checksum(src_ip.octets(), dst_ip.octets(), &pkt[20..]);
+            pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+            pkt
+        }
+        (std::net::IpAddr::V6(src_ip), std::net::IpAddr::V6(dst_ip)) => {
+            let mut pkt = vec![0u8; 60]; // 40 IPv6 + 20 TCP
+            pkt[0] = 0x60;
+            pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+            pkt[6] = 6;
+            pkt[7] = 64;
+            pkt[8..24].copy_from_slice(&src_ip.octets());
+            pkt[24..40].copy_from_slice(&dst_ip.octets());
+            pkt[40..42].copy_from_slice(&four.dst_port.to_be_bytes());
+            pkt[42..44].copy_from_slice(&four.src_port.to_be_bytes());
+            pkt[52] = 0x50;
+            pkt[53] = 0x14; // RST | ACK
+            pkt[54..56].copy_from_slice(&8192u16.to_be_bytes());
+            let tc = tcp_udp_checksum_v6(src_ip, dst_ip, 6, &pkt[40..]);
+            pkt[56..58].copy_from_slice(&tc.to_be_bytes());
+            pkt
+        }
+        _ => Vec::new(),
     }
 }
 
-/// 从 proxy 读数据。
-fn read_proxy(stream: &mut ProxyStream, buf: &mut [u8]) -> io::Result<usize> {
-    match stream {
-        ProxyStream::Tcp(s) => s.read(buf),
-        ProxyStream::Tls(s) => s.read(buf),
-        ProxyStream::Ss(c) => c.read(buf).map_err(|e| io::Error::other(e.to_string())),
-    }
+fn has_rst(pkts: &[Vec<u8>]) -> bool {
+    pkts.iter().any(|p| {
+        nexus_projection::tcp::parse_tcp(p).is_some_and(|(_, _, _, _, flags, _)| flags & 0x04 != 0)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
     use std::sync::Barrier;
 
     const STREAM: u32 = 7;
 
-    fn outbounds() -> HashMap<String, ProxyDialConfig> {
-        let mut m = HashMap::new();
-        m.insert(
-            "test".to_string(),
-            ProxyDialConfig::Socks5 {
-                server: "127.0.0.1:1".parse().expect("addr"),
-            },
-        );
+    /// 测试用 dialer（不真正拨号；真实拨号由注入的 `Dialer` 闭包完成）。
+    struct TagDialer;
+
+    impl OutboundDialer for TagDialer {
+        fn kind(&self) -> nexus_proxy_config::OutboundKind {
+            nexus_proxy_config::OutboundKind::Socks5
+        }
+
+        fn tag(&self) -> &str {
+            "test"
+        }
+
+        fn dial_tcp(&self, _target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError> {
+            Err(OutboundError::Closed)
+        }
+
+        fn udp_capability(&self) -> nexus_proxy_config::UdpCapability {
+            nexus_proxy_config::UdpCapability::Unsupported {
+                reason: nexus_proxy_config::UdpUnsupportedReason::NotWired,
+            }
+        }
+    }
+
+    /// 裸 TCP 隧道（测试上游替身）。
+    struct TestTunnel(TcpStream);
+
+    impl Read for TestTunnel {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for TestTunnel {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl TunnelStream for TestTunnel {
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.0.set_read_timeout(timeout)
+        }
+
+        fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.0.set_write_timeout(timeout)
+        }
+
+        fn shutdown(&mut self) -> io::Result<()> {
+            self.0.shutdown(std::net::Shutdown::Write)
+        }
+    }
+
+    fn outbounds() -> HashMap<String, Arc<dyn OutboundDialer>> {
+        let mut m: HashMap<String, Arc<dyn OutboundDialer>> = HashMap::new();
+        m.insert("test".to_string(), Arc::new(TagDialer));
         m
     }
 
@@ -536,12 +622,16 @@ mod tests {
         let upstream_addr = upstream.local_addr().expect("addr");
         let release = Arc::new(Barrier::new(2));
         let dial_release = Arc::clone(&release);
-        let dialer: Dialer = Arc::new(move |_cfg, _target| {
+        let dialer: Dialer = Arc::new(move |_dialer, _target| {
             dial_release.wait();
             if fail {
-                Err(io::Error::other("fake dial failure"))
+                Err(OutboundError::TcpConnect {
+                    kind: io::ErrorKind::Other,
+                })
             } else {
-                TcpStream::connect(upstream_addr).map(ProxyStream::Tcp)
+                TcpStream::connect(upstream_addr)
+                    .map(|s| Box::new(TestTunnel(s)) as Box<dyn TunnelStream>)
+                    .map_err(|e| OutboundError::Io { kind: e.kind() })
             }
         });
         let mut fwd = TcpForwarder::with_dialer(outbounds(), dialer);
@@ -556,7 +646,7 @@ mod tests {
             term,
             TcpEvent::Syn {
                 stream_id: STREAM,
-                dst: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+                dst: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
                 peer: "proxy".to_string(),
             },
             &mut out,

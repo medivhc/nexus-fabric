@@ -3,6 +3,7 @@ id = "product.cli-run-command"
 title = "nexus CLI run 命令：执行远程资源访问"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#cli"
+carrier = "v9-connectivity"
 
 [given]
 resource = "service"

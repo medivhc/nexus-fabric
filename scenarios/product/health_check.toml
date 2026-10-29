@@ -3,6 +3,7 @@ id = "product.health-check"
 title = "节点健康检查：连续失败计数与三态健康转移"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-health-check"
+carrier = "v9-connectivity"
 
 [given]
 probe_interval_ms = 1000

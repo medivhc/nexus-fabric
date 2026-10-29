@@ -3,6 +3,7 @@ id = "product.schedule-cli"
 title = "计划任务 CLI：at/every 注册、过去时间拒绝、取消、列表、tick 到期触发、持久化重载"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#14-schedule"
+carrier = "v9-connectivity"
 
 [when]
 command = "cargo run --quiet -p nexus --example schedule_cli_flow -- --json"

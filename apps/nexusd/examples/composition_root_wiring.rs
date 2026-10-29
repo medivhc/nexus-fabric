@@ -6,7 +6,7 @@
 //! - dns_toml_missing：缺失 → None；非法 → Err（R3）；
 //! - n1_assemble_ok：合法配置 → bridge 构造成功，route_count == 1（R1）；
 //! - n1_assemble_bad：非法配置 → Err（R1 降级路径）；
-//! - hot_reload_classify：network.toml → NeedsRestart；dns.toml → Hot（R5）。
+//! - hot_reload_classify：network.toml → NeedsRestart；dns.toml → NeedsRestart（R5/Q8）。
 
 use serde_json::json;
 
@@ -74,11 +74,17 @@ fn run() -> serde_json::Value {
 
     // R3：dns.toml 解析。
     let dns = dp_config.dns_config.as_ref().expect("dns_config");
-    let dns_upstream_ok = dns.upstream == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
-    let dns_suffix_ok = dns.mesh_suffix == "mesh";
-    let dns_hosts_ok = dns.hosts.len() == 1
-        && dns.hosts[0].0 == "myhost"
-        && dns.hosts[0].1.to_string() == "10.200.0.5";
+    let dns_upstream_ok = dns
+        .upstream
+        .servers
+        .iter()
+        .map(|addr| addr.ip().to_string())
+        .collect::<Vec<_>>()
+        == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
+    let dns_suffix_ok = dns.unified.mesh_suffix == "mesh";
+    let dns_hosts_ok = dns.unified.hosts.len() == 1
+        && dns.unified.hosts[0].0 == "myhost"
+        && dns.unified.hosts[0].1.to_string() == "10.200.0.5";
     // R3：缺失 → None。
     let dns_missing_none = {
         let d2 = std::env::temp_dir().join("nexusd-composition-root-e4-nodns");
@@ -91,7 +97,12 @@ fn run() -> serde_json::Value {
         cfg2.dns_config.is_none()
     };
     // R3：非法 → Err。
-    let dns_bad_err = config::parse_dns_toml("[dns]\nfake_ip_range = \"not-a-cidr\"\n").is_err();
+    let dns_bad_err = config::parse_dns_toml(
+        "[dns]\nupstream = [\"9.9.9.9\"]\nfake_ip_range = \"not-a-cidr\"\n",
+        None,
+        false,
+    )
+    .is_err();
 
     // R1：N1 装配成功（dial 尽力而为，无真实对端时 warn 不失败）。
     let n1_ok = match assembly::assemble_n1(
@@ -117,7 +128,8 @@ fn run() -> serde_json::Value {
         config::classify_change(&loaded, &loaded_new) == ChangeKind::NeedsRestart;
     let mut loaded_new2 = loaded.clone();
     loaded_new2.dns_toml = Some("[dns]\nupstream = [\"9.9.9.9\"]\n".to_string());
-    let hot_dns_hot = config::classify_change(&loaded, &loaded_new2) == ChangeKind::Hot;
+    let hot_dns_is_restart =
+        config::classify_change(&loaded, &loaded_new2) == ChangeKind::NeedsRestart;
 
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -131,23 +143,29 @@ fn run() -> serde_json::Value {
         && n1_ok
         && n1_bad_err
         && hot_network_restart
-        && hot_dns_hot;
+        && hot_dns_is_restart;
 
     json!({
         "verdict": if pass { "PASS" } else { "FAIL" },
         "wiring": {
             "mesh_cidrs": dp_config.mesh_cidrs.join(","),
             "mesh_cidrs_hardcoded_absent": hardcoded_absent,
-            "dns_upstream": dns.upstream.join(","),
-            "dns_mesh_suffix": dns.mesh_suffix,
-            "dns_hosts_count": dns.hosts.len(),
+            "dns_upstream": dns
+                .upstream
+                .servers
+                .iter()
+                .map(|addr| addr.ip().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            "dns_mesh_suffix": dns.unified.mesh_suffix,
+            "dns_hosts_count": dns.unified.hosts.len(),
             "dns_missing_is_none": dns_missing_none,
             "dns_bad_is_err": dns_bad_err,
             "n1_assemble_ok": n1_ok,
             "n1_route_count": if n1_ok { 1 } else { 0 },
             "n1_assemble_bad_is_err": n1_bad_err,
             "hot_network_is_restart": hot_network_restart,
-            "hot_dns_is_hot": hot_dns_hot,
+            "hot_dns_is_restart": hot_dns_is_restart,
         }
     })
 }

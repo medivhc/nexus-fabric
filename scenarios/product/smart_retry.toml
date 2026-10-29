@@ -3,6 +3,7 @@ id = "product.smart-retry"
 title = "智能重试：指数退避、错误分类与熔断器"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-smart-retry"
+carrier = "v9-connectivity"
 
 [given]
 max_attempts = 3

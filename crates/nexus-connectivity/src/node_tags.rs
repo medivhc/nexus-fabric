@@ -1,6 +1,6 @@
 //! Mesh 节点分组标签（内存骨架）。
 //!
-//! 本模块是 delivery 层共享底座的节点标签匹配骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的节点标签匹配骨架：
 //! - **标签**：每个节点可打多个 `NodeTag`（key=value 对，如 `region:us`、`role:db`）；
 //! - **节点信息**：`NodeInfo` 聚合 node_id + virtual_ip + tags；
 //! - **过滤**：`TagFilter` 描述单个过滤条件（精确匹配或存在性匹配）；

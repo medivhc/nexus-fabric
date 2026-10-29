@@ -168,7 +168,7 @@ impl PunchSocket for FakeSocket {
 }
 
 pub fn local_host(port: u16) -> LocalCandidates {
-    use nexus_connectivity::nat::NatType;
+    use nexus_domain::nat::NatType;
     LocalCandidates {
         host: vec![format!("10.0.0.2:{port}").parse().unwrap()],
         srflx: None,

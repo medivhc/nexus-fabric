@@ -3,6 +3,7 @@ id = "product.proxy-geoip-rule"
 title = "GEOIP 规则：按国家码匹配目标 IP 归属地"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 command = "proxy route"

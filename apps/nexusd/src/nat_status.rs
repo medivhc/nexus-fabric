@@ -5,8 +5,8 @@
 
 use std::sync::OnceLock;
 
-use nexus_connectivity::nat::NatType;
 use nexus_domain::NexusError;
+use nexus_domain::nat::NatType;
 use nexus_nat_wireup::{PunchPeerStatus, RelaySource, TunnelProto};
 use serde_json::{Value, json};
 

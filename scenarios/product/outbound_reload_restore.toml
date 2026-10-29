@@ -1,0 +1,34 @@
+schema_version = 1
+id = "product.outbound-reload-restore"
+title = "A10/R2-F12：proxy.yaml 被拒后原样恢复，outbound 状态面清标记（stale/file_rejected）"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#统一数据面装配"
+carrier = "n1-fabric"
+
+[given]
+# 可执行 E4（example outbound_reload_restore --json）：
+# - 临时配置目录（daemon.toml tun=false + proxy.yaml 合法 SS）；
+# - 启动真实 `nexusd <dir>`，等 READY 行拿 LocalAPI 地址；
+# - 覆盖 proxy.yaml 为畸形文件（含口令 marker）→ watcher 拒绝 →
+#   `outbound.file_rejected=true` 且 `stale=true`；
+# - 原样改回（与 active 逐字节相同）→ Applied 分支刷新 file 侧 →
+#   `file_rejected=false`、`stale=false`（R2-F12 修复点）。
+
+[when]
+command = "cargo run --quiet -p nexusd --example outbound_reload_restore -- --json"
+
+[[expect]]
+field = "rejected.file_rejected"
+equals = true
+
+[[expect]]
+field = "rejected.stale"
+equals = true
+
+[[expect]]
+field = "restored.file_rejected"
+equals = false
+
+[[expect]]
+field = "restored.stale"
+equals = false

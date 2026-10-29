@@ -3,6 +3,7 @@ id = "product.pipeline-firewall"
 title = "数据面管线：firewall 在隧道收发路径上真实拦截，traffic_stats 只计放行字节"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-dataplane-pipeline"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

@@ -11,6 +11,7 @@ members = [
   "crates/nexus-connectivity",
   "crates/nexus-ingress",
   "crates/nexus-proxy-config",
+  "crates/nexus-qos",
   "crates/nexus-proxy",
   "crates/nexus-dns",
   "crates/nexus-policy",

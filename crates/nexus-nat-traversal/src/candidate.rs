@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 
 /// 候选地址类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

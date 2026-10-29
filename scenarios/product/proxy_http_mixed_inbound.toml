@@ -3,16 +3,19 @@ id = "product.proxy-http-mixed-inbound"
 title = "HTTP/混合代理入站：同端口首字节分流 HTTP 代理（绝对 GET + CONNECT 隧道）与 SOCKS5 共存"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 inbound = "mixed (same TCP port: 0x05 -> SOCKS5, otherwise -> HTTP proxy)"
 egress = "real-outbound-connect (loopback origin)"
 origin = "loopback 127.0.0.1 local HTTP server replying 200"
 
-# 可执行 E4：本地 HTTP origin + Nexus 混合入站单会话闭环（accept 3 次，每会话一种协议）。
+# 可执行 E4：本地 HTTP origin + Nexus 混合入站单会话闭环（accept 4 次，每会话一种协议）。
 # (i) HTTP 绝对形式 GET 经混合端口 -> origin 200；
 # (ii) 同端口 CONNECT 隧道 -> 200 Connection Established -> 隧道内 GET 200；
-# (iii) 同端口 SOCKS5 握手 -> CONNECT -> GET 200（mixed 共存零回归）。
+# (iii) 同端口 SOCKS5 握手 -> CONNECT -> GET 200（mixed 共存零回归）；
+# (iv) 同端口 CONNECT 命中「trojan 出站 + 已关闭 locator」的失败会话 -> 502 + 零隧道字节
+#      （AC-11.2/11.3；既有三条成功断言零放宽）。
 [when]
 command = "cargo run --quiet -p nexus --example proxy_http_mixed_inbound -- --json"
 
@@ -38,6 +41,19 @@ equals = true
 
 [[expect]]
 field = "client.socks5_ok"
+equals = true
+
+# AC-11：失败会话的确定判据（502 之后不得有任何隧道字节）。
+[[expect]]
+field = "client.http_connect_failure_reply"
+equals = "HTTP/1.1 502 Bad Gateway"
+
+[[expect]]
+field = "client.http_connect_failure_tunnel_bytes"
+equals = 0
+
+[[expect]]
+field = "client.http_connect_failure_eof"
 equals = true
 
 [[expect]]

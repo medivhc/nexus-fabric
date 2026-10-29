@@ -28,6 +28,7 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # 那会撞冻结的 containment 不变量）。
 # 诚实边界：second_process_* / cache_second_run_tier / stale_fallback_verdict 要求宿主有可解析的
 # rust-analyzer；没有 RA 的宿主上本场景如实变红（与 provider_override_honored 同一口径）。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

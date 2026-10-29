@@ -21,7 +21,7 @@
 //! （E4 / `nexus network up`）的生命周期内此限制无影响。
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -98,12 +98,85 @@ impl std::fmt::Display for Ipv4Net {
     }
 }
 
+/// IPv6 子网（portable 最小实现：解析/包含/最长前缀匹配）。
+///
+/// 与 `Ipv4Net` 同构；`parse` 接受 `0..=128` 前缀，`[[vpi.routes6]]` 的
+/// `1..=128` 约束在配置层校验（见 `n1/config.rs`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Net {
+    network: Ipv6Addr,
+    prefix: u8,
+}
+
+impl Ipv6Net {
+    /// 解析 `"fd00::/64"`；非法输入返回 `InvalidConfig`。
+    pub fn parse(s: &str) -> Result<Self, N1Error> {
+        let (addr_s, prefix_s) = s.split_once('/').ok_or_else(|| {
+            N1Error::InvalidConfig(format!("subnet must be <addr>/<prefix>, got {s}"))
+        })?;
+        let addr: Ipv6Addr = addr_s
+            .parse()
+            .map_err(|_| N1Error::InvalidConfig(format!("bad ipv6 addr in subnet: {s}")))?;
+        let prefix: u8 = prefix_s
+            .parse()
+            .map_err(|_| N1Error::InvalidConfig(format!("bad prefix in subnet: {s}")))?;
+        if prefix > 128 {
+            return Err(N1Error::InvalidConfig(format!("prefix > 128: {s}")));
+        }
+        let mask = if prefix == 0 {
+            0u128
+        } else {
+            u128::MAX << (128 - prefix)
+        };
+        let network = Ipv6Addr::from(u128::from(addr) & mask);
+        Ok(Self { network, prefix })
+    }
+
+    /// 是否包含该地址。
+    #[must_use]
+    pub fn contains(&self, ip: Ipv6Addr) -> bool {
+        let mask = if self.prefix == 0 {
+            0u128
+        } else {
+            u128::MAX << (128 - self.prefix)
+        };
+        (u128::from(ip) & mask) == u128::from(self.network)
+    }
+
+    /// 前缀长度（最长前缀匹配用）。
+    #[must_use]
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix
+    }
+
+    /// 网络地址（由路由派生 mesh CIDR 用）。
+    #[must_use]
+    pub fn network_addr(&self) -> Ipv6Addr {
+        self.network
+    }
+}
+
+impl std::fmt::Display for Ipv6Net {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
 /// 静态路由条目：子网 → 对端（M3：首期静态配置；locator→identity 映射属
 /// Network Resource 领域信息，经配置表达，不在本 crate 自建注册表）。
 #[derive(Debug, Clone)]
 pub struct Ipv4Route {
     /// 目的子网。
     pub subnet: Ipv4Net,
+    /// 下一跳对端。
+    pub peer: N1PeerId,
+}
+
+/// IPv6 静态路由条目：子网 → 对端（与 `Ipv4Route` 同构；M1 v6 单播互通用）。
+#[derive(Debug, Clone)]
+pub struct Ipv6Route {
+    /// 目的子网。
+    pub subnet: Ipv6Net,
     /// 下一跳对端。
     pub peer: N1PeerId,
 }
@@ -692,6 +765,38 @@ mod tests {
         assert!(Ipv4Net::parse("10.144.0.0/33").is_err());
         assert!(Ipv4Net::parse("999.1.1.0/24").is_err());
         assert!(Ipv4Net::parse("10.144.0.0/-1").is_err());
+    }
+
+    #[test]
+    fn ipv6_net_parse_and_contains() {
+        let n = Ipv6Net::parse("fd00::/64").unwrap();
+        assert!(n.contains("fd00::1".parse().unwrap()));
+        assert!(n.contains("fd00::ffff".parse().unwrap()));
+        assert!(!n.contains("fd00:0:0:1::1".parse().unwrap()));
+        assert!(!n.contains("2001:db8::1".parse().unwrap()));
+        assert_eq!(n.prefix_len(), 64);
+        assert_eq!(n.network_addr(), "fd00::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(n.to_string(), "fd00::/64");
+
+        let host = Ipv6Net::parse("2001:db8::1/128").unwrap();
+        assert!(host.contains("2001:db8::1".parse().unwrap()));
+        assert!(!host.contains("2001:db8::2".parse().unwrap()));
+        assert_eq!(host.to_string(), "2001:db8::1/128");
+
+        let noncanonical = Ipv6Net::parse("fd00::1:0:0:1/64").unwrap();
+        assert_eq!(noncanonical.to_string(), "fd00::/64");
+
+        let all = Ipv6Net::parse("::/0").unwrap();
+        assert_eq!(all.prefix_len(), 0);
+        assert!(all.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_net_rejects_bad_input() {
+        assert!(Ipv6Net::parse("fd00::").is_err());
+        assert!(Ipv6Net::parse("fd00::/129").is_err());
+        assert!(Ipv6Net::parse("zzzz::/64").is_err());
+        assert!(Ipv6Net::parse("fd00::/-1").is_err());
     }
 
     #[test]

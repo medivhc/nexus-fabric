@@ -3,6 +3,7 @@ id = "product.fabric-projection-basic"
 title = "投影层 L3 隧道基本：TUN 包经 fabric 数据报到对端 TUN，字节级一致"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback, two Projection instances with MockTun (example binary)"

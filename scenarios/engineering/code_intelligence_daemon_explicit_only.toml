@@ -18,6 +18,7 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # 既然 tier 因该状态被排除，由同一状态派生的 session_source 就不能留着缓存开。
 # "默认为允许"这个承诺另有机器对应物：selftest 的 cache_default_enabled=true 与
 # cache_disableable=true（生命周期场景逐条钉值），不由本场景承担。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

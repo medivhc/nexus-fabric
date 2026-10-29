@@ -5,7 +5,7 @@
 
 ## Responsibility
 
-实现 `nexus_connectivity::OutboundAdapter` 的 **AnyTLS** 出站实现：
+实现 `nexus_proxy_config::outbound_seam::OutboundAdapter` 的 **AnyTLS** 出站实现：
 在一条 TLS 连接（rustls 0.23 + ring）上承载 AnyTLS v2 会话层多路复用。
 
 提供：
@@ -49,11 +49,12 @@
 ## Outputs
 
 - `OutboundAdapter::handoff` → `OutboundHandoff { kind = "anytls", tag, locator }`；
+  错误类型为 `OutboundHandoffError`（当前无生产者，见 proxy-config MODULE）；
 - 认证/帧/Settings/地址字节流；结构化错误。
 
 ## Allowed Dependencies
 
-- `nexus-connectivity`（OutboundAdapter 接缝）；
+- `nexus-proxy-config`（出站身份/交接词汇 `outbound_seam::OutboundAdapter`）；
 - 已评审入仓第三方：`rustls 0.23(ring,std)`、`rcgen 0.13`、`sha2 0.10`、
   `md5 0.7`（仅 `padding-md5` 指纹计算，非安全用途；版本已在 Cargo.lock 锁定，
   license 已 allowlisted）。
@@ -63,6 +64,10 @@
 - `nexus-proxy` / 选路 / 策略组 / 系统根证书（webpki-root-certs 类 CDLA 包）；
 - tokio / 异步运行时（与仓库 loopback blocking+thread 模式一致）；
 - 任何 wasm 不可移植但未隔离的依赖。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  接缝 ② 已于 2026-10-28（P2）清除：出站身份/交接词汇定义于 `nexus-proxy-config`，
+  本 crate 对 `nexus-connectivity` 的直接边为 0
+  （见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`）。
 
 ## Invariants
 

@@ -1,6 +1,7 @@
 //! 流表：5 元组 key + 流状态机。
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
 use nexus_domain::SessionId;
@@ -28,46 +29,150 @@ impl IpProto {
 
 /// 流 key = 完整 5 元组（D1：不按 destination 聚合）。
 ///
-/// TUN 只产生上行包，方向固定，精确匹配 O(1) 无歧义。
+/// R3（C17）：地址是 [`IpAddr`]，双栈共用一张流表；`TUN` 只产生上行包，
+/// 方向固定，精确匹配 O(1) 无歧义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    pub src_ip: [u8; 4],
+    /// 源地址（v4 或 v6）。
+    pub src_ip: IpAddr,
+    /// 源端口。
     pub src_port: u16,
-    pub dst_ip: [u8; 4],
+    /// 目的地址（v4 或 v6）。
+    pub dst_ip: IpAddr,
+    /// 目的端口。
     pub dst_port: u16,
+    /// 传输协议（只支持 TCP/UDP）。
     pub proto: IpProto,
 }
 
+/// 5 元组解析错误（AC15：可判别变体；与 `nexus_projection::ip::IpParseError`
+/// 同表，spec §5.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowParseError {
+    /// 短于固定头 / 扩展头 / L4 头越界。
+    Truncated,
+    /// 版本字段非 4/6。
+    BadVersion(u8),
+    /// 扩展头链超过 8 个。
+    TooManyExtensionHeaders,
+    /// ESP/AH 等无法安全定位 L4 的扩展头（值为 next header）。
+    UnsupportedExtension(u8),
+    /// 非首片（v6；不重组 → 不建 flow，调用方按目的地址分类）。
+    NonFirstFragment,
+    /// 非 TCP/UDP 协议（不建 flow）。
+    UnsupportedTransport(u8),
+    /// 与 `IpParseError` 同表保留；流表不校验校验和，`parse` 不返回该变体。
+    BadChecksum,
+}
+
+/// 扩展头链上限（spec §4.7.3：超过 8 个 → fail-closed）。
+const MAX_EXTENSION_HEADERS: usize = 8;
+
 impl FlowKey {
-    /// 从 IPv4 包字节解析 5 元组；非 TCP/UDP 或包太短返回 None。
-    #[must_use]
-    pub fn parse_ipv4(packet: &[u8]) -> Option<Self> {
-        if packet.len() < 20 || packet[0] >> 4 != 4 {
-            return None;
+    /// 从 IP 包字节解析 5 元组（v4/v6，含 v6 扩展头偏移）。
+    ///
+    /// v4 的既有语义保持不变（分片包仍按 L4 头偏移解析，不改判据）；v6 走
+    /// 固定头 + 扩展头链，非首片/未知 L4 以错误变体交回调用方，绝不静默建流。
+    ///
+    /// # Errors
+    /// 见 [`FlowParseError`]。
+    pub fn parse(packet: &[u8]) -> Result<Self, FlowParseError> {
+        match packet.first().map(|b| b >> 4) {
+            None => Err(FlowParseError::Truncated),
+            Some(4) => Self::parse_v4(packet),
+            Some(6) => Self::parse_v6(packet),
+            Some(other) => Err(FlowParseError::BadVersion(other)),
+        }
+    }
+
+    fn parse_v4(packet: &[u8]) -> Result<Self, FlowParseError> {
+        if packet.len() < 20 {
+            return Err(FlowParseError::Truncated);
         }
         let ihl = usize::from(packet[0] & 0x0f) * 4;
-        if packet.len() < ihl + 4 {
-            return None;
+        if ihl < 20 {
+            return Err(FlowParseError::Truncated);
         }
-        let proto = IpProto::from_ip_proto_number(packet[9])?;
-        let src_ip: [u8; 4] = packet[12..16].try_into().ok()?;
-        let dst_ip: [u8; 4] = packet[16..20].try_into().ok()?;
-        let (src_port, dst_port) = match proto {
-            IpProto::Tcp | IpProto::Udp => {
-                if packet.len() < ihl + 4 {
-                    return None;
+        // 协议不支持时没有 L4 端口可解析：先判定协议，再判长度。
+        let proto = IpProto::from_ip_proto_number(packet[9])
+            .ok_or(FlowParseError::UnsupportedTransport(packet[9]))?;
+        if packet.len() < ihl + 4 {
+            return Err(FlowParseError::Truncated);
+        }
+        Ok(Self {
+            src_ip: IpAddr::V4(Ipv4Addr::new(
+                packet[12], packet[13], packet[14], packet[15],
+            )),
+            src_port: u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(
+                packet[16], packet[17], packet[18], packet[19],
+            )),
+            dst_port: u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
+            proto,
+        })
+    }
+
+    fn parse_v6(packet: &[u8]) -> Result<Self, FlowParseError> {
+        if packet.len() < 40 {
+            return Err(FlowParseError::Truncated);
+        }
+        let mut src_octets = [0u8; 16];
+        src_octets.copy_from_slice(&packet[8..24]);
+        let mut dst_octets = [0u8; 16];
+        dst_octets.copy_from_slice(&packet[24..40]);
+
+        let mut next_header = packet[6];
+        let mut offset = 40usize;
+        let mut extensions = 0usize;
+        loop {
+            if matches!(next_header, 0 | 43 | 60) {
+                extensions += 1;
+                if extensions > MAX_EXTENSION_HEADERS {
+                    return Err(FlowParseError::TooManyExtensionHeaders);
                 }
-                (
-                    u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
-                    u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
-                )
+                if packet.len() < offset + 2 {
+                    return Err(FlowParseError::Truncated);
+                }
+                let ext_len = (usize::from(packet[offset + 1]) + 1) * 8;
+                if packet.len() < offset + ext_len {
+                    return Err(FlowParseError::Truncated);
+                }
+                next_header = packet[offset];
+                offset += ext_len;
+                continue;
             }
-        };
-        Some(Self {
-            src_ip,
-            src_port,
-            dst_ip,
-            dst_port,
+            match next_header {
+                44 => {
+                    extensions += 1;
+                    if extensions > MAX_EXTENSION_HEADERS {
+                        return Err(FlowParseError::TooManyExtensionHeaders);
+                    }
+                    if packet.len() < offset + 8 {
+                        return Err(FlowParseError::Truncated);
+                    }
+                    let fragment_offset =
+                        u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) >> 3;
+                    next_header = packet[offset];
+                    offset += 8;
+                    if fragment_offset != 0 {
+                        return Err(FlowParseError::NonFirstFragment);
+                    }
+                    continue;
+                }
+                50 | 51 => return Err(FlowParseError::UnsupportedExtension(next_header)),
+                _ => break,
+            }
+        }
+        let proto = IpProto::from_ip_proto_number(next_header)
+            .ok_or(FlowParseError::UnsupportedTransport(next_header))?;
+        if packet.len() < offset + 4 {
+            return Err(FlowParseError::Truncated);
+        }
+        Ok(Self {
+            src_ip: IpAddr::V6(Ipv6Addr::from(src_octets)),
+            src_port: u16::from_be_bytes([packet[offset], packet[offset + 1]]),
+            dst_ip: IpAddr::V6(Ipv6Addr::from(dst_octets)),
+            dst_port: u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]),
             proto,
         })
     }
@@ -223,31 +328,136 @@ mod tests {
 
     fn key() -> FlowKey {
         FlowKey {
-            src_ip: [192, 168, 1, 2],
+            src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
             src_port: 54321,
-            dst_ip: [93, 184, 216, 34],
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             dst_port: 443,
             proto: IpProto::Tcp,
         }
     }
 
+    fn v6_tcp_packet(next_header: u8, extension: Option<(u8, u8)>) -> Vec<u8> {
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+        pkt[6] = next_header;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&"fd00:144::6".parse::<Ipv6Addr>().unwrap().octets());
+        pkt[24..40].copy_from_slice(&"2001:db8::20".parse::<Ipv6Addr>().unwrap().octets());
+        match extension {
+            None => {
+                pkt[40..42].copy_from_slice(&54321u16.to_be_bytes());
+                pkt[42..44].copy_from_slice(&443u16.to_be_bytes());
+            }
+            Some((next, len_units)) => {
+                // 8B 扩展头 + 12B 剩余 L4 头（端口落在 offset+8）。
+                pkt[40] = next;
+                pkt[41] = len_units;
+                pkt[48..50].copy_from_slice(&54321u16.to_be_bytes());
+                pkt[50..52].copy_from_slice(&443u16.to_be_bytes());
+            }
+        }
+        pkt
+    }
+
     #[test]
-    fn parse_ipv4_tcp_extracts_five_tuple() {
+    fn parse_v4_tcp_extracts_five_tuple() {
         // 最小 IPv4/TCP 头。
         let mut pkt = vec![0x45u8, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
         pkt.extend_from_slice(&[192, 168, 1, 2]); // src
         pkt.extend_from_slice(&[93, 184, 216, 34]); // dst
         pkt.extend_from_slice(&[0xd4, 0x31, 0x01, 0xbb]); // sport 54321, dport 443
         pkt.extend_from_slice(&[0u8; 20]);
-        let k = FlowKey::parse_ipv4(&pkt).expect("parse ok");
+        let k = FlowKey::parse(&pkt).expect("parse ok");
         assert_eq!(k, key());
     }
 
     #[test]
-    fn parse_ipv4_rejects_non_tcp_udp() {
+    fn parse_rejects_non_tcp_udp() {
         let mut pkt = vec![0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0]; // proto 1 = ICMP
         pkt.extend_from_slice(&[192, 168, 1, 2, 93, 184, 216, 34]);
-        assert!(FlowKey::parse_ipv4(&pkt).is_none());
+        assert_eq!(
+            FlowKey::parse(&pkt),
+            Err(FlowParseError::UnsupportedTransport(1))
+        );
+    }
+
+    #[test]
+    fn parse_v6_tcp_extracts_five_tuple() {
+        let pkt = v6_tcp_packet(6, None);
+        let k = FlowKey::parse(&pkt).expect("v6 parse ok");
+        assert_eq!(
+            k,
+            FlowKey {
+                src_ip: IpAddr::V6("fd00:144::6".parse().unwrap()),
+                src_port: 54321,
+                dst_ip: IpAddr::V6("2001:db8::20".parse().unwrap()),
+                dst_port: 443,
+                proto: IpProto::Tcp,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_v6_honours_extension_header_offset() {
+        // Hop-by-Hop（next=6，长度单位 0 → 8B）→ 端口在 offset 48。
+        let pkt = v6_tcp_packet(0, Some((6, 0)));
+        let k = FlowKey::parse(&pkt).expect("v6 ext parse ok");
+        assert_eq!(k.src_port, 54321);
+        assert_eq!(k.dst_port, 443);
+    }
+
+    #[test]
+    fn parse_v6_error_variants() {
+        // 固定头截断。
+        assert_eq!(FlowKey::parse(&[0x60; 20]), Err(FlowParseError::Truncated));
+        // 版本非 4/6。
+        assert_eq!(
+            FlowKey::parse(&[0x50; 40]),
+            Err(FlowParseError::BadVersion(5))
+        );
+        // 非 TCP/UDP（ICMPv6）。
+        assert_eq!(
+            FlowKey::parse(&v6_tcp_packet(58, None)),
+            Err(FlowParseError::UnsupportedTransport(58))
+        );
+        // ESP/AH 无法定位 L4。
+        for hdr in [50u8, 51u8] {
+            assert_eq!(
+                FlowKey::parse(&v6_tcp_packet(hdr, None)),
+                Err(FlowParseError::UnsupportedExtension(hdr))
+            );
+        }
+        // 超过 8 个扩展头。
+        let mut pkt = vec![0u8; 40 + 9 * 8];
+        pkt[0] = 0x60;
+        pkt[6] = 0;
+        for i in 0..9 {
+            pkt[40 + i * 8] = if i == 8 { 6 } else { 0 };
+        }
+        assert_eq!(
+            FlowKey::parse(&pkt),
+            Err(FlowParseError::TooManyExtensionHeaders)
+        );
+        // 非首片（offset != 0）。
+        let mut frag = v6_tcp_packet(44, Some((6, 0)));
+        frag[42..44].copy_from_slice(&8u16.to_be_bytes()); // fragment offset = 1
+        assert_eq!(FlowKey::parse(&frag), Err(FlowParseError::NonFirstFragment));
+    }
+
+    #[test]
+    fn flow_parse_error_has_seven_variants() {
+        // AC15：7 个变体都有构造点（BadChecksum 为同表保留项，见变体文档）。
+        let all = [
+            FlowParseError::Truncated,
+            FlowParseError::BadVersion(5),
+            FlowParseError::TooManyExtensionHeaders,
+            FlowParseError::UnsupportedExtension(50),
+            FlowParseError::NonFirstFragment,
+            FlowParseError::UnsupportedTransport(58),
+            FlowParseError::BadChecksum,
+        ];
+        assert_eq!(all.len(), 7);
     }
 
     #[test]

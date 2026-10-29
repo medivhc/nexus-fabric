@@ -3,6 +3,7 @@ id = "product.lsa-discovery"
 title = "去中心化发现：Hello/Welcome 入网 + LSA 泛洪收敛 + LSDB 一致"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-lsa-discovery"
+carrier = "v9-connectivity"
 
 [given]
 lsa_frame = "version(u8=1) + tag(u8) + fields; strings = u16 BE len + UTF-8; ints = BE"

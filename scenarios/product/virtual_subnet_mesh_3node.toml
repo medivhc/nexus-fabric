@@ -3,6 +3,7 @@ id = "product.virtual-subnet-mesh-3node"
 title = "三节点虚拟子网静态路由转发闭环（A→B→C，B 转发）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-static-routing"
+carrier = "v9-connectivity"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

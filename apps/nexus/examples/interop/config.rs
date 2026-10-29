@@ -54,12 +54,16 @@ impl Variant {
 }
 
 /// cell（冻结枚举）。
+///
+/// `UdpEcho` 为产品级（`ProductSocks5`/`ProductPath`）；`UdpEchoCrate` 为 crate 级诊断格
+/// （`CrateDirect`/`ProtocolWire`，spec §9.2 Q10）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cell {
     Handshake,
     TcpSmall,
     TcpThroughput,
     UdpEcho,
+    UdpEchoCrate,
     BadCredential,
     BadConfig,
     LongLived,
@@ -76,6 +80,7 @@ impl Cell {
             Self::TcpSmall => "tcp-small",
             Self::TcpThroughput => "tcp-throughput",
             Self::UdpEcho => "udp-echo",
+            Self::UdpEchoCrate => "udp-echo-crate",
             Self::BadCredential => "bad-credential",
             Self::BadConfig => "bad-config",
             Self::LongLived => "long-lived",
@@ -305,6 +310,7 @@ impl InteropProbeConfig {
                     | C::TcpSmall
                     | C::TcpThroughput
                     | C::UdpEcho
+                    | C::UdpEchoCrate
                     | C::BadCredential
                     | C::BadConfig
                     | C::LongLived
@@ -317,6 +323,7 @@ impl InteropProbeConfig {
                     | C::TcpSmall
                     | C::TcpThroughput
                     | C::UdpEcho
+                    | C::UdpEchoCrate
                     | C::BadCredential
                     | C::BadConfig
                     | C::LongLived
@@ -329,6 +336,7 @@ impl InteropProbeConfig {
                     | C::TcpSmall
                     | C::TcpThroughput
                     | C::UdpEcho
+                    | C::UdpEchoCrate
                     | C::BadCredential
                     | C::BadConfig
                     | C::LongLived
@@ -340,6 +348,7 @@ impl InteropProbeConfig {
                     | C::TcpSmall
                     | C::TcpThroughput
                     | C::UdpEcho
+                    | C::UdpEchoCrate
                     | C::BadCredential
                     | C::BadConfig
                     | C::LongLived
@@ -502,8 +511,13 @@ pub fn validate_config(cfg: &InteropProbeConfig) -> Result<(), ProbeError> {
     if cfg.variant == Variant::AnyTlsCustomPadding && cfg.cell != Cell::BadConfig {
         return Err(invalid("variant", "AnyTlsCustomPadding only for BadConfig"));
     }
-    if cfg.variant == Variant::Hy2Salamander && cfg.cell != Cell::Handshake {
-        return Err(invalid("variant", "Hy2Salamander only for Handshake"));
+    if cfg.variant == Variant::Hy2Salamander
+        && !matches!(cfg.cell, Cell::Handshake | Cell::TcpSmall)
+    {
+        return Err(invalid(
+            "variant",
+            "Hy2Salamander only for Handshake | TcpSmall",
+        ));
     }
     Ok(())
 }
@@ -603,6 +617,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hy2_salamander_accepts_handshake_and_tcpsmall_only() {
+        let mut v = base_json();
+        v["protocol"] = serde_json::json!("Hysteria2");
+        v["variant"] = serde_json::json!("Hy2Salamander");
+        v["reference"]["port"] = serde_json::json!(26104);
+        v["credentials"] = serde_json::json!({
+            "Hysteria2": {
+                "password": "hy2-password",
+                "obfs": {"Salamander": {"password": "hy2-obfs-password"}}
+            }
+        });
+        v["cell"] = serde_json::json!("Handshake");
+        assert!(check(v.clone()).is_ok(), "Handshake must be accepted");
+        v["cell"] = serde_json::json!("TcpSmall");
+        assert!(check(v.clone()).is_ok(), "TcpSmall must be accepted");
+        v["cell"] = serde_json::json!("TcpThroughput");
+        assert!(
+            check(v.clone()).is_err(),
+            "TcpThroughput must be rejected for Hy2Salamander"
+        );
+        v["cell"] = serde_json::json!("UdpEcho");
+        assert!(
+            check(v).is_err(),
+            "UdpEcho must be rejected for Hy2Salamander"
+        );
+    }
+
+    #[test]
     fn rejects_anytls_padding_md5_drift() {
         let mut v = base_json();
         v["protocol"] = serde_json::json!("Anytls");
@@ -632,8 +674,20 @@ pub(crate) mod tests {
                 crate::evidence::Scope::ProductPath
             )
         );
+        // Q10（spec §9.1/§9.2）：UdpEcho 是产品级 required 格。
         let mut v = base_json();
         v["cell"] = serde_json::json!("UdpEcho");
+        let cfg = parse(v).expect("parse");
+        assert_eq!(
+            carrier_for(&cfg),
+            (
+                crate::evidence::Carrier::ProductSocks5,
+                crate::evidence::Scope::ProductPath
+            )
+        );
+        // Q10：UdpEchoCrate 是 crate 级 diag 格。
+        let mut v = base_json();
+        v["cell"] = serde_json::json!("UdpEchoCrate");
         let cfg = parse(v).expect("parse");
         assert_eq!(
             carrier_for(&cfg),
@@ -642,6 +696,53 @@ pub(crate) mod tests {
                 crate::evidence::Scope::ProtocolWire
             )
         );
+    }
+
+    #[test]
+    fn udp_echo_product_cells_are_not_synthetic() {
+        // spec §9.2：`UdpEcho` 的 Trojan/SS 是「产品未实现」而非 crate 合成格；
+        // 合成只对 `UdpEchoCrate` 的 Trojan/SS 生效。
+        for protocol in ["Vless", "Anytls", "Hysteria2", "Trojan", "Shadowsocks"] {
+            let mut v = base_json();
+            v["protocol"] = serde_json::json!(protocol);
+            v["variant"] = serde_json::json!("Default");
+            v["cell"] = serde_json::json!("UdpEcho");
+            v["credentials"] = match protocol {
+                "Vless" => {
+                    serde_json::json!({"Vless": {"uuid": "6af74a31-cd3b-49ee-83fe-34fb1b68497d", "flow": "None"}})
+                }
+                "Anytls" => serde_json::json!({"Anytls": {"password": "x", "padding_md5_hex":
+                    nexus_outbound_anytls::padding_md5_hex(nexus_outbound_anytls::DEFAULT_PADDING_SCHEME)}}),
+                "Hysteria2" => serde_json::json!({"Hysteria2": {"password": "x", "obfs": "None"}}),
+                "Trojan" => {
+                    serde_json::json!({"Trojan": {"password": "x", "header_format": "Standard"}})
+                }
+                _ => {
+                    serde_json::json!({"Shadowsocks": {"password": "x", "method": "Chacha20IetfPoly1305"}})
+                }
+            };
+            let cfg = parse(v).expect("parse");
+            assert!(!crate::is_synthetic(&cfg), "{protocol}/UdpEcho 不得标合成");
+            assert_eq!(
+                carrier_for(&cfg),
+                (
+                    crate::evidence::Carrier::ProductSocks5,
+                    crate::evidence::Scope::ProductPath
+                ),
+                "{protocol}/UdpEcho 必须是产品级"
+            );
+
+            let mut v = base_json();
+            v["protocol"] = serde_json::json!(protocol);
+            v["cell"] = serde_json::json!("UdpEchoCrate");
+            let cfg = parse(v).expect("parse");
+            let synthetic = matches!(protocol, "Trojan" | "Shadowsocks");
+            assert_eq!(
+                crate::is_synthetic(&cfg),
+                synthetic,
+                "{protocol}/UdpEchoCrate 合成性"
+            );
+        }
     }
 
     #[test]
@@ -679,7 +780,7 @@ pub(crate) mod tests {
             validate_config(&cfg).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             count += 1;
         }
-        assert_eq!(count, 46, "expected 46 probe templates");
+        assert_eq!(count, 52, "expected 52 probe templates");
     }
 
     #[test]

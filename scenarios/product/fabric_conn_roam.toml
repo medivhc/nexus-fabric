@@ -3,6 +3,7 @@ id = "product.fabric-conn-roam"
 title = "地址变更不断连：传输中 rebind socket，流不中断、数据不重不漏"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#3"
+carrier = "n1-fabric"
 
 [given]
 topology = "loopback UDP; client rebinds to a new local port mid-transfer"

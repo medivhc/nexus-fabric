@@ -1,0 +1,2 @@
+{"ts":1793097169091,"op":"apply_start","ifname":"lo","tun_ip":"10.99.0.1","dry_run":"true"}
+{"ts":1793097169091,"op":"apply_dry_run","ifname":"lo","result":"ok"}

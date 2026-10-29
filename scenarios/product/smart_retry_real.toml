@@ -3,6 +3,7 @@ id = "product.smart-retry-real"
 title = "智能重试真实执行：真实指数退避循环，2 次可重试失败后第 3 次成功"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-smart-retry-real"
+carrier = "v9-connectivity"
 
 [given]
 max_attempts = 5

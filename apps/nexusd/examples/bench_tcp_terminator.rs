@@ -126,7 +126,7 @@ fn run() -> serde_json::Value {
         n1_configured: false, // 无 N1：只测终结开销
         ..Default::default()
     };
-    let mut dp = Dataplane::new(tun, config).expect("dataplane");
+    let mut dp = Dataplane::new(tun, config, None).expect("dataplane");
     // 预建流：SYN→SYN-ACK→ACK。
     let syn = craft_tcp([10, 1, 2, 3], [10, 9, 9, 9], 41000, 80, 5000, 0, 0x02, &[]);
     mock.lock().unwrap().inject(syn);

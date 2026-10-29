@@ -2,6 +2,7 @@
 //!
 //! Binary (`main.rs`) 是装配的执行者；本模块提供可测试的纯装配逻辑：
 //! - `parse_mesh_cidrs`：从 `network.toml [vpi.routes]` 派生 mesh CIDR（R2）；
+//! - `parse_mesh_cidrs6`：从 `network.toml [vpi.routes6]` 派生 v6 mesh CIDR（C18）；
 //! - `assemble_n1`：构造 `N1MeshBridge` 并尽力 dial（R1）；
 //! - `build_dataplane_config`：组装 `DataplaneConfig`（R2/R3）；
 //! - `mesh_bypass_overlap`：mesh/bypass 重叠检测（R2 warn）。
@@ -37,6 +38,27 @@ pub fn parse_mesh_cidrs(network_toml: &str) -> Result<Vec<String>, String> {
         .map(|r| format!("{}/{}", r.subnet.network_addr(), r.subnet.prefix_len()))
         .collect())
 }
+
+/// 从 `network.toml` 文本派生 v6 mesh CIDR 列表（C18）。
+///
+/// 来源为 `[vpi.routes6]` 的 subnet 字段（`"fd00:144::/64"`）；
+/// 与 `parse_mesh_cidrs` 同一解析器（`N1Config::parse_toml`），不另写一套。
+///
+/// # Errors
+/// - `network.toml` 语义解析失败 → `Err`；调用方降级为空列表 + warn。
+pub fn parse_mesh_cidrs6(network_toml: &str) -> Result<Vec<String>, String> {
+    let config = nexus_network::n1::config::N1Config::parse_toml(network_toml)
+        .map_err(|e| format!("parse network.toml: {e:?}"))?;
+    Ok(config
+        .vpi
+        .routes6
+        .iter()
+        .map(|r| format!("{}/{}", r.subnet.network_addr(), r.subnet.prefix_len()))
+        .collect())
+}
+
+/// v6 bypass 默认集合（与 v4 的 `192.168/16`、`172.16/12` 对等，spec §4.7.3）。
+pub const DEFAULT_BYPASS_CIDRS6: [&str; 3] = ["fc00::/7", "fe80::/10", "::1/128"];
 
 /// 检测 mesh CIDR 与 bypass CIDR 的重叠（R2）。
 ///
@@ -126,6 +148,7 @@ pub fn assemble_n1_with_discovery(
     let bridge = Arc::new(N1MeshBridge::new(
         Arc::clone(&sessions),
         config.vpi.routes.clone(),
+        config.vpi.routes6.clone(),
     ));
     eprintln!(
         "[nexusd] N1 bridge assembled: {} routes",
@@ -268,8 +291,24 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
         },
         None => Vec::new(),
     };
+    // C18：v6 mesh 网段同样来自 network.toml（[[vpi.routes6]]）；解析失败 → 空。
+    let mesh_cidrs6 = match loaded.network_toml.as_deref() {
+        Some(text) => match parse_mesh_cidrs6(text) {
+            Ok(cidrs) => cidrs,
+            Err(e) => {
+                eprintln!("[nexusd] WARN: {e}; mesh_cidrs6 empty (degraded)");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     // Bypass：常见内网段（与 Clash Verge 默认一致）。
     let bypass_cidrs = vec!["192.168.0.0/16".to_string(), "172.16.0.0/12".to_string()];
+    // C18：v6 bypass（ULA / link-local / loopback；spec §4.7.3）。
+    let bypass_cidrs6: Vec<String> = DEFAULT_BYPASS_CIDRS6
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
 
     // R2：重叠检测（warn，mesh 优先）。
     let overlapped = mesh_bypass_overlap(&mesh_cidrs, &bypass_cidrs);
@@ -279,7 +318,7 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
 
     // QoS：从 daemon.toml [qos] 映射。
     let qos_enabled = loaded.daemon.qos.enabled;
-    let mut qos_config = nexus_connectivity::cake::CakeConfig::default();
+    let mut qos_config = nexus_qos::cake::CakeConfig::default();
     if qos_enabled {
         qos_config.quantum = loaded.daemon.qos.quantum;
         qos_config.high_priority_ports = loaded.daemon.qos.high_priority_ports.clone();
@@ -301,7 +340,7 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
                     rate_bps
                 );
             }
-            if let Ok(limit) = nexus_connectivity::qos::BandwidthLimit::new(rate_bps, rate_bps) {
+            if let Ok(limit) = nexus_qos::bucket::BandwidthLimit::new(rate_bps, rate_bps) {
                 qos_config.rate_limit = Some(limit);
             }
         }
@@ -317,16 +356,31 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
         .and_then(|e| e.as_bool())
         .unwrap_or(false);
 
-    // R3：dns.toml 解析。
-    let dns_config = match loaded.dns_toml.as_deref() {
-        Some(text) => Some(parse_dns_toml(text)?),
-        None => None,
+    // R3/C11：dns.toml 严格解析（三参数：mesh 网段归属 + 可用出站）。
+    // D-impl-6/SU-2：仅 TUN 启用时才解析；no-tun 下非法 dns.toml 不阻塞启动。
+    let dns_tun_enabled = loaded.daemon.tun.enabled;
+    let has_usable_outbound = match loaded.proxy_yaml.as_deref() {
+        Some(yaml) => crate::dns_classify::usable_outbound(yaml).map_err(|e| e.to_string())?,
+        None => false,
+    };
+    let dns_config = if dns_tun_enabled {
+        match loaded.dns_toml.as_deref() {
+            Some(text) => Some(
+                parse_dns_toml(text, loaded.network_toml.as_deref(), has_usable_outbound)
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        }
+    } else {
+        None
     };
 
     Ok(DataplaneConfig {
         mesh_cidrs,
+        mesh_cidrs6,
         bypass_cidrs,
-        dns_enabled: loaded.dns_toml.is_some(),
+        bypass_cidrs6,
+        dns_enabled: dns_tun_enabled && loaded.dns_toml.is_some(),
         dns_config,
         qos_enabled,
         qos_config,
@@ -535,6 +589,65 @@ mod tests {
     }
 
     #[test]
+    fn mesh_cidrs6_come_from_vpi_routes6() {
+        let peer_hex = "aa".repeat(32);
+        let text = format!(
+            "peer_id = \"{peer_hex}\"\n\
+             [[peers]]\n\
+             id = \"{peer_hex}\"\n\
+             addrs = [\"127.0.0.1:19001\"]\n\
+             [vpi]\n\
+             interface = \"nexus0\"\n\
+             address = \"10.200.0.1\"\n\
+             address6 = \"fd00:144::1\"\n\
+             mtu = 1200\n\
+             [[vpi.routes]]\n\
+             subnet = \"10.200.0.0/24\"\n\
+             peer = \"{peer_hex}\"\n\
+             [[vpi.routes6]]\n\
+             subnet = \"fd00:144::/64\"\n\
+             peer = \"{peer_hex}\"\n"
+        );
+        assert_eq!(
+            parse_mesh_cidrs6(&text).unwrap(),
+            vec!["fd00:144::/64".to_string()]
+        );
+        // v4-only 配置 → 空（不是硬编码）。
+        assert!(
+            parse_mesh_cidrs6(&network_toml_with_routes())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_mesh_cidrs6("[[[unclosed").is_err());
+    }
+
+    #[test]
+    fn dataplane_config_sets_v6_cidrs() {
+        let peer_hex = "aa".repeat(32);
+        let text = format!(
+            "peer_id = \"{peer_hex}\"\n\
+             [[peers]]\n\
+             id = \"{peer_hex}\"\n\
+             addrs = [\"127.0.0.1:19001\"]\n\
+             [vpi]\n\
+             interface = \"nexus0\"\n\
+             address = \"10.200.0.1\"\n\
+             address6 = \"fd00:144::1\"\n\
+             mtu = 1200\n\
+             [[vpi.routes6]]\n\
+             subnet = \"fd00:144::/64\"\n\
+             peer = \"{peer_hex}\"\n"
+        );
+        let cfg = build_dataplane_config(&loaded_with(Some(&text), false)).unwrap();
+        assert_eq!(cfg.mesh_cidrs6, vec!["fd00:144::/64".to_string()]);
+        assert_eq!(cfg.bypass_cidrs6, DEFAULT_BYPASS_CIDRS6.to_vec());
+        // 无 network.toml → 两族 mesh 都空，v6 bypass 仍是默认集合。
+        let cfg = build_dataplane_config(&loaded_with(None, false)).unwrap();
+        assert!(cfg.mesh_cidrs6.is_empty());
+        assert_eq!(cfg.bypass_cidrs6, vec!["fc00::/7", "fe80::/10", "::1/128"]);
+    }
+
+    #[test]
     fn mesh_cidrs_bad_config_is_err() {
         assert!(parse_mesh_cidrs("[[[unclosed").is_err());
     }
@@ -633,7 +746,7 @@ mod tests {
         assert!(!cfg.qos_enabled);
         assert_eq!(
             cfg.qos_config.quantum,
-            nexus_connectivity::cake::CakeConfig::default().quantum
+            nexus_qos::cake::CakeConfig::default().quantum
         );
     }
 

@@ -3,6 +3,7 @@ id = "product.workspace-cache-eviction"
 title = "Workspace CacheManager：pin 铁律 + 评分驱逐 + 超量拒绝"
 evidence_strength = "E4"
 requirement = "v9#22"
+carrier = "n1-fabric"
 
 [given]
 # CacheManager 是确定性纯内存结构（逻辑时钟），本场景在任何平台可跑。

@@ -3,6 +3,7 @@ id = "product.daemon-real-relay-flow"
 title = "真实 TCP 交付：直连不可达回退真实 relay 字节中继"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+carrier = "v9-connectivity"
 
 [given]
 delivery = "real-transport"

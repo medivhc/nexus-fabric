@@ -3,6 +3,7 @@ id = "platform.virtual-packet-interface"
 title = "Windows VPI 能力声明满足统一 Packet Semantics（wintun 窄 FFI 后端）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#cross-platform"
+carrier = "n1-fabric"
 
 [given]
 platform = "windows"

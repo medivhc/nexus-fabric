@@ -3,6 +3,7 @@ id = "product.strategy-watcher"
 title = "策略热加载 watcher：真实 TOML 文件变更驱动热切换"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12.58-strategy-hot-reload"
+carrier = "v9-connectivity"
 
 [given]
 topology = "diamond: A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms)"

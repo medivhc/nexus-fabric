@@ -444,6 +444,13 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
   拨号（Direct 语义）；不引入加密代理协议（与 §11.2 边界一致）。
 - 每次会话必须可观察：握手结果（NO-AUTH 回复）、CONNECT 回复码、命中规则、
   选定出站 tag、Session phase/outcome、双向中继字节数。
+- **CONNECT success 时序（2026-10-26，requirement-change / protocol-interop-fixes-5）**：
+  `Established` 步的 success 应答暂存（`DeferredConnectReply`），由调用方在「出站就绪」
+  时写出——非 trojan 出站仍在既有逻辑点（路由之后、出站建连之前）立即写出，字节与时序
+  不变；trojan 出站推迟到 TLS 握手 + 请求头 + seed flush 完成之后（fail-closed 窗口，
+  见 §11.9.3）。失败在 CONNECT 应答阶段对用户可观察（SOCKS5 `REP != 0` / HTTP `502`），
+  不再出现「先回 success、再把服务端 fallback 页面当隧道数据」的形态。成功会话 JSON
+  增加 `socks.reply_sent`、`socks.reply_deferred_ms` 与 trojan 的 `tunnel` 观测对象。
 - E4 场景：`scenarios/product/daemon_real_socks_proxy_flow.toml`（本地 HTTP 目标
   + 原始 SOCKS5 客户端经代理真实往返 HTTP 200）。
 
@@ -495,11 +502,14 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 该 trait 属推测性设计，已在第 1/3 步判停并推迟）。
 
 ```text
-OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
+OutboundAdapter trait（nexus-proxy-config，领域中立、可移植；经 nexus-connectivity 重导出）
   -> DirectAdapter / RelayAdapter（复用既有 LinkProbe 可达性语义，行为不变）
   -> ShadowsocksAdapter（nexus-outbound-shadowsocks：AEAD 封装）
   -> Composition Root 按 tag 注册 adapter；规则选定出站 tag -> 取对应 adapter 承接流量
 ```
+
+> 2026-10-28（接缝 ② P2）：上表的 trait 与 DTO 定义已下沉 `nexus-proxy-config::outbound_seam`；
+> `nexus-connectivity` 仅 `pub use` 重导出保持源码兼容，行为不变。
 
 - Shadowsocks 出站：配置 `{tag, server, port, method, password}`；本期冻结 method 为
   `chacha20-ietf-poly1305`（纯 Rust AEAD，已实测 wasm32-wasip1 可编译、license/advisory
@@ -567,6 +577,12 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
 
 ### 11.9 Trojan 出站 adapter（TLS + SHA-224 请求头，P1，2026-09-18） {#11-trojan}
 
+> **当前互操作结论**：Trojan `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（对照 sing-box 1.13.16，
+> 仅 TCP 产品路径）；产品 SOCKS5 入口已接受 UDP ASSOCIATE（VLESS（flow=None）/AnyTLS 出站 UDP 已实现；flow≠None 的 VLESS 未实现）；
+> Trojan 出站仍无 UDP 帧路径、按 fail-closed 丢弃（后续归 `fixes-6` Phase 2）；
+> success 之后到达的 fallback 不可判定（承诺边界）。权威口径见
+> `docs/USER_MANUAL.md` §4.1.10 与 `docs/protocols/interop/MATRIX.md`。
+
 在同一 `OutboundAdapter` 接缝上新增第五个真实出站实现 Trojan。Deletion Test（AGENTS.md §12）
 已成立：Direct / Relay / Shadowsocks / VMess / Trojan 是五个带真实行为的出站维度；Trojan 是首个
 带真实 TLS 握手（rustls 0.23 + ring）的出站，新增它不改动既有激活/选路路径。
@@ -579,7 +595,7 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
   `CertificateVerifier` 把服务端证书公钥 pin 住（不依赖系统根、不拉 webpki-root-certs，避开 CDLA）。
 - 离线确定性：loopback 127.0.0.1 同一进程内起 TLS server + client，rcgen 自签 CA，
   不连公网；server/客户端任务 join 回收（结构化并发，不丢 JoinHandle）。
-- 本期冻结边界：不做 WebSocket/gRPC 伪装、不做 UDP、不做多路复用；P0 仅 TCP 透明中继。
+- 本期冻结边界：不做 WebSocket/gRPC 伪装、不做 UDP（当前无 UDP 路径，非本批临时冻结）、不做多路复用；P0 仅 TCP 透明中继。
 - `nexus-outbound-trojan` 为 portable=false（出站/交付层，ring 需 C/asm，wasm 不可编译），
   不进入 `harness.toml [portable_core]` 清单；`OutboundAdapter` trait 本身保持可移植。
 - 错误面：`AUTH_DENIED` / `INVALID_HEADER` / `TLS` / `IO`，结构化，不以日志文本代替类型。
@@ -659,13 +675,131 @@ hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP | ADDR | PORT(BE) | CRL
 - `header_format` 若给值，必须是 `standard` 或 `singbox`，其它值 → `CONFIG_INVALID`；
 - 未给 `header_format` 时按 `standard` 解释（不翻转既有默认）。
 
+**第一响应守卫（2026-10-26，requirement-change / protocol-interop-fixes-5）**
+
+TLS 握手 + Trojan 请求头写完之后进入「就绪窗口」，在写出本地 CONNECT 应答前用首包
+判定节点是否真的接受了本次连接（Trojan 无响应头、无密码校验回执，只能从首个下行字节
+与目标端口推断）：
+
+- `fallback_guard: Option<String>`：`"strict"`（缺省）| `"signature"`；**不存在 `off`**
+  （没有完全关闭守卫的官方开关）。
+  - `strict`：只放行端口绑定的 server-first greeting 白名单——22 `SSH-`、21/25/587 `220`、
+    110 `+OK`、143 `* OK`、5900 `RFB `；其余首包一律判失败（含 HTTP 状态行）。
+  - `signature`：**明确标注的安全降级（官方逃生口）**，只拒绝 `HTTP/` 状态行，其余放行，
+    因此非 HTTP fallback 全部漏报。切换即接受该漏报面。
+  - `strict` 的确定代价（M-1~M-8 误杀面）：MySQL 3306 二进制握手、非规范端口 SSH
+    （如 2222）、telnet IAC、自定义 banner、SMTP 非 `220` 应答（554/421）、VNC/FTP/POP3/
+    IMAP 非规范端口、白名单前缀被 TCP 分片且 50ms 内未补齐、白名单端口但首包被中间盒
+    改写成非典型 banner —— 这些合法 server-first 目标在 `strict` 下会被拒绝；
+    `signature` 是它们的官方逃生口。
+- `ready_window_ms: Option<u64>`：`0..=5000`；缺省/`0` = 自适应窗口
+  `W = clamp(TcpStream::connect 耗时 + 50ms, 50ms, 600ms)`；`n>0` 时实际等待
+  `min(n, 5000)`ms。**只改等待时长，不改判据**。
+- 放行条件（按序）：客户端先载荷（载荷先写节点，零扣压）→ 立即 success；白名单 greeting
+  首包 → 立即 success；窗口静默到期 → success（延迟 = W）。
+- 失败条件：首包是 HTTP 状态行 / 严格模式下非白名单首包 / 首包前 EOF →
+  SOCKS5 `REP=0x01`（节点端口 `ECONNREFUSED` 为 `0x05`）、HTTP `502 Bad Gateway`，
+  有界 drain（≤64KiB 或 50ms）后正常关闭；不 flush `close_notify`、不写额外 TLS 记录。
+  （CONNECT 与非 CONNECT 绝对形式均适用；窗口内 fallback 透传语义不变。）
+- **承诺边界**：只承诺「success 之前到达的 fallback 首包零字节投递」；success 之后才到达
+  的 fallback 首包不可判定（协议上限），登记为残余缺口，不写成已关闭。
+- 配置校验（spec fixes-5 §8）：两字段按 presence-aware 提取，字段存在但非法
+  （空串 / `off` / 未知枚举 / 越界 / 非整数）→ `CONFIG_INVALID
+  [outbounds[<tag>].<field>]`；非 trojan 出站上的**合法值忽略**、**非法值硬失败**。
+- 可观察：成功会话 JSON `tunnel = { readiness: "greeting"|"client_payload"|
+  "window_expired"|"client_aborted", pre_payload_down_bytes, guard, window_ms }`；
+  失败会话的 reason 固定为
+  `<prefix>: waited_ms=<u64> first_bytes_hex=<hex≤32> dest_port=<u16>`，
+  prefix ∈ {`tunnel connect failed`, `tunnel handshake failed`,
+  `trojan fallback signature detected`, `unsolicited server data rejected`,
+  `tunnel closed before ready`, `late fallback response discarded`}。
+- **已接受的行为变更**：无 fallback 的坏凭据（`Default/BadCredential`）本地形态由
+  「先 success 再 EOF」变为「CONNECT 应答阶段 `REP≠0`」；MATRIX 判定与错误分类
+  （`E_EXPECTED_AUTH_REJECT`）不变。
+
 真实节点样例（密码一律占位 `CHANGE_ME`，严禁真实凭据入库）：
 `examples/configs/trojan_nodes.example.yaml`（日本-TY-3 / 日本-OS-3 两节点，
-server 域名/端口/ALPN/udp/skip-cert-verify 可用真实公开值，密码占位）。
+server 域名/端口/ALPN 可用真实公开值，密码占位；样例只写 `alpn`，缺省走系统根证书校验）。
 
 E4 场景：`scenarios/product/proxy_trojan_node_config.toml`——喂含两个 trojan 节点（Singbox +
 skip-verify + alpn）的 YAML，断言解析出 2 个 `OutboundConfig`、`kind=trojan`、`alpn=[h2,http/1.1]`、
 `skip_cert_verify=true`、`header_format=singbox`；再喂一个缺 `password` 的 trojan 节点 → `CONFIG_INVALID`。
+
+#### 11.9.4 明文 Trojan 出站退出与 TLS 迁移（2026-10-28） {#11-trojan-plaintext-exit}
+
+> 能力退出（不是新增开关）。本节记录**已发生**的用户可见行为变化、迁移方式与不可迁移的净损失。
+
+**退出范围**
+
+- `nexusd` 的两条前端（TUN 与 TPROXY，共享同一 `OutboundRegistry`）**都不再支持明文 Trojan 出站**：
+  首个 wired 出站是明文 Trojan → 启动硬失败（`stage=proxy_engine_init` + `exit 1`）；
+  非首个 wired 的明文 Trojan → 启动 warn（`engine=unsupported cause=PLAINTEXT_TROJAN_UNSUPPORTED`），
+  规则选中该 tag 时，TUN 侧 TCP 流当场 RST；TPROXY 侧由 `on_path_failure` 关闭/阻断、
+  不保证构造 RST；两条前端都不直连、不回退其他出站。
+- **没有配置开关可以回退**：不存在重新启用明文 Trojan 的字段。服务端只支持明文 Trojan 时，
+  用户唯一出路是换服务端或换协议。
+- `nexus proxy`（`apps/nexus` 的 SOCKS5/HTTP 数据面）**不受影响**：该路径的 Trojan 数据面本来恒 TLS；
+  本次退出实际只影响 `nexusd` 用户。
+
+**TLS 声明判据 = 字段出现（不看值）**
+
+trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
+
+- `alpn` 非空（如 `alpn: [h2, http/1.1]`），**或**
+- `skip_cert_verify` 字段出现——**写 `false` 也算声明**，且此时走系统根证书校验（推荐形态）。
+
+`tls: true` 对 Trojan **无效**（该字段只有 VLESS 语义，trojan 分支从不读取它，解析器接受该键
+但不产生 TLS 声明）。
+
+**迁移两步（任选其一）**
+
+```yaml
+# 1) 声明 ALPN（缺省走系统根证书校验）
+- tag: node
+  kind: trojan
+  locator: example.com:443
+  password: CHANGE_ME
+  alpn: [h2, http/1.1]
+
+# 2) 或显式声明 skip_cert_verify（false = 系统根校验；true = 仅当服务端证书不受信任）
+- tag: node
+  kind: trojan
+  locator: example.com:443
+  password: CHANGE_ME
+  skip_cert_verify: false
+```
+
+**边界行为漂移（与退出前的旧实现相比，须显式记账）**
+
+- `skip_cert_verify: false`：旧实现按「值」判定 → 视为**明文**；现在按「字段出现」判定 →
+  视为 **TLS 声明**（走系统根证书校验）。对只支持明文的服务端会在运行期握手失败，而不是启动失败。
+- `alpn: []`：旧实现视为 **TLS**（`alpn.is_some()`）；现在视为**无声明**——该出站被选中时按
+  明文 Trojan 处理（首个 wired 启动硬失败；非首个 wired 启动 warn + 运行期失败）。
+
+**UDP 不恢复（净损失）**
+
+- 迁移到 TLS **只恢复 TCP**。TLS Trojan 的 `udp_capability()` 恒为
+  `Unsupported{TlsVariantNotSupported}`：运行期 UDP 包全部丢弃（永久丢包），不直连、不伪造回包，
+  只计数 + 限频 `event=udp_unsupported`。退出前可用的是**明文** Trojan 的 UDP，因此
+  **Trojan 的 UDP 能力整体归零且不可通过配置迁移恢复**。
+- **TLS Trojan 的互操作判定**（`docs/protocols/interop/verdicts.json` 与 MATRIX）：fixes-5
+  合入后为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`——协议层证据（ProductSocks5 路径全 TCP
+  格 PASS、fallback fail-closed 已交付）成立，上限由 `UdpEcho` 未实现钉死。该判定不覆盖
+  nexusd 路径：迁移只让 TLS Trojan 的 TCP 能被引擎建连，nexusd 侧不因此获得产品级可用
+  结论；`TROJAN_FALLBACK_FAIL_OPEN` 安全警示（success 之后到达的 fallback 仍在承诺边界
+  外）未消除。
+
+**启动失败与静态检查（排障入口）**
+
+- 启动失败按阶段输出**单行 JSON 到 stderr + exit 1**，三个阶段字面量：
+  `config_load`（配置读取/解析）、`rule_engine_init`（规则/组构建）、`proxy_engine_init`
+  （首个 wired 出站非法）。明文 Trojan 属 `proxy_engine_init`：
+  `variant=SELECTED_OUTBOUND_INVALID`、`cause=PLAINTEXT_TROJAN_UNSUPPORTED`，并带 `hint`
+  （只建议真实信号 `alpn` / `skip_cert_verify`；`tls: true` 对 Trojan 无效）。
+- `nexus config check --dir <dir>` 对同一配置给结构化 `errors[]`
+  （`PLAINTEXT_TROJAN_UNSUPPORTED`，`field=skip_cert_verify`）与 `static_valid=false`（exit 1）。
+  注意：该检查是**文件侧静态校验**，与 daemon 的「首个 wired fail-closed / 非首个 wired 降级」
+  分层不是同一口径（契约层收口另议）。
 
 ### 11.10 节点测速（real node speedtest，2026-09-18） {#11-speedtest}
 
@@ -867,15 +1001,21 @@ SOCKS5 入站（Socks5Handshake，§11.4 不变）
   -> 双向字节中继（客户端 <-> 节点隧道）
 ```
 
-- 配置零新增：复用 `OutboundConfig` 既有字段（kind / locator / method / password /
-  alpn / skip_cert_verify / header_format），节点型 kind 的校验沿用 §11.9.3。
+- 配置：既有字段零变化（复用 kind / locator / method / password / alpn /
+  skip_cert_verify / header_format），节点型 kind 的校验沿用 §11.9.3；本节之外**唯一新增**
+  的是 §11.9.3 的 trojan 专属 `fallback_guard` / `ready_window_ms` 两字段
+  （2026-10-26 requirement-change）。
 - 用户可观察（新增字段；direct 会话不出现或为空）：
   - `routing.outbound_kind`：选定出站的 kind 标签（direct / shadowsocks / trojan / vmess）；
   - `outbound`：`{ kind, node_locator, method?, tls: { sni?, alpn?, skip_cert_verify? },
     header_format? }`（按 kind 可空）。
-- 失败语义：节点建连失败 / 协议握手失败 / 隧道中继失败 →
+- 失败语义：节点建连失败 / 协议握手失败 / 隧道中继失败 / **首包被判定为 fallback 或
+  非白名单 server-first（trojan，§11.9.3）** →
   `ConnectivityEstablishmentFailed { provider: <selected outbound tag> }`，会话级
   结构化 FAIL；服务循环继续 accept 下一会话（逐会话隔离，不中断 daemon）。
+  trojan 的失败在本地 CONNECT 应答阶段可观察（SOCKS5 `REP≠0` / HTTP `502`），
+  客户端在任何隧道载荷之前看到失败（详见 §11.9.3 与
+  `docs/protocols/interop/notes/trojan-fallback.md`）。
 - 回归保障：direct 路径与既有 `daemon_real_socks_proxy_flow` 行为零变化。
 - 冻结边界（本期不做）：UDP 隧道 / QUIC / 多路复用 / 节点自动切换（selector /
   urltest 已由 §11.1 提供）/ 订阅在线更新（已交付，见 §11.17，本边界不再冻结此项）。
@@ -979,7 +1119,10 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   规则在两条前端上的 `RouteTarget` 与 `selected_outbound` 必须一致。
 - **Direct / Proxy 真转发（G3b/G6）**：Direct TCP 走真实 `connect` 并双向中继，Direct
   UDP 走 `RealUdpEgress`；Proxy TCP 按规则 tag 拨号并中继，失败发 RST 且计数
-  `upstream_failed`。ICMP/分片/非 TCP-UDP 计 `direct_dropped_unsupported`，不伪装成功。
+  `upstream_failed`。**无可用出口（无 engine 或 tag 不可用）时 SYN 直接回 RST
+  （不静默直连、不回 SYN-ACK）**；TUN 与 TPROXY 共用同一 dialer 栈与导出站语义
+  （TPROXY 无 SYN 时刻，按 `on_path_failure` 关闭/阻断）。ICMP/分片/非 TCP-UDP 计
+  `direct_dropped_unsupported`，不伪装成功。
 - **会话层（G4）**：`auto` 在 `proxy.yaml` 派生 Provider 非空时启用，否则
   `disabled/no_providers`；`enabled=true` 且无 provider 源时 Proxy 流显式 RST（不静默直连）。
 - **UDP 回包源地址（requirement-change 2026-10-27，E5 S2）**：客户端收到的回包源
@@ -1001,6 +1144,10 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   缺失/非法 → 关闭/丢弃 + 计数，绝不回退 listener 地址。`on_path_failure=block` 时代理
   失效不静默直连。
 - **可观察性**：`/localapi/v0/dataplane/stats` 暴露 `takeover_mode`、`ingress_ip_family`、
+  `dataplane.proxy_tcp_streams_ok`、`dataplane.proxy_tcp_bytes(_down)`、
+  `dataplane.proxy_udp_unsupported{,_vless,_anytls,_other,_log_suppressed}`、顶层
+  `outbound` 块（active/stale/tag/kind/verdict/scope/claim/label/warnings/manifest/
+  sha1/file_*/file_rejected/engine）与 `interop_warnings`、
   `dataplane.flow_sessions.{state,reason,providers,planner_calls}`、
   `dataplane.os_assemble.*` 与 `tproxy.{state,reason,enforcement,backend,privilege,
   chain,mark,route_table,listen,ip_family,ipv6_enabled,counters,last_failure_reason}`。
@@ -1061,6 +1208,14 @@ TCP accept（apps/nexus，非 portable I/O）
   destination；其余路由 / Session / 字节计数与 §11.4 一致。
 - **失败语义**：坏 HTTP 请求行 → 400 响应后关闭会话（结构化错误，不 panic）；握手中途
   客户端断开 → 结构化内部错误，不静默直连。
+- **CONNECT 200 时序与失败应答（2026-10-26，requirement-change）**：CONNECT 的
+  `HTTP/1.1 200 Connection Established` 同样经 `DeferredConnectReply` 暂存——非 trojan
+  出站仍在既有逻辑点写出，trojan 出站推迟到出站就绪（§11.9.3 窗口）；trojan 出站失败
+  （建连失败 / 握手失败 / fallback 首包 / 非白名单首包 / 首包前 EOF）→
+  `HTTP/1.1 502 Bad Gateway\r\n\r\n` 后关闭（FIN），502 之后隧道字节 = 0。
+- **非 CONNECT 绝对形式转发（2026-10-26）**：成功路径不回本地成功应答（响应由上游 origin
+  透传，R-6 不变）；**建连/握手硬失败时与原 CONNECT 一致回 `HTTP/1.1 502 Bad Gateway` 后
+  关闭（旧行为为直接断连）**。
 - **E4 场景**：`scenarios/product/proxy_http_mixed_inbound.toml`——loopback 本地 HTTP
   origin（回 200）+ Nexus 混合入站：(i) 用原始 HTTP 代理客户端（绝对形式 GET）经混合端口
   请求 origin，断言 200；(ii) 同端口再发一个 CONNECT 隧道请求，断言 200 Connection
@@ -1366,7 +1521,7 @@ delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入�
 
 ### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）{#12-nat-probe}
 
-nat.rs（`nexus-connectivity::nat`：`NatType`；旧 `StunClient` / `HolePuncher` 已退役（2026-10-18），PRODUCT §6 Connectivity 链路激活语义）
+nat.rs（`nexus-domain::nat`：`NatType`/`StunMapping`；2026-10-26 P1 接缝① 迁入，`nexus-connectivity` 以 `pub use` 保旧路径；旧 `StunClient` / `HolePuncher` 已退役（2026-10-18），PRODUCT §6 Connectivity 链路激活语义）
 已交付且 E4 已绿；§12.1-§12.8 的 peer locator 为**静态配置注入**。本节把打洞接入
 虚拟子网数据面：打洞成功 → peer locator **动态学习**（切直连）；失败 → **Relay
 回退**（保底路径）。tunnel 侧不持有真实 UDP socket（保持 portable 边界，真实

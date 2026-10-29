@@ -32,6 +32,8 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 
@@ -118,8 +120,8 @@ cargo clippy -p nexus-network --all-targets -- -D warnings
 
 ### M1 范围
 
-首期只做 VirtualPacketInterface 单播 IP 互通（节点间）。
-Out of scope：广播/组播、DNS 劫持、系统代理（后置，不在本契约验收内）。
+首期只做 VirtualPacketInterface 单播 IP 互通（节点间），地址族含 IPv4 与 IPv6。
+Out of scope：广播/组播、IPv6 NAT、DNS 劫持、系统代理（后置，不在本契约验收内）。
 
 ### M2 承载
 
@@ -170,7 +172,9 @@ Out of scope：广播/组播、DNS 劫持、系统代理（后置，不在本契
 - 建连时序：`Resolve Candidate Providers → Plan Placement + Path → Create Session →
   Establish Connectivity → Execute`；禁止先对所有候选打洞再定 Plan。
 - 全系统唯一 Core Planner；领域特定数据只进类型化、版本化的 `NetworkPlanExtension`。
-- Connectivity/Transport 是共享 Delivery Infrastructure；禁止反向依赖 Workspace/Compute/Service 业务逻辑。
+- Delivery Infrastructure 是分层词（`ARCHITECTURE.md` §6）：v9 侧由 `nexus-connectivity`
+  实现（frozen），N1 侧由 `nexus-fabric` / `nexus-path` 实现；禁止反向依赖
+  Workspace/Compute/Service 业务逻辑。
 - Portable Core 禁止直接调用平台 API；`LinuxTunAdapter`（`TunVpi`）只存在于 `nexus-platform-linux`；
   跨平台统一抽象是 `VirtualPacketInterface`（`nexus-platform`），不是 Linux TUN（v9 §12）。
 - `nexus-network` 不编译依赖 `nexus-ingress`；Ingress 与 Network Runtime 由 Composition Root 同时装配
@@ -210,6 +214,13 @@ N1 装配新增：
     `inbound` 走 `FabricListener`。
   - Link 观测器：keepalive 心跳超时（主）/ 流错误（辅）→ `rebind`；失败事件结构化上报
     （携带 `connection_id`/`peer_id`，不以日志文本代替错误类型）。
+  - 地址族与路由（R3，`n1/pump.rs` + `n1/bridge.rs`）：`Ipv6Net`/`Ipv6Route` 与既有
+    `Ipv4Net`/`Ipv4Route` 同构（parse/contains/network_addr/prefix_len/Display）；
+    `N1VpiConfig` 增 `address6: Option<Ipv6Addr>` 与 `routes6: Vec<Ipv6Route>`
+    （`network.toml` 的 `[vpi].address6` / `[[vpi.routes6]]`，前缀 1..=128、peer 必须在
+    `[[peers]]`、有 `routes6` 时 `address6` 必填）；`N1MeshBridge` 持有 v4+v6 两张路由表，
+    `N1Sender::send_to_mesh(dst: IpAddr)` 按地址族做最长前缀匹配（v4 语义不变）。
+    `[[peers]].addrs` 保持 `Vec<SocketAddr>`，v6 字面量本就合法（仅说明/示例）。
 - 冻结语义：`rebind()` 不改变 `ConnectionId`（沿用 nexus-fabric S2/S3）；建连失败事件必须保留可诊断原因，
   支持 `Retry`/`Fallback`/`Abort`/`Escalate` 四类处置判定。
 

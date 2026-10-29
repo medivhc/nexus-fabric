@@ -1,6 +1,6 @@
 //! 故障转移（主备切换 + 自动回切状态机，内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的主备故障转移骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的主备故障转移骨架：
 //! - **配置**：`FailoverConfig` 声明一个主节点 `primary_node` 与一组备节点
 //!   `standby_nodes`（按顺序尝试），以及是否 `auto_failback`（主恢复后自动切回）；
 //! - **状态机**：`FailoverState` 四态——`Primary`（主在用）/ `Standby { node }`

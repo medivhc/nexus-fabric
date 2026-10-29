@@ -31,7 +31,7 @@
 - `nexus-compute`
 - `nexus-platform`
 - `nexus-projection`（统一数据面：TUN/分类器/多路径/Boost）
-- `nexus-connectivity`（统一数据面：CAKE-like QoS）
+- `nexus-qos`（跨栈共享叶：CAKE-like QoS 调度与令牌桶；`cake` / `bucket`）
 - `nexus-dns`（统一数据面：UnifiedDns）
 - `nexus-path`（统一数据面：PathManager/EWMA 选路，Boost 联动）
 - `signal-hook`（R4：Unix SIGTERM/SIGINT 优雅关闭；MIT/Apache-2.0；`default-features = false`）
@@ -42,6 +42,12 @@
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）：
+  接缝 ①（NAT 词汇）/ ②（出站交接词汇）/ ③（CAKE）/ ④（LinkMarker）
+  **均已清零**，本 crate 无任何直接依赖边与源码引用，且**无反向依赖例外**
+  （不设临时放行、不设 allow 条目）；跨栈共享词汇见
+  `nexus-domain` / `nexus-proxy-config` / `nexus-qos` / `nexus-session`。
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants
 
@@ -117,11 +123,17 @@
   不存在"Clash TUN 与 Mesh TUN 抢设备"（设计文档 §6）。
 - **D2（分类管线）**：从 TUN 读取的每个 IPv4 包 → `PacketClassifier::classify()`：
   - `Mesh{..}` → N1 转发（`network.toml` 未配置则计数 `mesh_dropped_no_n1`）；
-  - `Proxy` → proxy 转发（`proxy.yaml` 未配置则计数 `proxy_dropped_no_proxy`）；
+  - `Proxy` → 未配置/无可用出口 → SYN 直接回 RST（`craft_rst`，不进终结器、不回
+    SYN-ACK）+ 计数 `proxy_dropped_no_proxy`（D2=C）；tag 可拨号 → proxy 转发；
   - `Direct` → 直连（MVP 计数 `direct_forwarded`，实际经系统路由）；
   - `Drop` → 计数 `dropped`。
-- **D3（DNS 拦截）**：UDP 目的端口 53 的包短路分类器 → `UnifiedDns::resolve()` →
-  构造 DNS 响应写回 TUN（`dns_answered` 计数；响应包源端口 53）。
+- **D3（DNS 拦截）**：UDP/53 的 IPv4 包短路分类器，提交给单 owner DNS 线程（见「DNS
+  服务面」）：`UnifiedDns::step()` 本地命中（Hosts/Mesh/FakeIp）→ 线程内构造响应；
+  `Upstream` → 非阻塞上游引擎；响应经有界 channel 回数据面并写回 TUN（`dns_answered`
+  计数；响应包源端口 53）。**两条入口、一条引擎**：TUN 与 TPROXY UDP/53 提交同一 DNS
+  线程，回程按 `DnsReply` 的 sink 判别（TUN 写设备 / `TransparentOutput::UdpReply` 走
+  tproxy 回程，Q-3/D-impl-2）。目的为 v6 的 53 本 run 不拦截（D-impl-7：0x86DD 全部
+  落 `ipv6.*` 计数，不静默）。
 - **D4（QoS）**：`[qos].enabled=true` 时，分类后、转发前经过 `CakeScheduler`：
   `enqueue()` 拒绝则计数 `qos_dropped`；`enabled=false` 时零开销直通
   （`qos_bypassed=true` 可观测）。
@@ -134,6 +146,75 @@
 - 不变量：单 TUN（D1）；分类器是唯一分类入口（S29）；DNS 不泄露 mesh 内名
   （nexus-dns S-unified）；QoS 禁用时零开销（D4）。
 
+### IPv6 数据面 slice 1（R3 C18/C19：计数 / 分类 / 能力表 / Mesh 原始转发）
+
+- **入口分派**：`0x86DD` 包在 DNS 拦截与所有 v4 路径**之前**进入专用分支；
+  不变量：**任何 0x86DD 包都落在一个 `ipv6.*` 计数上，绝不只增通用 `dropped`**
+  （AC10，S-V6-A 合并点起生效）。
+- **分类单一出口**：v6 与 v4 共用 `PacketClassifier`（经 `classify_with_cache`）；
+  v6 在委托规则引擎**之前**短路（D-impl-1）：`mesh_cidrs6` 命中 → `Mesh`，
+  `bypass_cidrs6` 命中 → `Direct`，其余 → `Proxy{outbound:"proxy"}`。禁止第二套
+  v6 判定（D-impl-10）。v6 不建 flow 会话（终结双栈归 S-V6-B）。
+- **解析口径**（spec §4.7.3）：扩展头链支持 `0`/`43`/`60`/`44`；`44` 不重组
+  （Fragment 头存在 → `ipv6.fragments`，仍按目的地址分类）；ESP/AH 不解析 L4、
+  按目的地址分类；>8 个扩展头或长度越界 → `ipv6.dropped_extension`（fail-closed）；
+  固定头/L4 截断 → `ipv6.dropped_truncated`。入站 v6 包**不校验** L4 校验和
+  （TUN 可能携带 CHECKSUM_PARTIAL）；我们构造的 v6 响应必须写完整校验和。
+- **多播**：`ff00::/8` → `ipv6.multicast`，只计数、不进分类转发（classifier 对
+  多播不特判，契约由单测钉住）。
+- **路径结果**：Mesh → N1 原始转发（`send_to_mesh(IpAddr::V6, bytes)`，
+  `ipv6.mesh_forwarded`）；无 v6 路由 / 无 sender → `ipv6.mesh_no_route` 且既有
+  `mesh_dropped_no_n1` 同步 +1。Direct → 只计数（`ipv6.classified_direct` +
+  `direct_forwarded`；本 run 无 v6 direct egress，与 v4 一样"计数可见"，不静默）。
+  Proxy → 阻断（Q4 已裁定，不是缺口）：`ipv6.classified_proxy` +
+  `ipv6.proxy_dropped` + 限流日志，不调用 ProxyEngine、不计 `proxy_dropped_no_proxy`。
+- **v6 DNS 不拦截**（D-impl-7）：`is_dns_query`/`is_dns_tcp_query` 保持 v4-only；
+  v6/53 落 Proxy → `ipv6.proxy_dropped` 可见，不是静默丢弃。
+- **计数归属**（D-impl-10）：`ipv6.packets` 对所有 0x86DD +1；其余字段每个维度
+  只加一个语义分量——传输层 `udp`/`tcp`、分类 `classified_*`、路径结果
+  `mesh_forwarded`/`mesh_no_route`/`proxy_dropped`、标志位
+  `fragments`/`multicast`/`dropped_*`。
+- **能力表**：`ipv6_paths` 是静态表（启动时由 `[[vpi.routes6]]` 与编译特性决定，
+  不随包变化）：`mesh = supported|unsupported`、`direct = supported`、
+  `proxy_tcp = supported`（合并门 RC-r3-f3-proxytcp-20261028 对齐 C21 接线事实；CAC-1 实测）、`proxy_udp = blocked`、`tun_address = unassigned`、`nat = unsupported`；
+  经 `/localapi/v0/dataplane/stats` 的 `ipv6_paths` 暴露，并与 `ingress_ip_family`
+  派生自同一张表（v6 mesh 路由在位 → `dual-stack`，否则 `ipv4`；N-8：禁止硬编码
+  `ipv4` 与能力表矛盾）。
+- **日志**（60 s / `(event, 判别字段)` 一条）：`ipv6_proxy_unsupported proto=<n>`、
+  `ipv6_fragment_dropped path=proxy`、`ipv6_ext_unsupported hdr=<n>`；计数不随限流丢失。
+- **不在本 slice**：v6 TCP 终结（S-V6-B）、v6 代理出口、v6 NAT/打洞、TUN v6 地址
+  分配（Q7）、v6 QoS 归因（`unknown → Normal`）。这些是显式取舍，状态表可见。
+
+### DNS 服务面（R3，C5–C11；引擎契约见 `crates/nexus-dns/MODULE.md`）
+
+- **线程归属**：单一 DNS 线程（`nexusd-dns`）唯一持有 `UnifiedDns`、`FakeIpPool`、
+  `UpstreamEngine`、上游 socket 与缓存，无锁；dataplane 线程不持有 resolver。
+  `DnsService::start` 在 TUN 创建成功后调用；thread spawn 失败 → 数据面不启动
+  （不构造 `Dataplane`），状态 `service="failed"`，杜绝“dns_enabled 但无服务”的隐藏
+  Stub。no-tun 模式不启动 DNS 服务，`dns.enabled=false`、`service="disabled"`（SU-2）。
+- **队列/节奏**：dataplane→DNS 请求队列 256、DNS→dataplane 回包队列 256、TCP 回退
+  上限 32（`tcp_worker_queue`；当前实现为单查询在 `poll` 内联执行并受 R1 等待约束，
+  未单独起 worker 线程）、空闲 tick 5 ms、fake-ip 回收扫描 60 s、关闭 join 2 s。
+- **关闭语义**：数据面循环退出 → drop 请求发送端 → DNS 线程处理在途查询（≤2 s）→
+  join；超时记日志后继续，不 hang；结束后状态 `service="failed"`。
+- **上游**：明文 UDP/53（可带端口），≤8 台、声明序去重；`degraded`（连续失败 ≥3）
+  排在健康服务器之后；`TC=1` 可回退 TCP（实际等待 = min(`tcp_timeout_ms`, 剩余预算)，
+  剩余 ≤0 立即放弃并故障转移）；RCODE 失败、畸形响应、错源/错 txid/错 question 一律
+  不得误用。状态显式 `plaintext=true`（明文暴露面不隐藏）。
+- **状态面**：`/localapi/v0/dns/status` 返回 `dns` 对象：`enabled`、`service`、
+  `source="dataplane"`、`config_generation`（启动 = 1）、
+  `classes{hosts,mesh,proxy_classifier,upstream}`、
+  `proxy_policy{unmatched,unevaluable,rules,unevaluable_rules,default_proxied}`、
+  `upstream{state,plaintext,servers[],last_error}`、计数器（含 `classify_unevaluable`）、
+  `fake_ip{enabled,allocated,capacity,exhausted}`。进程级 `OnceLock` 只承载 LocalAPI
+  读口（第一个实例优先，D-impl-9）；example/E4 直接读 `DnsServiceHandle.status`。
+- **`dns_answered` 语义（修正）**：DNS 拦截产生的响应成功写入 TUN 的次数，含所有
+  rcode/class；TCP/53 的 RST 也计入；写失败另计 `dns_reply_write_failed`。等式：
+  `dns_answered = dns_noerror + dns_nodata + dns_nxdomain + dns_servfail + dns_refused
+  + dns_formerr + dns_tcp_refused`。
+- **日志**：统一 `[nexusd] dns` 前缀；每 `(event, reason)` 每 60 s ≤1 条；不记录用户
+  查询的域名（只记长度/类型/计数）。
+
 ### N1 组网接入（W1-W4，scenarios/product/n1_wireup.toml，2026-10-01 冻结）
 
 - **W1（N1 发送）**：`Classification::Mesh{..}` 且 `n1_configured=true` 时，
@@ -144,7 +225,8 @@
   写 TUN 失败 → 计数丢弃（不 panic）。
 - **W3（接口边界）**：`nexus-network` 新增 `N1MeshBridge`（`n1/bridge.rs`）：
   - 持有 `N1SessionManager`（连接表）+ `Ipv4Route` 路由表（复用 pump.rs 逻辑）；
-  - `send_to_mesh(dst: Ipv4Addr, packet: &[u8]) -> Result<(), N1Error>`；
+  - `send_to_mesh(dst: IpAddr, packet: &[u8]) -> Result<(), N1Error>`（IPv4/IPv6，
+    v6 路由来自 `[[vpi.routes6]]`）；
   - **不修改** M1-M7 冻结行为（`VpiPump`、`N1SessionManager` 核心逻辑不动）。
 - **W4（配置）**：`network.toml` 的 N1 配置（peer 列表、mesh CIDR）经
   `DataplaneConfig` 传给 dataplane；未配置 N1 时保持 D2 计数行为。
@@ -234,28 +316,46 @@
  （`"A.B.C.D/N"` 字符串）；`network.toml` 缺失 → 空列表；
   解析失败 → 空列表 + warn（降级，不阻断 dataplane）；
   与 bypass CIDR 重叠 → 启动时 warn 日志，mesh 优先（分类器 S29 顺序不变）。
-- **R3（dns.toml 解析）**：`dns.toml` 解析为 `DnsUnifiedConfig` 并传入
-  `DataplaneConfig.dns_config`：
-  - 缺失 → `None`（Dataplane 用默认配置，行为不变）；
-  - 格式错误（TOML 语法错 / fake_ip_range 非法 CIDR / hosts 非法 IP）→
-    daemon 启动失败，exit 1，`{"code":"CONFIG"}`（§13.6）；
-  - 字段（`[dns]` 小节，不存在时读根级键）：`upstream`（字符串数组）、
-    `fake_ip_enabled`（bool，默认 true）、`fake_ip_range`（CIDR，
-    默认 `198.18.0.0/15`）、`mesh_suffix`（字符串，默认 `"mesh"`）、
-    `fake_ip_ttl_secs`（整数，默认 300）、`hosts`（表，域名→IP）。
+- **R3（dns.toml 严格 schema）**：DNS 子系统实际启用时解析为 `DnsFileConfig`
+  （`unified` + `mesh_hosts` + `proxy` + `upstream`）：
+  - 所有键必须在 `[dns]` 下；未知键、根级键 → 启动失败 `CONFIG`（exit 1，
+    `{"code":"CONFIG"}`，消息含键名）；
+  - 19 键（类型/默认/范围见 spec §4.6.1）：`upstream`（必填、≤8、去重保序）、
+    `fake_ip_enabled`、`fake_ip_range`（前缀 ≤30）、`mesh_suffix`、`fake_ip_ttl_secs`、
+    `hosts`、`ip_preference`、`unmatched`、`unevaluable`、`attempt_timeout_ms`、
+    `attempts_per_server`、`total_budget_ms`、`edns_udp_size`、`tcp_fallback`、
+    `tcp_timeout_ms`、`cache_max_entries`、`cache_max_ttl_secs`、`negative_ttl_secs`、
+    `max_inflight`；
+  - `[dns.mesh.hosts]`：mesh 名源（SU-3：loopback 拒绝、link-local 接受；地址必须落在
+    `[[vpi.routes]]` 或 `[[vpi.routes6]]`；有 mesh 表但无对应网段 → `CONFIG` 失败）；
+  - `unmatched=proxied` 必须有可用出站（判定 = `outbound_manifest::select_index`，
+    F1），否则 `CONFIG` 失败；
+  - `[tun].enabled=false` 时 DNS 子系统整体禁用：`dns.toml` 不解析、不校验、不建线程，
+    其非法内容不影响启动结论（SU-2）；
+  - `dns.toml` 缺失 = DNS 禁用：`enabled=false`、`service="disabled"`、不拦截 53。
+  - 落点：`config::parse_dns_toml(text, network_toml, has_usable_outbound)`（三参数：
+    mesh 网段归属 + 可用出站上下文）+ `assembly::build_dataplane_config`；旧的宽松
+    解析已在 C11 原子迁移中删除。
 - **R4（关闭顺序）**：Unix SIGTERM/SIGINT → 按 §13.4 反向关闭：
   LocalAPI 停收新查询 → **Workspace unmount（C1/D7）** → dataplane 线程停
   （join 1s 超时）→ `N1SessionManager::shutdown()`（join 5s 超时）→ TUN 随
   dataplane 线程退出关闭 → exit 0；任一步超时 → warn 日志后强制继续，不无限等。
   （ProxyEngine 尚无独立运行时，步骤为 no-op，记 info。）
 - **R5（热加载分类）**：`network.toml` 内容变更 → `NeedsRestart`
-  （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `Hot`
-  （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）；
-  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）。
-- 不变量：TUN 失败仍致命（D1）；N1/DNS/Proxy 失败可降级（§13.3 原则）；
-  关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
+  （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `NeedsRestart`
+  （DNS 服务持有 socket 与缓存；固定日志原文
+  `[nexusd] WARN: config change requires restart: dns.toml (dns service owns sockets/cache)`）；
+  `dns.toml` 增删 → `NeedsRestart`（子系统启停）；
+  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）；
+  `proxy.yaml` **内容变更 → `NeedsRestart`**（engine 只在启动构造，Q-7=B），
+  并发布 stale 面（`outbound.stale=true` + active/file tag/kind/sha1）。
+- 不变量：TUN 失败仍致命；N1/DNS 失败可降级；**Proxy 失败分层**：`proxy.yaml`
+  解析失败、rule engine 构建失败、以及首个 wired 出站非法（`SelectedInvalid`，
+  含域名不可解析）一律启动失败（stderr JSON + exit 1）；**仅**『无任何可用代理
+  出站』（`NoUsableOutbound`）降级为『无 proxy engine』，Proxy 流按 D2 回 RST
+  并计数。关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
 
-### TCP 终结接线（S1-S11，scenarios/product/tcp_termination_wireup.toml，2026-10-01 冻结）
+### TCP 终结接线（S1-S11，engineering/e2e/test-plans/tcp_termination_wireup.toml，2026-10-01 冻结）
 
 - **S1（终结范围）**：IPv4 + proto 6 的包，且 `PacketClassifier` 分类为
   `Mesh{..}` 或 `Proxy` 时，进入 smoltcp 终结
@@ -314,6 +414,16 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 
+### NAT chunk 消费（P0）
+
+生产 TUN 的 Mesh TCP DATA 帧经 `NatPathProvider::send_chunk` 消费 NAT 层选定的 active conn：direct 活跃且发送门开启时每 chunk 新开一条 bi-stream（`WORKSPACE_SYNC` 帧，payload 为 `KIND=0x01 || STREAM_FRAME`），否则走既有 N1 fallback 并发送**原始 STREAM_FRAME**（不带 KIND）。SYN/FIN/RST 仍走 N1，不计入 chunk。
+
+- 句柄：组合根创建 `NatHandleSlot` 并在 dataplane 线程启动前注入；NAT runtime 起来后 `slot.set`。slot 为空 = 全部 fallback（`runtime="disabled"`），不是错误。
+- 门：`DIRECT_ACCEPT_QUIET_MS=30000`（接收）、`DIRECT_SEND_GUARD_MS=32000`（发送）；两端共享同一个单调 `PunchClock`，判据是 `PunchState::Succeeded` + `last_success_ms` 差值。不使用 `direct_conn_id`。
+- 接收端：只 accept active 为 `Direct` 的 conn；读到一帧后继续 drain 到 EOF 并关闭己方发送方向（quinn 双半释放后才补发 `MAX_STREAMS`）；帧读失败只关闭发送方向。队列满丢该 chunk，不阻塞 accept。
+- 状态面：只读路由 `GET /localapi/v0/nat/chunks`（新文件 `nat_chunk_stats.rs` 构建 JSON）；`/localapi/v0/connectivity/nat` 与 `/localapi/v0/dataplane/stats` 的既有字段零改动。计数字段用 `direct_attempts` 语义：只表示发送尝试，不表示送达。
+- 诚实边界：本段不引入 seq/ack/重排/重试，不声称 chunk 级顺序、送达或“不中断”；跨 conn 不迁移在途 stream；fabric driver 的流条目在 conn 关闭前不回收（既有 L-1）。
+
 ## Verification
 
 ### N3 装配契约增补（待实现）
@@ -348,22 +458,52 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   - dial 失败 → `handle_fabric_rst(stream_id)`，`proxy_dropped_no_proxy += 1`；
   - 对端关闭 → `handle_fabric_fin/rst`；本地关闭 → 关 proxy 连接。
 - **P2（UDP 转发）**：`Classification::Proxy` 的 UDP 包 → `ProxyEngine`：
-  - 解析 IP/UDP 头 → 按 P3 选定协议的 UDP 中继发送；
-  - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；trojan：TCP 上的 UDP；
+  - 解析 IP/UDP 头 → `dialer.udp_capability()` 分派 → `UdpMode` 承载：
+    SOCKS5 = `Socks5Associate`；SS = `ShadowsocksAead`（仍由 `ss_std::SsUdp` 承载，
+    删除门归 fixes-6）；VLESS/AnyTLS = `Unsupported{NotWired}`；Trojan（恒 TLS）=
+    `Unsupported{TlsVariantNotSupported}`；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
+  - `Unsupported` → 丢包 + `udp_send_failed`/`udp_unsupported*` 计数 +
+    每 `(kind,tag)` 首次与每 10 s 一条限频日志，**绝不直连**；
   - 发送失败 → `proxy_dropped_no_proxy += 1`。
-- **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，选首个可用
-  `kind ∈ {shadowsocks, trojan, socks5}`（跳过 direct/relay/vmess）；
-  - 无可用出站 → 等价未配置（`proxy_dropped_no_proxy`）；
-  - `OutboundKind` 新增 `Socks5`（ additive；`locator` 为 `host:port`）。
+- **P3（出站选择，Q-4=A 多出站 + strict-first）**：`OutboundRegistry::build` 按
+  `outbound_manifest::select_index`（文件顺序首个 proxy+wired，**唯一定义**）遍历：
+  - 全部 wired 出站（socks5/shadowsocks/trojan/vless/anytls）建 dialer 入表，
+    **按规则 tag 选路**（不是只选一个）；
+  - direct/relay → `skipped(NotProxyKind)`；vmess/hysteria2 → `skipped(ProtocolNotWired)`
+    且进 `unsupported` 槽（运行期结构化错误）；
+  - 首个 wired 配置非法 → `SelectedInvalid`（**硬失败，不跳到下一个**）；
+    非首个 wired 配置非法 → `Invalid` 槽（启动 warn + 运行期 `InvalidOutbound`）；
+  - 无任何 proxy+wired → `NoUsableOutbound` → 无 engine（D1 降级）；
+  - `OutboundKind` 集合不变（`Socks5` 为既有 additive）。
 - **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
   dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
+  - **D2=C 无出口 RST**：无 engine 或 tag 不可用（`UnknownOutbound` /
+    `UnsupportedOutboundKind` / `InvalidOutbound`）→ **TCP SYN 当场回 RST**
+    （唯一发射点 `emit_proxy_egress_rst`；不进终结器、不回 SYN-ACK、
+    `stream_id=-`），每包恰好计一次 `proxy_dropped_no_proxy`（tag 不可用另加
+    `dropped++`）；UDP 维持丢包 + 计数（无 RST 语义）。
+  - **两态去重**：flow_mgr 开且无 engine 时，SYN 已发的 RST 记入
+    `proxy_egress_rst_pending`；`FlowSignal::TcpReset` 命中只做会话回收
+    + 既有 `dropped++`，不再发第二个 RST。
 - **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；
   UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
   完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
   （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
   发生时计数（不再是纯分类计数）。
+- **统计面（D3=A，15 个恒定字段）**：`tcp_streams`（Syn 数）/ `tcp_dials_ok` /
+  `tcp_dials_failed` / `tcp_dial_buffer_dropped_bytes` / `tcp_dial_buffer_overflow_resets` /
+  `udp_sent` / `udp_send_failed` + `tcp_streams_ok`（dial 成功进 relay）/
+  `tcp_bytes_up` / `tcp_bytes_down` / `udp_unsupported` / `udp_unsupported_vless` /
+  `udp_unsupported_anytls` / `udp_unsupported_other` / `udp_unsupported_log_suppressed`。
+  **不存在** `tcp_flows_rejected` / `tcp_dials_throttled`（不引入上限，不是 0 值字段）。
+  - **同步点唯一**：`Dataplane::poll_proxy_engine()` 每 tick 一次（`saturating_sub` delta）；
+    Proxy 分类分支不再同步（避免同 tick 两次 delta）。
+  - 字段语义写死：`proxy_tcp_streams` = 握手流数（Syn）；`proxy_tcp_streams_ok` =
+    dial 成功流数；`proxy_tcp_bytes` **自本版本起为真实上行字节**（旧值恒 0，修死计数）；
+    `proxy_tcp_bytes_down` 为下行；`proxy_dropped_no_proxy` 聚合「无出口」与「dial 失败」，
+    同一事件只加一次。
 
 ### Workspace 生产接线（C1/D1-D9，scenarios/product/daemon_workspace_mount.toml，2026-10-02 冻结）
 

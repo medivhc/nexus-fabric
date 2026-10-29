@@ -3,6 +3,7 @@ id = "product.fabric-turn-relay"
 title = "TURN 真实中继：双 client 经自研 TURN server 建 QUIC 并传数据"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#4"
+carrier = "n1-fabric"
 
 [given]
 topology = "TURN server S on 127.0.0.1:0; clients A and B allocate relay addresses on S (xc-pc-linux, real UDP)"

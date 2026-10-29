@@ -3,6 +3,7 @@ id = "product.proxy-outbound-vless-flow"
 title = "节点加密出站数据面：SOCKS5 会话经 VLESS 明文隧道出站（loopback vless 节点 + echo 目标）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-vless-dataplane"
+carrier = "v9-connectivity"
 
 [given]
 topology = "same-process loopback 127.0.0.1: echo target + local VLESS plaintext node (tls=false) + nexus proxy (outbound=vless-node) + raw SOCKS5 client"

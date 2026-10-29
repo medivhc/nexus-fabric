@@ -17,6 +17,7 @@ pub mod classifier;
 pub mod dns;
 pub mod egress;
 pub mod flow_session;
+pub mod ip;
 pub mod multipath;
 pub mod path_link;
 pub mod process;
@@ -46,7 +47,7 @@ pub use path_link::{PathLink, PathLinkStats};
 pub use process::{
     Attribution, FlowLabels, PlatformAttributor, ProcessAttributor, Proto, QosClass, QosConfig,
 };
-pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
+pub use routing::{Cidr, IpCidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
 pub use semantic::{SemanticDeps, SemanticIngress, SemanticStats};
 pub use tcp::{TcpEgress, TcpRelayStats, TcpTermStats};
 pub use transport::{DatagramTransport, FabricTransport, MockTransport, TransportError};

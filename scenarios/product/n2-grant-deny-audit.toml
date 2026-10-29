@@ -3,6 +3,7 @@ id = "product.n2-grant-deny-audit"
 title = "无 grant 时 provider 侧拒绝建 Session 并写审计记录（目录可见≠有权限）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#16-n2-resource-access"
+carrier = "v9-connectivity"
 
 [given]
 # P0-0 契约冻结（2026-10-03）：grant 判定与审计在 P0-1（nexus-auth）/P0-4 实现，

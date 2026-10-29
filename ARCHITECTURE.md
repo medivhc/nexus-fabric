@@ -147,13 +147,25 @@ Planner 生成 DecisionTrace，记录候选、拒绝原因、Measurement、Conne
 
 规划前只做 Connectivity Evaluation；Plan + Session 创建后才做 Establishment。
 
-Delivery Infrastructure 被 Network/Service/Workspace/Compute 共享：
+系统内有两套建连运行时，划界于 2026-10-26（C 案：划界 + 接缝清零；决策记录见
+`docs/adr/0001-dual-stack-boundary.md`）：
 
-```text
-Connectivity
-Transport
-Delivery Session Binding
-```
+1. **N1 投递面（唯一演进面）**：`nexus-fabric`（QUIC 驱动）、`nexus-path`（路径选择）、
+   `nexus-nat-traversal` / `nexus-nat-wireup` / `nexus-nat-quality`、`nexus-projection`、
+   `nexus-network`、`nexus-dns`、`nexus-turn`，由 `apps/nexusd` 装配。新能力、新协议字段、
+   新 pub API 只在这一面演进。
+2. **v9 CLI 运行时（frozen）**：`nexus-connectivity` 是 v9 `nexus`（CLI）产品线
+   `subnet` / `mesh` / `proxy` / `connectivity` 命令面的建连与组网运行时本体，不承载新栈演进；
+   只接受带 Red Evidence 的缺陷 / 安全 / 崩溃一致性修复（判据见该 crate `MODULE.md` 的
+   `Lifecycle` 节）。N1 运行时面对它的**直接依赖边必须为 0**（机器判据：
+   `policies/architecture.toml` 的 `[dual_stack]`，P5 落地）。
+3. **跨栈共享叶**：两栈共享的只有词汇/记录层——`nexus-domain`（NAT 词汇、
+   `ConnectivityEvaluation` DTO）、`nexus-proxy-config`（出站身份/交接词汇）、
+   `nexus-session`（durable record）、`nexus-qos`（包调度与令牌桶，P3 落地）。
+   叶子被两栈同时依赖**不是**反向边。
+
+`Delivery Infrastructure` 仍是分层词（Ingress → Session → Delivery → Platform）；
+在 N1 它的实现面是 fabric/path，`nexus-connectivity` 只是 v9 产品线对该层的旧实现。
 
 ## 7. Session 与结构化并发
 
@@ -251,13 +263,13 @@ SOCKS5 Ingress（nexus-ingress Socks5Handshake）
   Plan，也不修改 `NetworkPlanExtension`。规则动作链属于 `nexus-proxy` 内部的
   typed extension，不污染领域中立的 `Plan` 模型。
 - 出站激活委派 `nexus-connectivity::LinkActivator`（Direct -> Relay 回退），
-  与远程资源访问闭环共享同一 Delivery Infrastructure。
+  与 v9 CLI 建连路径共享 `LinkActivator`（v9 运行时）。
 - `nexus-proxy-config` 是 Nexus 首个配置文件入口（YAML -> typed structs），
   位于 portable-core 层，不依赖运行时 crate。
 - Portable Core 不引入平台 API：SOCKS5 监听 socket、LinkProbe 的真实 I/O 由
   Composition Root / `nexus-platform-*` 注入。
 - `nexus-proxy` 不反向依赖 `nexus-network` / `nexus-service` / `nexus-workspace`
-  / `nexus-compute`；代理内核产品线与远程资源访问闭环共享底座但不互相调用业务逻辑。
+  / `nexus-compute`；代理内核产品线与远程资源访问闭环不互相调用业务逻辑；两者共享的仅为跨栈共享叶（见 §6）。
 - `FlowContext.egress_hint` 是规则给出的出口 tag **提示**，只影响 Provider 候选快照
   的单候选过滤；它不是 Resource/Provider 身份、不是 Locator、不是 Plan/Session。
   `None` 表示无提示，未解析的 hint 必须显式 Drop/报错，不得静默改走其它出口。

@@ -13,6 +13,8 @@ workspace = true
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+# 跨栈共享叶：CAKE 调度器与令牌桶（run qos-cake 内联实现）。
+nexus-qos = { path = "../../crates/nexus-qos" }
 nexus-turn = { path = "../../crates/nexus-turn" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 nexus-dns = { path = "../../crates/nexus-dns" }

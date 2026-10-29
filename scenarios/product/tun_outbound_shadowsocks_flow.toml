@@ -1,0 +1,87 @@
+schema_version = 1
+id = "product.tun-outbound-shadowsocks-flow"
+title = "真实 TUN + sing-box 1.13.16 Shadowsocks 参照端：SS TCP 走 crate（AC-3）且无直连"
+evidence_strength = "E4"
+requires_root = true
+requirement = "apps/nexusd/MODULE.md#proxy-fwd"
+carrier = "external"
+
+[given]
+# 可执行 E4（scripts/e4/tun_outbound_ref_flow.sh shadowsocks）：
+# - 特权命名空间内创建真实 TUN（TunRsDevice）；非 root 时经既有 docker
+#   --privileged + chroot 真机能力路径升权重放；
+# - 生产 Dataplane::process_one() 常态驱动，proxy.yaml 选中 kind=shadowsocks；
+# - 参照端为 sing-box 1.13.16（sha256 见 spec §10.2）的 SIP004 AEAD inbound
+#   （chacha20-ietf-poly1305，无 TLS 外壳）；
+# - 独立 netns 客户端向 10.99.0.2:18080 发 POST，目标经 OUTPUT DNAT 落到本机
+#   echo 服务；参照端 direct 出站到目标（目标侧只见参照端出口）；
+# - 请求/响应 sha256 必须一致（脚本内比对 client.sha_match）；
+# - AC-3 调用图/符号证据：nexusd 直接依赖 nexus-outbound-shadowsocks
+#   （`cargo tree -p nexusd`），SS TCP 不再经过 ss_std（该文件只留 SsUdp）。
+
+[when]
+command = "scripts/e4/tun_outbound_ref_flow.sh shadowsocks"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "tun.created"
+equals = true
+
+[[expect]]
+field = "outbound.kind"
+equals = "shadowsocks"
+
+[[expect]]
+field = "outbound.tag"
+equals = "proxy"
+
+[[expect]]
+field = "client.status"
+equals = 200
+
+[[expect]]
+field = "client.request_sha256"
+non_empty = true
+
+[[expect]]
+field = "client.response_sha256"
+non_empty = true
+
+[[expect]]
+field = "client.sha_match"
+equals = true
+
+[[expect]]
+field = "tcp_dials_ok.positive"
+equals = true
+
+[[expect]]
+field = "log.source_crate"
+equals = true
+
+[[expect]]
+field = "stats.proxy_forwarded"
+non_empty = true
+
+[[expect]]
+field = "stats.proxy_tcp_bytes"
+non_empty = true
+
+[[expect]]
+field = "ref.target_seen"
+equals = true
+
+[[expect]]
+field = "ref.version"
+equals = "1.13.16"
+
+[[expect]]
+field = "ref.sha256"
+equals = "8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262"
+
+[[expect]]
+field = "no_direct"
+equals = true

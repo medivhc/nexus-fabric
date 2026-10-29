@@ -8,6 +8,7 @@ requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteri
 # 本场景只断言**契约保证的结构**（字段映射 + severity 归类 + 归一化 in_scope），
 # 不钉 provider 的自由文本，也不钉诊断条数——两者都随 rust-analyzer 版本的分析面
 # 变化，钉它们会得到与语义无关的脆弱红（MODULE.md「诊断条目字段映射」）。
+carrier = "engineering"
 
 [given]
 repository = "initialized"

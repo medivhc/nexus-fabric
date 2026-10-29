@@ -3,6 +3,7 @@ id = "platform.windows-system-proxy"
 title = "WinINET 系统代理接管：HKCU 读写 + InternetSetOption 广播 + 自清理恢复"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#13-system-proxy"
+carrier = "n1-fabric"
 
 [given]
 platform = "windows"

@@ -1,0 +1,72 @@
+schema_version = 1
+id = "product.proxy-engine-unsupported-outbound"
+title = "A11：非首个 wired 非法（启动 warn + 运行期结构化错误 + RST，不回退）；Q-2：NoUsableOutbound 降级"
+evidence_strength = "E4"
+requirement = "apps/nexusd/MODULE.md#统一数据面装配"
+carrier = "n1-fabric"
+
+[given]
+# 可执行 E4（example proxy_engine_unsupported_outbound --json）：
+# 1) 真实 `nexusd` 子进程（两个 wired，第二个 trojan 未声明 TLS）→ 启动
+#    `engine=unsupported cause=PLAINTEXT_TROJAN_UNSUPPORTED` warn 且 daemon 存活；
+# 2) MockTun + 真实 Dataplane：规则选中坏 tag → 恰好一个 RST、无 SYN-ACK、
+#    `direct_forwarded == 0`（不回退 direct / 不回退其他出站）；
+# 3) Q-2（灾备/合法 TUN 分流场景）：只有 direct 的 proxy.yaml → daemon 存活、
+#    不输出 `stage=proxy_engine_init` 失败 JSON（`no_startup_failure_json`）、
+#    `ProxyEngine unavailable (NO_USABLE_OUTBOUND)` warn，且无 engine 的 Proxy
+#    SYN 仍按 D2 回 RST（`proxy_rst_on_no_engine`）。
+# 4) SUG-5：运行期结构化行 `event=outbound_unavailable` 本身必须被断言——
+#    行存在、`cause=PLAINTEXT_TROJAN_UNSUPPORTED`、`kind=trojan`、`tag=bad`
+#    （坏出站的 tag）。事件行由隐藏子进程模式捕获 stderr；限频保证首次立即
+#    发射，故首行断言不依赖时序；`event_suppressed == 0` 钉住该首条未被限频吞。
+
+[when]
+command = "cargo run --quiet -p nexusd --example proxy_engine_unsupported_outbound -- --json"
+
+[[expect]]
+field = "startup_warn.present"
+equals = true
+
+[[expect]]
+field = "runtime_invalid.rst_count"
+equals = 1
+
+[[expect]]
+field = "runtime_invalid.no_synack"
+equals = true
+
+[[expect]]
+field = "runtime_invalid.direct_forwarded"
+equals = 0
+
+[[expect]]
+field = "runtime_invalid.event_line_present"
+equals = true
+
+[[expect]]
+field = "runtime_invalid.event_cause"
+equals = "PLAINTEXT_TROJAN_UNSUPPORTED"
+
+[[expect]]
+field = "runtime_invalid.event_kind"
+equals = "trojan"
+
+[[expect]]
+field = "runtime_invalid.event_tag"
+equals = "bad"
+
+[[expect]]
+field = "runtime_invalid.event_suppressed"
+equals = 0
+
+[[expect]]
+field = "degraded.alive_without_engine"
+equals = true
+
+[[expect]]
+field = "degraded.no_startup_failure_json"
+equals = true
+
+[[expect]]
+field = "degraded.proxy_rst_on_no_engine"
+equals = true

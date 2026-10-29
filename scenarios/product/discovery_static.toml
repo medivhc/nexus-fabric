@@ -3,6 +3,7 @@ id = "product.discovery-static"
 title = "三源发现：静态/LSA/聚合优先级、去重与可观测计数"
 evidence_strength = "E4"
 requirement = "DESIGN.md#8.2"
+carrier = "v9-connectivity"
 
 [given]
 static_table = "peer-a -> 10.0.0.1:5001, peer-b -> 10.0.0.9:5009（显式映射）"

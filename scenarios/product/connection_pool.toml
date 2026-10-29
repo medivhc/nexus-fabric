@@ -3,6 +3,7 @@ id = "product.connection-pool"
 title = "连接池：复用空闲连接、上限保护与空闲超时回收"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-connection-pool"
+carrier = "v9-connectivity"
 
 [given]
 pool = { max_idle = 2, max_total = 3, idle_timeout_ms = 1000 }

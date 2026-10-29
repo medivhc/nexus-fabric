@@ -3,6 +3,7 @@
 //! 场景 `scenarios/product/flow_session_mapping.toml` 的可执行验证
 //! （requirement-change 2026-10-02；mock TUN，无需特权）。
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,9 +123,9 @@ fn build_udp(
 
 fn tcp_key() -> FlowKey {
     FlowKey {
-        src_ip: [192, 168, 1, 2],
+        src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
         src_port: 54321,
-        dst_ip: [10, 1, 2, 100],
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 100)),
         dst_port: 443,
         proto: IpProto::Tcp,
     }
@@ -132,11 +133,19 @@ fn tcp_key() -> FlowKey {
 
 fn udp_key() -> FlowKey {
     FlowKey {
-        src_ip: [192, 168, 1, 2],
+        src_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
         src_port: 54322,
-        dst_ip: [10, 1, 2, 100],
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 100)),
         dst_port: 8080, // 非 53，避免 DNS 短路
         proto: IpProto::Udp,
+    }
+}
+
+/// C17：FlowKey 持 `IpAddr`，本 example 构造的仍是 v4 包。
+fn v4(ip: IpAddr) -> [u8; 4] {
+    match ip {
+        IpAddr::V4(ip) => ip.octets(),
+        IpAddr::V6(_) => panic!("flow_session_mapping builds IPv4 packets only"),
     }
 }
 
@@ -175,7 +184,7 @@ fn run() -> serde_json::Value {
     impl nexus_network::n1::bridge::N1Sender for MockN1Sender {
         fn send_to_mesh(
             &self,
-            _dst: std::net::Ipv4Addr,
+            _dst: std::net::IpAddr,
             _packet: &[u8],
         ) -> Result<(), nexus_network::n1::N1Error> {
             Ok(())
@@ -193,7 +202,7 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp = Dataplane::new(Box::new(SharedTun(tun_clone)), config).expect("new");
+    let mut dp = Dataplane::new(Box::new(SharedTun(tun_clone)), config, None).expect("new");
     // 注入 mock N1 → establish 成功（会话可进 Active）。
     dp.set_n1_sender(std::sync::Arc::new(MockN1Sender));
     inject_production_chain(&mut dp);
@@ -205,8 +214,8 @@ fn run() -> serde_json::Value {
     // ---- 1. SYN → 会话创建 ----
     let syn = build_tcp(
         &TcpParams {
-            src_ip: tk.src_ip,
-            dst_ip: tk.dst_ip,
+            src_ip: v4(tk.src_ip),
+            dst_ip: v4(tk.dst_ip),
             src_port: tk.src_port,
             dst_port: tk.dst_port,
             seq: 1000,
@@ -249,8 +258,8 @@ fn run() -> serde_json::Value {
         .unwrap_or(0);
     let ack = build_tcp(
         &TcpParams {
-            src_ip: tk.src_ip,
-            dst_ip: tk.dst_ip,
+            src_ip: v4(tk.src_ip),
+            dst_ip: v4(tk.dst_ip),
             src_port: tk.src_port,
             dst_port: tk.dst_port,
             seq: 1001,
@@ -264,8 +273,8 @@ fn run() -> serde_json::Value {
     // 发数据包。
     let data = build_tcp(
         &TcpParams {
-            src_ip: tk.src_ip,
-            dst_ip: tk.dst_ip,
+            src_ip: v4(tk.src_ip),
+            dst_ip: v4(tk.dst_ip),
             src_port: tk.src_port,
             dst_port: tk.dst_port,
             seq: 1001,
@@ -324,10 +333,16 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp3 = Dataplane::new(Box::new(SharedTun3(tun3_clone)), config3).expect("new3");
+    let mut dp3 = Dataplane::new(Box::new(SharedTun3(tun3_clone)), config3, None).expect("new3");
     inject_production_chain(&mut dp3);
     dp3.enable_flow_sessions_with_establisher(Box::new(BlockingEstablisher));
-    let udp_pkt = build_udp(uk.src_ip, uk.dst_ip, uk.src_port, uk.dst_port, b"udp-data");
+    let udp_pkt = build_udp(
+        v4(uk.src_ip),
+        v4(uk.dst_ip),
+        uk.src_port,
+        uk.dst_port,
+        b"udp-data",
+    );
     tun3.lock().unwrap().inject(udp_pkt.clone());
     let _ = dp3.process_one();
     let udp_session_created = dp3.flow_session_for_key(&uk).is_some();
@@ -366,7 +381,7 @@ fn run() -> serde_json::Value {
         proxy_configured: false,
         ..Default::default()
     };
-    let mut dp2 = Dataplane::new(Box::new(SharedTun2(tun2_clone)), config2).expect("new2");
+    let mut dp2 = Dataplane::new(Box::new(SharedTun2(tun2_clone)), config2, None).expect("new2");
     inject_production_chain(&mut dp2);
     dp2.enable_flow_sessions();
     tun2.lock().unwrap().inject(syn.clone());
@@ -409,8 +424,8 @@ fn run() -> serde_json::Value {
     };
     let syn2 = build_tcp(
         &TcpParams {
-            src_ip: tk2.src_ip,
-            dst_ip: tk2.dst_ip,
+            src_ip: v4(tk2.src_ip),
+            dst_ip: v4(tk2.dst_ip),
             src_port: tk2.src_port,
             dst_port: tk2.dst_port,
             seq: 2000,
@@ -426,8 +441,8 @@ fn run() -> serde_json::Value {
     for _ in 0..10 {
         let d = build_tcp(
             &TcpParams {
-                src_ip: tk2.src_ip,
-                dst_ip: tk2.dst_ip,
+                src_ip: v4(tk2.src_ip),
+                dst_ip: v4(tk2.dst_ip),
                 src_port: tk2.src_port,
                 dst_port: tk2.dst_port,
                 seq: 2001,

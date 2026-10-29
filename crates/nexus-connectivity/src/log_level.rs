@@ -1,6 +1,6 @@
 //! 日志级别控制（内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的日志级别查询 / 覆盖骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的日志级别查询 / 覆盖骨架：
 //! - **级别**：`LogLevel` 五档（Error/Warn/Info/Debug/Trace），带小写字符串往返与严重度排序；
 //! - **配置**：`LogLevelConfig` 持有全局级别 + 模块覆盖表（`module -> LogLevel`）；
 //! - **控制器**：`LogLevelController` 按"模块覆盖优先、否则回退全局"给出某模块的有效级别，

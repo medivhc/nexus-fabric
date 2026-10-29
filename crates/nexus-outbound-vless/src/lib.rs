@@ -30,7 +30,7 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
+use nexus_proxy_config::outbound_seam::{OutboundAdapter, OutboundHandoff, OutboundHandoffError};
 
 // ---------- 协议常量 ----------
 
@@ -1073,7 +1073,7 @@ impl OutboundAdapter for VlessAdapter {
         &self.tag
     }
 
-    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError> {
+    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, OutboundHandoffError> {
         Ok(OutboundHandoff {
             kind: self.outbound_kind().to_string(),
             tag: self.tag.clone(),

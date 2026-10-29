@@ -3,6 +3,7 @@ id = "product.failover-health"
 title = "故障转移：消费健康事件流驱动主备切换与自动回切"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-failover-health"
+carrier = "v9-connectivity"
 
 [given]
 primary = "primary"

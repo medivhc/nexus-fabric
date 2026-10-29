@@ -3,6 +3,7 @@ id = "product.proxy-transport"
 title = "ProxyTransport：QUIC over SOCKS5 CONNECT（X1–X6）"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#3.5"
+carrier = "n1-fabric"
 
 [given]
 topology = "self-built minimal SOCKS5 server; A dials B via SOCKS5 CONNECT; QUIC over length-prefixed TCP (X1)"

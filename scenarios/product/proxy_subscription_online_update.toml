@@ -3,6 +3,7 @@ id = "product.proxy-subscription-online-update"
 title = "订阅节点在线更新：loopback HTTP 订阅源拉取 -> §11.8 解析 -> 合并 -> 热生效，失败回退不清空"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 source = "loopback HTTP subscription source (mutable body, can be made to fail)"

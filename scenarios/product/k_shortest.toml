@@ -3,6 +3,7 @@ id = "product.k-shortest"
 title = "K-shortest 路径：Yen 算法求前 K 条无环最短路（主备）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-k-shortest"
+carrier = "v9-connectivity"
 
 [given]
 topology = "A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms), A-D(35ms direct); K=3"

@@ -3,6 +3,7 @@ id = "product.multihop-routing"
 title = "四节点线性拓扑距离矢量多跳路由闭环（A-B-C-D，3 跳可达）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-multihop-routing"
+carrier = "v9-connectivity"
 
 [given]
 topology = "linear"

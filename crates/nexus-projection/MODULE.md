@@ -67,6 +67,8 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 - `nexus-proxy`（旧规则引擎；新决策经 `nexus-domain::RuleEngine` trait）
 - 手写平台 TUN FFI（用户决策 2026-09-30：用 `tun-rs` v2 跨平台库，
   不重复造轮子。`TunDevice` trait 保留，`TunRsDevice` 包装 `tun-rs::SyncDevice`）
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）。
 
 ## Invariants
 
@@ -158,6 +160,15 @@ RST/错误 → 对端 RST；smoltcp 侧 socket 关闭 → 发 FIN 帧；
 egress 侧 TcpStream EOF/错误 → 发 FIN/RST 帧。半开连接（SYN 已收、
 30s 未 ESTABLISHED）回收并计数（`tcp_half_open_expired`）。
 `close()` 时关闭所有流并 join 中继线程。
+
+**S21-v6（双栈 TCP 终结，R3 C20）**：`TcpTerminator` 同时持有 v4
+（`SMOLTCP_IFACE_IP = 10.254.0.1/24`）与 v6（`SMOLTCP_IFACE_IP6 = fd00::1/128`）
+接口地址，smoltcp 启用 `proto-ipv6`。`FourTuple` 与 `TcpEvent::Syn.dst` 使用
+`IpAddr`/`SocketAddr`；`parse_tcp` 走共享的 `crate::ip::parse_ip_packet`
+（v6 扩展头链偏移，非首片/ESP/AH 返回 `None`）；`rewrite_dst`/`rewrite_src`
+v6 只重算 TCP 伪头校验和（v6 无 IP 头校验和）。SYN 载荷新增 addr-type
+`0x02`（16 字节 IPv6 + port），`0x01`/`0x03` 与 6 字节 legacy 规则不变。
+egress `TcpRelay` 对 `SynTarget::V6` 直接 `connect_timeout`。
 
 **S24（真实 TUN 设备）**：`TunRsDevice` 实现 `TunDevice` trait，基于
 `tun-rs` v2 的 sync API（`default-features = false`，不启用任何 async

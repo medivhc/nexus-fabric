@@ -3,6 +3,7 @@ id = "product.n1-wireup"
 title = "N1 组网接入：TUN Mesh 包真发进 N1 网络（E4）"
 evidence_strength = "E4"
 requirement = "apps/nexusd/MODULE.md#W1-W4"
+carrier = "n1-fabric"
 
 [given]
 # 可执行 E4（example n1_wireup --json，进程内闭环）：

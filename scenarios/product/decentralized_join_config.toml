@@ -3,6 +3,7 @@ id = "product.decentralized-join-config"
 title = "去中心化组网配置层：确定性 VIP 派生 + PSK 装配 + bootstrap 列表"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12-decentralized-join-config"
+carrier = "v9-connectivity"
 
 [given]
 vip_derivation = "fnv1a64(static_public || nonce_be64) mod usable_count, skip network/broadcast"

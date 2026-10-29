@@ -3,6 +3,7 @@ id = "product.path-fallback"
 title = "路径自动 fallback：直连被阻断时 staggered 建连自动经 SOCKS5 代理，数据真实走通"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#3.5"
+carrier = "n1-fabric"
 
 [given]
 topology = "xc-pc-linux 真机；直连候选指向不可路由地址 192.0.2.1（TEST-NET-1，模拟防火墙 DROP：发出去的包有去无回、无 RST，connect 超时；不是真实 GFW）；SOCKS5 代理与 TCP echo 服务均在 127.0.0.1（example 内建）"

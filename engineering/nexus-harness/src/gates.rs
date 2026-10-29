@@ -4,7 +4,8 @@
 use crate::config::Config;
 use crate::env::{Repo, cargo_metadata, path_is_within};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Clone)]
@@ -775,9 +776,356 @@ fn changed_member_names(
     Ok(with_rev)
 }
 
+// ---------------------------------------------------------------------------
+// Q6 依赖边门禁（run dual-stack-convergence §2.6.1/§2.6.2，P5）
+//
+// obligation gap：`unlisted_internal_dependencies = "deny"` 以前只是声明——
+// `architecture_gate` 只校验 `crates/*` 成员是否出现在 `[[crate]]` 里，从不读取
+// `allowed_internal_dependencies`，也不比对实际边，边清零因此没有任何机制守。
+//
+// 下面两个函数是纯函数（解析后的 metadata / policy 入参，不在内部再跑 cargo），
+// 单测可直接构造合成输入做 fail-closed 验证。`architecture_gate` 统一接线，
+// 因此 fast 的 `architecture-delta` 与 full 的 `architecture-policy` 两档都拦
+// （`commands.rs` 两个门名都路由到 `gates::architecture_gate`）。
+// ---------------------------------------------------------------------------
+
+/// 一条 `[[crate]]` 声明：crate 名 + 允许的内部依赖名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrateDecl {
+    name: String,
+    allowed: Vec<String>,
+}
+
+/// 读取表内字符串数组；缺失/畸形一律返回空列表（由调用方按 fail-closed 判定）。
+fn toml_str_list(value: &toml::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn declared_crates(policy: &toml::Value) -> Vec<CrateDecl> {
+    policy
+        .get("crate")
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(toml::Value::as_str)?.to_string();
+                    Some(CrateDecl {
+                        name,
+                        allowed: toml_str_list(c, "allowed_internal_dependencies"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn member_dir(meta: &Value, name: &str) -> Option<PathBuf> {
+    member_manifests(meta)
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, dir)| dir)
+}
+
+/// 无 `[[crate]]` 条目属正常的宿主：apps/ 与 engineering/ 下的工作区包
+/// （`nexus` / `nexusd` / `nexus-platform-host` / `nexus-harness` 之类）。
+fn member_is_host(meta: &Value, name: &str) -> bool {
+    let root = meta["workspace_root"].as_str().unwrap_or_default();
+    let Some(dir) = member_dir(meta, name) else {
+        return false;
+    };
+    let rel = dir.strip_prefix(Path::new(root)).unwrap_or(&dir);
+    matches!(
+        rel.components().next().and_then(|c| c.as_os_str().to_str()),
+        Some("apps") | Some("engineering")
+    )
+}
+
+/// 某包的 normal 内部依赖（`kind == null` 且目标是工作区成员）。
+fn normal_internal_dependencies(meta: &Value, name: &str, members: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(pkgs) = meta["packages"].as_array() else {
+        return out;
+    };
+    let Some(pkg) = pkgs
+        .iter()
+        .find(|p| p["name"].as_str() == Some(name))
+        .filter(|p| {
+            members
+                .iter()
+                .any(|m| Some(m.as_str()) == p["name"].as_str())
+        })
+    else {
+        return out;
+    };
+    if let Some(deps) = pkg["dependencies"].as_array() {
+        for dep in deps {
+            let Some(dep_name) = dep["name"].as_str() else {
+                continue;
+            };
+            // normal 依赖 = `kind == null`；dev/build 目标不是生产边。
+            if !dep["kind"].is_null() {
+                continue;
+            }
+            if members.iter().any(|m| m == dep_name) {
+                out.insert(dep_name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn fmt_set(set: &BTreeSet<String>) -> String {
+    format!("[{}]", set.iter().cloned().collect::<Vec<_>>().join(", "))
+}
+
+/// §2.6.1 边校验：对每个有 `[[crate]]` 声明的包比对
+/// `actual − allowed_internal_dependencies`，并拒绝 typo 造成的假允许。
+///
+/// FAIL 条件（全部 fail-closed）：
+/// 1. `actual − allowed` 非空（未声明的内部生产边）；
+/// 2. `allowed` 里出现非工作区成员名（typo → 假允许）；
+/// 3. `allowed` 指向无 `[[crate]]` 条目的工作区包（app/engineering 宿主除外）；
+/// 4. `[[crate]]` 声明了非工作区成员（phantom 声明同样是 typo 面）。
+pub(crate) fn check_internal_edges(meta: &Value, policy: &toml::Value) -> Result<(), String> {
+    let manifests = member_manifests(meta);
+    let members: Vec<String> = manifests.iter().map(|(n, _)| n.clone()).collect();
+    let decls = declared_crates(policy);
+    let declared: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
+    let mut errors: Vec<String> = Vec::new();
+
+    for decl in &decls {
+        if !members.iter().any(|m| m == &decl.name) {
+            errors.push(format!(
+                "{}: [[crate]] declares a package that is not a workspace member",
+                decl.name
+            ));
+            continue;
+        }
+        for allowed in &decl.allowed {
+            if !members.iter().any(|m| m == allowed) {
+                errors.push(format!(
+                    "{}: allowed_internal_dependencies lists '{}', which is not a workspace member",
+                    decl.name, allowed
+                ));
+            } else if !declared.contains(&allowed.as_str()) && !member_is_host(meta, allowed) {
+                errors.push(format!(
+                    "{}: allowed_internal_dependencies lists '{}', which has no [[crate]] declaration (app/engineering hosts excepted)",
+                    decl.name, allowed
+                ));
+            }
+        }
+        let actual = normal_internal_dependencies(meta, &decl.name, &members);
+        let extra: Vec<&str> = actual
+            .iter()
+            .map(String::as_str)
+            .filter(|a| !decl.allowed.iter().any(|x| x == a))
+            .collect();
+        if !extra.is_empty() {
+            errors.push(format!(
+                "{}: undeclared internal dependencies: {}",
+                decl.name,
+                extra.join(", ")
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// 严格解析 `YYYY-MM-DD`（含真实日历校验），失败返回 None。
+fn parse_iso_date(text: &str) -> Option<(i32, u32, u32)> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
+        bytes[range].iter().try_fold(0u32, |acc, b| {
+            if b.is_ascii_digit() {
+                Some(acc * 10 + u32::from(*b - b'0'))
+            } else {
+                None
+            }
+        })
+    };
+    let year = digits(0..4)? as i32;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// 运行当日（UTC）的 `YYYY-MM-DD`；日期来源集中在这一点，便于单测注入。
+fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// days-since-1970-01-01 → (year, month, day)（Howard Hinnant 的 civil_from_days）。
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
+}
+
+/// §2.6.2 `[dual_stack]` 校验：冻结 crate 的实际直接依赖方集合必须**等于**
+/// `allowed_dependents ∪ {allow.crate}`；每条 allow 必须有非空 `reason` 与
+/// 合法、未过期的 `review_by`（`today` 由调用方注入，单测可控）。
+///
+/// fail-closed：`[dual_stack]` 缺失 / `frozen_crates` 为空 / 成员名未知 /
+/// allow 缺字段 / 日期非法或过期，一律 FAIL（不是 WARN）。
+pub(crate) fn check_dual_stack(
+    meta: &Value,
+    policy: &toml::Value,
+    today: &str,
+) -> Result<(), String> {
+    let today_date = parse_iso_date(today)
+        .ok_or_else(|| format!("invalid evaluation date '{today}' (expected YYYY-MM-DD)"))?;
+    let section = policy.get("dual_stack").ok_or_else(|| {
+        "missing [dual_stack] in policies/architecture.toml (fail-closed: the frozen runtime edge set is not declared)"
+            .to_string()
+    })?;
+    let frozen = toml_str_list(section, "frozen_crates");
+    if frozen.is_empty() {
+        return Err("[dual_stack] frozen_crates is empty (fail-closed)".to_string());
+    }
+    let manifests = member_manifests(meta);
+    let members: Vec<String> = manifests.iter().map(|(n, _)| n.clone()).collect();
+
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    for dependent in toml_str_list(section, "allowed_dependents") {
+        if !members.iter().any(|m| m == &dependent) {
+            return Err(format!(
+                "[dual_stack] allowed_dependents lists '{dependent}', which is not a workspace member"
+            ));
+        }
+        expected.insert(dependent);
+    }
+
+    if let Some(allows) = section.get("allow").and_then(toml::Value::as_array) {
+        for (idx, entry) in allows.iter().enumerate() {
+            let label = format!("[[dual_stack.allow]] #{}", idx + 1);
+            let crate_name = entry
+                .get("crate")
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("{label}: missing 'crate'"))?;
+            if !members.iter().any(|m| m == crate_name) {
+                return Err(format!(
+                    "{label}: crate '{crate_name}' is not a workspace member"
+                ));
+            }
+            let reason = entry
+                .get("reason")
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if reason.is_empty() {
+                return Err(format!(
+                    "{label} ({crate_name}): missing non-empty 'reason'"
+                ));
+            }
+            let review_by = entry
+                .get("review_by")
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("{label} ({crate_name}): missing 'review_by'"))?;
+            let review_date = parse_iso_date(review_by).ok_or_else(|| {
+                format!(
+                    "{label} ({crate_name}): invalid review_by '{review_by}' (expected YYYY-MM-DD)"
+                )
+            })?;
+            if review_date < today_date {
+                return Err(format!(
+                    "{label} ({crate_name}): review_by {review_by} has expired (today {today})"
+                ));
+            }
+            expected.insert(crate_name.to_string());
+        }
+    }
+
+    for frozen_crate in &frozen {
+        if !members.iter().any(|m| m == frozen_crate) {
+            return Err(format!(
+                "[dual_stack] frozen crate '{frozen_crate}' is not a workspace member"
+            ));
+        }
+        let actual: BTreeSet<String> = members
+            .iter()
+            .filter(|name| {
+                normal_internal_dependencies(meta, name, &members).contains(frozen_crate)
+            })
+            .cloned()
+            .collect();
+        if actual != expected {
+            let missing: Vec<&str> = expected
+                .iter()
+                .map(String::as_str)
+                .filter(|e| !actual.contains(*e))
+                .collect();
+            let unexpected: Vec<&str> = actual
+                .iter()
+                .map(String::as_str)
+                .filter(|a| !expected.contains(*a))
+                .collect();
+            return Err(format!(
+                "[dual_stack] {frozen_crate}: direct dependents {} != allowed_dependents ∪ allow {} (missing: [{}], unexpected: [{}])",
+                fmt_set(&actual),
+                fmt_set(&expected),
+                missing.join(", "),
+                unexpected.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Light architecture gate: every `crates/*` workspace member must be declared
 /// in policies/architecture.toml [[crate]] (apps/engineering are hosts/tooling).
-pub fn architecture_gate(config: &Config, _budget: GateBudget) -> Gate {
+pub fn architecture_gate(repo: &Repo, config: &Config, _budget: GateBudget) -> Gate {
     let policy = config.policies_dir.join("architecture.toml");
     let text = match std::fs::read_to_string(&policy) {
         Ok(t) => t,
@@ -814,20 +1162,52 @@ pub fn architecture_gate(config: &Config, _budget: GateBudget) -> Gate {
         .filter(|name| !declared.iter().any(|d| d == name))
         .collect();
 
-    if missing.is_empty() {
-        Gate::ok(
-            "architecture-policy",
-            &format!("{} crates declared", declared.len()),
-        )
-    } else {
-        Gate::fail(
+    if !missing.is_empty() {
+        return Gate::fail(
             "architecture-policy",
             &format!(
                 "crates/ members missing from architecture.toml: {}",
                 missing.join(", ")
             ),
-        )
+        );
     }
+    // 证据索引一致性（与 `scenario index --check` 共用 evidence_index::check；
+    // 进程内调用，不 shell-out —— 判定随本次构建的 source_revision 绑定）。
+    // 放在 policy 校验之后：policy 缺失/畸形的既有早退路径不变。
+    let index_detail = match crate::evidence_index::check(repo, config) {
+        Ok(detail) => detail,
+        Err(errors) => {
+            return Gate::fail(
+                "architecture-policy",
+                &format!("evidence index mismatch:\n{}", errors.join("\n")),
+            );
+        }
+    };
+    let prefix = format!(
+        "{} crates declared; evidence index: {index_detail}",
+        declared.len()
+    );
+
+    // Q6 依赖边校验（§2.6.1 + §2.6.2）：成员声明与证据索引两段语义不变，
+    // 只在其后追加。fast/full 两档共用本函数 → 两档都拦新增边。
+    if let Err(errors) = check_internal_edges(&meta, &v) {
+        return Gate::fail(
+            "architecture-policy",
+            &format!("{prefix}; internal dependency edges FAILED:\n{errors}"),
+        );
+    }
+    let today = today_utc();
+    if let Err(error) = check_dual_stack(&meta, &v, &today) {
+        return Gate::fail(
+            "architecture-policy",
+            &format!("{prefix}; [dual_stack] FAILED: {error}"),
+        );
+    }
+
+    Gate::ok(
+        "architecture-policy",
+        &format!("{prefix}; internal dependency edges: OK; [dual_stack]: OK"),
+    )
 }
 
 /// Light dependency-governance gate: lockfile present + policy parses.
@@ -3180,13 +3560,330 @@ mod tests {
             bind_working_tree_digest: true,
             verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
-        let g = architecture_gate(&cfg, GateBudget::unlimited());
+        let g = architecture_gate(&Repo { root: tmp.clone() }, &cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("read failed"), "{}", g.detail);
         std::fs::write(tmp.join("architecture.toml"), "not = = toml").unwrap();
-        let g = architecture_gate(&cfg, GateBudget::unlimited());
+        let g = architecture_gate(&Repo { root: tmp.clone() }, &cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("parse failed"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn arch_cfg(tmp: &std::path::Path) -> Config {
+        Config {
+            policies_dir: tmp.to_path_buf(),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.join("evidence"),
+            crates_dir: tmp.join("crates"),
+            engineering_dir: tmp.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
+        }
+    }
+
+    #[test]
+    fn architecture_gate_fails_on_index_drift() {
+        // policy 合法但索引与场景集不一致（索引里有未知 id）→ FAIL。
+        let tmp = std::env::temp_dir().join(format!("harness-arch-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("docs")).unwrap();
+        std::fs::write(tmp.join("architecture.toml"), "[crate]\n").unwrap();
+        let mut rows = vec![crate::evidence_index::Row {
+            id: "product.ghost".to_string(),
+            carrier: crate::scenario::Carrier::V9Connectivity,
+            command_carrier: "cargo -p nexus".to_string(),
+            requirement: None,
+            first_revision: None,
+        }];
+        rows[0].first_revision = Some("unrecorded".to_string());
+        std::fs::write(
+            tmp.join(crate::evidence_index::INDEX_PATH),
+            crate::evidence_index::render(&rows, None),
+        )
+        .unwrap();
+        let g = architecture_gate(
+            &Repo { root: tmp.clone() },
+            &arch_cfg(&tmp),
+            GateBudget::unlimited(),
+        );
+        assert_eq!(g.verdict, "FAIL", "{}", g.detail);
+        assert!(g.detail.contains("evidence index mismatch"), "{}", g.detail);
+        assert!(g.detail.contains("product.ghost"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn architecture_gate_passes_on_clean_index() {
+        // policy 合法 + 零场景 + 空索引 → PASS（detail 附索引摘要）。
+        let tmp = std::env::temp_dir().join(format!("harness-arch-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("docs")).unwrap();
+        std::fs::write(
+            tmp.join("architecture.toml"),
+            "[crate]\n[dual_stack]\nfrozen_crates = [\"nexus-connectivity\"]\n\
+             allowed_dependents = [\"nexus\", \"nexus-harness\", \"nexus-proxy\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join(crate::evidence_index::INDEX_PATH),
+            crate::evidence_index::render(&[], None),
+        )
+        .unwrap();
+        let g = architecture_gate(
+            &Repo { root: tmp.clone() },
+            &arch_cfg(&tmp),
+            GateBudget::unlimited(),
+        );
+        assert_eq!(g.verdict, "PASS", "{}", g.detail);
+        assert!(
+            g.detail.contains("evidence index: 0 rows, 0 carriers"),
+            "{}",
+            g.detail
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- P5 / Q6：依赖边门禁（§2.6.1）+ [dual_stack]（§2.6.2）fail-closed 单测 ---
+
+    /// 合成 cargo metadata（纯数据，不跑 cargo）：`(name, host_dir, normal deps)`，
+    /// host_dir ∈ {"crates", "apps", "engineering"}，用于区分 crate 与宿主。
+    fn synth_meta(crates: &[(&str, &str, &[&str])]) -> Value {
+        let id = |(name, host, _): &(&str, &str, &[&str])| {
+            format!("path+file:///ws/{host}/{name}#{name}@0.1.0")
+        };
+        let packages: Vec<Value> = crates
+            .iter()
+            .map(|entry @ (name, host, deps)| {
+                serde_json::json!({
+                    "name": name,
+                    "id": id(entry),
+                    "manifest_path": format!("/ws/{host}/{name}/Cargo.toml"),
+                    "dependencies": deps
+                        .iter()
+                        .map(|d| serde_json::json!({"name": d, "kind": null}))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "workspace_root": "/ws",
+            "workspace_members": crates.iter().map(id).collect::<Vec<_>>(),
+            "packages": packages,
+        })
+    }
+
+    fn synth_policy(text: &str) -> toml::Value {
+        toml::from_str(text).expect("synthetic policy must parse")
+    }
+
+    #[test]
+    fn internal_edges_fail_on_undeclared_edge() {
+        // (i) 注入一条未声明边（nexus-proxy → nexus-domain 未写进 allowed）→ FAIL。
+        let meta = synth_meta(&[
+            ("nexus-domain", "crates", &[]),
+            ("nexus-proxy", "crates", &["nexus-domain"]),
+            ("nexus-connectivity", "crates", &[]),
+        ]);
+        let policy = synth_policy(
+            "[[crate]]\nname = \"nexus-domain\"\nallowed_internal_dependencies = []\n\
+             [[crate]]\nname = \"nexus-proxy\"\nallowed_internal_dependencies = []\n\
+             [[crate]]\nname = \"nexus-connectivity\"\nallowed_internal_dependencies = []\n",
+        );
+        let err = check_internal_edges(&meta, &policy).expect_err("undeclared edge must fail");
+        assert!(err.contains("nexus-proxy"), "{err}");
+        assert!(err.contains("nexus-domain"), "{err}");
+    }
+
+    #[test]
+    fn internal_edges_pass_after_edge_removed() {
+        // (ii) 把该边写进 allowed（= 移除违规边）→ PASS。
+        let meta = synth_meta(&[
+            ("nexus-domain", "crates", &[]),
+            ("nexus-proxy", "crates", &["nexus-domain"]),
+            ("nexus-connectivity", "crates", &[]),
+        ]);
+        let policy = synth_policy(
+            "[[crate]]\nname = \"nexus-domain\"\nallowed_internal_dependencies = []\n\
+             [[crate]]\nname = \"nexus-proxy\"\nallowed_internal_dependencies = [\"nexus-domain\"]\n\
+             [[crate]]\nname = \"nexus-connectivity\"\nallowed_internal_dependencies = []\n",
+        );
+        check_internal_edges(&meta, &policy).expect("declared edge must pass");
+    }
+
+    #[test]
+    fn internal_edges_fail_on_unknown_allowed_name_and_missing_declaration() {
+        // typo 造成的假允许（非成员名）+ allowed 指向无 [[crate]] 的非宿主 crate。
+        let meta = synth_meta(&[
+            ("nexus-domain", "crates", &[]),
+            ("nexus-proxy", "crates", &[]),
+        ]);
+        let typo = synth_policy(
+            "[[crate]]\nname = \"nexus-domain\"\nallowed_internal_dependencies = [\"nexus-domian\"]\n\
+             [[crate]]\nname = \"nexus-proxy\"\nallowed_internal_dependencies = []\n",
+        );
+        let err = check_internal_edges(&meta, &typo).expect_err("typo allow must fail");
+        assert!(err.contains("nexus-domian"), "{err}");
+
+        // nexus-proxy 是 crates/ 成员但 policy 只声明了 nexus-domain：
+        // allowed 指向它属于"允许了未登记 crate"，同样 FAIL。
+        let undeclared_target = synth_policy(
+            "[[crate]]\nname = \"nexus-domain\"\nallowed_internal_dependencies = [\"nexus-proxy\"]\n",
+        );
+        let err = check_internal_edges(&meta, &undeclared_target)
+            .expect_err("allowed target without [[crate]] must fail");
+        assert!(err.contains("no [[crate]] declaration"), "{err}");
+    }
+
+    #[test]
+    fn internal_edges_allow_app_host_target() {
+        // app/engineering 宿主无 [[crate]] 条目属正常：allowed 指向它们不 FAIL。
+        let meta = synth_meta(&[("nexus-proxy", "crates", &[]), ("nexusd", "apps", &[])]);
+        let policy = synth_policy(
+            "[[crate]]\nname = \"nexus-proxy\"\nallowed_internal_dependencies = [\"nexusd\"]\n",
+        );
+        check_internal_edges(&meta, &policy).expect("host target must be accepted");
+    }
+
+    /// `[dual_stack]` 测试的公共输入：connectivity 的四个直接依赖方
+    /// （3 个目标值 + 1 个 allow 候选 nexusd）+ 一个**不依赖** connectivity 的
+    /// 成员 nexus-qos（供"allowed 多写一个"用例）。
+    fn dual_stack_meta() -> Value {
+        synth_meta(&[
+            ("nexus-connectivity", "crates", &[]),
+            ("nexus-qos", "crates", &[]),
+            ("nexus", "apps", &["nexus-connectivity"]),
+            ("nexus-harness", "engineering", &["nexus-connectivity"]),
+            ("nexus-proxy", "crates", &["nexus-connectivity"]),
+            ("nexusd", "apps", &["nexus-connectivity"]),
+        ])
+    }
+
+    const DUAL_STACK_TARGET: &str = "[dual_stack]\n\
+         frozen_crates = [\"nexus-connectivity\"]\n";
+
+    fn dual_stack_policy(extra: &str) -> toml::Value {
+        synth_policy(&format!(
+            "{DUAL_STACK_TARGET}allowed_dependents = [\"nexus\", \"nexus-harness\", \"nexus-proxy\"]\n{extra}"
+        ))
+    }
+
+    #[test]
+    fn dual_stack_fails_closed_when_section_missing() {
+        let policy =
+            synth_policy("[[crate]]\nname = \"nexus-proxy\"\nallowed_internal_dependencies = []\n");
+        let err = check_dual_stack(&dual_stack_meta(), &policy, "2026-10-28")
+            .expect_err("missing [dual_stack] must fail");
+        assert!(err.contains("missing [dual_stack]"), "{err}");
+    }
+
+    #[test]
+    fn dual_stack_fails_when_dependent_set_has_extra_member() {
+        // (iii)-多：实际依赖方比 allowed_dependents 多一个（allow 未覆盖）→ FAIL。
+        let policy = synth_policy(&format!(
+            "{DUAL_STACK_TARGET}allowed_dependents = [\"nexus\", \"nexus-harness\"]\n"
+        ));
+        let err = check_dual_stack(&dual_stack_meta(), &policy, "2026-10-28")
+            .expect_err("extra dependent must fail");
+        assert!(err.contains("unexpected"), "{err}");
+        assert!(err.contains("nexus-proxy"), "{err}");
+    }
+
+    #[test]
+    fn dual_stack_fails_when_dependent_set_missing_member() {
+        // (iii)-少：policy 声称有一个并不存在的依赖方（nexus-qos 不依赖
+        // connectivity）→ FAIL（policy 与实际脱节）。
+        let policy = synth_policy(&format!(
+            "{DUAL_STACK_TARGET}allowed_dependents = [\"nexus\", \"nexus-harness\", \"nexus-proxy\", \"nexus-qos\"]\n"
+        ));
+        let err = check_dual_stack(&dual_stack_meta(), &policy, "2026-10-28")
+            .expect_err("missing dependent must fail");
+        assert!(err.contains("missing"), "{err}");
+        assert!(err.contains("nexus-qos"), "{err}");
+    }
+
+    #[test]
+    fn dual_stack_allow_entry_without_reason_fails() {
+        // (iv) allow 缺非空 reason → FAIL（不是 WARN）。
+        let policy = dual_stack_policy(
+            "\n[[dual_stack.allow]]\ncrate = \"nexusd\"\nreason = \"  \"\nreview_by = \"2027-01-31\"\n",
+        );
+        let err = check_dual_stack(&dual_stack_meta(), &policy, "2026-10-28")
+            .expect_err("allow without reason must fail");
+        assert!(err.contains("reason"), "{err}");
+    }
+
+    #[test]
+    fn dual_stack_allow_entry_expired_review_by_fails() {
+        // (v) review_by 早于运行当日 → FAIL。
+        let policy = dual_stack_policy(
+            "\n[[dual_stack.allow]]\ncrate = \"nexusd\"\nreason = \"v1.4 追认未完成，见 run dual-stack-convergence §5.3\"\nreview_by = \"2026-10-27\"\n",
+        );
+        let err = check_dual_stack(&dual_stack_meta(), &policy, "2026-10-28")
+            .expect_err("expired allow must fail");
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn dual_stack_valid_allow_admits_extra_dependent() {
+        // (vi) allow 合法（reason 非空 + review_by 未过期）→ 该 crate 可作额外依赖方。
+        let policy = dual_stack_policy(
+            "\n[[dual_stack.allow]]\ncrate = \"nexusd\"\nreason = \"v1.4 追认未完成，见 run dual-stack-convergence §5.3\"\nreview_by = \"2026-10-28\"\n",
+        );
+        check_dual_stack(&dual_stack_meta(), &policy, "2026-10-28")
+            .expect("valid allow must admit the extra dependent");
+    }
+
+    #[test]
+    fn architecture_gate_wires_edge_and_dual_stack_checks() {
+        // 接线证据：gate 本体（不只纯函数）在 policy 出错时 FAIL，policy 正确时 PASS。
+        let repo = crate::env::Repo::discover().expect("repo must be discoverable");
+        let tmp = std::env::temp_dir().join(format!("harness-arch-edges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("docs")).unwrap();
+        std::fs::write(
+            tmp.join(crate::evidence_index::INDEX_PATH),
+            crate::evidence_index::render(&[], None),
+        )
+        .unwrap();
+
+        // 1) 允许名单里写 typo → gate FAIL，且 detail 带上边校验结果。
+        std::fs::write(
+            tmp.join("architecture.toml"),
+            "[dual_stack]\nfrozen_crates = [\"nexus-connectivity\"]\n\
+             allowed_dependents = [\"nexus\", \"nexus-harness\", \"nexus-proxy\"]\n\
+             [[crate]]\nname = \"nexus-domain\"\nallowed_internal_dependencies = [\"nexus-ghost\"]\n",
+        )
+        .unwrap();
+        let g = architecture_gate(
+            &Repo { root: tmp.clone() },
+            &arch_cfg(&tmp),
+            GateBudget::unlimited(),
+        );
+        assert_eq!(g.verdict, "FAIL", "{}", g.detail);
+        assert!(g.detail.contains("nexus-ghost"), "{}", g.detail);
+        assert!(g.detail.contains("evidence index:"), "{}", g.detail);
+
+        // 2) 仓库真实 policy 拷进沙盒 → gate PASS，detail 追加两段边校验摘要。
+        std::fs::copy(
+            repo.root.join("policies/architecture.toml"),
+            tmp.join("architecture.toml"),
+        )
+        .unwrap();
+        let g = architecture_gate(
+            &Repo { root: tmp.clone() },
+            &arch_cfg(&tmp),
+            GateBudget::unlimited(),
+        );
+        assert_eq!(g.verdict, "PASS", "{}", g.detail);
+        assert!(
+            g.detail.contains("internal dependency edges: OK"),
+            "{}",
+            g.detail
+        );
+        assert!(g.detail.contains("[dual_stack]: OK"), "{}", g.detail);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

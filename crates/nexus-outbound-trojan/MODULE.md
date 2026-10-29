@@ -5,7 +5,7 @@
 
 ## Responsibility
 
-实现 `nexus_connectivity::OutboundAdapter` 的第五个真实出站实现 **Trojan**：
+实现 `nexus_proxy_config::outbound_seam::OutboundAdapter` 的第五个真实出站实现 **Trojan**：
 在既有 TCP 字节流之上叠加 TLS（rustls 0.23 + ring）与 trojan 请求头
 （`hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`，与 trojan-gfw 官方线上格式一致），其后双向透明中继。
 
@@ -31,11 +31,12 @@
 ## Outputs
 
 - `OutboundAdapter::handoff` → `OutboundHandoff { kind = "trojan", tag, locator }`；
+  错误类型为 `OutboundHandoffError`（当前无生产者，见 proxy-config MODULE）；
 - 请求头字节流；结构化错误。
 
 ## Allowed Dependencies
 
-- `nexus-connectivity`（OutboundAdapter 接缝）；
+- `nexus-proxy-config`（出站身份/交接词汇 `outbound_seam::OutboundAdapter`）；
 - 已评审入仓第三方：`rustls 0.23(ring,std)`、`rcgen 0.13`、`sha2 0.10`。
 
 ## Forbidden Dependencies
@@ -43,6 +44,10 @@
 - `nexus-proxy` / 选路 / 策略组 / 系统根证书（webpki-root-certs 类 CDLA 包）；
 - tokio / 异步运行时（与仓库 loopback blocking+thread 模式一致）；
 - 任何 wasm 不可移植但未隔离的依赖。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  接缝 ② 已于 2026-10-28（P2）清除：出站身份/交接词汇定义于 `nexus-proxy-config`，
+  本 crate 对 `nexus-connectivity` 的直接边为 0
+  （见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`）。
 
 ## Invariants
 

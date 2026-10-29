@@ -3,6 +3,7 @@ id = "product.fabric-egress-basic"
 title = "统一路由本地出口：TUN 包经规则匹配走 Egress{self} UDP NAT， hồi包正确"
 evidence_strength = "E4"
 requirement = "docs/foundation/DESIGN.md#6.4"
+carrier = "n1-fabric"
 
 [given]
 topology = "single Projection with MockTun + SimpleRuleEngine + EgressNat (example binary)"

@@ -2,15 +2,19 @@
 //!
 //! 只使用产品既有出站字段（§7.3），不新增配置面。
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nexus_ingress::{Socks5Address, decode_udp_datagram, encode_udp_datagram};
+
 use crate::Outcome;
 use crate::config::{
-    Cell, Credentials, HeaderFormat, Hy2Obfs, InteropProbeConfig, Protocol, Variant,
+    Cell, Credentials, HeaderFormat, Hy2Obfs, InteropProbeConfig, Protocol, Variant, VlessFlowKind,
 };
 use crate::evidence::{ErrorClass, ErrorInfo, Metrics, Verdict};
 use crate::util;
@@ -90,8 +94,21 @@ struct ProxyConn {
     rx: mpsc::Receiver<Result<serde_json::Value, String>>,
 }
 
+/// SOCKS5 CONNECT 的结果（AC-12：失败格需要把「拒绝」与 tool error 区分开）。
+enum ProxyAttempt {
+    /// CONNECT 成功（success 应答已读）。
+    Connected(ProxyConn),
+    /// CONNECT 被拒绝：`REP != 0` 或应答写出前 EOF。
+    Refused {
+        stream: TcpStream,
+        rep: Option<u8>,
+        eof_before_reply: bool,
+        rx: mpsc::Receiver<Result<serde_json::Value, String>>,
+    },
+}
+
 impl ProxyConn {
-    fn open(cfg: &InteropProbeConfig, timeout: Duration) -> Result<Self, String> {
+    fn open(cfg: &InteropProbeConfig, timeout: Duration) -> Result<ProxyAttempt, String> {
         let yaml = proxy_yaml(cfg)?;
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("bind proxy: {e}"))?;
@@ -102,14 +119,27 @@ impl ProxyConn {
             let result = nexus::proxy_serve_once(&clone, &yaml).map_err(|e| format!("{e:?}"));
             let _ = tx.send(result);
         });
-        let stream = socks5_connect(addr, &cfg.target.host, cfg.target.port, timeout)?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| e.to_string())?;
-        Ok(Self { stream, rx })
+        match socks5_connect(addr, &cfg.target.host, cfg.target.port, timeout)? {
+            Socks5Attempt::Connected(stream) => {
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .map_err(|e| e.to_string())?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .map_err(|e| e.to_string())?;
+                Ok(ProxyAttempt::Connected(Self { stream, rx }))
+            }
+            Socks5Attempt::Refused {
+                stream,
+                rep,
+                eof_before_reply,
+            } => Ok(ProxyAttempt::Refused {
+                stream,
+                rep,
+                eof_before_reply,
+                rx,
+            }),
+        }
     }
 
     /// 关闭隧道并等待 proxy JSON（有界等待，避免中继未终止时挂死探针）。
@@ -127,13 +157,26 @@ impl ProxyConn {
     }
 }
 
+/// SOCKS5 CONNECT 的结果形态。
+enum Socks5Attempt {
+    Connected(TcpStream),
+    Refused {
+        stream: TcpStream,
+        rep: Option<u8>,
+        eof_before_reply: bool,
+    },
+}
+
 /// 最小 SOCKS5 客户端（NO-AUTH + CONNECT IPv4/域名）。
+///
+/// AC-12：`REP != 0` 与「应答写出前 EOF」不再一律变成 tool error——它们作为结构化
+/// `Refused` 返回，由调用方按 cell 类型决定是「预期拒绝」还是失败。
 fn socks5_connect(
     proxy: SocketAddr,
     host: &str,
     port: u16,
     timeout: Duration,
-) -> Result<TcpStream, String> {
+) -> Result<Socks5Attempt, String> {
     let mut stream = TcpStream::connect_timeout(&proxy, timeout)
         .map_err(|e| format!("connect proxy {proxy}: {e}"))?;
     stream
@@ -166,12 +209,19 @@ fn socks5_connect(
         .write_all(&req)
         .map_err(|e| format!("socks5 connect request: {e}"))?;
     let mut head = [0u8; 4];
-    stream
-        .read_exact(&mut head)
-        .map_err(|e| format!("socks5 connect reply: {e}"))?;
-    if head[0] != 0x05 || head[1] != 0x00 {
-        return Err(format!("socks5 connect refused: {head:?}"));
+    if stream.read_exact(&mut head).is_err() {
+        // 应答写出前 EOF/读失败：失败格可判「成功前失败」，成功格仍是 tool error。
+        return Ok(Socks5Attempt::Refused {
+            stream,
+            rep: None,
+            eof_before_reply: true,
+        });
     }
+    if head[0] != 0x05 {
+        return Err(format!("socks5 connect reply not v5: {head:?}"));
+    }
+    // 失败应答本身也是完整 SOCKS5 应答（ATYP + BND.ADDR + BND.PORT）：
+    // 必须按应答格式**读干净**，否则残留字节会被计入「隧道字节」（AC-1.2）。
     match head[3] {
         0x01 => {
             let mut rest = [0u8; 6];
@@ -189,7 +239,14 @@ fn socks5_connect(
         }
         other => return Err(format!("socks5 unknown atyp {other:#x}")),
     }
-    Ok(stream)
+    if head[1] != 0x00 {
+        return Ok(Socks5Attempt::Refused {
+            stream,
+            rep: Some(head[1]),
+            eof_before_reply: false,
+        });
+    }
+    Ok(Socks5Attempt::Connected(stream))
 }
 
 /// 单连接工作负载（在 SOCKS5 隧道上跑）。
@@ -198,6 +255,61 @@ struct WorkloadResult {
     echoed: Vec<u8>,
     errors: Vec<String>,
     metrics: Metrics,
+    /// 失败格（BadCredential/BadConfig）的本地失败观测（AC-12 三重断言）。
+    failure: Option<FailureObservation>,
+}
+
+/// 失败格的本地失败观测（spec AC-12.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureObservation {
+    /// SOCKS5 CONNECT 应答 REP（`None` = 应答前 EOF/读失败）。
+    pub rep: Option<u8>,
+    /// 应答写出前连接被关闭（无 REP 可读）。
+    pub eof_before_reply: bool,
+    /// `t_fail` 之后到 EOF 之间读到的隧道字节数（必须为 0）。
+    pub tunnel_bytes: u64,
+    /// `t_fail` 起 500ms 单次读超时内是否读到 EOF。
+    pub eof_seen: bool,
+}
+
+/// 失败格判定结果（纯函数，供 meta 负向测试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureVerdict {
+    /// REP≠0 或应答前 EOF，零隧道字节，且 500ms 内 EOF。
+    Pass,
+    /// 失败格出现成功会话 JSON（静默成功）。
+    FailSilentAccept,
+    /// 隧道出现任何下行字节（fallback 内容被上交）。
+    FailTunnelBytes,
+    /// 失败后 500ms 内未读到 EOF。
+    FailNoEof,
+    /// 既没有 REP≠0 也没有应答前 EOF。
+    FailNoRefusal,
+}
+
+/// AC-12 的失败格判据（纯函数）：三重断言全部满足才算 PASS。
+///
+/// 1. 失败先于任何隧道字节：`REP != 0` 或「应答前 EOF」恰取其一；
+/// 2. `tunnel_bytes_to_client == 0`（失败应答本身不计入隧道字节）；
+/// 3. 失败后 500ms 内读到 EOF。
+///
+/// 另外，失败格不允许出现成功会话 JSON（那是「静默成功」这一 fail-open 现象）。
+#[must_use]
+pub fn failure_cell_verdict(obs: &FailureObservation, proxy_json_present: bool) -> FailureVerdict {
+    if proxy_json_present {
+        return FailureVerdict::FailSilentAccept;
+    }
+    if obs.tunnel_bytes > 0 {
+        return FailureVerdict::FailTunnelBytes;
+    }
+    let refused = obs.rep.is_some_and(|r| r != 0) || obs.eof_before_reply;
+    if !refused {
+        return FailureVerdict::FailNoRefusal;
+    }
+    if !obs.eof_seen {
+        return FailureVerdict::FailNoEof;
+    }
+    FailureVerdict::Pass
 }
 
 fn tcp_roundtrip(
@@ -413,7 +525,11 @@ fn run_workload(
                 }
             }
         }
-        Cell::Reconnect | Cell::UdpEcho | Cell::QpackDiag | Cell::PaddingDiag => {
+        Cell::Reconnect
+        | Cell::UdpEcho
+        | Cell::UdpEchoCrate
+        | Cell::QpackDiag
+        | Cell::PaddingDiag => {
             return Err(format!("cell {cell} is not a product tunnel workload"));
         }
     };
@@ -423,11 +539,45 @@ fn run_workload(
         echoed,
         errors,
         metrics,
+        failure: None,
     })
 }
 
+/// 失败格：在 `t_fail` 之后按 AC-1.2 的冻结程序结算隧道字节与 EOF。
+fn observe_failure(
+    stream: &mut TcpStream,
+    rep: Option<u8>,
+    eof_before_reply: bool,
+) -> FailureObservation {
+    // 单次 500ms 读超时循环直到 EOF（冻结口径）。
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut tunnel_bytes = 0u64;
+    let mut eof_seen = false;
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                eof_seen = true;
+                break;
+            }
+            Ok(n) => tunnel_bytes += n as u64,
+            Err(_) => break,
+        }
+    }
+    FailureObservation {
+        rep,
+        eof_before_reply,
+        tunnel_bytes,
+        eof_seen,
+    }
+}
+
 /// 产品载波 cell 执行入口。
-pub fn run_cell(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
+pub fn run_cell(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, String> {
+    if cfg.cell == Cell::UdpEcho {
+        // spec §9.1：产品级 UDP 是独立路径（不是 CONNECT 隧道），第 1–7 步自成闭环。
+        return run_product_udp(cfg, cell_dir);
+    }
     if cfg.cell == Cell::Reconnect {
         return run_reconnect(cfg);
     }
@@ -436,7 +586,48 @@ pub fn run_cell(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
     } else {
         cfg.timeouts.cell_ms
     });
-    let mut conn = ProxyConn::open(cfg, timeout)?;
+    let attempt = ProxyConn::open(cfg, timeout)?;
+    let mut conn = match attempt {
+        ProxyAttempt::Connected(conn) => conn,
+        ProxyAttempt::Refused {
+            mut stream,
+            rep,
+            eof_before_reply,
+            rx,
+        } => {
+            if !cfg.cell.is_failure_cell() {
+                // 成功格出现拒绝 = tool error（判定零放宽）。
+                return Err(format!(
+                    "socks5 connect refused on {} cell: rep={rep:?} eof_before_reply={eof_before_reply}",
+                    cfg.cell.label()
+                ));
+            }
+            let failure = observe_failure(&mut stream, rep, eof_before_reply);
+            drop(stream);
+            let (proxy_json, proxy_error) = match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(value)) => (Some(value), None),
+                Ok(Err(err)) => (None, Some(err)),
+                Err(_) => (
+                    None,
+                    Some("proxy relay did not terminate within wait window".to_string()),
+                ),
+            };
+            let workload = WorkloadResult {
+                echo_ok: false,
+                echoed: Vec::new(),
+                errors: Vec::new(),
+                metrics: Metrics::default(),
+                failure: Some(failure),
+            };
+            return Ok(judge(
+                cfg,
+                &workload,
+                proxy_json.as_ref(),
+                proxy_error.as_deref(),
+                0,
+            ));
+        }
+    };
     if cfg.cell == Cell::PaddingDiag {
         let (proxy_json, proxy_error) = conn.finish(Duration::from_secs(3));
         let workload = WorkloadResult {
@@ -444,6 +635,7 @@ pub fn run_cell(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
             echoed: Vec::new(),
             errors: Vec::new(),
             metrics: Metrics::default(),
+            failure: None,
         };
         let mut outcome = judge(
             cfg,
@@ -466,6 +658,7 @@ pub fn run_cell(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
             echoed: Vec::new(),
             errors: vec![err],
             metrics: Metrics::default(),
+            failure: None,
         },
     };
     let join_wait = Duration::from_secs(if cfg.cell == Cell::LongLived { 10 } else { 3 });
@@ -488,7 +681,14 @@ fn run_reconnect(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
     let mut last_proxy = None;
     for i in 0..cfg.workload.reconnect_cycles {
         let timeout = Duration::from_millis(cfg.timeouts.cell_ms);
-        let mut conn = ProxyConn::open(cfg, timeout)?;
+        let mut conn = match ProxyConn::open(cfg, timeout)? {
+            ProxyAttempt::Connected(conn) => conn,
+            ProxyAttempt::Refused { rep, .. } => {
+                return Err(format!(
+                    "socks5 connect refused in reconnect cycle: rep={rep:?}"
+                ));
+            }
+        };
         match tcp_roundtrip(
             &mut conn.stream,
             &payload,
@@ -515,6 +715,7 @@ fn run_reconnect(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
         echoed: Vec::new(),
         errors: notes,
         metrics,
+        failure: None,
     };
     Ok(judge(
         cfg,
@@ -588,6 +789,65 @@ fn judge(
         } else {
             ErrorClass::EExpectedConfigReject
         };
+        // AC-12 三重断言：本地观测到的失败形态（REP≠0 / 应答前 EOF + 零隧道字节 + EOF）。
+        if let Some(obs) = workload.failure.as_ref() {
+            let verdict = failure_cell_verdict(obs, proxy_json.is_some());
+            match obs.rep {
+                Some(rep) => notes.push(format!("socks5_rep={rep}")),
+                None => notes.push("eof_before_reply=true".to_string()),
+            }
+            notes.push(format!("tunnel_bytes_to_client={}", obs.tunnel_bytes));
+            notes.push(format!("eof_within_500ms={}", obs.eof_seen));
+            if let Some(err) = proxy_error {
+                notes.push(format!("proxy_error={err}"));
+            }
+            notes.push(format!("classification={}", class_label(expected_class)));
+            return match verdict {
+                FailureVerdict::Pass => Outcome {
+                    verdict: Verdict::Pass,
+                    error: None,
+                    metrics,
+                    notes,
+                    proxy_json: proxy_json.cloned(),
+                },
+                FailureVerdict::FailTunnelBytes => Outcome {
+                    verdict: Verdict::Fail,
+                    error: Some(ErrorInfo {
+                        class: ErrorClass::ENexusFraming,
+                        message: format!(
+                            "negative case surfaced {} tunnel bytes before/after failure",
+                            obs.tunnel_bytes
+                        ),
+                        first_failure_artifact: Some("pcap.pcap".into()),
+                    }),
+                    metrics,
+                    notes,
+                    proxy_json: proxy_json.cloned(),
+                },
+                FailureVerdict::FailSilentAccept => Outcome {
+                    verdict: Verdict::Fail,
+                    error: Some(ErrorInfo {
+                        class: ErrorClass::ENexusFraming,
+                        message: "negative case produced a successful session JSON".into(),
+                        first_failure_artifact: Some("pcap.pcap".into()),
+                    }),
+                    metrics,
+                    notes,
+                    proxy_json: proxy_json.cloned(),
+                },
+                FailureVerdict::FailNoRefusal | FailureVerdict::FailNoEof => Outcome {
+                    verdict: Verdict::Fail,
+                    error: Some(ErrorInfo {
+                        class: ErrorClass::ENexusFraming,
+                        message: "negative case did not fail closed before tunnel bytes".into(),
+                        first_failure_artifact: Some("pcap.pcap".into()),
+                    }),
+                    metrics,
+                    notes,
+                    proxy_json: proxy_json.cloned(),
+                },
+            };
+        }
         // 客户端自身的解码失败不能被当作“参照端拒绝了负向用例”：两者都表现为无 echo。
         if let Some(err) = proxy_error {
             let lower = err.to_ascii_lowercase();
@@ -758,6 +1018,383 @@ fn judge(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 产品级 UDP（spec §9.1 第 1–7 步；Q10：`UdpEcho` 是产品级 required 格）
+// ---------------------------------------------------------------------------
+
+/// 一次 SOCKS5 UDP ASSOCIATE 会话（控制连接 + 客户端 UDP socket + BND）。
+struct UdpAssociation {
+    control: TcpStream,
+    client: UdpSocket,
+    bnd: SocketAddr,
+    rx: mpsc::Receiver<Result<serde_json::Value, String>>,
+}
+
+impl UdpAssociation {
+    /// 第 1–3 步：起 `proxy_serve_once`（loopback）→ greeting → UDP ASSOCIATE → 解析 BND。
+    fn open(cfg: &InteropProbeConfig, timeout: Duration) -> Result<Self, String> {
+        let yaml = proxy_yaml(cfg)?;
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("bind proxy: {e}"))?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let clone = listener.try_clone().map_err(|e| e.to_string())?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = nexus::proxy_serve_once(&clone, &yaml).map_err(|e| format!("{e:?}"));
+            let _ = tx.send(result);
+        });
+        let mut control = TcpStream::connect_timeout(&addr, timeout)
+            .map_err(|e| format!("connect proxy {addr}: {e}"))?;
+        control
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| e.to_string())?;
+        control
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| e.to_string())?;
+        control
+            .write_all(&[0x05, 0x01, 0x00])
+            .map_err(|e| format!("socks5 greeting: {e}"))?;
+        let mut method = [0u8; 2];
+        control
+            .read_exact(&mut method)
+            .map_err(|e| format!("socks5 greeting reply: {e}"))?;
+        if method != [0x05, 0x00] {
+            return Err(format!("socks5 no-auth rejected: {method:?}"));
+        }
+        // UDP ASSOCIATE，DST.ADDR/DST.PORT = 0.0.0.0:0（首包学习客户端端点）。
+        control
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .map_err(|e| format!("socks5 associate request: {e}"))?;
+        let mut reply = [0u8; 10];
+        control
+            .read_exact(&mut reply)
+            .map_err(|e| format!("socks5 associate reply: {e}"))?;
+        if reply[0] != 0x05 {
+            return Err(format!("socks5 associate reply not v5: {reply:?}"));
+        }
+        if reply[1] != 0x00 {
+            return Err(format!("socks5 associate rejected: rep={:#04x}", reply[1]));
+        }
+        let bnd = parse_bnd(&reply)?;
+        let client = UdpSocket::bind(("127.0.0.1", 0)).map_err(|e| format!("bind client: {e}"))?;
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            control,
+            client,
+            bnd,
+            rx,
+        })
+    }
+
+    /// 第 6 步：关闭控制连接，等待 serve JSON。
+    fn finish(self, wait: Duration) -> (Option<serde_json::Value>, Option<String>) {
+        let Self { control, rx, .. } = self;
+        drop(control);
+        match rx.recv_timeout(wait) {
+            Ok(Ok(value)) => (Some(value), None),
+            Ok(Err(err)) => (None, Some(err)),
+            Err(_) => (
+                None,
+                Some("proxy association did not terminate within wait window".into()),
+            ),
+        }
+    }
+}
+
+/// 应答 BND.ADDR/PORT → `SocketAddr`（产品回 IPv4/IPv6 literal）。
+fn parse_bnd(reply: &[u8; 10]) -> Result<SocketAddr, String> {
+    match reply[3] {
+        0x01 => Ok(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])),
+            u16::from_be_bytes([reply[8], reply[9]]),
+        )),
+        // 产品对 loopback 监听只回 IPv4 BND（10B 定长应答）；IPv6 变体不在本工具面。
+        other => Err(format!("unexpected BND ATYP {other:#x}")),
+    }
+}
+
+/// 目标端 → SOCKS5 UDP 头里的 DST.ADDR/DST.PORT。
+fn socks5_target(cfg: &InteropProbeConfig) -> Result<Socks5Address, String> {
+    let port = cfg.target.port;
+    if let Ok(v4) = cfg.target.host.parse::<Ipv4Addr>() {
+        return Ok(Socks5Address::Ipv4 {
+            addr: v4.octets(),
+            port,
+        });
+    }
+    if let Ok(v6) = cfg.target.host.parse::<Ipv6Addr>() {
+        return Ok(Socks5Address::Ipv6 {
+            addr: v6.octets(),
+            port,
+        });
+    }
+    Ok(Socks5Address::Domain {
+        host: cfg.target.host.clone(),
+        port,
+    })
+}
+
+/// 产品侧该协议是否声明了 UDP 能力（与 `build_udp_outbound` 的分派一致）。
+fn product_udp_supported(cfg: &InteropProbeConfig) -> bool {
+    match (&cfg.protocol, &cfg.credentials) {
+        (Protocol::Vless, Credentials::Vless(c)) => c.flow == VlessFlowKind::None,
+        (Protocol::Anytls, Credentials::Anytls(_)) => true,
+        _ => false,
+    }
+}
+
+/// 产品级 UDP cell 执行入口。
+fn run_product_udp(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, String> {
+    let timeout = Duration::from_millis(cfg.timeouts.cell_ms);
+    let assoc = UdpAssociation::open(cfg, timeout)?;
+    if product_udp_supported(cfg) {
+        run_udp_echo(cfg, assoc)
+    } else {
+        run_udp_unsupported(cfg, assoc, cell_dir)
+    }
+}
+
+/// 第 4–7 步：经产品路径收发 1000 个数据报，并断言 JSON/路由事实。
+fn run_udp_echo(cfg: &InteropProbeConfig, assoc: UdpAssociation) -> Result<Outcome, String> {
+    let seed = util::cell_seed(cfg.protocol.label(), cfg.variant.label(), cfg.cell.label());
+    let total = cfg.workload.udp_datagrams;
+    let len = cfg.workload.udp_payload_bytes;
+    let target = socks5_target(cfg)?;
+    let mut metrics = Metrics::default();
+    let mut received: BTreeSet<u64> = BTreeSet::new();
+    let mut buf = vec![0u8; 65_535];
+    // 窗口化：产品关联循环以 100ms 控制连接轮询为节拍，整批 1000 包会撞内核 socket 缓冲；
+    // 128 包/窗（≈67KB）在默认 rmem/wmem 之内，且总时长仍远小于 `cell_ms`。
+    const WINDOW: u32 = 128;
+    let mut seq = 0u32;
+    while seq < total {
+        let end = (seq + WINDOW).min(total);
+        for current in seq..end {
+            let payload = util::udp_payload(seed, u64::from(current), len);
+            let datagram = encode_udp_datagram(&target, &payload)
+                .map_err(|e| format!("encode udp datagram seq {current}: {e}"))?;
+            assoc
+                .client
+                .send_to(&datagram, assoc.bnd)
+                .map_err(|e| format!("udp send seq {current}: {e}"))?;
+            metrics.udp_sent += 1;
+            metrics.bytes_up += payload.len() as u64;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received.len() < end as usize && Instant::now() < deadline {
+            match assoc.client.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    let Ok(decoded) = decode_udp_datagram(&buf[..n]) else {
+                        metrics.udp_corrupt += 1;
+                        continue;
+                    };
+                    let reply = decoded.payload;
+                    if reply.len() < 8 {
+                        metrics.udp_corrupt += 1;
+                        continue;
+                    }
+                    let reply_seq = u64::from_be_bytes([
+                        reply[0], reply[1], reply[2], reply[3], reply[4], reply[5], reply[6],
+                        reply[7],
+                    ]);
+                    let expected = util::udp_payload(seed, reply_seq, len);
+                    if reply != expected {
+                        metrics.udp_corrupt += 1;
+                        continue;
+                    }
+                    if received.insert(reply_seq) {
+                        metrics.udp_received += 1;
+                        metrics.bytes_down += reply.len() as u64;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        seq = end;
+    }
+
+    let bnd = assoc.bnd;
+    let (proxy_json, proxy_error) = assoc.finish(Duration::from_secs(10));
+    let mut notes = vec![format!("bnd={bnd}")];
+    if let Some(err) = proxy_error {
+        notes.push(format!("proxy_error={err}"));
+        return Ok(Outcome {
+            verdict: Verdict::Fail,
+            error: Some(ErrorInfo {
+                class: ErrorClass::ENexusUdp,
+                message: format!("product udp association did not terminate: {err}"),
+                first_failure_artifact: Some("pcap.pcap".into()),
+            }),
+            metrics,
+            notes,
+            proxy_json: None,
+        });
+    }
+    let kind = product_kind(cfg.protocol);
+    let mut assertions_ok = metrics.udp_received == total && metrics.udp_corrupt == 0;
+    if let Some(json) = proxy_json.as_ref() {
+        let flow_kind = json
+            .pointer("/routing/flows/0/outbound_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        let datagrams_in = json
+            .pointer("/udp/datagrams_in")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let datagrams_out = json
+            .pointer("/udp/datagrams_out")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let send_failed = json
+            .pointer("/udp/send_failed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(u64::MAX);
+        notes.push(format!(
+            "proxy_json verdict={} routing.flows[0].outbound_kind={flow_kind} udp.datagrams_in={datagrams_in} udp.datagrams_out={datagrams_out} udp.send_failed={send_failed}",
+            json.pointer("/verdict").and_then(serde_json::Value::as_str).unwrap_or("<missing>")
+        ));
+        assertions_ok &= flow_kind == kind
+            && datagrams_in == u64::from(total)
+            && datagrams_out == u64::from(total)
+            && send_failed == 0;
+    } else {
+        notes.push("proxy JSON unavailable; carrier assertion incomplete".into());
+        assertions_ok = false;
+    }
+    notes.push(format!(
+        "udp sent={} received={} corrupt={}",
+        metrics.udp_sent, metrics.udp_received, metrics.udp_corrupt
+    ));
+    notes.push("udp_seq_and_hash_ok".into());
+    if assertions_ok {
+        Ok(Outcome {
+            verdict: Verdict::Pass,
+            error: None,
+            metrics,
+            notes,
+            proxy_json,
+        })
+    } else {
+        Ok(Outcome {
+            verdict: Verdict::Fail,
+            error: Some(ErrorInfo {
+                class: ErrorClass::ENexusUdp,
+                message: format!("product udp cell did not satisfy assertions: {notes:?}"),
+                first_failure_artifact: Some("pcap.pcap".into()),
+            }),
+            metrics,
+            notes,
+            proxy_json,
+        })
+    }
+}
+
+/// 出站未接线协议：产品入口存在 → 新鲜产品级 `NOT_IMPLEMENTED` 证据（不是 crate 合成格）。
+///
+/// 断言 fail-closed：数据报按协议计数丢弃、`sent == 0`、目标端零收包（由 probe 侧核 target stats）。
+fn run_udp_unsupported(
+    cfg: &InteropProbeConfig,
+    assoc: UdpAssociation,
+    cell_dir: &Path,
+) -> Result<Outcome, String> {
+    let bnd = assoc.bnd;
+    let target = socks5_target(cfg)?;
+    let payload = util::udp_payload(0, 0, 16);
+    let datagram =
+        encode_udp_datagram(&target, &payload).map_err(|e| format!("encode udp datagram: {e}"))?;
+    assoc
+        .client
+        .send_to(&datagram, assoc.bnd)
+        .map_err(|e| format!("udp send: {e}"))?;
+    // 关联循环以 100ms 轮询控制连接；给一次轮询 + 一次投递尝试的窗口。
+    thread::sleep(Duration::from_millis(600));
+    let (proxy_json, proxy_error) = assoc.finish(Duration::from_secs(10));
+
+    let proto_field = format!("unsupported_{}", cfg.protocol.label());
+    let mut notes = vec![format!("bnd={bnd}")];
+    if let Some(err) = proxy_error.as_deref() {
+        notes.push(format!("proxy_error={err}"));
+    }
+    let (dropped, sent) = proxy_json.as_ref().map_or((0, u64::MAX), |json| {
+        let dropped = json
+            .pointer(&format!("/udp/{proto_field}"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let sent = json
+            .pointer("/udp/sent")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(u64::MAX);
+        (dropped, sent)
+    });
+    notes.push(format!(
+        "proxy_json udp.{proto_field}={dropped} udp.sent={sent} udp.dropped_unsupported={}",
+        proxy_json
+            .as_ref()
+            .and_then(|json| json.pointer("/udp/dropped_unsupported"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    ));
+    notes.push("fail_closed=no_direct_no_reply".into());
+
+    let fail_closed = proxy_json.is_some() && dropped == 1 && sent == 0;
+    if !fail_closed {
+        return Ok(Outcome {
+            verdict: Verdict::Fail,
+            error: Some(ErrorInfo {
+                class: ErrorClass::ENexusUdp,
+                message: format!(
+                    "product udp fail-closed assertion failed for {}: {notes:?}",
+                    cfg.protocol.label()
+                ),
+                first_failure_artifact: Some("pcap.pcap".into()),
+            }),
+            metrics: Metrics::default(),
+            notes,
+            proxy_json,
+        });
+    }
+
+    crate::crate_direct::write_manifest(
+        cell_dir,
+        &format!("{}-udp-product-not-implemented", cfg.protocol.label()),
+        &format!(
+            "Nexus {} 出站无 UDP 帧 API：产品 SOCKS5 UDP ASSOCIATE 入口已存在，数据报按 fail-closed 丢弃（不直连）",
+            cfg.protocol.label()
+        ),
+        &[
+            (
+                "apps/nexus/src/udp_outbound.rs",
+                "build_udp_outbound",
+                "Trojan/Shadowsocks/Hysteria2 → Unsupported{NotWired}（R-3）",
+            ),
+            (
+                "apps/nexus/src/lib.rs",
+                "udp_stats_json",
+                "dropped_unsupported_<proto> / unsupported_<proto> 计数",
+            ),
+        ],
+    )?;
+    Ok(Outcome {
+        verdict: Verdict::NotImplemented,
+        error: Some(ErrorInfo {
+            class: ErrorClass::ENexusNotImplemented,
+            message: format!(
+                "{} UDP 路径未实现（产品入口存在、出站无 UDP 帧路径）",
+                cfg.protocol.label()
+            ),
+            first_failure_artifact: Some("code-refs.json".into()),
+        }),
+        metrics: Metrics {
+            udp_sent: 0,
+            ..Metrics::default()
+        },
+        notes,
+        proxy_json,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +1417,125 @@ mod tests {
     fn socks5_frames_are_rejected_on_dead_port() {
         let addr: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         assert!(socks5_connect(addr, "127.0.0.1", 26200, Duration::from_millis(200)).is_err());
+    }
+
+    /// AC-12 meta 负向测试 (a)：成功格（REP=0 + 正常 echo）仍判 PASS。
+    #[test]
+    fn meta_a_success_cell_with_echo_still_passes() {
+        let mut v = base_json();
+        v["cell"] = serde_json::json!("Handshake");
+        let cfg = cfg(v);
+        let workload = WorkloadResult {
+            echo_ok: true,
+            echoed: b"echo".to_vec(),
+            errors: Vec::new(),
+            metrics: Metrics::default(),
+            failure: None,
+        };
+        let proxy_json = serde_json::json!({
+            "routing": {"outbound_kind": product_kind(cfg.protocol)},
+            "outbound": {"kind": product_kind(cfg.protocol)},
+        });
+        let outcome = judge(&cfg, &workload, Some(&proxy_json), None, 0);
+        assert_eq!(outcome.verdict, Verdict::Pass);
+    }
+
+    /// AC-12 meta 负向测试 (b)：失败格若隧道出现任何下行字节 → 必须 FAIL
+    /// （不得因为存在 REP 就 PASS）。
+    #[test]
+    fn meta_b_failure_cell_with_tunnel_bytes_fails() {
+        let mut v = base_json();
+        v["protocol"] = serde_json::json!("Trojan");
+        v["variant"] = serde_json::json!("TrojanFallback");
+        v["cell"] = serde_json::json!("BadCredential");
+        v["credentials"] = serde_json::json!({
+            "Trojan": {"password": "wrong-password", "header_format": "Standard"}
+        });
+        let cfg = cfg(v);
+        let workload = WorkloadResult {
+            echo_ok: false,
+            echoed: Vec::new(),
+            errors: Vec::new(),
+            metrics: Metrics::default(),
+            failure: Some(FailureObservation {
+                rep: Some(0x01),
+                eof_before_reply: false,
+                tunnel_bytes: 4096,
+                eof_seen: true,
+            }),
+        };
+        let outcome = judge(&cfg, &workload, None, None, 0);
+        assert_eq!(outcome.verdict, Verdict::Fail);
+        let msg = outcome.error.expect("error").message;
+        assert!(msg.contains("tunnel bytes"), "{msg}");
+    }
+
+    #[test]
+    fn failure_cell_verdict_matrix() {
+        let ok = FailureObservation {
+            rep: Some(0x01),
+            eof_before_reply: false,
+            tunnel_bytes: 0,
+            eof_seen: true,
+        };
+        assert_eq!(failure_cell_verdict(&ok, false), FailureVerdict::Pass);
+        // 应答前 EOF 也是合法失败形态。
+        let eof = FailureObservation {
+            rep: None,
+            eof_before_reply: true,
+            tunnel_bytes: 0,
+            eof_seen: true,
+        };
+        assert_eq!(failure_cell_verdict(&eof, false), FailureVerdict::Pass);
+        // REP=0 且无字节：静默成功。
+        let silent = FailureObservation {
+            rep: Some(0x00),
+            ..ok.clone()
+        };
+        assert_eq!(
+            failure_cell_verdict(&silent, false),
+            FailureVerdict::FailNoRefusal
+        );
+        // 出现成功会话 JSON：静默成功（优先级最高）。
+        assert_eq!(
+            failure_cell_verdict(&ok, true),
+            FailureVerdict::FailSilentAccept
+        );
+        // 有隧道字节：即使 REP≠0 也 FAIL。
+        let bytes = FailureObservation {
+            tunnel_bytes: 1,
+            ..ok.clone()
+        };
+        assert_eq!(
+            failure_cell_verdict(&bytes, false),
+            FailureVerdict::FailTunnelBytes
+        );
+        // 500ms 内没有 EOF：FAIL。
+        let no_eof = FailureObservation {
+            eof_seen: false,
+            ..ok
+        };
+        assert_eq!(
+            failure_cell_verdict(&no_eof, false),
+            FailureVerdict::FailNoEof
+        );
+    }
+
+    /// AC-12 meta 负向测试 (d) 的机判部分：成功格的既有断言未被改写
+    /// （REP=0 的正常 echo 走原 success 路径，失败格判据不参与）。
+    #[test]
+    fn meta_d_success_cell_without_proxy_json_still_fails_as_before() {
+        let mut v = base_json();
+        v["cell"] = serde_json::json!("Handshake");
+        let cfg = cfg(v);
+        let workload = WorkloadResult {
+            echo_ok: true,
+            echoed: b"echo".to_vec(),
+            errors: Vec::new(),
+            metrics: Metrics::default(),
+            failure: None,
+        };
+        let outcome = judge(&cfg, &workload, None, None, 0);
+        assert_eq!(outcome.verdict, Verdict::Fail, "缺 proxy JSON 仍判 FAIL");
     }
 }

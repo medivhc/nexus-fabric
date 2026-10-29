@@ -1232,6 +1232,8 @@ dependencies = [
  "nexus-domain",
  "nexus-measurement",
  "nexus-platform",
+ "nexus-proxy-config",
+ "nexus-qos",
  "rand 0.8.8",
  "ring",
  "x25519-dalek",
@@ -1296,6 +1298,7 @@ dependencies = [
  "nexus-dns",
  "nexus-platform",
  "nexus-projection",
+ "nexus-qos",
  "nexus-turn",
  "serde_json",
  "sha2",
@@ -1328,14 +1331,14 @@ dependencies = [
 name = "nexus-nat-traversal"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-domain",
 ]
 
 [[package]]
 name = "nexus-nat-wireup"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-domain",
  "nexus-fabric",
  "nexus-nat-quality",
  "nexus-nat-traversal",
@@ -1366,7 +1369,7 @@ name = "nexus-outbound-anytls"
 version = "0.1.0"
 dependencies = [
  "md5",
- "nexus-connectivity",
+ "nexus-proxy-config",
  "rcgen 0.13.2",
  "rustls",
  "sha2",
@@ -1378,7 +1381,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "bytes",
- "nexus-connectivity",
+ "nexus-proxy-config",
  "quinn-proto",
  "rcgen 0.13.2",
  "ring",
@@ -1394,8 +1397,8 @@ dependencies = [
  "chacha20poly1305",
  "hkdf",
  "md5",
- "nexus-connectivity",
  "nexus-plugin",
+ "nexus-proxy-config",
  "ring",
  "sha1",
  "sha2",
@@ -1405,8 +1408,8 @@ dependencies = [
 name = "nexus-outbound-trojan"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
  "nexus-plugin",
+ "nexus-proxy-config",
  "rcgen 0.13.2",
  "rustls",
  "sha2",
@@ -1416,7 +1419,7 @@ dependencies = [
 name = "nexus-outbound-vless"
 version = "0.1.0"
 dependencies = [
- "nexus-connectivity",
+ "nexus-proxy-config",
  "rcgen 0.13.2",
  "rustls",
 ]
@@ -1426,7 +1429,7 @@ name = "nexus-outbound-vmess"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
- "nexus-connectivity",
+ "nexus-proxy-config",
  "sha2",
 ]
 
@@ -1556,6 +1559,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-qos"
+version = "0.1.0"
+
+[[package]]
 name = "nexus-registry"
 version = "0.1.0"
 dependencies = [
@@ -1658,7 +1665,6 @@ dependencies = [
  "libc",
  "nexus",
  "nexus-compute",
- "nexus-connectivity",
  "nexus-control-api",
  "nexus-discovery",
  "nexus-dns",
@@ -1672,6 +1678,7 @@ dependencies = [
  "nexus-network",
  "nexus-outbound-anytls",
  "nexus-outbound-hysteria2",
+ "nexus-outbound-shadowsocks",
  "nexus-outbound-trojan",
  "nexus-outbound-vless",
  "nexus-path",
@@ -1684,12 +1691,15 @@ dependencies = [
  "nexus-proxy",
  "nexus-proxy-config",
  "nexus-proxy-transport",
+ "nexus-qos",
  "nexus-registry",
  "nexus-service",
  "nexus-session",
  "nexus-storage",
  "nexus-turn",
  "nexus-workspace",
+ "rustls",
+ "rustls-native-certs",
  "serde_json",
  "sha1",
  "signal-hook",

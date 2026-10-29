@@ -3,6 +3,7 @@ id = "product.workspace-gc"
 title = "Workspace 存储治理（v9 §20）：Reachability GC 两阶段回收"
 evidence_strength = "E4"
 requirement = "v9 §20 Workspace DAG Compaction、Shallow Sync 与 CAS GC"
+carrier = "n1-fabric"
 
 [given]
 description = "填满 CAS（可达对象 + 孤儿对象 + 历史 state 对象）→ plan_gc 计算可达闭包 → tombstone 两阶段 → sweep；Protected Roots 存活，孤儿对象被清，pin 阻止删除"

@@ -1,0 +1,1 @@
+[{"established_at_unix":1700000000,"kind":"direct","link_id":"direct/peer-a","locator":"10.0.0.1:9000","stale":false},{"established_at_unix":1700000001,"kind":"relay","link_id":"relay/peer-b","locator":"relay.example:443","stale":true}]

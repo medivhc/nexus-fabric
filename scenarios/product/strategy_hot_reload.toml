@@ -3,6 +3,7 @@ id = "product.strategy-hot-reload"
 title = "策略热切换：运行时换策略无需重启"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#12.58-strategy-hot-reload"
+carrier = "v9-connectivity"
 
 [given]
 topology = "diamond: A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms)"

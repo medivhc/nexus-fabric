@@ -1,6 +1,6 @@
 //! CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 令牌桶整形，内存确定性）。
 //!
-//! 本模块是 delivery 层共享底座的用户态包调度器（MVP）：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的用户态包调度器（MVP）：
 //! - **流识别**：`FiveTuple`（5 元组）→ `FlowId`（同进程内确定性哈希，不持久化）；
 //! - **优先级**：`Priority::{High, Medium, Low}`，类间严格优先级（High 排空前不看
 //!   Medium/Low），类内 DRR；新流按端口/协议规则定级（ICMP 恒 High，命中
@@ -8,7 +8,7 @@
 //! - **DRR**：每流 `deficit` 计数器；每次访问 `deficit += quantum`，队首包
 //!   `len <= deficit` 则发送并 `deficit -= len`；单包大于 quantum 时 deficit
 //!   跨轮累积直到能发（保证大包最终能走，不饿死）；
-//! - **整形**：复用 `qos::TokenBucket` 做 per-egress 速率门控；令牌不足时**不**出队、
+//! - **整形**：复用 `bucket::TokenBucket` 做 per-egress 速率门控；令牌不足时**不**出队、
 //!   **不**扣 deficit、**不**跳过找小包，直接返回 `None`（调用方稍后重试）；
 //! - **流回收**：`reap(now)` 回收 `now - last_seen >= flow_timeout` 的流（默认 60s）；
 //! - **时钟**：调用方显式传入 `now: Duration`（`QosClock` 体系），单测用假时钟；
@@ -37,7 +37,7 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use super::qos::{BandwidthLimit, QosError, TokenBucket};
+use crate::bucket::{BandwidthLimit, QosError, TokenBucket};
 
 // ---------- 常量 ----------
 

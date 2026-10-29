@@ -24,9 +24,39 @@ probe 判 `FAIL` + `E_NEXUS_FRAMING`（D1 无“客户端不识别 fallback/静�
 2) 产品在 SOCKS5 CONNECT 前不做上游就绪判定（当前架构），改为延迟回 success 直到目标首包。
 两者都涉及产品语义/架构，超出本 run “局部 bug”范围。
 
-## 量化估算
+## 量化估算（已被 fixes-5 实测结论取代）
 - 方案 2 涉及 proxy_serve_once 握手时序与所有出站路径：>400 行 / >2 人日 → **不满足硬门**。
 - 本 run 结论：按 spec E1 规则 1 判 Trojan BROKEN；修复升级 coordinator 决策。
+
+## 修复结论（protocol-interop-fixes-5，2026-10-26，requirement-change）
+
+方案 2 已实现（`fixes-5`）：**CONNECT 应答暂存 + Trojan 就绪窗口 + 首包分类 + 失败应答**。
+
+- `DeferredConnectReply` 把 `Established` 步的 success 从握手循环里暂存出来；非 trojan
+  出站仍在既有逻辑点写出（字节/时机不变），trojan 出站在 TLS 握手 + 请求头 + seed 全部
+  flush 之后才决定写 success 还是失败应答。
+- 窗口 `W = clamp(节点建连耗时 + 50ms, 50ms, 600ms)`（或 `ready_window_ms` 覆盖
+  `min(n,5000)`）：客户端先载荷 → 载荷先写节点再回 success（零扣压）；白名单 greeting
+  首包 → 放行；静默到期 → 放行；HTTP 状态行 / 非白名单首包 / 首包前 EOF → 失败应答
+  （SOCKS5 `REP≠0` / HTTP 502）+ 有界 drain + FIN，不写额外 TLS 记录。
+- 规模：机制 ~300 行（app 行为代码 + `trojan_guard`）+ 验证 ~300 行（probe 失败格 +
+  E4 场景/example）；另计配置面 60–80、单测 120、文档 40–90。
+
+**承诺边界（不得写成已关闭全部残余）**：
+
+| # | 残余 | 后果 |
+|---|---|---|
+| R-1 | fallback 响应慢于 `W`（>1 RTT + 50ms，或 >600ms 上限；显式覆盖过小同理） | success 已写出，窗口外的 fallback 内容仍可能被当隧道数据 |
+| R-2 | fallback 等客户端先发载荷才响应 | 零载荷判据失效，同上 |
+| R-3 | `signature` 模式下的非 HTTP fallback | 该模式是显式安全降级，漏报属已知代价 |
+| R-4 | 客户端在 success 前 pipelined 载荷（seed 非空） | 守卫不适用（扣压又违反上行零扣压） |
+| R-5 | `nexusd` TUN / `ProxyEngine` 路径 | 该入口的成功由 smoltcp SYN-ACK 伪造，本 run 不覆盖 |
+| R-6 | HTTP 绝对形式转发（non-CONNECT） | 不回本地成功应答，fallback 的 404 仍会作为 origin 响应出现 |
+| R-7 | 服务端被完全劫持并伪装成真实目标 | 超出协议可判定范围（需端到端认证/证书钉扎） |
+
+**已接受的行为变更**：无 fallback 的坏凭据由「先 success 再 EOF」变为「CONNECT 应答阶段
+`REP≠0`」；MATRIX 判定与 `E_EXPECTED_AUTH_REJECT` 分类不变。误杀面 M-1~M-8 与
+`signature` 逃生口代价见 PRODUCT §11.9.3 / USER_MANUAL §4.1.10 / MATRIX 的 Trojan 注记。
 
 ## 终局状态更正
 

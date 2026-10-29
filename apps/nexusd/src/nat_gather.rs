@@ -47,7 +47,7 @@
 
 use std::net::SocketAddr;
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_nat_traversal::{LocalCandidates, PortSample};
 
 use crate::nat_stun::{StunError, StunProber};

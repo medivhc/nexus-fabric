@@ -3,6 +3,7 @@ id = "product.proxy-speedtest-http204"
 title = "proxy speedtest http204 probe_kind 按 measurement 排序输出（离线 mock）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 command = "proxy speedtest"

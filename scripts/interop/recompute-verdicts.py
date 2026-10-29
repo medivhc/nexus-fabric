@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""机械复算 verdict + 渲染 MATRIX（AC-06/10/18/19；E1 规则 1–9 按序）。
+"""机械复算 verdict + 渲染 MATRIX（AC-06/10/18/19；E1 规则 1–9 按序），
+并派生仓库级 `docs/protocols/interop/verdicts.json`（outbound-adapter-wiring
+步骤 3.0；spec v1.4 §5.2）。
 
 输入：
   --run-dir <dir>      证据根（evidence/analysis/...）
   --run-meta <path>    run 元数据 JSON（run/baseline/spec/完成项/修复条目）；
                        省略时保持旧版叙述渲染，供前序 run 目录复算
   --matrix <path>      输出 MATRIX.md（仓库内唯一正本）
-  --check             不写盘，重算后与现有 MATRIX 比对
+  --repo-out [path]    写仓库级 verdicts.json（省略 path 时用仓库根默认路径）；
+                       只写该产物，不改 MATRIX / run-dir。仓库根由脚本位置推导，
+                       不依赖 cwd。
+  --check [path]       不带 path：旧语义（MATRIX + <run-dir>/analysis/verdicts.json
+                       零漂移）；带 path：只校验该仓库级 verdicts.json 零漂移
+                       （MATRIX 派生五条 + synthetic 两条全量）。
   --allow-partial     阶段提交用：只渲染已有证据的协议节
 
 规则实现顺序严格按 spec E1：首个命中即停。人工不得覆盖。
+
+仓库级 `verdicts.json` 的 `inputs_sha256` 算法（写死；改算法必须同步改
+`--check` 与步骤 3 的契约 hash 说明）：按 `REPO_INPUT_FILES` 固定顺序，对
+`sha256(相对路径字节 || b"\\0" || 文件内容字节)` 的 hex 串按顺序拼接，再对
+拼接结果做一次 sha256。文件名进 hash，防止换序；synthetic 常量文件进 hash，
+使合成条目/文案改动可被 `--check` 检出。
 """
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +37,23 @@ import labels  # noqa: E402
 
 REPO = SCRIPT_DIR.parents[1]
 DEFAULT_CELL_MATRIX = SCRIPT_DIR / "cell-matrix.json"
+
+# 仓库级 verdicts.json 的输入（固定顺序；相对仓库根）。
+REPO_MATRIX_PATH = REPO / "docs/protocols/interop/MATRIX.md"
+REPO_MANIFEST_PATH = REPO / "docs/protocols/interop/verdicts.json"
+SYNTHETIC_INPUT_PATH = SCRIPT_DIR / "verdicts-synthetic.json"
+REPO_INPUT_FILES = [
+    (REPO_MATRIX_PATH, "docs/protocols/interop/MATRIX.md"),
+    (DEFAULT_CELL_MATRIX, "scripts/interop/cell-matrix.json"),
+    (SYNTHETIC_INPUT_PATH, "scripts/interop/verdicts-synthetic.json"),
+]
+MATRIX_PROTOCOLS = ["vless", "anytls", "hysteria2", "trojan", "shadowsocks"]
+# MATRIX 协议表的 scope 只能落在协议级取值；合成条目另用钉死常量。
+MATRIX_SCOPES = {"PROTOCOL_SUBSET", "FULL", "TCP_ONLY"}
+SYNTHETIC_SCOPES = {"NOT_IN_MATRIX", "LOCAL_E4"}
+VERDICTS = {"VERIFIED", "PARTIAL", "BROKEN"}
+RUN_ID = "protocol-interop-fixes-1"
+SCHEMA_VERSION = 1
 
 NEXUS_CLASSES = {
     "E_NEXUS_HANDSHAKE_WIRE",
@@ -43,6 +74,20 @@ BLOCKING_CLASSES = {
 }
 BANNED_WORDS = ["probably", "maybe", "待观察", "应该支持", "完全支持", "fully supported"]
 FAILURE_CELLS = {"BadCredential", "BadConfig"}
+
+# spec v1.4 §5.2(a)：claim 映射是唯一实现，MATRIX 渲染与仓库级 verdicts.json
+# 派生都必须调用 `claim_for`，不得各写一套。
+CLAIM_MAP = {
+    "VERIFIED": "USABLE",
+    "BROKEN": "NOT_USABLE",
+}
+
+
+def claim_for(verdict, handshake_ok, tcp_small_ok):
+    """verdict + 两格状态 → claim（spec v1.4 §5.2(a) 冻结规则）。"""
+    if verdict == "PARTIAL":
+        return "USABLE_WITH_GAPS" if (handshake_ok and tcp_small_ok) else "NOT_CLAIMED"
+    return CLAIM_MAP.get(verdict, "NOT_CLAIMED")
 
 PROTOCOL_ORDER = ["Vless", "Anytls", "Hysteria2", "Trojan", "Shadowsocks"]
 RUN_META_REQUIRED = ("run_id", "baseline", "spec_version", "completed_items", "fix_branches")
@@ -185,9 +230,16 @@ def load_rows(run_dir, matrix):
             "1.13.16",
             "26.10.21",
         ):
-            raise RecomputeError(
-                f"{ev['evidence_id']}: unexpected ref version {ev['reference'].get('version')}"
+            # `NOT_IMPLEMENTED` 格在出站未接线时根本不会触达参照端（fail-closed 丢弃），
+            # 其证据里 ref version = `none` 是事实而非漂移；其余状态仍强制钉版参照端。
+            ref_none_ok = (
+                ev.get("reference", {}).get("version") == "none"
+                and ev.get("verdict") == "NotImplemented"
             )
+            if not ref_none_ok:
+                raise RecomputeError(
+                    f"{ev['evidence_id']}: unexpected ref version {ev['reference'].get('version')}"
+                )
         if cell == "TcpThroughput" and status == "PASS":
             samples = ev.get("metrics", {}).get("throughput_samples_bps", [])
             if len(samples) != 3 or ev.get("metrics", {}).get("throughput_median_bps", 0) <= 0:
@@ -250,18 +302,15 @@ def protocol_verdict(proto, rows, allow_partial):
         for r in non_diag:
             key = r["status"] if r["present"] else "MISSING"
             counts[key] = counts.get(key, 0) + 1
-        claim_map = {
-            "VERIFIED": "USABLE",
-            "BROKEN": "NOT_USABLE",
-        }
         if claim is None:
             if verdict == "PARTIAL":
                 h = by("Handshake")
                 t1 = by("TcpSmall")
-                ok = all(x is not None and x["status"] == "PASS" for x in (h, t1))
-                claim = "USABLE_WITH_GAPS" if ok else "NOT_CLAIMED"
+                handshake_ok = h is not None and h["status"] == "PASS"
+                tcp_small_ok = t1 is not None and t1["status"] == "PASS"
+                claim = claim_for(verdict, handshake_ok, tcp_small_ok)
             else:
-                claim = claim_map.get(verdict, "NOT_CLAIMED")
+                claim = claim_for(verdict, False, False)
         rc = root_cause
         if rc is None:
             rc = "NONE"
@@ -351,7 +400,19 @@ def proto_scope(proto, verdict):
     return "FULL" if verdict == "VERIFIED" else "PROTOCOL_SUBSET"
 
 
-def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_meta=None, run_meta_path=None):
+def render_matrix(
+    run_dir,
+    matrix,
+    verdicts,
+    rows,
+    findings,
+    allow_partial,
+    run_meta=None,
+    run_meta_path=None,
+    notes=None,
+    notes_path=None,
+    notes_sha256=None,
+):
     run_dir = Path(run_dir)
     env = run_dir / "evidence/env"
     ref = run_dir / "evidence/ref"
@@ -371,6 +432,40 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     )
     window = f"{times[0]} .. {times[-1]}" if times else "n/a"
     archive = sorted((run_dir / "archive").glob("*.tar.zst"))
+    # Q10（spec §9.1/§9.2）：UdpEcho 是产品级 required 格，UdpEchoCrate 是 crate 级 diag 格。
+    # 产品级 UDP 的叙述必须由证据本身派生，不得在无产品级证据时提前宣称可用。
+    product_udp_rows = [
+        r
+        for r in rows
+        if r["cell"] == "UdpEcho"
+        and r["present"]
+        and r["evidence"].get("carrier") == "ProductSocks5"
+    ]
+    product_udp_ok = [r["protocol"] for r in product_udp_rows if r["status"] == "PASS"]
+    product_udp_gap = [r["protocol"] for r in product_udp_rows if r["status"] != "PASS"]
+    # D-1（产品评审 §4.2）：Hy2 的「作用域变化 ≠ 能力回归」由证据派生，只拼叙事、
+    # 不参与 verdict/scope/claim/格状态。两个条件同时成立才追加，前序 run（无产品级
+    # UdpEcho 格）输出保持逐字节不变。
+    hy2_product_gap = any(
+        r["protocol"] == "Hysteria2" and r["status"] != "PASS"
+        for r in product_udp_rows
+    )
+    hy2_crate_ok = any(
+        r["cell"] == "UdpEchoCrate"
+        and r["protocol"] == "Hysteria2"
+        and r["present"]
+        and r["status"] == "PASS"
+        for r in rows
+    )
+    if product_udp_rows:
+        udp_carrier_clause = (
+            "`UdpEcho` 为产品级（`ProductSocks5`/`ProductPath`），`UdpEchoCrate` 为 crate 级诊断格"
+            "（`CrateDirect`/`ProtocolWire`）；VLESS Vision 部分格为 crate 直调。"
+        )
+    else:
+        udp_carrier_clause = (
+            "`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。"
+        )
     lines = []
     lines.append("# 出站协议互操作证据总表（MATRIX）")
     lines.append("")
@@ -400,13 +495,19 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         + (", ".join(f"`{p}`" for p in archive) if archive else "（S30 归档后追加）")
         + "。"
     )
+    if notes is not None:
+        # AC-14.3 的机器路径：Trojan 注记只经 --notes 注入，人工零编辑。
+        lines.append(
+            f"- 注记：`{notes_path}`（sha256 `{notes_sha256}`）；"
+            "本节由 `recompute-verdicts.py --notes` 注入，禁止手工编辑 MATRIX。"
+        )
     lines.append("")
     lines.append("## 先读：范围 / 结论 / 图例")
     lines.append("")
     lines.append(
-        "- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）"
-        "共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision "
-        "部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。"
+        f"- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）"
+        f"共 {len(matrix['cells'])} 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；"
+        + udp_carrier_clause
     )
     lines.append(
         "- **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、"
@@ -414,7 +515,7 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     )
     lines.append(
         "- **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把"
-        "「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。"
+        "「产品级 UDP 能力缺口」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。"
     )
     # 结论 1/3 必须由本次复算的 verdict 派生，禁止硬编码与结果无关的结论句。
     verdict_names = {
@@ -431,15 +532,38 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     if not_run:
         counts += f"，未运行 {len(not_run)} 个（{'、'.join(not_run)}）"
     if verdict_names["VERIFIED"]:
-        usable = f"当前可宣称可用（`VERIFIED`）的协议为 {'、'.join(verdict_names['VERIFIED'])}。"
+        usable = (
+            "当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 "
+            f"{'、'.join(verdict_names['VERIFIED'])}"
+        )
+        with_gaps = [
+            p
+            for p in PROTOCOL_ORDER
+            if verdicts.get(p, {}).get("claim") == "USABLE_WITH_GAPS"
+        ]
+        if with_gaps:
+            usable += f"；另有 {len(with_gaps)} 个 `USABLE_WITH_GAPS`（{'、'.join(with_gaps)}）"
+        usable += "。"
     else:
         usable = "当前无任何协议可宣称可用。"
     lines.append(f"- **结论 1**：本次复算：{counts}；{usable}")
     if run_meta:
-        lines.append(
-            "- **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE "
-            "五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。"
-        )
+        if product_udp_rows:
+            udp_claim = (
+                "`USABLE` 指协议级互操作：TCP 产品路径 + 产品级 UDP（`UdpEcho` 行）。"
+                + (f"产品 SOCKS5 UDP ASSOCIATE 已有产品级证据支撑：{'、'.join(product_udp_ok)}；" if product_udp_ok else "")
+                + (
+                    f"其余协议产品级 UDP 仍为 `NOT_IMPLEMENTED` 或未通过（{'、'.join(product_udp_gap)}），见「产品级 UDP」节。"
+                    if product_udp_gap
+                    else "五协议产品级 UDP 均已取证。"
+                )
+            )
+        else:
+            udp_claim = (
+                "`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，"
+                "`UdpEcho` 为 crate 级证据、不代表产品入口可用。"
+            )
+        lines.append(f"- **结论 1 限定**：{udp_claim}")
     if run_meta:
         lines.append(
             "- **结论 2**："
@@ -454,6 +578,14 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         lines.append(
             "- **结论 2**：阻断分属产品装配、跨协议传输、协议编解码、协议线格式与产品安全语义；"
             "`root_cause_class` 只是规则代表类，不是完整根因。"
+        )
+    if hy2_product_gap and hy2_crate_ok:
+        # 产品评审 §4.2 三句话：同一事实（产品级 UdpEcho 未实现）不得被读成能力回归。
+        lines[-1] += (
+            " Hysteria2 的口径需三句话讲清："
+            "(1) Hy2 的 TCP 产品路径结论不变（逐格 PASS 仍在）；"
+            "(2) 变化的是证据作用域：产品级 `UdpEcho` 未实现，按 spec E1 规则 6 记 `PARTIAL`；"
+            "(3) crate 级 UDP 仍 PASS（`UdpEchoCrate`），QUIC 出站传输不受影响。"
         )
     unverified = [
         p
@@ -488,9 +620,13 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         )
     if run_meta:
         lines.append(
-            "- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
-            "配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地"
-            "（本 run 不改产品代码）。"
+            "- **结论 5**："
+            + narrative.get("conclusions", {}).get(
+                "5",
+                "五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
+                "配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地"
+                "（本 run 不改产品代码）。",
+            )
         )
     else:
         lines.append(
@@ -570,33 +706,42 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
             "（含 REALITY、ws/grpc）未测。"
         )
     lines.append("")
-    lines.append("## ⚠ 安全警示：Trojan fallback fail-open")
-    lines.append("")
-    lines.append(
-        "- **触发条件**：Trojan 密码错误、服务端被劫持，或服务端配置了 fallback"
-        "（本 run 参照端 fallback → HTTP 404）。"
-    )
-    lines.append(
-        "- **用户所见**：SOCKS5 CONNECT 已回 success，服务端 fallback 的 HTTP 响应被当作"
-        "隧道数据交给应用（404 页面内容），用户误以为代理成功。"
-    )
-    lines.append(
-        "- **白皮书映射**：违背 §6.2「路径失效时按配置阻断或回退，并向用户显示实际行为」"
-        "与 §16.1 N1「失败与恢复可观察」。"
-    )
-    lines.append(
-        "- **当前临时缓解（仅文档层）**：把含 fallback 的 Trojan 出站视为实验性/不安全；"
-        "产品负责人决定是否默认禁用。本 run 不改产品代码。"
-    )
-    lines.append(
-        "- **完整修复成本**：延迟 SOCKS5 success 至上游就绪或等价 fail-closed 方案，"
-        ">400 行 / >2 人日，触及 `proxy_serve_once` 全部出站路径，应另立 run。"
-    )
-    lines.append(
-        "- **证据**：`TrojanFallback/BadCredential`（FAIL，`E_NEXUS_FRAMING`），"
-        "根因见 [fix/trojan/root-cause.md](fix/trojan/root-cause.md)。"
-    )
-    lines.append("")
+    if notes is None:
+        # 无 --notes：保持历史 run 目录复算的逐字节输出（R-7 兼容口径）。
+        lines.append("## ⚠ 安全警示：Trojan fallback fail-open")
+        lines.append("")
+        lines.append(
+            "- **触发条件**：Trojan 密码错误、服务端被劫持，或服务端配置了 fallback"
+            "（本 run 参照端 fallback → HTTP 404）。"
+        )
+        lines.append(
+            "- **用户所见**：SOCKS5 CONNECT 已回 success，服务端 fallback 的 HTTP 响应被当作"
+            "隧道数据交给应用（404 页面内容），用户误以为代理成功。"
+        )
+        lines.append(
+            "- **白皮书映射**：违背 §6.2「路径失效时按配置阻断或回退，并向用户显示实际行为」"
+            "与 §16.1 N1「失败与恢复可观察」。"
+        )
+        lines.append(
+            "- **当前临时缓解（仅文档层）**：把含 fallback 的 Trojan 出站视为实验性/不安全；"
+            "产品负责人决定是否默认禁用。本 run 不改产品代码。"
+        )
+        lines.append(
+            "- **完整修复成本**：延迟 SOCKS5 success 至上游就绪或等价 fail-closed 方案，"
+            ">400 行 / >2 人日，触及 `proxy_serve_once` 全部出站路径，应另立 run。"
+        )
+        lines.append(
+            "- **证据**：`TrojanFallback/BadCredential`（FAIL，`E_NEXUS_FRAMING`），"
+            "根因见 [fix/trojan/root-cause.md](fix/trojan/root-cause.md)。"
+        )
+        lines.append("")
+    else:
+        lines.append(f"## Trojan 注记（机器注入自 `{notes_path}`）")
+        lines.append("")
+        lines.append(f"<!-- notes_sha256={notes_sha256} -->")
+        lines.append("")
+        lines.append(notes.rstrip())
+        lines.append("")
     lines.append("## 协议 verdict（按 spec E1 复算）")
     lines.append("")
     lines.append("| 协议 | verdict | scope | claim | root_cause_class | missing_cells | 命中规则 |")
@@ -642,8 +787,8 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
                 "否，依赖产品 UDP / fallback 架构",
             ),
             "Shadowsocks": (
-                "线格式/SIP004 AEAD + 产品 UDP 未实现",
-                "协议实现错误 + 产品 UDP 能力缺口",
+                "产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复）",
+                "产品 UDP 能力缺口（fixes-6）",
                 "否，依赖产品 UDP",
             ),
         }
@@ -769,8 +914,11 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
                 qualifiers.append("诊断格，不参与 verdict")
             if proto == "Vless" and r["variant"] == "VlessVision":
                 qualifiers.append("crate 级，产品 splice 未实现")
-            if run_meta and proto in ("Vless", "Anytls") and r["cell"] == "UdpEcho":
-                qualifiers.append("crate 级，产品入口不可用")
+            if run_meta and r["cell"] == "UdpEcho":
+                if ev.get("carrier") == "CrateDirect":
+                    qualifiers.append("crate 级，产品入口不可用")
+                else:
+                    qualifiers.append("产品级（ProductSocks5）")
             if r["cell"] in FAILURE_CELLS and r["status"] == "PASS":
                 override = narrative.get("failure_cell_qualifier")
                 if override and proto in override:
@@ -798,31 +946,56 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         lines.append("")
     lines.append("## 产品级 UDP（不参与协议 verdict）")
     lines.append("")
-    lines.append(
-        "产品 SOCKS5 入口 `crates/nexus-ingress/src/lib.rs:232-241` 拒绝 BND/UDP ASSOCIATE；"
-        "Trojan/SS 出站也没有 UDP 帧路径。因此产品级 UDP 按能力缺口记录，"
-        "不进入五协议 verdict；crate 级 UDP 结论见各协议 `UdpEcho` 行。"
-    )
+    if product_udp_rows:
+        parts = []
+        if product_udp_ok:
+            parts.append(f"已可用（产品级 `UdpEcho` PASS）：{'、'.join(product_udp_ok)}")
+        if product_udp_gap:
+            parts.append(
+                f"仍为 `NOT_IMPLEMENTED`/未通过：{'、'.join(product_udp_gap)}"
+                "（出站无 UDP 帧路径，按 fail-closed 丢弃，不直连）"
+            )
+        lines.append(
+            "产品 SOCKS5 UDP ASSOCIATE 入口与出站帧路径按协议分别取证：`UdpEcho` 为产品级 required 格，"
+            "`UdpEchoCrate` 为 crate 级诊断格（不参与 verdict）。" + "；".join(parts) + "。"
+        )
+    else:
+        lines.append(
+            "产品 SOCKS5 UDP ASSOCIATE 入口与出站帧路径的证据见各协议 `UdpEcho`（产品级 required）与 "
+            "`UdpEchoCrate`（crate 级诊断）两行；本表不据此对产品级 UDP 可用性下结论。"
+        )
     lines.append("")
     lines.append(
-        "**区分**：本项指产品 SOCKS5 UDP relay 入口/出站帧路径缺失，"
-        "不等于所有 UDP/QUIC 路径不可用——Hy2 出站到代理服务器仍走 QUIC/UDP 传输，"
-        "其失败点是认证响应编解码（`E_NEXUS_CODEC`），不是 UDP 传输本身。"
+        "**区分**：本项指产品 SOCKS5 UDP relay 入口/出站帧路径，"
+        "不等于所有 UDP/QUIC 路径不可用——Hy2 出站到代理服务器仍走 QUIC/UDP 传输。"
     )
     lines.append("")
     lines.append("## 产品能力缺口")
     lines.append("")
-    lines.append("- 产品级 UDP：未实现（上节）。")
-    lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
-    lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
-    lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")
-    lines.append(
-        "- Trojan fallback fail-open（安全语义）：错凭据/被劫持/服务端 fallback 时，"
-        "SOCKS5 仍回 success，fallback 的 HTTP 内容被当隧道数据。"
-    )
-    lines.append(
-        "- 代理失败可观察性：上述场景下产品不显示实际行为，不满足白皮书 §6.2/§16.1。"
-    )
+    gaps_override = narrative.get("capability_gaps")
+    if gaps_override:
+        # 数据驱动的能力缺口清单（run-meta 覆盖）：避免历史硬编码条目在新 run 里腐烂。
+        for item in gaps_override:
+            lines.append(f"- {item}")
+    else:
+        if product_udp_gap:
+            lines.append(
+                f"- 产品级 UDP：{'、'.join(product_udp_gap)} 未实现（上节）。"
+            )
+        elif product_udp_rows:
+            lines.append("- 产品级 UDP：五协议均已取证（上节）。")
+        else:
+            lines.append("- 产品级 UDP：未实现（上节）。")
+        lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
+        lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
+        lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")
+        lines.append(
+            "- Trojan fallback fail-open（安全语义）：错凭据/被劫持/服务端 fallback 时，"
+            "SOCKS5 仍回 success，fallback 的 HTTP 内容被当隧道数据。"
+        )
+        lines.append(
+            "- 代理失败可观察性：上述场景下产品不显示实际行为，不满足白皮书 §6.2/§16.1。"
+        )
     lines.append("")
     lines.append("## fix 支线与复验")
     lines.append("")
@@ -996,7 +1169,15 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     return text
 
 
-def build(run_dir, matrix_path, allow_partial, run_meta=None, run_meta_path=None):
+def build(
+    run_dir,
+    matrix_path,
+    allow_partial,
+    run_meta=None,
+    run_meta_path=None,
+    notes=None,
+    notes_path=None,
+):
     matrix = json.loads(Path(matrix_path).read_text(encoding="utf-8"))
     rows, findings = load_rows(run_dir, matrix)
     verdicts = {}
@@ -1021,6 +1202,9 @@ def build(run_dir, matrix_path, allow_partial, run_meta=None, run_meta_path=None
         allow_partial,
         run_meta=run_meta,
         run_meta_path=run_meta_path,
+        notes=notes,
+        notes_path=notes_path,
+        notes_sha256=(hashlib.sha256(notes.encode("utf-8")).hexdigest() if notes is not None else None),
     )
     payload = {
         "schema_version": 1,
@@ -1031,23 +1215,288 @@ def build(run_dir, matrix_path, allow_partial, run_meta=None, run_meta_path=None
     return payload, text
 
 
+def repo_inputs_sha256(files=None):
+    """固定顺序 + 文件名 + 内容 → inputs_sha256（见模块 docstring）。"""
+    concat = []
+    for path, rel in files or REPO_INPUT_FILES:
+        path = Path(path)
+        if not path.is_file():
+            raise RecomputeError(f"missing manifest input: {path}")
+        digest = hashlib.sha256(rel.encode("utf-8") + b"\0" + path.read_bytes()).hexdigest()
+        concat.append(digest)
+    return hashlib.sha256("".join(concat).encode("ascii")).hexdigest()
+
+
+def rfc3339_utc(epoch_seconds):
+    import datetime
+
+    stamp = datetime.datetime.fromtimestamp(int(epoch_seconds), datetime.timezone.utc)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now_rfc3339():
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def matrix_baseline_revision(text):
+    for line in text.splitlines():
+        marker = "baseline `"
+        if marker in line:
+            rest = line.split(marker, 1)[1]
+            candidate = rest.split("`", 1)[0].strip()
+            if len(candidate) == 40 and all(ch in "0123456789abcdef" for ch in candidate):
+                return candidate
+            break
+    raise RecomputeError("MATRIX header has no baseline <40hex> revision")
+
+
+def parse_matrix(text):
+    """MATRIX → {proto: {verdict, scope, claim, cells{(variant, cell): status}}}。
+
+    MATRIX 是协议 verdict 与格状态的唯一正本；本函数只做文本读取，不重算规则。
+    """
+    protocols = {}
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            title = line[3:].strip()
+            section = title.lower() if title.lower() in MATRIX_PROTOCOLS else None
+            continue
+        if not line.startswith("|"):
+            continue
+        cols = [col.strip() for col in line.strip("|").split("|")]
+        if not cols or set(cols[0]) <= {"-", ":", " "} or cols[0] in ("Cell", "协议"):
+            continue
+        if section is not None:
+            if "/" not in cols[0] or len(cols) < 2:
+                continue
+            variant, cell = cols[0].split("/", 1)
+            entry = protocols.setdefault(section, {})
+            entry.setdefault("cells", {})[(variant.strip(), cell.strip())] = cols[1]
+            continue
+        proto_key = cols[0].lower()
+        if proto_key in MATRIX_PROTOCOLS and len(cols) >= 4:
+            verdict = cols[1]
+            scope = cols[2]
+            claim = cols[3]
+            if verdict not in VERDICTS:
+                continue
+            entry = protocols.setdefault(proto_key, {})
+            entry.update({"verdict": verdict, "scope": scope, "claim": claim})
+    return protocols
+
+
+def load_synthetic(path=SYNTHETIC_INPUT_PATH):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        raise RecomputeError(f"synthetic input unreadable: {err}") from err
+    for key in ("synthetic", "annotations", "messages"):
+        if key not in data:
+            raise RecomputeError(f"synthetic input missing '{key}'")
+    return data
+
+
+def build_repo_manifest(target_path, prompt_generated_at=None, revision=None,
+                        matrix_path=REPO_MATRIX_PATH,
+                        synthetic_path=SYNTHETIC_INPUT_PATH,
+                        files=None):
+    """从现行 MATRIX + synthetic 机器输入派生仓库级 verdicts.json（spec v1.4 §5.2）。"""
+    matrix_text = Path(matrix_path).read_text(encoding="utf-8")
+    baseline = revision or matrix_baseline_revision(matrix_text)
+    synthetic = load_synthetic(synthetic_path)
+    annotations = synthetic["annotations"]
+    messages = synthetic["messages"]
+    matrix = parse_matrix(matrix_text)
+
+    generated_at = prompt_generated_at
+    if not generated_at:
+        epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if epoch is not None:
+            generated_at = rfc3339_utc(epoch)
+        else:
+            existing = Path(target_path)
+            if existing.is_file():
+                try:
+                    generated_at = json.loads(existing.read_text(encoding="utf-8")).get("generated_at")
+                except (OSError, json.JSONDecodeError):
+                    generated_at = None
+        generated_at = generated_at or now_rfc3339()
+
+    entries = {}
+    for proto in MATRIX_PROTOCOLS:
+        row = matrix.get(proto)
+        if not row:
+            raise RecomputeError(f"MATRIX is missing protocol row: {proto}")
+        verdict = row["verdict"]
+        scope = row["scope"]
+        if scope not in MATRIX_SCOPES or "product" in scope.lower():
+            raise RecomputeError(
+                f"{proto}: matrix-derived scope must be protocol-level {sorted(MATRIX_SCOPES)}, got {scope}"
+            )
+        cells = row["cells"]
+        handshake_ok = cells.get(("Default", "Handshake")) == "PASS"
+        tcp_small_ok = cells.get(("Default", "TcpSmall")) == "PASS"
+        claim = claim_for(verdict, handshake_ok, tcp_small_ok)
+        if claim != row["claim"]:
+            raise RecomputeError(
+                f"{proto}: derived claim {claim} != MATRIX claim {row['claim']} "
+                "(MATRIX and claim_for disagree; fix the source, do not rewrite JSON)"
+            )
+        note = annotations.get(proto) or {}
+        entries[proto] = {
+            "origin": "matrix",
+            "verdict": verdict,
+            "scope": scope,
+            "claim": claim,
+            "boundaries": list(note.get("boundaries") or []),
+            "safety": list(note.get("safety") or []),
+        }
+
+    for proto, entry in (synthetic.get("synthetic") or {}).items():
+        scope = entry["scope"]
+        if scope not in SYNTHETIC_SCOPES:
+            raise RecomputeError(
+                f"{proto}: synthetic scope must be one of {sorted(SYNTHETIC_SCOPES)}, got {scope}"
+            )
+        expected_claim = claim_for(entry["verdict"], False, False)
+        if entry["claim"] != expected_claim:
+            raise RecomputeError(
+                f"{proto}: synthetic claim {entry['claim']} != claim_for({entry['verdict']}) {expected_claim}"
+            )
+        entries[proto] = {
+            "origin": "synthetic",
+            "verdict": entry["verdict"],
+            "scope": scope,
+            "claim": entry["claim"],
+            "boundaries": list(entry.get("boundaries") or []),
+            "safety": list(entry.get("safety") or []),
+        }
+
+    missing_codes = sorted(
+        {
+            code
+            for entry in entries.values()
+            for code in (*entry["boundaries"], *entry["safety"])
+            if code not in messages
+        }
+    )
+    if missing_codes:
+        raise RecomputeError("messages missing codes: " + ", ".join(missing_codes))
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_from_revision": baseline,
+        "generated_at": generated_at,
+        "run_id": RUN_ID,
+        "inputs_sha256": repo_inputs_sha256(files),
+        "protocols": {proto: entries[proto] for proto in sorted(entries)},
+        "messages": messages,
+    }
+
+
+def dump_manifest(manifest):
+    return json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+
+
+def normalize_manifest_text(text):
+    """`--check` 归一化：generated_at 是溯源元数据，不参与零漂移比较。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    data.pop("generated_at", None)
+    return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--matrix", required=True)
+    ap.add_argument("--run-dir", default=None)
+    ap.add_argument("--matrix", default=None)
     ap.add_argument("--cell-matrix", default=str(DEFAULT_CELL_MATRIX))
     ap.add_argument("--run-meta", default=None)
-    ap.add_argument("--check", action="store_true")
+    ap.add_argument(
+        "--check",
+        nargs="?",
+        const=True,
+        default=None,
+        help="无参数=旧语义（MATRIX+run-dir verdicts）；带 path=校验仓库级 verdicts.json",
+    )
+    ap.add_argument(
+        "--repo-out",
+        nargs="?",
+        const=str(REPO_MANIFEST_PATH),
+        default=None,
+        help="写仓库级 verdicts.json（省略 path 用仓库根默认路径）",
+    )
+    ap.add_argument("--generated-at", default=None)
+    ap.add_argument("--revision", default=None)
+    ap.add_argument(
+        "--notes",
+        default=None,
+        help="Trojan 注记 Markdown（随仓库 check-in）；注入 MATRIX 的安全警示段（AC-14.3）",
+    )
     ap.add_argument("--allow-partial", action="store_true")
     args = ap.parse_args()
+
+    repo_mode = isinstance(args.check, str) or args.repo_out is not None
+    if args.repo_out is None and isinstance(args.check, str):
+        # 只校验时不需要 --run-dir/--matrix；输出目标仅用于路径解析（不写盘）。
+        args.repo_out = isinstance(args.check, str) and args.check or str(REPO_MANIFEST_PATH)
+    if not repo_mode:
+        if not args.run_dir or not args.matrix:
+            print("recompute error: --run-dir and --matrix are required (legacy mode)", file=sys.stderr)
+            return 2
+        return run_legacy(args)
+
+    try:
+        repo = build_repo_manifest(args.repo_out, prompt_generated_at=args.generated_at,
+                                   revision=args.revision)
+    except RecomputeError as err:
+        print(f"recompute error: {err}", file=sys.stderr)
+        return 2
+    text = dump_manifest(repo)
+    target = Path(args.repo_out)
+    if isinstance(args.check, str):
+        existing_path = Path(args.check)
+        existing = existing_path.read_text(encoding="utf-8") if existing_path.exists() else ""
+        if normalize_manifest_text(existing) != normalize_manifest_text(text):
+            print(
+                f"verdicts.json drift: {existing_path} != derived manifest "
+                "(run --repo-out to regenerate)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"verdicts.json is up to date: {existing_path}")
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    print(
+        "wrote manifest: "
+        + json.dumps(
+            {k: v["verdict"] for k, v in repo["protocols"].items()}, ensure_ascii=False
+        )
+    )
+    return 0
+
+
+def run_legacy(args):
     try:
         run_meta = load_run_meta(args.run_meta) if args.run_meta else None
+        notes = None
+        if args.notes:
+            notes = Path(args.notes).read_text(encoding="utf-8")
         payload, text = build(
             args.run_dir,
             args.cell_matrix,
             args.allow_partial,
             run_meta=run_meta,
             run_meta_path=args.run_meta,
+            notes=notes,
+            notes_path=args.notes,
         )
     except RecomputeError as err:
         print(f"recompute error: {err}", file=sys.stderr)
@@ -1060,6 +1509,14 @@ def main():
     )
     if args.check:
         existing = Path(args.matrix).read_text(encoding="utf-8") if Path(args.matrix).exists() else ""
+        if args.notes and existing != text:
+            # 注记漂移同样是 drift（AC-14.3）：显式给出 notes_sha256 诊断。
+            want = hashlib.sha256(Path(args.notes).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+            if want not in existing:
+                print(
+                    f"notes drift: notes_sha256={want} not present in {args.matrix}",
+                    file=sys.stderr,
+                )
         if existing != text:
             print("MATRIX drift: run recompute without --check", file=sys.stderr)
             return 1

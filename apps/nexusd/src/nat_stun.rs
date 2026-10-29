@@ -24,7 +24,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nexus_connectivity::nat::{NatType, StunMapping};
+use nexus_domain::nat::{NatType, StunMapping};
 use nexus_nat_traversal::{DefaultPredictor, PortSample, Predictability, PunchPredictor};
 use nexus_turn::stun::{self, Attribute, StunMessage};
 
@@ -175,7 +175,7 @@ impl StunProber {
     ///
     /// 映射不同 → `Symmetric`；相同 → `RestrictedCone`（无法区分
     /// Full/Restricted/PortRestricted，保守取 RestrictedCone，与
-    /// `nexus_connectivity::nat` 同口径）。
+    /// `nexus_domain::nat` 同口径）。
     pub fn detect_nat_type(
         &mut self,
         server1: SocketAddr,
@@ -190,6 +190,25 @@ impl StunProber {
         })
     }
 
+    /// 同一 transport（生产上即 punch driver socket）连续探测两个目标。
+    ///
+    /// 返回两条 mapping + NAT 类型；任一 probe 失败即返回该错误，不返回半成品。
+    /// 双样本是 `DefaultPredictor` 的 `distinct_targets >= 2` 前提。
+    pub fn probe_pair(
+        &mut self,
+        server1: SocketAddr,
+        server2: SocketAddr,
+    ) -> Result<(StunMapping, StunMapping, NatType), StunError> {
+        let m1 = self.probe_once(server1, STUN_PROBE_TIMEOUT)?;
+        let m2 = self.probe_once(server2, STUN_PROBE_TIMEOUT)?;
+        let nat_type = if m1.public != m2.public {
+            NatType::Symmetric
+        } else {
+            NatType::RestrictedCone
+        };
+        Ok((m1, m2, nat_type))
+    }
+
     /// 双服务器探测：返回 server1 的公网映射 + 双映射对比的 NAT 类型。
     ///
     /// 一次调用只做两次 Binding 探测（调用方不再需要额外的 `probe_once`），
@@ -199,13 +218,7 @@ impl StunProber {
         server1: SocketAddr,
         server2: SocketAddr,
     ) -> Result<(StunMapping, NatType), StunError> {
-        let m1 = self.probe_once(server1, STUN_PROBE_TIMEOUT)?;
-        let m2 = self.probe_once(server2, STUN_PROBE_TIMEOUT)?;
-        let nat_type = if m1.public != m2.public {
-            NatType::Symmetric
-        } else {
-            NatType::RestrictedCone
-        };
+        let (m1, _m2, nat_type) = self.probe_pair(server1, server2)?;
         Ok((m1, nat_type))
     }
 
@@ -229,7 +242,6 @@ impl StunProber {
 pub struct DriverStunTransport {
     driver: Arc<nexus_fabric::Driver>,
     inbox: std::sync::Mutex<std::sync::mpsc::Receiver<nexus_fabric::StunResponse>>,
-    local: SocketAddr,
 }
 
 struct TapSink {
@@ -244,7 +256,6 @@ impl nexus_fabric::StunSink for TapSink {
 
 impl DriverStunTransport {
     pub fn new(driver: Arc<nexus_fabric::Driver>) -> Result<Self, io::Error> {
-        let local = *driver.shared().local_addr.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         driver
             .install_stun_tap(Arc::new(TapSink { tx }))
@@ -252,7 +263,6 @@ impl DriverStunTransport {
         Ok(Self {
             driver,
             inbox: std::sync::Mutex::new(rx),
-            local,
         })
     }
 }
@@ -279,7 +289,8 @@ impl StunTransport for DriverStunTransport {
                 return Err(StunError::Timeout);
             }
             match inbox.recv_timeout(remain) {
-                Ok(r) if r.transaction_id == txn => return Ok(r.bytes),
+                // 只接受本事务且来自目标服务器的响应（与 UdpStunTransport 同口径）。
+                Ok(r) if r.transaction_id == txn && r.from == server => return Ok(r.bytes),
                 Ok(_) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(StunError::Timeout),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -290,7 +301,14 @@ impl StunTransport for DriverStunTransport {
     }
 
     fn local_addr(&self) -> Result<SocketAddr, StunError> {
-        Ok(self.local)
+        // 实时读取 driver socket 地址（rebind 后不返回构造期缓存）。
+        let local = self
+            .driver
+            .shared()
+            .local_addr
+            .lock()
+            .map_err(|_| StunError::Io(io::Error::other("driver local_addr poisoned")))?;
+        Ok(*local)
     }
 }
 
@@ -584,6 +602,141 @@ mod tests {
         assert!(s.at_ms > 0);
     }
 
+    #[test]
+    fn probe_pair_returns_two_mappings_and_type() {
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 40000));
+        let server1 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3478));
+        let server2 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3479));
+        let same = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 54321));
+
+        // 双服务器返回相同映射 → RestrictedCone；两次请求。
+        let transport = MockStunTransport::new(local, vec![same, same]);
+        let mut cone = StunProber::new(Box::new(transport));
+        let (m1, m2, nat) = cone.probe_pair(server1, server2).unwrap();
+        assert_eq!(m1.public, same);
+        assert_eq!(m2.public, same);
+        assert_eq!(m1.local, local);
+        assert_eq!(m2.local, local);
+        assert_eq!(nat, NatType::RestrictedCone);
+
+        // 第二个服务器返回不同映射 → Symmetric；仍只有两次请求。
+        let second = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 54322));
+        let transport = MockStunTransport::new(local, vec![same, second]);
+        let mut sym = StunProber::new(Box::new(transport));
+        let (m1, m2, nat) = sym.probe_pair(server1, server2).unwrap();
+        assert_eq!(m1.public, same);
+        assert_eq!(m2.public, second);
+        assert_eq!(nat, NatType::Symmetric);
+
+        // 投影保持既有签名/语义（丢弃 m2）。
+        let transport = MockStunTransport::new(local, vec![same, second]);
+        let mut projected = StunProber::new(Box::new(transport));
+        let (m1, nat) = projected.probe_and_detect(server1, server2).unwrap();
+        assert_eq!(m1.public, same);
+        assert_eq!(nat, NatType::Symmetric);
+    }
+
+    /// 顺序分配公网端口的 mock：每次响应 +1（从 40000 起）。
+    fn sequential_ip_responses(count: usize) -> Vec<SocketAddr> {
+        (0..count)
+            .map(|i| {
+                SocketAddr::from((
+                    Ipv4Addr::new(203, 0, 113, 7),
+                    40_000u16.wrapping_add(i as u16),
+                ))
+            })
+            .collect()
+    }
+
+    /// 按采样轮次顺序（每轮 s1,s2）把 `probe_pair` 的映射压成端口样本。
+    fn sample_pair_series(
+        prober: &mut StunProber,
+        server1: SocketAddr,
+        server2: SocketAddr,
+        rounds: usize,
+        samples: &mut Vec<PortSample>,
+    ) -> (StunMapping, NatType) {
+        let mut last_m1 = None;
+        let mut last_nat = NatType::Unknown;
+        for round in 0..rounds {
+            let (m1, m2, nat) = prober.probe_pair(server1, server2).unwrap();
+            for (mapping, target) in [(&m1, server1), (&m2, server2)] {
+                samples.push(PortSample {
+                    port: mapping.public.port(),
+                    at_ms: 1_000_000 + (round * 2) as u64 * 100,
+                    target,
+                    observed_from: mapping.local,
+                });
+            }
+            last_m1 = Some(m1);
+            last_nat = nat;
+        }
+        (last_m1.expect("at least one round"), last_nat)
+    }
+
+    #[test]
+    fn sample_series_is_predictable() {
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 40000));
+        let server1 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3478));
+        let server2 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3479));
+        let mut prober = StunProber::new(Box::new(MockStunTransport::new(
+            local,
+            sequential_ip_responses(6),
+        )));
+
+        let mut samples = Vec::new();
+        sample_pair_series(&mut prober, server1, server2, 3, &mut samples);
+        assert_eq!(samples.len(), 6, "3 rounds x 2 targets");
+        let first_observed = samples[0].observed_from;
+        assert!(samples.iter().all(|s| s.observed_from == first_observed));
+        let mut targets: Vec<SocketAddr> = samples.iter().map(|s| s.target).collect();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets.len(), 2, "two distinct targets per round");
+
+        let ports: Vec<u16> = samples.iter().map(|s| s.port).collect();
+        assert_eq!(ports, vec![40000, 40001, 40002, 40003, 40004, 40005]);
+        assert_eq!(
+            DefaultPredictor.assess(&samples),
+            Predictability::Predictable {
+                base_port: 40005,
+                delta: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn p1_ac2_candidates_projection() {
+        use crate::nat_gather::CandidateGatherer;
+
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 40000));
+        let server1 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3478));
+        let server2 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3479));
+        let stun = StunProber::new(Box::new(MockStunTransport::new(
+            local,
+            sequential_ip_responses(6),
+        )));
+        let mut gatherer = CandidateGatherer::new(stun, local);
+        let mut samples = Vec::new();
+        let (last_m1, nat) =
+            sample_pair_series(gatherer.stun_prober(), server1, server2, 3, &mut samples);
+        gatherer.set_nat_type(nat);
+
+        // 组合根投影（Wave B 的 sample_round 规则；Wave A 在测试内复刻）：
+        // srflx = 最后一轮 s1 的 XOR-MAPPED，srflx_stun = Some(s1)。
+        let mut candidates = gatherer
+            .gather(None, false, &mut samples)
+            .expect("host candidate present");
+        candidates.srflx = Some(last_m1.public);
+        candidates.srflx_stun = Some(server1);
+
+        assert_eq!(candidates.srflx, Some(last_m1.public));
+        assert_eq!(candidates.srflx_stun, Some(server1));
+        assert_eq!(candidates.srflx_turn, None);
+        assert_eq!(candidates.nat_type, nat);
+        assert_eq!(samples.len(), 6);
+    }
+
     fn port_samples(ports: &[u16]) -> Vec<PortSample> {
         ports
             .iter()
@@ -688,6 +841,26 @@ mod tests {
 mod gap_tests {
     use super::*;
     use nexus_fabric::Driver;
+    use std::net::UdpSocket;
+    use std::thread;
+
+    fn binding_request(txn: [u8; 12]) -> Vec<u8> {
+        StunMessage {
+            msg_type: 0x0001, // STUN Binding Request
+            txn,
+            attrs: vec![],
+        }
+        .encode()
+    }
+
+    fn binding_response(txn: [u8; 12], public: SocketAddr) -> Vec<u8> {
+        StunMessage {
+            msg_type: 0x0101, // Binding Success Response
+            txn,
+            attrs: vec![Attribute::XorMappedAddress(public)],
+        }
+        .encode()
+    }
 
     #[test]
     fn g1_stun_samples_share_punch_socket() {
@@ -698,6 +871,98 @@ mod gap_tests {
             transport.local_addr().unwrap(),
             local,
             "STUN must be observed on the punch driver socket"
+        );
+    }
+
+    /// S1/AC-1：`local_addr()` 跟随 driver 实时地址，不返回构造期缓存。
+    #[test]
+    fn tap_local_addr_is_live_driver_addr() {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let transport = DriverStunTransport::new(driver.clone()).expect("install tap");
+        let rebound: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        // D-3：没有服务端级 rebind API；测试直接改 driver 的共享 local_addr
+        // （无 traffic，安全），以证明 transport 不再缓存构造期值。
+        *driver.shared().local_addr.lock().unwrap() = rebound;
+        assert_eq!(
+            transport.local_addr().unwrap(),
+            rebound,
+            "driver local_addr must be read live (rebind-safe)"
+        );
+    }
+
+    /// S2/AC-1：伪造同 txn 的错误源响应必须先被丢弃。
+    ///
+    /// D-1（ANCHOR-DRIFT）：fabric tap 在第一个 txn 命中时就把 pending 消费掉
+    /// （不论源地址），因此正确源的后到响应不会再进 sink。本测试断言：
+    /// 伪造先到 → `Timeout`；干净路径 → `Ok`。目标（不接受错误源）不变。
+    #[test]
+    fn send_recv_rejects_wrong_source() {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let driver_addr = *driver.shared().local_addr.lock().unwrap();
+        let mut transport = DriverStunTransport::new(driver.clone()).expect("install tap");
+
+        let legit = UdpSocket::bind("127.0.0.1:0").expect("bind legit responder");
+        let legit_addr = legit.local_addr().expect("legit addr");
+        let attacker = UdpSocket::bind("127.0.0.1:0").expect("bind attacker");
+
+        // 第 1 轮：等 driver 的请求到达 legit（证明 txn 已注册），attacker
+        // 立即发伪造响应，legit 50ms 后发正确响应 → Timeout（D-1）。
+        let txn1 = [0x31u8; 12];
+        let forged_public: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        let legit_public: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let forged = binding_response(txn1, forged_public);
+        let legit_response = binding_response(txn1, legit_public);
+        let coordinator = {
+            let legit = legit.try_clone().expect("clone legit");
+            let attacker = attacker.try_clone().expect("clone attacker");
+            thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                legit
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("set legit read timeout");
+                let _ = legit.recv_from(&mut buf).expect("probe request arrives");
+                let _ = attacker.send_to(&forged, driver_addr);
+                thread::sleep(Duration::from_millis(50));
+                let _ = legit.send_to(&legit_response, driver_addr);
+            })
+        };
+        let err = transport
+            .send_recv(
+                &binding_request(txn1),
+                legit_addr,
+                Duration::from_millis(400),
+            )
+            .expect_err("forged response must never be accepted");
+        assert!(
+            matches!(err, StunError::Timeout),
+            "forged-first must yield Timeout, got {err:?}"
+        );
+        coordinator.join().unwrap();
+
+        // 第 2 轮：干净路径（正确源）→ Ok，字节可解析为同一映射。
+        let txn2 = [0x32u8; 12];
+        let clean_response = binding_response(txn2, legit_public);
+        let clean_sender = {
+            let sock = legit.try_clone().expect("clone legit");
+            thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                sock.set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("set legit read timeout");
+                let _ = sock.recv_from(&mut buf).expect("probe request arrives");
+                let _ = sock.send_to(&clean_response, driver_addr);
+            })
+        };
+        let bytes = transport
+            .send_recv(
+                &binding_request(txn2),
+                legit_addr,
+                Duration::from_millis(400),
+            )
+            .expect("clean source response must be accepted");
+        clean_sender.join().unwrap();
+        assert_eq!(
+            parse_binding_response(&bytes, &txn2).expect("parse clean response"),
+            legit_public
         );
     }
 }

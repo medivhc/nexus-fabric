@@ -321,6 +321,8 @@ cargo build --workspace
 
   * SDK：`nexus_connectivity::nat::{NatEvent, NatType, StunMapping}`（canonical codec：`nexus_turn::stun`；`StunClient`/`HolePuncher` 已随 #1 退役）
 
+  > 该 SDK 面属 v9 CLI 运行时（frozen）；新栈请用 `nexus_domain::nat`。
+
 * **代码级校验**：`nexus-harness run nat-hole-punching` → PASS（2026-10-18：RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析确定性自检）；单元测试 `cargo test -p nexusd nat_stun` 12/12。真实 STUN 服务器集成测试待完善。
 
 #### 4.1.9 Proxy 节点测速（tcp /http204，§11.10）
@@ -353,7 +355,7 @@ cargo build --workspace
 
 
 
-* **能力**：规则路由代理内核 ——Clash 风格配置解析（订阅节点解析）、规则匹配（DOMAIN / GEOSITE / GEOIP / IP-CIDR / MATCH / 端口）、规则集与 rule-providers（含在线 URL 拉取）、分组策略（selector /url-test/load-balance /relay）。真实数据面：`nexus proxy --addr <ip:port> [--config <path>]` 提供真实 SOCKS5 监听，逐会话完成握手 → 规则路由 → Session → 真实出站 → 双向字节中继。
+* **能力**：规则路由代理内核 ——Clash 风格配置解析（订阅节点解析）、规则匹配（DOMAIN / GEOSITE / GEOIP / IP-CIDR / MATCH / 端口）、规则集与 rule-providers（含在线 URL 拉取）、分组策略（selector /url-test/load-balance /relay）。真实数据面：`nexus proxy [--config <path>]` 提供真实 SOCKS5 监听（当前固定监听 `127.0.0.1:1080`；`--addr` 对 `proxy` 子命令暂不生效，见本节末「`--addr` 的临时口径」），逐会话完成握手 → 规则路由 → Session → 真实出站 → 双向字节中继。
 
 * **出站适配器**：Shadowsocks（真实 TCP 会话）、VMess（线格式）、Trojan（TLS + 认证 + Standard/Singbox 头格式 + SNI/ALPN/skip-verify 参数）。适配器经 `OutboundAdapter` trait 注入（MODULE.md 冻结契约）。
 
@@ -361,8 +363,61 @@ cargo build --workspace
 > 互操作状态以 [出站协议互操作证据总表](protocols/interop/MATRIX.md) 为准：VLESS、AnyTLS
 > 为 `VERIFIED / USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
 > （SIP004 互操作已通、产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；
-> Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`。
+> Hysteria2 为 `PARTIAL / PROTOCOL_SUBSET / USABLE_WITH_GAPS`；Trojan 为 `PARTIAL / TCP_ONLY /
+> USABLE_WITH_GAPS`（fallback fail-closed 已交付，产品 UDP 未实现、success 之后到达的
+> fallback 仍在承诺边界外，见下方「Trojan fallback 行为变更」）。
 > 五协议均可在配置面选择但无「实验性/未验证」标注。
+>
+> Hysteria2 三句话：TCP 产品路径结论不变（逐格 PASS 仍在）；变化的是证据作用域——产品级
+> `UdpEcho` 未实现，按 E1 规则 6 记 `PARTIAL`；crate 级 UDP 仍 PASS（`UdpEchoCrate`），
+> QUIC 出站传输不受影响。
+
+**Trojan fallback 守卫字段（proxy.yaml，2026-10-26）**
+
+`outbounds[]` 中 `kind: trojan` 的出站新增两个可选字段（仅 trojan 生效；非 trojan
+出站上写**合法值**会被忽略、写**非法值**会 `CONFIG_INVALID` 硬失败）：
+
+```yaml
+outbounds:
+  - tag: trojan-node
+    kind: trojan
+    locator: node.example.com:443
+    password: "CHANGE_ME"
+    fallback_guard: strict      # 缺省 strict；可选 signature（安全降级）
+    ready_window_ms: 0          # 0/缺省 = 自适应；1..=5000 = 显式窗口
+```
+
+- `fallback_guard: strict`（默认）：在本地 CONNECT 应答写出前，用「目标端口 + 首包」
+  判定节点是否接受了本次连接；只放行端口绑定的 server-first greeting 白名单
+  （22 `SSH-`、21/25/587 `220`、110 `+OK`、143 `* OK`、5900 `RFB `），其余首包
+  （含 HTTP 404 页面）在客户端看到任何隧道数据之前判失败。
+- `fallback_guard: signature`：**明确标注的安全降级（官方逃生口）**，只拒绝 HTTP
+  状态行，其余首包放行；代价是非 HTTP fallback 全部漏报。没有 `off`（不存在完全关闭
+  守卫的官方开关）。
+- `ready_window_ms`：把「等待首包」的时长显式设为 `n` 毫秒（上限 5000），只改等待时长、
+  不改判据；缺省用自适应窗口 `clamp(节点建连耗时 + 50ms, 50ms, 600ms)`。
+- 失败形态：SOCKS5 客户端在 CONNECT 应答阶段得到 `REP≠0`，HTTP 代理客户端得到
+  `HTTP/1.1 502 Bad Gateway`；失败后 500ms 内连接关闭，隧道字节为 0。
+
+**strict 模式的已知误杀面（M-1~M-8）**：MySQL 3306 二进制握手、非规范端口的 SSH
+（如 2222）、telnet IAC、自定义 banner、SMTP 非 `220` 应答（554/421）、非规范端口的
+VNC/FTP/POP3/IMAP、白名单前缀被 TCP 分片且 50ms 内未补齐、白名单端口但首包被中间盒
+改写 —— 这些合法 server-first 目标在 `strict` 下会被当成 fallback 拒绝。需要这类目标时
+请显式切换该出站为 `fallback_guard: signature`。
+
+**Trojan fallback 行为变更（发布说明面）**
+
+- **无 fallback 的坏凭据**（密码错、服务端直接关闭）：以前是「先回 SOCKS5 success，
+  随后隧道 EOF」，现在是「CONNECT 应答阶段直接失败（`REP≠0` / HTTP 502）」。客户端不再
+  把失败误认为已建立的隧道；MATRIX 判定与错误分类不变。
+- **有 fallback 的坏凭据**：fallback 页面（如 404）不再被当作隧道数据交给应用。
+- **非 CONNECT 绝对形式**：建连/握手失败由「直接断连」变为「HTTP 502」。
+- **承诺边界**：只保证「在 success 之前到达的 fallback 首包零字节投递」；若 fallback
+  响应慢于窗口（默认最多 600ms）或等到客户端先发数据后才响应，仍可能漏报；HTTP 绝对
+  形式转发（非 CONNECT）不在守卫的 fallback 识别范围内。建连/握手硬失败时仍回
+  `HTTP/1.1 502 Bad Gateway`（与 CONNECT 一致）。残余项登记在
+  [Trojan 注记](protocols/interop/notes/trojan-fallback.md) 与
+  [MATRIX](protocols/interop/MATRIX.md)。
 
 * **用户用法**：
 
@@ -376,7 +431,74 @@ cargo build --workspace
 > **互操作状态注记**：上述 `proxy-*` 是代码级/自洽校验，不等于对参照实现的互操作。
 > 互操作结论以 [出站协议互操作证据总表](protocols/interop/MATRIX.md) 为准：VLESS、AnyTLS
 > 为 `VERIFIED / USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
-> （产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`。
+> （产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；Hysteria2 为
+> `PARTIAL / PROTOCOL_SUBSET / USABLE_WITH_GAPS`；
+> Trojan 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（fallback fail-closed 已交付、
+> 产品 UDP 未实现；不写成 `VERIFIED`）。
+>
+> Hysteria2 三句话：TCP 产品路径结论不变（逐格 PASS 仍在）；变化的是证据作用域——产品级
+> `UdpEcho` 未实现，按 E1 规则 6 记 `PARTIAL`；crate 级 UDP 仍 PASS（`UdpEchoCrate`），
+> QUIC 出站传输不受影响。
+
+**SOCKS5 UDP ASSOCIATE（产品 UDP，fixes-6 Phase 1）**
+
+支持矩阵（产品 SOCKS5 入口，`CMD=0x03`）：
+
+| 出站协议 | 产品 SOCKS5 UDP | 说明 |
+|---|---|---|
+| VLESS | 可用 | 仅 `flow=None`；其它 flow（如 `xtls-rprx-vision`）按不支持处理 → 丢弃 |
+| AnyTLS | 可用 | UoT（UDP over TLS） |
+| Trojan | fail-closed | 出站无 UDP 帧路径：数据报丢弃、不直连 |
+| Shadowsocks | fail-closed | 同上 |
+| Hysteria2 | fail-closed | 同上；QUIC 出站传输本身不受影响（crate 级 `UdpEchoCrate` 仍 PASS） |
+
+四个前置条件（缺一条即不成立）：
+
+1. **仅 `nexus proxy` CLI 入口**：`nexusd` / TUN 表面尚未实现产品级 UDP 语义（该表面仍报 `PRODUCT_UDP_NOT_IMPLEMENTED`）。
+2. **仅 loopback 监听**：监听地址非 loopback 时 ASSOCIATE 一律 `REP=0x01` 拒绝（本产品无显式认证；不 bind、不建关联），计入 `udp.associations_rejected`。
+3. **VLESS 仅 `flow=None`**：带 flow 的 VLESS 出站没有 UDP 帧路径，数据报按 fail-closed 丢弃。
+4. **单进程有效并发 = 1**：关联在 serve 循环内阻塞到控制连接结束，`association.effective_concurrency` 恒为 `1`；`association.max_associations`（128）是进程内上限，该模型下不可达。**实际后果**：一个关联存续期间 accept 循环不推进，新的 SOCKS5 会话（TCP/UDP）排队，直到控制连接 EOF / RST 才继续。
+
+**显式产品语义：关联成功 ≠ UDP 可用**
+
+ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在其后的数据面。对 Trojan / Shadowsocks / Hysteria2（以及非 `flow=None` 的 VLESS）：
+
+- 关联已建立，客户端看到的是成功应答；
+- 之后收到的数据报**全部丢弃**（不直连、不伪造回包）；
+- 客户端**没有任何协议内错误信号**（没有 `REP`、没有 ICMP），只能观察到 UDP 超时。
+
+因此「关联成功」只说明入口接受了请求，不代表该出站协议支持 UDP；判断是否真的通了，看下面 serve JSON 的计数。
+
+**验证方法（serve JSON）**
+
+每个 UDP 关联结束时，`nexus proxy` 的 serve JSON 只新增 `association` / `udp` 两段（TCP 路径字段 `socks.*` / `routing.*` / `bytes.*` 逐字不变）：
+
+| 字段 | 含义 |
+|---|---|
+| `udp.modes` | 本次关联实际用到的 UDP 能力标签：`vless_over_tcp`（VLESS `flow=None`）/ `anytls_uot`（AnyTLS）；空数组表示没有任何出站被成功路由 |
+| `udp.datagrams_in` / `udp.datagrams_out` | 客户端→代理 / 代理→客户端 的数据报计数（`udp.sent` 是 `datagrams_in` 的产品侧别名） |
+| `udp.send_failed` | 出站发送/握手失败计数（工厂期配置错误、出站 IO/超时） |
+| `udp.unsupported_<proto>` | 按协议的能力缺口丢弃计数：`unsupported_vless` / `unsupported_anytls` / `unsupported_trojan` / `unsupported_shadowsocks` / `unsupported_hysteria2` / `unsupported_other` |
+| `udp.associations_rejected` | 被拒绝的关联请求数（原因见排障表） |
+| `association.listener_loopback` | 监听地址是否 loopback（`false` 时所有关联都会被拒） |
+| `association.max_associations` / `association.effective_concurrency` | 进程内上限（128，不可达）/ 单进程有效并发（恒为 `1`） |
+| `association.outcome` / `association.reason` | 关联终态与原因（`control_closed`、`non_loopback_listener`、`client_address_mismatch` 等） |
+| `routing.flows[]` | 关联内路由过的 target / `outbound_tag` / `outbound_kind`（去重，最多 16 条） |
+
+判读例子：`udp.modes=["vless_over_tcp"]` 且 `datagrams_in > 0`、`datagrams_out > 0` 才说明 UDP 真正通了；`association.outcome=completed` 但 `datagrams_out=0` 且 `unsupported_hysteria2>0`，说明是 fail-closed 黑洞。
+
+**排障表**
+
+| 症状 | 服务端信号 |
+|---|---|
+| 客户端 ASSOCIATE 直接失败（`REP=0x01`） | `udp.associations_rejected` ≥ 1；`association.reason` = `non_loopback_listener`（监听非 loopback）/ `client_address_mismatch`（请求 `DST.ADDR` 与控制连接对端不符）/ `association_limit` / `config_invalid` / `service_build_failed` / `bind_failed`；日志 `[proxy-udp] event=udp_drop ... reason=<同值>` |
+| 关联成功但所有 UDP 超时 | `udp.unsupported_<proto>` 增长、`udp.datagrams_out` 不增长：该协议 fail-closed（Trojan / Shadowsocks / Hysteria2，或 VLESS 非 `flow=None`）；日志 `event=udp_drop` |
+| 关联成功但只有部分目标通 | 看 `udp.modes` 与 `routing.flows[]`：规则路由到可用协议才通；target 未命中任何出站时计 `udp.dropped_no_route` |
+| 出站发送失败 | `udp.send_failed` 增长；日志 `event=udp_send_failed ... error=...`（如出站配置缺 uuid/password/obfs → 握手期失败） |
+| 回包没回到客户端 | `udp.dropped_source_mismatch`（源地址不符）/ `udp.unmatched_replies`（无对应 flow）；日志 `event=udp_source_rejected` |
+| 日志很少 | `[proxy-udp]` 按事件+原因限频 10s；被抑制的条数在下一行以 `suppressed=<n>` 回填，关联结束总数见 `udp.log_suppressed` |
+
+**`--addr` 的临时口径**：`nexus proxy` 当前固定监听 `127.0.0.1:1080`，`--addr` 对 `proxy` 子命令**不生效**（全局 `--addr` 在命令分发前被剥离，属既存解析缺陷，已单独立项 `nexus-proxy-addr-parsing-fix`）。缺陷修复前按默认 1080 规划客户端；READY JSON 的 `daemon.addr` 是实际监听地址。
 
 #### 4.1.11 规则数据注入（geoip.nex/geosite.nex）
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""由 cell-matrix.json 生成 46 份 token 化 probe 模板（S17）。
+"""由 cell-matrix.json 生成 47 份 token 化 probe 模板（S17）。
 
 令牌只允许凭据/运行期值；端口与协议字段全部具体化，便于评审。
 `--check` 幂等：生成到内存后与磁盘逐字节比较，不写盘。

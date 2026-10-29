@@ -3,6 +3,7 @@ id = "product.proxy-speedtest"
 title = "proxy speedtest 按 measurement 排序输出测速结果表"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#11-proxy-kernel"
+carrier = "v9-connectivity"
 
 [given]
 command = "proxy speedtest"

@@ -3,6 +3,7 @@ id = "product.daemon-run-with-command"
 title = "nexus run service -- <cmd>：N3 任务语义诚实拒绝，不假执行"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#16-n2-resource-access"
+carrier = "v9-connectivity"
 
 [given]
 daemon = "nexusd"

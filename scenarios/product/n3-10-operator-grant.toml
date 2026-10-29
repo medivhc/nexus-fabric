@@ -3,6 +3,7 @@ id = "product.n3-10-operator-grant"
 title = "真实产物通过本地scoped Use运维撤权、恢复和过期拒绝"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#177-n3-10"
+carrier = "external"
 [given]
 [when]
 command = "python3 engineering/verifiers/n3_operator_grant.py"
