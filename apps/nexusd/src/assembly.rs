@@ -1270,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn dial_lifecycle_skips_self_peer_with_verbatim_warn() {
+    fn n1_dial_skips_self() {
         let self_id = peer(0x10);
         let shutdown = Arc::new(AtomicBool::new(false));
         let clock = FakeClock::stopping_after(1, Arc::clone(&shutdown));
