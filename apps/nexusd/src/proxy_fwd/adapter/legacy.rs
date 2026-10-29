@@ -3,7 +3,8 @@
 //! - `Socks5Dialer` → `nexus_proxy_transport::socks5_connect`（零行为变化）；
 //! - `ShadowsocksCrateDialer` → `nexus-outbound-shadowsocks` 的 SIP004 TCP 会话
 //!   （步骤 4 切换；`ss_std` 的 TCP 实现已删除）；
-//! - `TrojanProxyTransportDialer` → `trojan_tls_connect`（**始终 TLS**，§3.5）。
+//! - `TrojanProxyTransportDialer` → `trojan_tls_connect`（**始终 TLS**，§3.5）；拨号前经
+//!   凭据探测闸门（PRODUCT §11.9.5，`credential_probe: false` 时不探测）。
 //!
 //! UDP 只做能力声明：SOCKS5 = `Supported(Socks5Associate)`、SS =
 //! `Supported(ShadowsocksAead)`、Trojan = `Unsupported(TlsVariantNotSupported)`。
@@ -20,6 +21,7 @@ use nexus_proxy_transport::{
     ProxyError, Socks5ProxyConfig, TlsStream, TrojanTlsConfig, socks5_connect, trojan_tls_connect,
 };
 
+use super::trojan_probe::{self, ProbeGate, Verdict};
 use super::{
     DIAL_TIMEOUT, HandshakeFailure, OutboundConfigError, OutboundDialer, OutboundError, Protocol,
     TlsFailure, TunnelStream, UdpCapability, UdpMode, UdpUnsupportedReason,
@@ -145,11 +147,14 @@ impl OutboundDialer for ShadowsocksCrateDialer {
 pub(crate) struct TrojanProxyTransportDialer {
     tag: String,
     config: TrojanTlsConfig,
+    /// 凭据探测状态（MODULE P6）；`credential_probe: false` 时为 `None`。
+    probe: Option<ProbeGate>,
 }
 
 impl TrojanProxyTransportDialer {
-    pub(crate) fn new(tag: String, config: TrojanTlsConfig) -> Self {
-        Self { tag, config }
+    pub(crate) fn new(tag: String, config: TrojanTlsConfig, credential_probe: bool) -> Self {
+        let probe = credential_probe.then(|| ProbeGate::new(tag.clone()));
+        Self { tag, config, probe }
     }
 }
 
@@ -163,6 +168,15 @@ impl OutboundDialer for TrojanProxyTransportDialer {
     }
 
     fn dial_tcp(&self, target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError> {
+        if let Some(gate) = &self.probe
+            && gate.verdict(|| trojan_probe::run_probe(&self.config)) == Verdict::Rejected
+        {
+            return Err(OutboundError::ProtocolHandshake(
+                HandshakeFailure::AuthRejected {
+                    protocol: Protocol::Trojan,
+                },
+            ));
+        }
         let stream = trojan_tls_connect(&self.config, target)
             .map_err(|error| map_proxy_error(error, Protocol::Trojan, target))?;
         Ok(Box::new(TlsTunnel(stream)))

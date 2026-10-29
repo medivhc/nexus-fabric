@@ -715,6 +715,9 @@ pub struct OutboundConfig {
     /// trojan 就绪窗口毫秒覆盖（仅 kind=trojan 生效）：`None`/`0` = 自适应公式，
     /// `n>0` 时实际等待 `min(n, 5000)`ms。非 trojan 出站同上（合法值忽略、非法值硬失败）。
     pub ready_window_ms: Option<u64>,
+    /// trojan 凭据探测开关（PRODUCT §11.9.5，只由 nexusd 消费；`None` 视为 `true`）。
+    /// 只接受 `true` / `false`；非 trojan 出站同上（合法值忽略、非法值硬失败）。
+    pub credential_probe: Option<bool>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -1485,6 +1488,25 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                     ));
                 }
             };
+            // 不复用宽松的 `opt_bool`（它把任何非 "true" 的值当作 false）：§11.9.5 只接受
+            // `true` / `false`，其他值或非标量硬失败。
+            let credential_probe = match opt_str_present(item, "credential_probe") {
+                None => None,
+                Some(Ok(v)) if v == "true" => Some(true),
+                Some(Ok(v)) if v == "false" => Some(false),
+                Some(Ok(v)) => {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{tag}].credential_probe"),
+                        format!("credential_probe must be true or false, got '{v}'"),
+                    ));
+                }
+                Some(Err(())) => {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{tag}].credential_probe"),
+                        "credential_probe must be true or false, got '<non-scalar>'",
+                    ));
+                }
+            };
             outbounds.push(OutboundConfig {
                 tag,
                 kind,
@@ -1507,6 +1529,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                 obfs_password,
                 fallback_guard,
                 ready_window_ms,
+                credential_probe,
             });
         }
     }
@@ -2177,6 +2200,7 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
                 obfs_password: None,
                 fallback_guard: None,
                 ready_window_ms: None,
+                credential_probe: None,
             })
         }
         "vmess" => Ok(OutboundConfig {
@@ -2201,6 +2225,7 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
             obfs_password: None,
             fallback_guard: None,
             ready_window_ms: None,
+            credential_probe: None,
         }),
         other => Err((
             line.to_string(),
@@ -2836,6 +2861,88 @@ outbounds:
     }
 
     #[test]
+    fn credential_probe_is_absent_true_or_false() {
+        // PRODUCT §11.9.5：缺省 None（nexusd 视为 true）；去引号后的 true / false。
+        let cfg = parse(&yaml_with_outbound(
+            "trojan",
+            "    skip_cert_verify: true\n",
+        ))
+        .expect("absent");
+        assert_eq!(cfg.outbounds[0].credential_probe, None);
+        for (raw, expect) in [
+            ("true", true),
+            ("false", false),
+            ("\"true\"", true),
+            ("\"false\"", false),
+            ("'false'", false),
+        ] {
+            let cfg = parse(&yaml_with_outbound(
+                "trojan",
+                &format!("    credential_probe: {raw}\n"),
+            ))
+            .expect("legal value");
+            assert_eq!(cfg.outbounds[0].credential_probe, Some(expect), "{raw}");
+        }
+    }
+
+    #[test]
+    fn credential_probe_rejects_anything_but_true_or_false() {
+        for raw in [
+            "yes", "no", "on", "off", "1", "0", "maybe", "True", "TRUE", "False", "''",
+        ] {
+            let yaml = yaml_with_outbound("trojan", &format!("    credential_probe: {raw}\n"));
+            let err = parse(&yaml).expect_err("illegal value must fail");
+            assert_eq!(err.field, "outbounds[t].credential_probe", "{raw}");
+            assert!(
+                err.to_string()
+                    .starts_with("CONFIG_INVALID [outbounds[t].credential_probe]"),
+                "{raw}: {err}"
+            );
+            assert!(
+                err.reason
+                    .starts_with("credential_probe must be true or false, got '")
+            );
+        }
+        for extra in [
+            "    credential_probe:\n      - true\n",
+            "    credential_probe:\n      enabled: true\n",
+            "    credential_probe: [true]\n",
+        ] {
+            let err = parse(&yaml_with_outbound("trojan", extra)).expect_err("non-scalar");
+            assert_eq!(err.field, "outbounds[t].credential_probe", "{extra}");
+            assert_eq!(
+                err.reason,
+                "credential_probe must be true or false, got '<non-scalar>'"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_probe_on_non_trojan_ignores_legal_and_rejects_illegal() {
+        for (kind, extra) in [
+            ("direct", ""),
+            ("shadowsocks", "    method: chacha20-ietf-poly1305\n"),
+            (
+                "vless",
+                "    uuid: 123e4567-e89b-12d3-a456-426614174000\n    tls: true\n",
+            ),
+        ] {
+            let cfg = parse(&yaml_with_outbound(
+                kind,
+                &format!("{extra}    credential_probe: false\n"),
+            ))
+            .expect("legal value on a non-trojan outbound must parse");
+            assert_eq!(cfg.outbounds[0].credential_probe, Some(false), "{kind}");
+            let err = parse(&yaml_with_outbound(
+                kind,
+                &format!("{extra}    credential_probe: yes\n"),
+            ))
+            .expect_err("illegal value must fail for any kind");
+            assert_eq!(err.field, "outbounds[t].credential_probe", "{kind}");
+        }
+    }
+
+    #[test]
     fn anytls_config_parses_all_fields() {
         let yaml = "\
 schema_version: 1
@@ -3100,6 +3207,7 @@ mod subscription_online_tests {
             obfs_password: None,
             fallback_guard: None,
             ready_window_ms: None,
+            credential_probe: None,
         }]
     }
 

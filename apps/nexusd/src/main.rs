@@ -3399,6 +3399,21 @@ mod redact_parity_tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// PRODUCT §11.9.5：非法 `credential_probe` 是配置错误——引擎构造失败，启动行为
+    /// `stage=config_load` + `PROXY_YAML_INVALID`，字段指向该出站。
+    #[test]
+    fn illegal_credential_probe_fails_config_load() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: t\noutbounds:\n  - tag: t\n    kind: trojan\n    locator: 127.0.0.1:443\n    password: pwd\n    skip_cert_verify: true\n    credential_probe: yes\n";
+        assert!(nexusd::proxy_fwd::ProxyEngine::new(Some(yaml)).is_err());
+        let (path, dir) = temp_config_dir("credential-probe");
+        std::fs::write(path.join("proxy.yaml"), yaml).expect("write");
+        let value = config_load_failure_json("parse proxy.yaml failed", Some(&dir));
+        assert_eq!(value["stage"], "config_load");
+        assert_eq!(value["error"]["variant"], "PROXY_YAML_INVALID");
+        assert_eq!(value["error"]["field"], "outbounds[t].credential_probe");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn error_debug_hides_secrets() {
         use nexus_proxy_config::UdpMode;
