@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use nexus_discovery::DiscoveryHub;
+use nexus_fabric::{FabricIdentity, PeerId as FabricPeerId};
 use nexus_network::n1::bridge::N1MeshBridge;
-use nexus_network::n1::{N1PeerId, config::N1Config, session::N1SessionManager};
+use nexus_network::n1::{N1Error, N1PeerId, config::N1Config, session::N1SessionManager};
 
 use super::config::{self, LoadedConfig};
 use super::dataplane::DataplaneConfig;
@@ -125,26 +126,254 @@ pub struct N1Assembly {
     pub config: N1Config,
 }
 
+/// 拨号退避初值/封顶（spec §8.1 `N1_DIAL_RETRY_INITIAL_MS` / `N1_DIAL_RETRY_MAX_MS`）。
+///
+/// 唯一定义点在 `n1_rx.rs`（spec §7 冻结落点）；此处只重导出，
+/// 保持 WP2 既有的 `assembly::N1_DIAL_RETRY_*` 引用路径。
+pub use crate::n1_rx::{N1_DIAL_RETRY_INITIAL_MS, N1_DIAL_RETRY_MAX_MS};
+
+/// 已连接 peer 的存活轮询间隔。复用退避初值，不引入新的量化判据。
+const N1_DIAL_CONNECTED_POLL_MS: u64 = N1_DIAL_RETRY_INITIAL_MS;
+
+/// shutdown 响应粒度（既有 accept 退化用 100ms；这里只影响退出延迟）。
+const N1_DIAL_SHUTDOWN_SLICE_MS: u64 = 100;
+
+/// 可注入时钟：测试用虚拟时间，生产用单调 `Instant`。
+trait DialClock {
+    fn now_ms(&self) -> u64;
+    /// 等待 `ms`；返回 `false` 表示 shutdown 已置位、调用方应退出。
+    fn sleep_ms(&self, ms: u64, shutdown: &AtomicBool) -> bool;
+}
+
+struct SystemDialClock {
+    start: std::time::Instant,
+}
+
+impl SystemDialClock {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl DialClock for SystemDialClock {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn sleep_ms(&self, ms: u64, shutdown: &AtomicBool) -> bool {
+        let mut remaining = ms;
+        while remaining > 0 {
+            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let slice = remaining.min(N1_DIAL_SHUTDOWN_SLICE_MS);
+            std::thread::sleep(std::time::Duration::from_millis(slice));
+            remaining -= slice;
+        }
+        !shutdown.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// dial 生命周期只需要会话表的两个操作，测试可用替身注入。
+trait DialSessions {
+    fn connected(&self, peer: &N1PeerId) -> bool;
+    fn dial(&self, peer: &N1PeerId) -> Result<(), N1Error>;
+}
+
+struct SessionDialPort<'a> {
+    sessions: &'a N1SessionManager,
+}
+
+impl DialSessions for SessionDialPort<'_> {
+    fn connected(&self, peer: &N1PeerId) -> bool {
+        self.sessions.connection_for(peer).is_some()
+    }
+
+    fn dial(&self, peer: &N1PeerId) -> Result<(), N1Error> {
+        self.sessions.dial(peer)
+    }
+}
+
+fn dial_peer_hex(peer: &N1PeerId) -> String {
+    peer.to_hex().chars().take(16).collect()
+}
+
+fn dial_ok_log(peer: &N1PeerId, attempt: u64) -> String {
+    format!(
+        "[n1-dial] peer={} attempt={attempt} result=ok",
+        dial_peer_hex(peer)
+    )
+}
+
+fn n1_error_kind(error: &N1Error) -> &'static str {
+    match error {
+        N1Error::Transport(_) => "Transport",
+        N1Error::PeerUnknown => "PeerUnknown",
+        N1Error::Closed => "Closed",
+        N1Error::PeerClosed(_) => "PeerClosed",
+        N1Error::Timeout => "Timeout",
+        N1Error::OversizeDatagram(_) => "OversizeDatagram",
+        N1Error::InvalidConfig(_) => "InvalidConfig",
+    }
+}
+
+fn dial_err_log(peer: &N1PeerId, attempt: u64, error: &N1Error) -> String {
+    format!(
+        "[n1-dial] peer={} attempt={attempt} result=err kind={}",
+        dial_peer_hex(peer),
+        n1_error_kind(error)
+    )
+}
+
+struct DialPeerState {
+    peer: N1PeerId,
+    attempt: u64,
+    backoff_ms: u64,
+    next_at_ms: u64,
+    was_connected: bool,
+}
+
+/// 定版拨号生命周期（spec §5.1）：
+/// - tie-break：只有 `my_id.0 < peer.0` 一侧拨号；大 id 只等 accept；
+/// - 失败按 1000ms 起、×2、封顶 30000ms 退避重试；
+/// - 成功停拨，仅轮询连接存活；连接被 `remove` 后按同一退避序重拨；
+/// - 自 peer 不拨，输出逐字 WARN 句。
+fn run_dial_lifecycle(
+    my_id: N1PeerId,
+    peers: &[N1PeerId],
+    sessions: &dyn DialSessions,
+    clock: &dyn DialClock,
+    shutdown: &AtomicBool,
+    log: &mut dyn FnMut(String),
+) {
+    let mut states: Vec<DialPeerState> = Vec::new();
+    for &peer in peers {
+        if peer == my_id {
+            log("[n1-dial] self peer skipped".to_string());
+            continue;
+        }
+        if my_id.0 >= peer.0 {
+            // 大 id 只等 accept；双向拨号会互相 close（spec §5.1）。
+            continue;
+        }
+        states.push(DialPeerState {
+            peer,
+            attempt: 0,
+            backoff_ms: N1_DIAL_RETRY_INITIAL_MS,
+            next_at_ms: 0,
+            was_connected: false,
+        });
+    }
+    if states.is_empty() {
+        return;
+    }
+
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let now = clock.now_ms();
+        let mut next_wake_ms = u64::MAX;
+        for state in &mut states {
+            if sessions.connected(&state.peer) {
+                if !state.was_connected {
+                    state.was_connected = true;
+                    state.attempt = 0;
+                    state.backoff_ms = N1_DIAL_RETRY_INITIAL_MS;
+                    state.next_at_ms = now.saturating_add(N1_DIAL_CONNECTED_POLL_MS);
+                }
+                if now >= state.next_at_ms {
+                    state.next_at_ms = now.saturating_add(N1_DIAL_CONNECTED_POLL_MS);
+                }
+                next_wake_ms = next_wake_ms.min(state.next_at_ms);
+                continue;
+            }
+
+            state.was_connected = false;
+            if now < state.next_at_ms {
+                next_wake_ms = next_wake_ms.min(state.next_at_ms);
+                continue;
+            }
+
+            state.attempt += 1;
+            match sessions.dial(&state.peer) {
+                Ok(()) => {
+                    log(dial_ok_log(&state.peer, state.attempt));
+                    state.attempt = 0;
+                    state.backoff_ms = N1_DIAL_RETRY_INITIAL_MS;
+                    state.was_connected = true;
+                    state.next_at_ms = now.saturating_add(N1_DIAL_CONNECTED_POLL_MS);
+                }
+                Err(error) => {
+                    log(dial_err_log(&state.peer, state.attempt, &error));
+                    state.next_at_ms = now.saturating_add(state.backoff_ms);
+                    state.backoff_ms = state.backoff_ms.saturating_mul(2).min(N1_DIAL_RETRY_MAX_MS);
+                }
+            }
+            next_wake_ms = next_wake_ms.min(state.next_at_ms);
+        }
+
+        if next_wake_ms == u64::MAX {
+            // 不可达：每个 state 要么 connected、要么已排定 next_at。
+            debug_assert!(false, "dial lifecycle has no scheduled wake");
+            return;
+        }
+        let wait_ms = next_wake_ms.saturating_sub(clock.now_ms()).max(1);
+        if !clock.sleep_ms(wait_ms, shutdown) {
+            return;
+        }
+    }
+}
+
+/// 从 `network.toml` 的 `peer_id` 与 seed 派生 mTLS 身份（dial 与 listen 共用）。
+///
+/// # Errors
+/// - `network.toml` 解析失败；
+/// - seed 与 `peer_id` 不匹配（`nat_relay::identity_from_seed`）。
+pub fn identity_from_network_seed(
+    network_toml: &str,
+    seed: [u8; 32],
+) -> Result<FabricIdentity, String> {
+    let config =
+        N1Config::parse_toml(network_toml).map_err(|e| format!("parse network.toml: {e:?}"))?;
+    crate::nat_relay::identity_from_seed(seed, FabricPeerId(config.peer_id.0))
+        .map_err(|e| e.to_string())
+}
+
 /// Assemble N1 with the single discovery hub (daemon path).
 ///
 /// The hub, the N1 session manager and the returned assembly share one
-/// instance; the background dial thread is unchanged (best-effort per peer).
+/// instance; the background dial thread follows the frozen WP2 lifecycle
+/// (tie-break ownership + exponential retry, spec §5.1).
 pub fn assemble_n1_with_discovery(
     network_toml: &str,
     proxy: Option<&config::ProxySection>,
     shutdown: Arc<AtomicBool>,
     params: nexus::network::DiscoveryParams,
+    identity: Option<FabricIdentity>,
 ) -> Result<N1Assembly, String> {
     let proxy_cfg = match proxy {
         Some(section) => Some(proxy_config_from(section)?),
         None => None,
     };
-    let (config, sessions, discovery) = nexus::network::build_session_manager_with_discovery(
-        network_toml,
-        proxy_cfg,
-        shutdown,
-        params,
-    )?;
+    let cancel = Arc::clone(&shutdown);
+    let (config, sessions, discovery) = match identity {
+        Some(identity) => nexus::network::build_session_manager_with_discovery_mtls(
+            network_toml,
+            proxy_cfg,
+            cancel,
+            params,
+            identity,
+        )?,
+        None => nexus::network::build_session_manager_with_discovery(
+            network_toml,
+            proxy_cfg,
+            cancel,
+            params,
+        )?,
+    };
     let bridge = Arc::new(N1MeshBridge::new(
         Arc::clone(&sessions),
         config.vpi.routes.clone(),
@@ -155,21 +384,20 @@ pub fn assemble_n1_with_discovery(
         bridge.route_count()
     );
     let static_peers: Vec<N1PeerId> = config.peers.iter().map(|p| p.id).collect();
-    // 后台 dial：不阻塞启动；失败记 warn（降级）。
+    // 后台 dial：不阻塞启动；按定版生命周期重试/重拨（降级）。
+    let my_id = config.peer_id;
     let peers = static_peers.clone();
     let dial_sessions = Arc::clone(&sessions);
+    let dial_shutdown = Arc::clone(&shutdown);
     std::thread::Builder::new()
         .name("nexusd-n1-dial".to_string())
         .spawn(move || {
-            for peer_id in peers {
-                if let Err(e) = dial_sessions.dial(&peer_id) {
-                    let hex = peer_id.to_hex();
-                    eprintln!(
-                        "[nexusd] WARN: N1 dial peer {} failed: {e:?} (degraded, continuing)",
-                        &hex[..8.min(hex.len())]
-                    );
-                }
-            }
+            let port = SessionDialPort {
+                sessions: &dial_sessions,
+            };
+            let clock = SystemDialClock::new();
+            let mut log = |line: String| eprintln!("{line}");
+            run_dial_lifecycle(my_id, &peers, &port, &clock, &dial_shutdown, &mut log);
         })
         .map_err(|e| format!("spawn n1 dial thread: {e}"))?;
     Ok(N1Assembly {
@@ -192,6 +420,7 @@ pub fn assemble_n1(
         proxy,
         shutdown,
         nexus::network::DiscoveryParams::static_only(),
+        None,
     )?
     .bridge)
 }
@@ -805,6 +1034,257 @@ mod tests {
         let cleanup = assemble.cleanup().expect("dry-run cleanup");
         assert_eq!(cleanup.excludes_removed, 0);
     }
+    // ---- WP2 dial lifecycle（spec §5.1 生命周期 / §8.1 常量 / §8.2 日志原文） ----
+
+    #[derive(Default)]
+    struct FakeClockState {
+        now_ms: u64,
+        sleeps: Vec<u64>,
+        stop_after: Option<usize>,
+        shutdown: Option<Arc<AtomicBool>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeClock(Arc<std::sync::Mutex<FakeClockState>>);
+
+    impl FakeClock {
+        fn stopping_after(n: usize, shutdown: Arc<AtomicBool>) -> Self {
+            let clock = Self::default();
+            {
+                let mut state = clock.0.lock().unwrap();
+                state.stop_after = Some(n);
+                state.shutdown = Some(shutdown);
+            }
+            clock
+        }
+
+        fn sleeps(&self) -> Vec<u64> {
+            self.0.lock().unwrap().sleeps.clone()
+        }
+    }
+
+    impl DialClock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.lock().unwrap().now_ms
+        }
+
+        fn sleep_ms(&self, ms: u64, shutdown: &AtomicBool) -> bool {
+            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let mut state = self.0.lock().unwrap();
+            state.sleeps.push(ms);
+            state.now_ms += ms;
+            if state
+                .stop_after
+                .is_some_and(|limit| state.sleeps.len() >= limit)
+            {
+                if let Some(flag) = &state.shutdown {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                return false;
+            }
+            true
+        }
+    }
+
+    struct FakePort {
+        clock: FakeClock,
+        dials: std::sync::Mutex<u32>,
+        connected: std::sync::Mutex<bool>,
+        outcomes: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        disconnect_at_ms: Option<u64>,
+        disconnected: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakePort {
+        fn new(clock: FakeClock, outcomes: &[bool]) -> Self {
+            Self {
+                clock,
+                dials: std::sync::Mutex::new(0),
+                connected: std::sync::Mutex::new(false),
+                outcomes: std::sync::Mutex::new(outcomes.iter().copied().collect()),
+                disconnect_at_ms: None,
+                disconnected: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn dials(&self) -> u32 {
+            *self.dials.lock().unwrap()
+        }
+    }
+
+    impl DialSessions for FakePort {
+        fn connected(&self, _peer: &N1PeerId) -> bool {
+            if let Some(at_ms) = self.disconnect_at_ms {
+                if self.clock.now_ms() >= at_ms
+                    && !self
+                        .disconnected
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    *self.connected.lock().unwrap() = false;
+                }
+            }
+            *self.connected.lock().unwrap()
+        }
+
+        fn dial(&self, _peer: &N1PeerId) -> Result<(), nexus_network::n1::N1Error> {
+            *self.dials.lock().unwrap() += 1;
+            let ok = self.outcomes.lock().unwrap().pop_front().unwrap_or(false);
+            if ok {
+                *self.connected.lock().unwrap() = true;
+                Ok(())
+            } else {
+                Err(nexus_network::n1::N1Error::Timeout)
+            }
+        }
+    }
+
+    fn peer(byte: u8) -> N1PeerId {
+        N1PeerId([byte; 32])
+    }
+
+    #[test]
+    fn dial_lifecycle_only_smaller_id_owns_dialing() {
+        let small = peer(0x10);
+        let large = peer(0x20);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::stopping_after(1, Arc::clone(&shutdown));
+        let port = FakePort::new(clock.clone(), &[true]);
+        let mut logs = Vec::new();
+        run_dial_lifecycle(small, &[large], &port, &clock, &shutdown, &mut |line| {
+            logs.push(line)
+        });
+        assert_eq!(port.dials(), 1, "smaller id must dial the larger peer");
+        assert_eq!(
+            logs,
+            vec!["[n1-dial] peer=2020202020202020 attempt=1 result=ok".to_string()]
+        );
+        assert_eq!(clock.sleeps(), vec![N1_DIAL_RETRY_INITIAL_MS]);
+
+        // Larger id only waits for accept: zero dials, zero sleeps, zero dial logs.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::stopping_after(1, Arc::clone(&shutdown));
+        let port = FakePort::new(clock.clone(), &[true]);
+        let mut logs = Vec::new();
+        run_dial_lifecycle(large, &[small], &port, &clock, &shutdown, &mut |line| {
+            logs.push(line)
+        });
+        assert_eq!(port.dials(), 0, "larger id must never dial");
+        assert!(clock.sleeps().is_empty());
+        assert!(logs.is_empty());
+    }
+
+    #[test]
+    fn dial_lifecycle_backoff_doubles_and_caps_at_max() {
+        let peer_id = peer(0x20);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::stopping_after(7, Arc::clone(&shutdown));
+        let port = FakePort::new(clock.clone(), &[]);
+        let mut logs = Vec::new();
+        run_dial_lifecycle(
+            peer(0x10),
+            &[peer_id],
+            &port,
+            &clock,
+            &shutdown,
+            &mut |line| logs.push(line),
+        );
+
+        assert_eq!(port.dials(), 7);
+        assert_eq!(
+            clock.sleeps(),
+            vec![1000, 2000, 4000, 8000, 16000, 30000, 30000],
+            "退避必须 1000ms 起、x2、封顶 30000ms"
+        );
+        assert_eq!(logs.len(), 7);
+        for (index, line) in logs.iter().enumerate() {
+            assert!(
+                line.contains(&format!("attempt={}", index + 1)),
+                "attempt counter must increment per failed dial: {line}"
+            );
+            assert!(
+                line.ends_with("result=err kind=Timeout"),
+                "log line must follow §8.2: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn dial_lifecycle_stops_after_successful_dial() {
+        let peer_id = peer(0x20);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::stopping_after(3, Arc::clone(&shutdown));
+        let port = FakePort::new(clock.clone(), &[true]);
+        let mut logs = Vec::new();
+        run_dial_lifecycle(
+            peer(0x10),
+            &[peer_id],
+            &port,
+            &clock,
+            &shutdown,
+            &mut |line| logs.push(line),
+        );
+
+        assert_eq!(port.dials(), 1, "successful dial must stop retrying");
+        assert_eq!(
+            clock.sleeps(),
+            vec![1000, 1000, 1000],
+            "connected peer must only be polled, not re-dialed"
+        );
+        assert_eq!(
+            logs,
+            vec!["[n1-dial] peer=2020202020202020 attempt=1 result=ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn dial_lifecycle_redials_after_connection_removed() {
+        let peer_id = peer(0x20);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::stopping_after(4, Arc::clone(&shutdown));
+        let mut port = FakePort::new(clock.clone(), &[true, false, true]);
+        port.disconnect_at_ms = Some(1000);
+        let mut logs = Vec::new();
+        run_dial_lifecycle(
+            peer(0x10),
+            &[peer_id],
+            &port,
+            &clock,
+            &shutdown,
+            &mut |line| logs.push(line),
+        );
+
+        assert_eq!(port.dials(), 3, "removed connection must be re-dialed");
+        assert_eq!(
+            logs,
+            vec![
+                "[n1-dial] peer=2020202020202020 attempt=1 result=ok".to_string(),
+                "[n1-dial] peer=2020202020202020 attempt=1 result=err kind=Timeout".to_string(),
+                "[n1-dial] peer=2020202020202020 attempt=2 result=ok".to_string(),
+            ],
+            "re-dial must restart the same backoff sequence"
+        );
+        assert_eq!(clock.sleeps(), vec![1000, 1000, 1000, 1000]);
+    }
+
+    #[test]
+    fn n1_dial_skips_self() {
+        let self_id = peer(0x10);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::stopping_after(1, Arc::clone(&shutdown));
+        let port = FakePort::new(clock.clone(), &[true]);
+        let mut logs = Vec::new();
+        run_dial_lifecycle(self_id, &[self_id], &port, &clock, &shutdown, &mut |line| {
+            logs.push(line)
+        });
+
+        assert_eq!(port.dials(), 0);
+        assert!(clock.sleeps().is_empty());
+        assert_eq!(logs, vec!["[n1-dial] self peer skipped".to_string()]);
+    }
+
     #[test]
     fn assemble_n1_with_discovery_static_peers_ids_only() {
         let text = network_toml_with_routes();
@@ -813,6 +1293,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             nexus::network::DiscoveryParams::static_only(),
+            None,
         )
         .expect("assembly");
         // Id-only: two configured addrs stay in `config.peers`, the id list
@@ -836,6 +1317,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             nexus::network::DiscoveryParams::static_only(),
+            None,
         )
         .expect("assembly with two addrs");
         assert_eq!(assembly.config.peers[0].addrs.len(), 2);

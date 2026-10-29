@@ -139,6 +139,24 @@ impl FabricConn {
         Ok(Self { inner, driver })
     }
 
+    /// Connect with mandatory TLS1.3 client authentication and server-key pinning
+    /// over a caller-provided transport (additive; same semantics as
+    /// [`Self::connect_mtls`], preserving `cand.local_addr` / proxy tier).
+    pub fn connect_mtls_with_transport(
+        peer: PeerId,
+        identity: &FabricIdentity,
+        config: &ConnConfig,
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<Self, FabricError> {
+        let remote = *config.addrs.first().ok_or(FabricError::PathUnreachable)?;
+        let start = Instant::now();
+        let crypto = cert::build_mtls_client_crypto(peer, identity)?;
+        let driver = Driver::new_mtls_client_with_transport(transport)?;
+        let budget = config.handshake_timeout.saturating_sub(start.elapsed());
+        let inner = driver.connect_with_crypto(peer, remote, budget, crypto)?;
+        Ok(Self { inner, driver })
+    }
+
     /// Verified mutual-TLS identity, never a legacy anonymous/single-pin claim.
     pub fn mutually_authenticated_peer(&self) -> Option<PeerId> {
         self.inner.state.lock().ok()?.mutual_peer
@@ -386,6 +404,19 @@ impl FabricListener {
             inner,
             driver: self.driver.clone(),
         })
+    }
+
+    /// Additive (WP1b/spec §19): total inbound mTLS handshakes this listener
+    /// rejected because the peer was unauthenticated or the handshake failed.
+    ///
+    /// This is a plain counter read; it deliberately does not change
+    /// `accept_timeout`'s error shape (a rejection still surfaces as
+    /// `FabricError::Timeout`). Callers derive per-poll deltas themselves.
+    pub fn rejected_handshakes(&self) -> u64 {
+        self.driver
+            .shared()
+            .rejected_handshakes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn accept(&self) -> Result<FabricConn, FabricError> {

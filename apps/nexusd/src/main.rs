@@ -561,6 +561,8 @@ fn run_dataplane(
     direct_gate: Arc<nexusd::nat_chunk_recv::DirectGate>,
     nat_inbound_rx: std::sync::mpsc::Receiver<nexusd::nat_chunk_recv::NatInboundChunk>,
     chunk_stats: Arc<nexusd::nat_chunk_stats::ChunkStats>,
+    n1_inbound_rx: std::sync::mpsc::Receiver<nexusd::n1_runtime::N1Inbound>,
+    n1_stats: Arc<nexusd::n1_stats::N1Stats>,
 ) {
     use nexus_projection::TunDevice;
     // D1：TUN 模式创建单个 TUN；纯 TPROXY 模式使用 InertTun（不伪造数据面）。
@@ -774,6 +776,16 @@ fn run_dataplane(
     dp.set_nat_inbound_rx(nat_inbound_rx);
     dp.set_chunk_stats(chunk_stats);
 
+    // WP4：N1 入站队列（WP3 supervisor 持发送端）+ 共享计数面。
+    dp.set_n1_inbound_rx(n1_inbound_rx);
+    dp.set_n1_stats(Arc::clone(&n1_stats));
+    // WP5：把真实 `TcpRelay` 装进 dataplane（§5.5 additive 接线；与上面两个
+    // setter 同处）。egress relay 跑在 dataplane 线程，由主循环 `n1_egress_poll`
+    // 每轮驱动（§5.7）。
+    dp.set_n1_relay(Box::new(nexusd::dataplane::TcpRelayEgress::new(
+        Arc::clone(&n1_stats),
+    )));
+
     #[cfg(target_os = "linux")]
     let mut tproxy_frontend = match tproxy_config {
         Some(config) => setup_tproxy_frontend(
@@ -819,6 +831,10 @@ fn run_dataplane(
         }
         // P0：每轮 drain direct chunk（不放进 process_one，Proxy 分支零改动）。
         dp.pump_nat_inbound();
+        // WP4：紧邻 drain N1 入站队列（spec §5.5；与 direct 共用 dispatch）。
+        dp.pump_n1_inbound();
+        // WP5：每轮驱动 egress relay（spec §5.5/§5.7：线程模型 = dataplane 线程）。
+        dp.n1_egress_poll();
         if last_tproxy_publish.elapsed() >= std::time::Duration::from_secs(1) {
             nexusd::dataplane::publish_flow_sessions(dp.flow_sessions_state());
             nexusd::dataplane::publish_tproxy_counters(
@@ -2069,6 +2085,37 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         },
         lsa_stale_after: Duration::from_secs(discovery_section.lsa_stale_sec),
     };
+    // N1 listen 请求：identity 缺失/不匹配时 fail-closed（spec §5.1/§9）。
+    let n1_listen_requested = loaded.daemon.n1.enabled && loaded.daemon.n1.listen_addr.is_some();
+    // dial 侧与 listen 侧都从同一 seed 派生身份。`FabricIdentity` 不可 Clone，
+    // 因此按需派生两次（确定性，成本为一次 ed25519 公钥推导）。
+    let load_n1_identity = |text: &str| -> Result<nexus_fabric::FabricIdentity, String> {
+        let path = loaded
+            .daemon
+            .identity
+            .seed_file
+            .as_deref()
+            .ok_or_else(|| "seed_file not configured".to_string())?;
+        let seed = nexusd::nat_relay::load_seed_file(std::path::Path::new(path))
+            .map_err(|e| e.to_string())?;
+        assembly::identity_from_network_seed(text, seed)
+    };
+    let dial_identity = match loaded.network_toml.as_deref() {
+        Some(text) => match load_n1_identity(text) {
+            Ok(identity) => Some(identity),
+            Err(e) => {
+                if n1_listen_requested {
+                    eprintln!(
+                        "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
+                    );
+                    return ExitCode::from(1);
+                }
+                eprintln!("[nexusd] WARN: N1 identity unavailable ({e}); dialing without mTLS");
+                None
+            }
+        },
+        None => None,
+    };
     let n1_assembly: Option<assembly::N1Assembly> = match loaded.network_toml.as_deref() {
         Some(text) => {
             match assembly::assemble_n1_with_discovery(
@@ -2076,6 +2123,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 loaded.daemon.proxy.as_ref(),
                 Arc::clone(&shutdown),
                 discovery_params,
+                dial_identity,
             ) {
                 Ok(assembly) => Some(assembly),
                 Err(e) => {
@@ -2093,6 +2141,65 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> = n1_bridge
         .clone()
         .map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
+
+    // 3a. N1 入站监听（spec §5.8/§9）：默认 disabled 时零 bind/零线程。
+    //     listen enabled 时身份 fail-closed（与 NAT BLOCKED-1 同口径）。
+    let mut n1_runtime = match n1_assembly.as_ref() {
+        Some(assembly) => {
+            let section = &loaded.daemon.n1;
+            let identity = if n1_listen_requested {
+                match loaded.network_toml.as_deref() {
+                    Some(text) => match load_n1_identity(text) {
+                        Ok(identity) => Some(identity),
+                        Err(e) => {
+                            eprintln!(
+                                "[n1-listener] ERROR: identity unavailable; refusing to listen ({e})"
+                            );
+                            return ExitCode::from(1);
+                        }
+                    },
+                    None => {
+                        eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            Some(nexusd::n1_runtime::assemble_n1_runtime(
+                assembly,
+                section,
+                identity,
+                Arc::clone(&shutdown),
+            ))
+        }
+        None => {
+            if loaded.daemon.n1.enabled && loaded.daemon.n1.listen_addr.is_some() {
+                eprintln!("[n1-listener] ERROR: identity unavailable; refusing to listen");
+                return ExitCode::from(1);
+            }
+            eprintln!("[n1-listener] listener disabled reason=no_listen_addr");
+            None
+        }
+    };
+
+    // WP4：N1 入站队列的所有权移交给 dataplane 线程（§5.8「run_daemon 只负责把
+    // inbound_rx 交给 run_dataplane」）。shutdown 只 join `accept`/`rx`，因此在
+    // 句柄里留一个已断开占位（disabled 路径本来就是 Disconnected 常态）。
+    let (dp_n1_inbound_rx, dp_n1_stats) = match n1_runtime.as_mut() {
+        Some(handles) => {
+            let (_placeholder_tx, placeholder) = std::sync::mpsc::channel();
+            (
+                std::mem::replace(&mut handles.inbound_rx, placeholder),
+                Arc::clone(&handles.stats),
+            )
+        }
+        None => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(nexusd::n1_runtime::N1_INBOUND_QUEUE_CAP);
+            drop(tx);
+            (rx, Arc::new(nexusd::n1_stats::N1Stats::default()))
+        }
+    };
 
     // 3b. 发现 pump：即使没有 `[network.turn]` 也启动（发现/状态面独立，
     // 启动顺序冻结：装配 → DiscoveryRuntime::start → NatSwitchRuntime::start）。
@@ -2288,6 +2395,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         dp_direct_gate,
                         nat_rx,
                         dp_chunk_stats,
+                        dp_n1_inbound_rx,
+                        dp_n1_stats,
                     );
                 })
                 .expect("spawn dataplane thread"),
@@ -2526,6 +2635,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         localapi_handle,
         dataplane_handle,
         n1_bridge,
+        n1_runtime,
         n2_sweeper_handle,
         discovery_handle,
         nat_switch_handle,
@@ -2540,10 +2650,13 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 /// 内部 feed → switch → turn）→ Workspace unmount（D7）→ Dataplane（1s）→
 /// N1（5s）→ TUN（随 dataplane 线程退出）。
 /// 任一步超时 → warn 日志后强制继续，不无限等。
+// 每个参数是一个独立子系统的 join 句柄，拆结构体只会把同一条关闭序列拆散。
+#[allow(clippy::too_many_arguments)]
 fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
+    n1_runtime: Option<nexusd::n1_runtime::N1RuntimeHandles>,
     n2_sweeper_handle: Option<std::thread::JoinHandle<()>>,
     discovery_handle: Option<nexusd::discovery_runtime::DiscoveryRuntimeHandle>,
     nat_switch_handle: Option<std::thread::JoinHandle<()>>,
@@ -2588,6 +2701,16 @@ fn shutdown_sequence(
         assembly::join_with_timeout(handle, Duration::from_secs(1), "dataplane");
     } else {
         eprintln!("[nexusd] shutdown: dataplane not running (no-tun mode)");
+    }
+
+    if let Some(mut handles) = n1_runtime {
+        eprintln!("[nexusd] shutdown: stopping N1 runtime");
+        if let Some(handle) = handles.accept.take() {
+            assembly::join_with_timeout(handle, Duration::from_secs(5), "n1-accept");
+        }
+        if let Some(handle) = handles.rx.take() {
+            assembly::join_with_timeout(handle, Duration::from_secs(5), "n1-rx");
+        }
     }
 
     if let Some(bridge) = n1_bridge {
@@ -2678,6 +2801,10 @@ fn log_enabled_subsystems(cfg: &LoadedConfig) {
 /// socket 都中招）。设置失败只告警——超时机制本身不阻断服务。
 const LOCALAPI_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// WP0 测量底座（spec §11.2 唯一定义处：`LOCALAPI_ACCEPT_POLL_MS = 5`）：
+/// 空闲 accept 轮询粒度。100ms 会注入 38–100ms 的采样延迟，使冻结带不可达。
+const LOCALAPI_ACCEPT_POLL_MS: u64 = 5;
+
 macro_rules! apply_localapi_io_timeouts {
     ($stream:expr) => {{
         if let Err(e) = $stream.set_read_timeout(Some(LOCALAPI_IO_TIMEOUT)) {
@@ -2692,7 +2819,7 @@ macro_rules! apply_localapi_io_timeouts {
 /// LocalAPI 服务（后台线程版；复用既有 serve 逻辑，READY 经 channel 上报）。
 /// LocalAPI 服务（后台线程版；R4：经 shutdown 标志可停止）。
 ///
-/// 非阻塞 accept + 100ms 轮询，关闭信号置位后退出循环。
+/// 非阻塞 accept + `LOCALAPI_ACCEPT_POLL_MS` 轮询，关闭信号置位后退出循环。
 fn serve_localapi(
     addr_raw: &str,
     ready_tx: std::sync::mpsc::Sender<String>,
@@ -2762,7 +2889,7 @@ fn serve_localapi(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(LOCALAPI_ACCEPT_POLL_MS));
             }
             Err(e) => {
                 eprintln!("[nexusd] localapi accept error: {e}");
@@ -3190,6 +3317,12 @@ fn handle_localapi_request(
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
+    if path == "/localapi/v0/n1/stats" {
+        // WP6（spec §5.6）：N1 计数面独立路由；`[network.n1] disabled` 时
+        // 返回全 0 + HTTP 200（不 404/500，与 `/nat/chunks` 同口径）。
+        write_http_json(stream, 200, &nexusd::n1_stats::n1_status()).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     let result: Result<Value, (String, String)> = match path {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
@@ -3367,7 +3500,9 @@ fn write_http_json(
 
 #[cfg(test)]
 mod parse_flags_tests {
-    use super::{LOCALAPI_IO_TIMEOUT, N2_SESSION_SWEEP_INTERVAL_SECS, parse_flags};
+    use super::{
+        LOCALAPI_ACCEPT_POLL_MS, LOCALAPI_IO_TIMEOUT, N2_SESSION_SWEEP_INTERVAL_SECS, parse_flags,
+    };
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -3410,6 +3545,19 @@ mod parse_flags_tests {
         // P1-15：读请求行/头必须有超时，否则一个不发换行的客户端永久占住控制面。
         assert!(LOCALAPI_IO_TIMEOUT.as_secs() > 0);
         assert!(LOCALAPI_IO_TIMEOUT <= std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn localapi_accept_poll_is_not_100ms_granular() {
+        // WP0（spec §11.2 第 1 步）：空闲 accept 若仍以 100ms 为粒度，
+        // LocalAPI 采样 poll_ms 会出现 38–100ms 的结构性延迟，冻结带不可达。
+        assert_eq!(
+            LOCALAPI_ACCEPT_POLL_MS, 5,
+            "WP0 定版值：spec §11.2 LOCALAPI_ACCEPT_POLL_MS = 5"
+        );
+        // 常量断言放编译期（与下方 N2 常量断言同一写法），避免 clippy
+        // assertions_on_constants；运行期数值由上面 assert_eq! 钉死。
+        const { assert!(LOCALAPI_ACCEPT_POLL_MS < 100) };
     }
 
     #[test]
