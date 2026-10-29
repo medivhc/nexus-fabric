@@ -245,9 +245,13 @@ MVP 优先 Cargo metadata + 显式 mapping，不构造脆弱的全程序猜测�
   `* text=auto`，只有经 git checkout 落地的文件会被转成 CRLF，由工具直接写入的
   新文件保持 LF。于是 `contract_hash` 取决于"这个文件是 checkout 来的还是写出来的"
   这一瞬态属性。因此**契约身份必须按已提交 tree 的 blob（仓库内容为 LF）计算**，
-  复现方法：对 `scenarios/<dir>/<name>.toml` 按目录名与文件名排序，每段拼
-  `"<path>\n<LF 内容>"`，段间用 `"\n===\n"` 连接，喂给 `git hash-object --stdin`。
-  按此口径：`8ba9fea` = `cea5547a…`，契约冻结提交 `d4138b7` = `f13e96c6…`。
+  复现方法（2026-10-27 起，见 `engineering/nexus-harness/MODULE.md` Invariants 中的
+  `contract_hash` 条）：输入集为 `harness.toml [protection].root_contract_paths` 下的全部
+  git 可见文件与全仓 `**/MODULE.md`（`git ls-files -z -co --exclude-standard`），按路径
+  字节序排序；每个文件拼 `<path>\0<字节长度>\0<内容>`（工作树缺失的已跟踪文件记为
+  `<path>\0-\0`），整体喂给 `git hash-object --stdin`。此前的值（只覆盖
+  `scenarios/*/*.toml`，如 `8ba9fea` = `cea5547a…`、`d4138b7` = `f13e96c6…`）与新口径不可比。
+  覆盖面扩大到 `*.md` 契约后，CRLF 工作树字节的问题影响更多文件，下面的待办仍未关闭。
 - `scenario.rs` 用 `Command::new(program)` 直接执行命令首词，`echo` 在 Windows 上是
   cmd 内建而不是 PE 可执行文件，因此 3 个以 `echo` 为 fixture 的场景单测
   （`run_single_pass_report`、`run_single_expect_failure_signature`、
