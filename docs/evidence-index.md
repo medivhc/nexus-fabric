@@ -251,6 +251,7 @@
 | product.proxy-fwd-trojan-tls-engine | n1-fabric | cargo -p nexusd | apps/nexusd/MODULE.md#proxy-fwd | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.proxy-fwd-tun-production | n1-fabric | cargo -p nexusd | apps/nexusd/MODULE.md#proxy-fwd | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.proxy-fwd-udp-unsupported | n1-fabric | cargo -p nexusd | apps/nexusd/MODULE.md#proxy-fwd | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
+| product.proxy-fwd-udp-vless-anytls | n1-fabric | cargo -p nexusd | PRODUCT.md#11-tun-proxy-udp | unrecorded |
 | product.proxy-geoip-rule | v9-connectivity | cargo -p nexus | PRODUCT.md#11-proxy-kernel | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.proxy-geosite-rule | v9-connectivity | cargo -p nexus | PRODUCT.md#11-proxy-kernel | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |
 | product.proxy-http-mixed-inbound | v9-connectivity | cargo -p nexus | PRODUCT.md#11-proxy-kernel | cd60989394be2c939cabfc74ecbbc25c81b8b8e4 |

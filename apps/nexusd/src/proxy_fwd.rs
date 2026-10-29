@@ -14,6 +14,7 @@ pub mod ss_std;
 pub(crate) mod adapter;
 pub(crate) mod tcp_relay;
 pub(crate) mod udp_relay;
+mod udp_stream;
 
 pub use udp_relay::build_udp_reply;
 
@@ -474,7 +475,7 @@ impl ProxyEngine {
             .udp
             .entry(outbound_tag.to_string())
             .or_insert_with(|| udp_relay::UdpForwarder::new(dialer));
-        let forwarded = forwarder.handle_packet(packet);
+        let forwarded = forwarder.handle_packet(packet) == udp_relay::UdpSend::Written;
         Ok(ProxyHandleResult {
             tun_packets: Vec::new(),
             forwarded,
@@ -503,11 +504,9 @@ impl ProxyEngine {
             stream_events,
         };
         for forwarder in self.udp.values_mut() {
-            for inbound in forwarder.drain_inbound() {
-                if let Some(local) = forwarder.lookup_local(&inbound.remote) {
-                    if let Some(pkt) = build_udp_reply(local, inbound.remote, &inbound.payload) {
-                        out.tun_packets.push(pkt);
-                    }
+            for reply in forwarder.drain_replies() {
+                if let Some(pkt) = build_udp_reply(reply.local, reply.remote, &reply.payload) {
+                    out.tun_packets.push(pkt);
                 }
             }
         }
@@ -543,6 +542,15 @@ impl ProxyEngine {
             }
         }
         (ready, dropped)
+    }
+
+    /// 自上次调用以来 UDP 代理流（VLESS / AnyTLS）实际写出的数据报数：入队时不计转发，
+    /// 写出时才计（`proxy_forwarded` 只计真实转发）。由 dataplane 的唯一同步点读取。
+    pub(crate) fn take_udp_stream_writes(&mut self) -> u64 {
+        self.udp
+            .values_mut()
+            .map(udp_relay::UdpForwarder::take_stream_writes)
+            .sum()
     }
 
     /// 合并统计（15 字段）。

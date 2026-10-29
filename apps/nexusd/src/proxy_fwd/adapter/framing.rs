@@ -17,6 +17,22 @@ pub(super) struct BufferedReader<R> {
     start: usize,
 }
 
+/// 从字节流前缀切出全部完整的 `u16 BE 长度 + 数据` 数据报（VLESS UDP / AnyTLS UoT 共用）；
+/// 返回数据报与消耗的字节数，残缺的尾部留给下一次。
+pub(super) fn split_u16_datagrams(bytes: &[u8]) -> (Vec<Vec<u8>>, usize) {
+    let mut datagrams = Vec::new();
+    let mut used = 0;
+    while let Some(header) = bytes.get(used..used + 2) {
+        let len = usize::from(u16::from_be_bytes([header[0], header[1]]));
+        let Some(body) = bytes.get(used + 2..used + 2 + len) else {
+            break;
+        };
+        datagrams.push(body.to_vec());
+        used += 2 + len;
+    }
+    (datagrams, used)
+}
+
 #[allow(dead_code)]
 impl<R: Read> BufferedReader<R> {
     pub(super) fn new(inner: R) -> Self {
@@ -148,5 +164,15 @@ mod tests {
         assert!(reader.fill_at_least(3).expect("fill"));
         reader.consume(3);
         assert!(reader.buffered().is_empty());
+    }
+
+    #[test]
+    fn split_u16_datagrams_keeps_partial_tail() {
+        let bytes = [0, 2, b'a', b'b', 0, 0, 0, 3, b'x'];
+        let (datagrams, used) = split_u16_datagrams(&bytes);
+        assert_eq!(datagrams, vec![b"ab".to_vec(), Vec::new()]);
+        assert_eq!(used, 6);
+        assert_eq!(split_u16_datagrams(&[0]), (Vec::new(), 0));
+        assert_eq!(split_u16_datagrams(&[]), (Vec::new(), 0));
     }
 }

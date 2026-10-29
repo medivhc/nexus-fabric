@@ -56,8 +56,33 @@ pub trait OutboundDialer: Send + Sync {
     fn tag(&self) -> &str;
     /// 拨号到 TUN 流的目标地址；阻塞，调用方在独立线程执行。
     fn dial_tcp(&self, target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError>;
-    /// UDP 能力声明；VLESS/AnyTLS 返回 Unsupported{NotWired}。
+    /// UDP 能力声明（SOCKS5 / SS 走数据报中继；VLESS / AnyTLS 走 [`Self::open_udp`]）。
     fn udp_capability(&self) -> UdpCapability;
+    /// 为一个 UDP 目的地址打开一条代理流（PRODUCT §11.18.1）；阻塞，调用方在独立线程执行。
+    /// 只有 `udp_capability()` 为 `VlessOverTcp` / `AnytlsUot` 的出站实现。
+    fn open_udp(&self, target: SocketAddr) -> Result<Box<dyn UdpStream>, OutboundError> {
+        let _ = target;
+        Err(OutboundError::UdpUnsupported)
+    }
+}
+
+/// 一条 UDP 代理流（PRODUCT §11.18.1）：按数据报读写，协议成帧由实现负责。
+pub trait UdpStream: Send {
+    /// 写一个数据报。
+    fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<()>;
+    /// 读出至少一个完整数据报；`Ok(None)` = 对端正常关闭。读超时原样返回
+    /// （`WouldBlock` / `TimedOut`），半帧保留到下次调用。
+    fn recv_datagrams(&mut self) -> io::Result<Option<Vec<Vec<u8>>>>;
+    /// 设置底层 socket 读超时。
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    /// 设置底层 socket 写超时。
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    /// 关闭写方向（AnyTLS 发 Fin）。
+    fn shutdown(&mut self) -> io::Result<()>;
+    /// 节点是否已确认这条流（VLESS：已读到响应头；AnyTLS 在 `open_udp` 内等到 SynAck）。
+    /// 未确认就结束的流按建流失败处理（拒绝 / 不支持 UDP 的节点不会被逐包重连）。
+    /// 无默认实现：每种传输必须说明自己的确认语义。
+    fn established(&self) -> bool;
 }
 
 /// 单个出站配置错误（spec §2.6）。错误消息不得包含密码/UUID/hash/obfs_key。

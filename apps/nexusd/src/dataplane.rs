@@ -1656,8 +1656,8 @@ impl Dataplane {
 
     /// 把 ProxyEngine 的增量同步到 DataplaneStats。
     fn sync_proxy_stats(&mut self) {
-        let eng_stats = match self.proxy_engine.as_ref() {
-            Some(engine) => engine.stats(),
+        let (eng_stats, udp_stream_writes) = match self.proxy_engine.as_mut() {
+            Some(engine) => (engine.stats(), engine.take_udp_stream_writes()),
             None => return,
         };
         let ok_delta = eng_stats
@@ -1718,7 +1718,8 @@ impl Dataplane {
         self.last_proxy_udp_unsupported_suppressed = eng_stats.udp_unsupported_log_suppressed;
         self.with_stats(|s| {
             s.proxy_tcp_streams += stream_delta;
-            s.proxy_forwarded += ok_delta;
+            // TCP：dial 成功；UDP 代理流：写出（数据报中继在处理包时已计）。
+            s.proxy_forwarded += ok_delta + udp_stream_writes;
             s.proxy_dropped_no_proxy += fail_delta + udp_fail_delta;
             s.upstream_failed += fail_delta;
             s.proxy_dial_buffer_dropped_bytes += dial_buf_drop_delta;

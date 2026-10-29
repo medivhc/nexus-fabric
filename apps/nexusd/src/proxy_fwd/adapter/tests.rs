@@ -298,12 +298,11 @@ fn build_vless_ignores_sni_and_alpn_but_keeps_servername_as_sni() {
     let dialer = build_dialer(&config).expect("vless dialer");
     assert_eq!(dialer.kind(), OutboundKind::Vless);
     assert_eq!(dialer.tag(), "test");
-    // Q5=B：VLESS UDP 一律 fail-closed。
+    // PRODUCT §11.18.1（requirement-change 2026-10-28）：VLESS 承载代理 UDP。
+    let server: SocketAddr = "127.0.0.1:443".parse().expect("server");
     assert_eq!(
         dialer.udp_capability(),
-        UdpCapability::Unsupported {
-            reason: UdpUnsupportedReason::NotWired
-        }
+        UdpCapability::Supported(UdpMode::VlessOverTcp { server })
     );
 }
 
@@ -318,7 +317,7 @@ fn build_vless_rejects_invalid_servername() {
 }
 
 #[test]
-fn build_anytls_requires_password_and_declares_not_wired_udp() {
+fn build_anytls_requires_password_and_declares_uot_udp() {
     let mut config = outbound(OutboundKind::Anytls);
     config.locator = Some("127.0.0.1:443".to_string());
     assert_eq!(
@@ -332,11 +331,11 @@ fn build_anytls_requires_password_and_declares_not_wired_udp() {
     config.alpn = Some(vec!["h2".to_string()]);
     let dialer = build_dialer(&config).expect("anytls dialer");
     assert_eq!(dialer.kind(), OutboundKind::Anytls);
+    // PRODUCT §11.18.1（requirement-change 2026-10-28）：AnyTLS 经 UoT 承载代理 UDP。
+    let server: SocketAddr = "127.0.0.1:443".parse().expect("server");
     assert_eq!(
         dialer.udp_capability(),
-        UdpCapability::Unsupported {
-            reason: UdpUnsupportedReason::NotWired
-        }
+        UdpCapability::Supported(UdpMode::AnytlsUot { server })
     );
 }
 
