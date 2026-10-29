@@ -112,6 +112,10 @@ fn craft_tcp(
     pkt
 }
 
+fn dst_port(pkt: &[u8]) -> Option<u16> {
+    (pkt.len() >= 40 && pkt[9] == 6).then(|| u16::from_be_bytes([pkt[22], pkt[23]]))
+}
+
 fn tcp_parts(pkt: &[u8]) -> Option<(u32, u32, u8, &[u8])> {
     if pkt.len() < 40 || pkt[9] != 6 {
         return None;
@@ -157,6 +161,16 @@ fn read_trojan_header<S: Read>(tls: &mut S) -> Result<Vec<u8>, String> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    /// 读完请求头立即 404。
+    Immediate,
+    /// 读完请求头后再读到 `\r\n\r\n` 才 404（真实 HTTP fallback）。
+    Lazy,
+    /// 读完请求头后延迟 500 ms 才 404（拉长探测窗口，制造并发）。
+    Delayed,
+}
+
 /// 节点侧记账：探测连接与流连接分开计数。
 #[derive(Default)]
 struct NodeLog {
@@ -166,7 +180,11 @@ struct NodeLog {
 }
 
 /// 本地 TLS Trojan 节点：持续 accept 直到 `stop`，每条连接一个线程。
-fn spawn_node(log: Arc<Mutex<NodeLog>>, stop: Arc<AtomicBool>) -> Result<SocketAddr, String> {
+fn spawn_node(
+    log: Arc<Mutex<NodeLog>>,
+    stop: Arc<AtomicBool>,
+    mode: Fallback,
+) -> Result<SocketAddr, String> {
     let identity = generate_loopback_identity().map_err(|e| format!("identity: {e:?}"))?;
     let cfg = Arc::new(server_config(&identity).map_err(|e| format!("server config: {e:?}"))?);
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind node: {e}"))?;
@@ -183,7 +201,7 @@ fn spawn_node(log: Arc<Mutex<NodeLog>>, stop: Arc<AtomicBool>) -> Result<SocketA
                     let cfg = Arc::clone(&cfg);
                     let log = Arc::clone(&log);
                     std::thread::spawn(move || {
-                        let _ = serve_node_connection(tcp, cfg, log);
+                        let _ = serve_node_connection(tcp, cfg, log, mode);
                     });
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(2)),
@@ -197,6 +215,7 @@ fn serve_node_connection(
     mut tcp: TcpStream,
     cfg: Arc<rustls::ServerConfig>,
     log: Arc<Mutex<NodeLog>>,
+    mode: Fallback,
 ) -> Result<(), String> {
     tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))
@@ -219,6 +238,17 @@ fn serve_node_connection(
         } else {
             log.flow_connections += 1;
         }
+    }
+    if !accepted && mode == Fallback::Lazy {
+        let mut req = Vec::new();
+        let mut one = [0u8; 1];
+        while !req.ends_with(b"\r\n\r\n") {
+            tls.read_exact(&mut one).map_err(|e| e.to_string())?;
+            req.push(one[0]);
+        }
+    }
+    if !accepted && mode == Fallback::Delayed {
+        std::thread::sleep(Duration::from_millis(500));
     }
     if !accepted {
         // fallback：读完请求头就应答 404（不等载荷），短暂保持后关闭——与真实服务端一样，
@@ -321,6 +351,9 @@ fn run_flow(
     while Instant::now() < deadline {
         let _ = dp.tick(now());
         for pkt in mock.lock().map_err(|e| e.to_string())?.take_written() {
+            if dst_port(&pkt) != Some(src_port) {
+                continue;
+            }
             if let Some((_, _, flags, data)) = tcp_parts(&pkt) {
                 outcome.rst |= flags & 0x04 != 0;
                 outcome.downstream.extend_from_slice(data);
@@ -339,12 +372,116 @@ fn run_flow(
     Ok(outcome)
 }
 
+/// 并发：同一 tick 注入 `n` 条流的 SYN，再逐条 ACK + DATA，然后按端口收集结果。
+fn run_concurrent(
+    dp: &mut Dataplane,
+    mock: &Arc<Mutex<MockTun>>,
+    epoch: Instant,
+    n: u16,
+    dst: SocketAddr,
+) -> Result<Vec<FlowOutcome>, String> {
+    let now = || u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let src = [10, 0, 0, 2];
+    let std::net::IpAddr::V4(dst_ip) = dst.ip() else {
+        return Err("target is not IPv4".into());
+    };
+    let dst_ip = dst_ip.octets();
+    let ports: Vec<u16> = (0..n).map(|i| 43001 + i).collect();
+    let mut seqs = std::collections::HashMap::new();
+    for &p in &ports {
+        mock.lock().map_err(|e| e.to_string())?.inject(craft_tcp(
+            src,
+            dst_ip,
+            p,
+            dst.port(),
+            1000,
+            0,
+            0x02,
+            &[],
+        ));
+        dp.tick(now()).map_err(|e| format!("syn: {e}"))?;
+        let written = mock.lock().map_err(|e| e.to_string())?.take_written();
+        for pkt in &written {
+            if let (Some(q), Some((seq, _, flags, _))) = (dst_port(pkt), tcp_parts(pkt))
+                && flags & 0x12 == 0x12
+            {
+                seqs.insert(q, seq);
+            }
+        }
+    }
+    for &p in &ports {
+        let srv = *seqs.get(&p).ok_or("no SYN-ACK")?;
+        mock.lock().map_err(|e| e.to_string())?.inject(craft_tcp(
+            src,
+            dst_ip,
+            p,
+            dst.port(),
+            1001,
+            srv.wrapping_add(1),
+            0x10,
+            &[],
+        ));
+        dp.tick(now()).map_err(|e| format!("ack: {e}"))?;
+        mock.lock().map_err(|e| e.to_string())?.inject(craft_tcp(
+            src,
+            dst_ip,
+            p,
+            dst.port(),
+            1001,
+            srv.wrapping_add(1),
+            0x18,
+            PAYLOAD,
+        ));
+        dp.tick(now()).map_err(|e| format!("data: {e}"))?;
+    }
+    let mut early = Vec::new();
+    early.extend(mock.lock().map_err(|e| e.to_string())?.take_written());
+    let mut out: Vec<FlowOutcome> = ports
+        .iter()
+        .map(|_| FlowOutcome {
+            rst: false,
+            downstream: Vec::new(),
+        })
+        .collect();
+    let deadline = Instant::now() + FLOW_DEADLINE;
+    while Instant::now() < deadline {
+        let _ = dp.tick(now());
+        let mut batch = std::mem::take(&mut early);
+        batch.extend(mock.lock().map_err(|e| e.to_string())?.take_written());
+        for pkt in batch {
+            let Some(p) = dst_port(&pkt) else { continue };
+            let Some(i) = ports.iter().position(|&x| x == p) else {
+                continue;
+            };
+            if let Some((_, _, flags, data)) = tcp_parts(&pkt) {
+                out[i].rst |= flags & 0x04 != 0;
+                out[i].downstream.extend_from_slice(data);
+            }
+        }
+        if out
+            .iter()
+            .all(|o| o.rst || o.downstream.len() >= PAYLOAD.len().min(NOT_FOUND.len()))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(out)
+}
+
 /// 一个用例：独立的节点 + 引擎，依次跑 `flows` 条流。
-fn run_case(password: &str, probe_field: Option<bool>, flows: u16, echo: SocketAddr) -> Value {
+fn run_case(
+    password: &str,
+    probe_field: Option<bool>,
+    flows: u16,
+    echo: SocketAddr,
+    mode: Fallback,
+    concurrent: bool,
+) -> Value {
     let log = Arc::new(Mutex::new(NodeLog::default()));
     let stop = Arc::new(AtomicBool::new(false));
     let result = (|| -> Result<Value, String> {
-        let node = spawn_node(Arc::clone(&log), Arc::clone(&stop))?;
+        let node = spawn_node(Arc::clone(&log), Arc::clone(&stop), mode)?;
         let probe_line = probe_field
             .map(|b| format!("    credential_probe: {b}\n"))
             .unwrap_or_default();
@@ -372,9 +509,23 @@ fn run_case(password: &str, probe_field: Option<bool>, flows: u16, echo: SocketA
         dp.set_proxy_engine(engine);
         dp.set_rule_engine(Box::new(rule_engine));
         let epoch = Instant::now();
+        // 时机：引擎装配后、首条流之前不得探测。
+        std::thread::sleep(Duration::from_millis(300));
+        let before = log
+            .lock()
+            .map(|l| l.probe_connections)
+            .unwrap_or(usize::MAX);
         let mut results = Vec::new();
-        for i in 0..flows {
-            let outcome = run_flow(&mut dp, &mock, epoch, 42001 + i, echo)?;
+        let outcomes = if concurrent {
+            run_concurrent(&mut dp, &mock, epoch, flows, echo)?
+        } else {
+            let mut v = Vec::new();
+            for i in 0..flows {
+                v.push(run_flow(&mut dp, &mock, epoch, 42001 + i, echo)?);
+            }
+            v
+        };
+        for outcome in outcomes {
             let echo_ok = outcome
                 .downstream
                 .windows(PAYLOAD.len())
@@ -398,6 +549,8 @@ fn run_case(password: &str, probe_field: Option<bool>, flows: u16, echo: SocketA
                 .filter_map(|f| f["downstream_bytes"].as_u64())
                 .sum::<u64>(),
             "tcp_dials_failed": stats.tcp_dials_failed,
+            "probe_connections_before_flows": before,
+            "last_failure_reason": dp.tproxy_last_failure(),
             "flows": results,
         }))
     })();
@@ -430,13 +583,78 @@ fn flows_all(case: &Value, pred: impl Fn(&Value) -> bool, expected: usize) -> bo
         .is_some_and(|f| f.len() == expected && f.iter().all(pred))
 }
 
-fn main() {
+fn child_case(name: &str) -> Value {
     let echo = start_tcp_echo();
-    let wrong = run_case(WRONG_PASSWORD, None, 2, echo);
-    let right = run_case(NODE_PASSWORD, None, 2, echo);
-    let disabled = run_case(NODE_PASSWORD, Some(false), 1, echo);
+    match name {
+        "wrong" => run_case(WRONG_PASSWORD, None, 2, echo, Fallback::Immediate, false),
+        "right" => run_case(NODE_PASSWORD, None, 2, echo, Fallback::Immediate, false),
+        "disabled" => run_case(
+            NODE_PASSWORD,
+            Some(false),
+            1,
+            echo,
+            Fallback::Immediate,
+            false,
+        ),
+        "lazy" => run_case(WRONG_PASSWORD, None, 1, echo, Fallback::Lazy, false),
+        "concurrent" => run_case(WRONG_PASSWORD, None, 3, echo, Fallback::Delayed, true),
+        _ => json!({"error": "unknown case"}),
+    }
+}
+
+/// 父进程：每个用例一个子进程（同一可执行文件），捕获 stderr 中的探测行。
+fn spawn_case(name: &str) -> Value {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return json!({"error": format!("current_exe: {e}"), "flows": []}),
+    };
+    let out = match std::process::Command::new(exe)
+        .env("PROBE_CASE", name)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return json!({"error": format!("spawn: {e}"), "flows": []}),
+    };
+    let mut v: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| json!({"error": format!("child json: {e}"), "flows": []}));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let probe_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("trojan credential probe tag="))
+        .collect();
+    let results: Vec<String> = probe_lines
+        .iter()
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix("result="))
+                .map(str::to_string)
+        })
+        .collect();
+    v["probe_results_joined"] = json!(results.join(","));
+    v["probe_results"] = json!(results);
+    v["auth_rejected_reported"] = json!(
+        v["last_failure_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("auth_rejected"))
+    );
+    v["stderr_leaks_password"] =
+        json!(stderr.contains(NODE_PASSWORD) || stderr.contains(WRONG_PASSWORD));
+    v
+}
+
+fn main() {
+    if let Ok(name) = std::env::var("PROBE_CASE") {
+        println!("{}", child_case(&name));
+        return;
+    }
+    let wrong = spawn_case("wrong");
+    let right = spawn_case("right");
+    let disabled = spawn_case("disabled");
+    let lazy = spawn_case("lazy");
+    let concurrent = spawn_case("concurrent");
 
     let probe_target = format!("{PROBE_HOST}:{PROBE_PORT}");
+    // 每个用例的流量都必须没有 fallback 字节、不泄露密码。
     let wrong_ok = wrong["probe_connections"] == 1
         && wrong["flow_connections"] == 0
         && wrong["probe_target"] == probe_target.as_str()
@@ -451,7 +669,29 @@ fn main() {
     let disabled_ok = disabled["probe_connections"] == 0
         && disabled["flow_connections"] == 1
         && flows_all(&disabled, |f| f["echo_ok"] == true, 1);
-    let verdict = if wrong_ok && right_ok && disabled_ok {
+    let strict =
+        |c: &Value| c["probe_connections_before_flows"] == 0 && c["stderr_leaks_password"] == false;
+    let wrong_ok = wrong_ok
+        && wrong["probe_results"] == json!(["rejected"])
+        && wrong["tcp_dials_failed"] == 2
+        && wrong["fallback_bytes_seen"] == false
+        && wrong["auth_rejected_reported"] == true
+        && strict(&wrong);
+    let right_ok = right_ok && right["probe_results"] == json!(["passed"]) && strict(&right);
+    let disabled_ok = disabled_ok && disabled["probe_results"] == json!([]);
+    let lazy_ok = lazy["probe_connections"] == 1
+        && lazy["flow_connections"] == 0
+        && flows_all(&lazy, |f| f["rst"] == true && f["downstream_bytes"] == 0, 1);
+    let concurrent_ok = concurrent["probe_connections"] == 1
+        && concurrent["flow_connections"] == 0
+        && concurrent["tcp_dials_failed"] == 3
+        && concurrent["probe_results_joined"] == "rejected"
+        && flows_all(
+            &concurrent,
+            |f| f["rst"] == true && f["downstream_bytes"] == 0,
+            3,
+        );
+    let verdict = if wrong_ok && right_ok && disabled_ok && lazy_ok && concurrent_ok {
         "PASS"
     } else {
         "FAIL"
@@ -460,10 +700,12 @@ fn main() {
         "{}",
         json!({
             "verdict": verdict,
-            "probe_target": probe_target,
             "wrong_password": wrong,
             "right_password": right,
             "probe_disabled": disabled,
+            "wrong_password_lazy_fallback": lazy,
+            "wrong_password_concurrent": concurrent,
+            "checks": {"wrong": wrong_ok, "right": right_ok, "disabled": disabled_ok, "lazy": lazy_ok, "concurrent": concurrent_ok},
         })
     );
 }

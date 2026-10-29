@@ -480,12 +480,13 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
   完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。
 - **P6（Trojan 凭据探测，PRODUCT §11.9.5，2026-10-28）**：每个 wired trojan 出站的
-  dialer 持有一份探测状态（registry 拥有，随启动/热加载重建，不持久化——崩溃后重新探测，
-  无需 Recovery）。`dial_tcp` 在无有效结果时先探测：探测在发起拨号的 worker 线程内同步
-  执行（不新建长期任务），同出站的并发拨号等同一结果（single-flight，等待上限 = 一次
-  探测的上限）；`rejected` → `dial_tcp` 返回既有 `ProtocolHandshake(AuthRejected{Trojan})`，
+  dialer 持有一份探测状态（registry 拥有，每个新 registry 从空状态开始，不持久化——崩溃后
+  重新探测，无需 Recovery）。`dial_tcp` 在无有效结果时先探测：探测在发起拨号的 worker 线程内
+  同步执行（不新建长期任务，不阻塞 dataplane `tick()`），同出站的并发拨号等同一结果
+  （single-flight，等待上限 = 单次探测上限 13 s：建连 5 s + TLS/写请求 5 s + 读 3 s）；`rejected` → `dial_tcp` 返回既有 `ProtocolHandshake(AuthRejected{Trojan})`，
   不连接节点，走 P4 的 dial 失败语义（RST + `tcp_dials_failed`）；有效期 `passed` 10 min /
-  `rejected` 60 s / `inconclusive` 不缓存且两次探测间隔 ≥ 10 s，按单调时钟计。
+  `rejected` 60 s / `inconclusive` 不缓存且两次探测间隔 ≥ 10 s，均从探测结束时刻按单调时钟计
+  （实现以 `Instant` 参数注入时间，便于单测边界）。
   `credential_probe: false` 时 dialer 行为与 P6 之前完全相同。每次探测结束一条 stderr 行
   （不含密码）。统计面不新增字段。
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane

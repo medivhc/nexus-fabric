@@ -808,11 +808,13 @@ trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
 > （ADR 0001 的 N1 演进面）；`nexus proxy`（frozen）行为不变，也不读取本节字段。
 
 - **开关**：trojan 专属 `credential_probe: Option<bool>`，缺省 `true`（nexusd 上唯一的
-  fallback 防护）；`false` 关闭探测，行为与本节之前相同。presence-aware 校验同 §11.9.3：
-  值非布尔 → `CONFIG_INVALID [outbounds[<tag>].credential_probe]`；非 trojan 出站上的合法值
-  忽略、非法值硬失败。
-- **作用域与生命周期**：探测状态按 `OutboundRegistry` 内每个 wired 的 trojan 出站各一份，
-  随 registry 构建（启动 / 热加载）新建，热加载即重置；不持久化。
+  fallback 防护）；`false` 关闭探测，行为与本节之前相同。只接受 `true` / `false`（解析器去掉
+  引号，`"false"` 与 `false` 等价）；其他值（`yes` / `no` / `1` / `0` / `True` / 非标量）→
+  `CONFIG_INVALID [outbounds[<tag>].credential_probe]`；非 trojan 出站上的合法值忽略、非法值
+  硬失败（presence-aware，同 §11.9.3）。校验在共享的 `nexus-proxy-config` 解析器中，因此对
+  所有入口（含 `nexus proxy` / `nexus config check`）一致；`nexus proxy` 运行时不读取该字段。
+- **作用域与生命周期**：探测状态按 `OutboundRegistry` 内每个 wired 的 trojan 出站各一份；
+  每个新构建的 registry 从空状态开始（`proxy.yaml` 变更需重启 nexusd）；不持久化。
 - **时机**：某 trojan 出站的流拨号时，若该出站没有有效的探测结果，先探测再拨号；探测进行中
   同一出站的其他流等待同一结果（single-flight），不各自发起探测。
 - **探测线缆**：独立的新 TCP + TLS 连接（与该出站拨号相同的 TLS 参数），写一个标准 Trojan
@@ -820,11 +822,12 @@ trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
   密码正确时节点解析失败而关闭，不会到达任何真实目标），随后写
   `GET / HTTP/1.1\r\nHost: <SNI>\r\nConnection: close\r\n\r\n`（密码错误时 fallback 收到完整
   请求，覆盖「等客户端先发载荷才应答」的 fallback）；之后只读，最多等 3 s，然后关闭。
-  流自身的连接与字节不变。
+  单次探测的上限：TCP 建连 5 s + TLS 握手与写请求 5 s + 读 3 s，合计 ≤ 13 s；等待同一结果的
+  流最多等到该探测结束。流自身的连接与字节不变。
 - **判定**：3 s 内收到任意下行字节 → `rejected`（密码正确时目标不可达，不存在可回传的数据，
   下行字节只能来自 fallback）；零字节 EOF / reset → `passed`（密码被接受；或节点没有
   fallback，此时错误密码的流本身只会被关闭，不会注入数据）；3 s 内零字节且连接仍开，或
-  TCP / TLS 失败 → `inconclusive`。
+  TCP 建连 / TLS 握手 / 写请求阶段失败（含写入时被 reset）→ `inconclusive`。
 - **后果**：
   - `rejected`：该出站的流拨号失败，不连接节点，按既有拨号失败语义收尾（TUN：RST；TPROXY：
     `on_path_failure`），失败原因为既有的 `auth_rejected`；结果保留 60 s，之后的第一次拨号
@@ -832,18 +835,26 @@ trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
   - `passed`：照常拨号；结果保留 10 min。
   - `inconclusive`：本次照常拨号；不缓存，但同一出站两次探测至少间隔 10 s（间隔内的拨号
     视为 `inconclusive`，不再探测）。
-- **可观察**：每次探测结束打印一行 stderr
-  `[nexusd] trojan credential probe tag=<tag> result=<passed|rejected|inconclusive> elapsed_ms=<u64> first_bytes_hex=<hex≤32>`
-  （`rejected` 为 `WARN` 级；不含密码）；被拒绝的流计入既有 `tcp_dials_failed`。
+  - 有效期与间隔都从探测**结束**时刻起算（单调时钟）。
+- **可观察**：每次探测结束打印一行 stderr（不含密码及其哈希）：
+  `[nexusd] trojan credential probe tag=<tag> result=<passed|inconclusive> elapsed_ms=<u64> first_bytes_hex=`，
+  `rejected` 为 `[nexusd] WARN trojan credential probe tag=<tag> result=rejected elapsed_ms=<u64> first_bytes_hex=<hex>`；
+  `first_bytes_hex` 为收到的前 16 字节的小写 hex（≤ 32 个字符），`passed` / `inconclusive`
+  时为空。被拒绝的流计入既有 `tcp_dials_failed`，失败原因 `auth_rejected` 与其他拨号失败一样
+  进入 `last_failure_reason`。
 - **不覆盖**：只对非 HTTP 载荷才应答的 fallback（探测判 `passed` / `inconclusive`）、
   `nexus proxy`（§11.9.3）、服务端被劫持（R-7）、Trojan UDP（nexusd 未接线）。
 - **E4 场景**：`scenarios/product/nexusd_trojan_credential_probe.toml`（`carrier = "n1-fabric"`）
-  ——nexusd 引擎（`Dataplane` + `ProxyEngine` + MockTun）+ 本地 TLS Trojan 节点：
-  密码错误 + 立即应答 404 的 fallback → 节点只收到 1 条探测连接（目标
-  `credential-probe.nexus.invalid:9`），两条流都被 RST、TUN 侧下行零字节、节点没有流连接；
-  密码正确 → 1 条探测连接 + 2 条流连接，两条流回显正常（第二条流不再探测）；
-  `credential_probe: false` → 没有探测连接，回显正常。旧实现在密码错误时把 404 当作隧道
-  数据写回 TUN、从不探测 → FAIL（Red Evidence）。
+  ——nexusd 引擎（`Dataplane` + `ProxyEngine` + MockTun）+ 本地 TLS Trojan 节点，每个用例
+  一个子进程（断言 stderr 的 `result=`）：
+  - 密码错误 + 立即应答 404 的 fallback → 节点只收到 1 条探测连接（目标
+    `credential-probe.nexus.invalid:9`，在首条流之前不探测），两条流都被 RST、TUN 侧下行
+    零字节、节点没有流连接、`result=rejected`、原因 `auth_rejected`；
+  - fallback 只在收到完整 HTTP 请求后才应答 → 同样 rejected、零字节；
+  - 3 条流同时首次拨号 → 只探测一次，3 条流全部被拒、零字节；
+  - 密码正确 → 1 条探测连接 + 2 条流连接，两条流回显正常（第二条流不再探测），`result=passed`；
+  - `credential_probe: false` → 没有探测连接，回显正常。
+  旧实现在密码错误时把 404 当作隧道数据写回 TUN、从不探测 → FAIL（Red Evidence）。
 
 ### 11.10 节点测速（real node speedtest，2026-09-18） {#11-speedtest}
 

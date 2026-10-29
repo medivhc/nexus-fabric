@@ -187,6 +187,7 @@ fn run() -> serde_json::Value {
             .map_err(|e| e.to_string())?;
         // §11.9.5：nexusd 先发凭据探测连接（目标为保留域）；真实节点解析失败即关闭，
         // 这里同样关闭并继续等流连接。
+        let mut probes_skipped = 0u32;
         let (mut tcp, mut conn, header) = loop {
             let mut accepted = None;
             for _ in 0..50 {
@@ -211,8 +212,14 @@ fn run() -> serde_json::Value {
                 .map_err(|e| format!("tls server conn: {e}"))?;
             let header = read_trojan_header(&mut rustls::Stream::new(&mut conn, &mut tcp))?;
             let target = parse_request(PASSWORD, &header).map_err(|e| format!("{e:?}"))?;
-            if target.host_label() != "credential-probe.nexus.invalid" {
+            let is_probe =
+                target.host_label() == "credential-probe.nexus.invalid" && target.port() == 9;
+            if !is_probe {
                 break (tcp, conn, header);
+            }
+            probes_skipped += 1;
+            if probes_skipped > 1 {
+                return Err("more than one credential probe for a single flow".into());
             }
         };
         connected_clone.store(true, Ordering::SeqCst);

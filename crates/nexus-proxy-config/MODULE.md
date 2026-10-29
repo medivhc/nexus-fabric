@@ -124,8 +124,9 @@
     可选 `fallback_guard: Option<String>`（`"strict"`|`"signature"`）与
     `ready_window_ms: Option<u64>`（`0..=5000`），校验语义见上节；可选
     `credential_probe: Option<bool>`（PRODUCT §11.9.5，只由 nexusd 消费，缺省视为 `true`；
-    presence-aware：非布尔 → `CONFIG_INVALID [outbounds[<tag>].credential_probe]`，非 trojan
-    出站上合法值忽略、非法值硬失败）。
+    只接受 `true` / `false`（去引号后），其他值或非标量 → `CONFIG_INVALID
+    [outbounds[<tag>].credential_probe]`；presence-aware：非 trojan 出站上合法值忽略、非法值
+    硬失败；不复用宽松的 `opt_bool`）。
   - 混淆插件（§7.3，二期）：任意 TCP 出站（ss/trojan）可选 `obfs: String`（插件名，
     如 `"xor"`；缺省/空 = plain 直通）与 `obfs_key: String`（插件参数 key，如 xor 的
     key 材料）；`obfs` 指向未知插件名 → dial 时直接失败（硬校验，不静默回退明文）。
