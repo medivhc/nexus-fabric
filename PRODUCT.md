@@ -1194,9 +1194,11 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   `orig_dst` 发回该客户端）。
 - **计数**：写入代理流的数据报计 `udp_sent`；vless / anytls 不再计
   `udp_unsupported{,_vless,_anytls}`（两字段保留，恒为 0）。TPROXY 前端：数据报写入或进入
-  建流队列时 `send_udp` 返回 `Ok`（之后才能把该 flow 记入透明流表、回包才能路由）；被丢弃
-  （队列满、建流失败、重试间隔内、超上限）时返回 `Err`，计入既有 TPROXY 计数
-  `upstream_failed` 与 `udp_dropped`。
+  建流队列时 `send_udp` 返回 `Ok`（之后才能把该 flow 记入透明流表、回包才能路由）；在
+  `send_udp` 调用内即被丢弃（队列满、上次建流失败后的重试间隔内、超上限）时返回 `Err`，计入
+  既有 TPROXY 计数 `upstream_failed` 与 `udp_dropped`。已返回 `Ok` 的排队数据报若随后因建流
+  失败被丢弃，TPROXY 计数不变，由 `event=udp_stream_open_failed` 日志可见（forwarder 照常计
+  `udp_send_failed`，但只有 TUN 前端的统计面暴露它；`StreamProxyEgress` 无统计面）。
 - **不做**：XUDP / mux、UDP over Vision、FullCone 语义（每个流键独立一条流，不承诺共享
   源端口）、Hysteria2 / Trojan UDP。
 - **E4 场景**：`scenarios/product/proxy_fwd_udp_vless_anytls.toml`（`carrier = "n1-fabric"`；
@@ -1204,15 +1206,17 @@ Linux nftables/iptables mangle（专用链 NEXUS_TPROXY，mark 0x1f3，table 100
   拒绝错误 UUID）——本地 VLESS（明文）与 AnyTLS（TLS 自签）节点把 UDP 中继到本轮新建的两个
   本地 UDP echo。节点只接受配置的凭据（VLESS 还要求 `flow` 为空、`command = UDP`），按目的
   地址记录打开的流与经手的数据报，并把回包改写为 `node:` + echo 回包；echo 记录实收数据报。
-  绕过节点直发的数据报因此既拿不到 `node:` 前缀，也会让 echo 实收数大于节点经手数（`bypassed`）：
+  绕过节点直发的数据报因此既拿不到 `node:` 前缀，也会让 echo 实收数大于节点经手数（`bypassed`）。
+  节点在本轮全部数据报发出之前不中继（闸门）：回包全部晚于发送，回包串流（如发给最后一个
+  发送者）每次都暴露，建流期间到达的数据报也一定经过排队：
   - TUN 轮（MockTun + 生产 `Dataplane` / `ProxyEngine`）：源 A 向两个目的地址各发 2 个数据报，
     源 B 向第一个目的地址发 2 个。断言 6 个回包各自回到发出它的源、源地址与载荷正确，收齐后
     再排空 200 ms 无多余回包；节点上每目的地址的流数 `[2, 1]`、经手数与 echo 实收数均为
     `[4, 2]`、`bypassed = 0`；AnyTLS 会话数 3；`udp_sent = 6`，`udp_send_failed`、
     `udp_unsupported{,_vless,_anytls}`、`proxy_dropped_no_proxy`、`direct_forwarded` 均为 0。
-  - TPROXY 轮（生产 `StreamProxyEgress`）：两个 flow（不同客户端、不同目的地址）各 2 个
-    数据报，`send_udp` 全部 `Ok`，4 个回包经 `UdpReply` 回到各自 flow key、无多余回包；节点
-    流数 `[1, 1]`、经手数 `[2, 2]`、`bypassed = 0`；AnyTLS 会话数 2。
+  - TPROXY 轮（生产 `StreamProxyEgress`）：客户端 A、C 发往第一个目的地址、B 发往第二个，
+    各 2 个数据报，`send_udp` 全部 `Ok`，6 个回包经 `UdpReply` 回到各自 flow key、无多余回包；
+    节点流数 `[2, 1]`、经手数与 echo 实收数 `[4, 2]`、`bypassed = 0`；AnyTLS 会话数 3。
   - `product.proxy-fwd-udp-unsupported` 同步改为只覆盖 TLS Trojan（删除其 VLESS / AnyTLS 期望）。
   - 旧实现两协议 UDP 全部丢弃 → FAIL（Red Evidence）。
 

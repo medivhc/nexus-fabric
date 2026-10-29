@@ -465,7 +465,8 @@ cargo clippy -p nexusd --all-targets -- -D warnings
     流一个新会话；建流在 dataplane 线程外、每条流排队 ≤ 64、失败计 `udp_send_failed` 并打
     `event=udp_stream_open_failed`（每 `(tag,cause)` 10 s 限频）、失败后重试间隔 ≥ 1 s、
     任一方向空闲 60 s 回收并 join 读线程、上限 1024 条且不驱逐；绝不直发目的地址；TPROXY
-    `send_udp` 写入或入队即 `Ok`，丢弃即 `Err`（计 `upstream_failed` + `udp_dropped`））；
+    `send_udp` 写入或入队即 `Ok`，调用内丢弃即 `Err`（计 `upstream_failed` + `udp_dropped`；
+    入队后因建流失败丢弃只见于 `udp_stream_open_failed` 日志））；
     Trojan（恒 TLS）= `Unsupported{TlsVariantNotSupported}`；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
   - `Unsupported` → 丢包 + `udp_send_failed`/`udp_unsupported*` 计数 +

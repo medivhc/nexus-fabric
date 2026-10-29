@@ -11,9 +11,12 @@
 //! - 本地 AnyTLS 节点（TLS 自签）：认证后接受 UoT v2 connect 模式 stream，按 TLS 会话计数；
 //! - 两种节点都按目的地址记录打开的流与经手的数据报，并把回包改写为 `node:` + echo 回包——
 //!   绕过节点直发目的地的数据报拿不到 `node:` 前缀，也不会出现在节点计数里。
+//! - 节点在本轮全部数据报发出之前不中继（闸门）：所有回包都晚于所有发送，「回包发给最后一个
+//!   发送者」一类的串流每次都会暴露，建流期间到达的数据报也一定经过排队。
 //! - TUN 轮：MockTun + 生产 `Dataplane` / `ProxyEngine`。源 A 向两个目的地址各发 2 个数据报，
 //!   源 B 向第一个目的地址发 2 个：每个（源，目的地址）一条代理流，回包只回到发出它的源。
-//! - TPROXY 轮：生产 `StreamProxyEgress`，两个 flow（不同源、不同目的地址）各 2 个数据报。
+//! - TPROXY 轮：生产 `StreamProxyEgress`，客户端 A、C 发往第一个目的地址、B 发往第二个，
+//!   各 2 个数据报。
 //! - `--self-test`：用 crate 自带客户端（不经 nexusd）验证两个本地节点本身可用。
 
 use std::collections::HashMap;
@@ -39,6 +42,7 @@ const TUN_SRC_A: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 50
 const TUN_SRC_B: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 5002);
 const TPROXY_SRC_A: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 5001);
 const TPROXY_SRC_B: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 4), 5003);
+const TPROXY_SRC_C: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 5004);
 /// 一轮从发出到收齐回包的上限（建流 + TLS 握手 + 中继）。
 const ROUND_DEADLINE: Duration = Duration::from_secs(10);
 /// 收齐后再排空的时长：多余 / 重复 / 串流的回包在此期间暴露。
@@ -55,6 +59,22 @@ struct NodeLog {
     sessions: usize,
     /// VLESS：因 UUID / flow / command 不符被拒绝的请求数。
     rejected: usize,
+    /// 闸门：为 `false` 时节点不中继（本轮数据报全部发出后由驱动打开）。
+    relay_open: bool,
+}
+
+/// 闸门已打开的节点记账（`--self-test` 用）。
+fn open_log() -> SharedLog {
+    Arc::new(Mutex::new(NodeLog {
+        relay_open: true,
+        ..NodeLog::default()
+    }))
+}
+
+fn open_relay(log: &SharedLog) {
+    if let Ok(mut log) = log.lock() {
+        log.relay_open = true;
+    }
 }
 
 type SharedLog = Arc<Mutex<NodeLog>>;
@@ -106,6 +126,13 @@ fn spawn_udp_echo() -> Result<(SocketAddr, Arc<AtomicUsize>), String> {
 
 /// 节点把一个数据报交给真实目的地址，返回 `node:` + echo 回包，并记账。
 fn relay_once(log: &SharedLog, target: SocketAddr, datagram: &[u8]) -> io::Result<Vec<u8>> {
+    let gate_deadline = Instant::now() + ROUND_DEADLINE;
+    while !log.lock().map(|l| l.relay_open).unwrap_or(true) {
+        if Instant::now() >= gate_deadline {
+            return Err(io::Error::other("relay gate never opened"));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let socket = UdpSocket::bind("127.0.0.1:0")?;
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     socket.send_to(datagram, target)?;
@@ -330,7 +357,7 @@ fn self_test() -> Value {
         vless::encode_request(&request).map_err(|e| e.to_string())
     };
     let vless_ok = (|| -> Result<bool, String> {
-        let log = SharedLog::default();
+        let log = open_log();
         let node = spawn_vless_node(Arc::clone(&log))?;
         let mut s = TcpStream::connect(node).map_err(|e| e.to_string())?;
         s.set_read_timeout(Some(Duration::from_secs(5)))
@@ -355,7 +382,7 @@ fn self_test() -> Value {
     })();
     let anytls_ok = (|| -> Result<bool, String> {
         let identity = loopback_identity()?;
-        let node = spawn_anytls_node(SharedLog::default(), &identity)?;
+        let node = spawn_anytls_node(open_log(), &identity)?;
         let cfg = Arc::new(anytls::client_config(&identity).map_err(|e| format!("{e:?}"))?);
         let sock = TcpStream::connect(node).map_err(|e| e.to_string())?;
         sock.set_read_timeout(Some(Duration::from_secs(5)))
@@ -539,6 +566,7 @@ fn tun_round(kind: &str) -> Value {
                 dp.tick(now()).map_err(|e| format!("tick: {e}"))?;
             }
         }
+        open_relay(&log);
         let total_expected = expected.len();
         let mut unexpected = 0usize;
         let mut received = 0usize;
@@ -586,7 +614,7 @@ fn tun_round(kind: &str) -> Value {
     out
 }
 
-/// TPROXY 轮：两个 flow（不同源、不同目的地址）各 2 个数据报。
+/// TPROXY 轮：客户端 A、C → 第一个目的地址，B → 第二个，各 2 个数据报。
 fn tproxy_round(kind: &str) -> Value {
     let log = SharedLog::default();
     let echoes = match spawn_echoes() {
@@ -606,6 +634,7 @@ fn tproxy_round(kind: &str) -> Value {
         for (f, (src, echo)) in [
             (TPROXY_SRC_A, echoes.addrs[0]),
             (TPROXY_SRC_B, echoes.addrs[1]),
+            (TPROXY_SRC_C, echoes.addrs[0]),
         ]
         .into_iter()
         .enumerate()
@@ -629,6 +658,7 @@ fn tproxy_round(kind: &str) -> Value {
                 }
             }
         }
+        open_relay(&log);
         let total_expected = expected.len();
         let mut unexpected = 0usize;
         let mut received = 0usize;
@@ -695,11 +725,11 @@ fn main() {
             && tun["proxy_dropped_no_proxy"] == 0
             && tun["direct_forwarded"] == 0
             && tproxy["replies_ok"] == true
-            && tproxy["ledger"]["streams_per_destination"] == json!([1, 1])
-            && tproxy["ledger"]["relayed_per_destination"] == json!([2, 2])
-            && tproxy["ledger"]["echo_received_per_destination"] == json!([2, 2])
+            && tproxy["ledger"]["streams_per_destination"] == json!([2, 1])
+            && tproxy["ledger"]["relayed_per_destination"] == json!([4, 2])
+            && tproxy["ledger"]["echo_received_per_destination"] == json!([4, 2])
             && tproxy["ledger"]["bypassed"] == 0
-            && sessions_ok(&tproxy, 2);
+            && sessions_ok(&tproxy, 3);
         report[kind] = json!({"tun": tun, "tproxy": tproxy});
     }
     report["verdict"] = json!(if pass { "PASS" } else { "FAIL" });
