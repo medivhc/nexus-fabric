@@ -320,6 +320,15 @@ fn syn_target_display(payload: &[u8]) -> String {
     }
 }
 
+/// C-3 前向发送失败的种类日志（`[nat-chunk]` 既有风格；§8.2 之外的诊断行）。
+///
+/// 不额外限频：同一 fallback 路径的 `[nat-chunk] fallback … reason=` 行本就
+/// 逐帧发射（既有先例），另加限频会打散 Q3 归因需要的「首个失败种类 + 帧长」
+/// 序列；每失败帧恒一条，与 `mesh_dropped_no_n1` 增量 1:1。
+fn n1_send_failure_line(dst: IpAddr, kind: &str, len: usize) -> String {
+    format!("[nat-chunk] n1 send failed dst={dst} kind={kind} len={len}")
+}
+
 /// TPROXY 跨线程消息（spec §9.14）。
 #[derive(Debug)]
 pub enum TransparentInbound {
@@ -3518,17 +3527,37 @@ impl Dataplane {
     ///
     /// 成功 → `mesh_tcp_frames += 1`；失败（无 sender/无路由/发送错）→
     /// `mesh_dropped_no_n1 += 1`（W1 语义复用）。
+    ///
+    /// C-3：失败分支同时记录 `N1Error` 种类（`[nat-chunk]` 既有风格）。
+    /// 此前只回 `bool`，`PeerUnknown`（无路由/无 conn）、
+    /// `OversizeDatagram`、`Transport` 在 dataplane 层不可区分，Q3 无法归因。
+    /// 计数语义、返回值与控制流不变；日志点与 `mesh_dropped_no_n1` 同一分支
+    /// （严格 1:1），因此本函数是 `send_mesh_data_frame` 全部 fallback 失败
+    /// 分支（NoPeer/NoPath/QuietGate/NoDirect）与 DATA/FIN/RST 发送失败的
+    /// 唯一发射点。
     fn send_mesh_tcp_frame(&self, dst: IpAddr, frame: &[u8]) -> bool {
-        let sent = match &self.n1_sender {
-            Some(sender) => sender.send_to_mesh(dst, frame).is_ok(),
-            None => false,
-        };
-        if sent {
-            self.with_stats(|s| s.mesh_tcp_frames += 1);
-        } else {
-            self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+        match &self.n1_sender {
+            Some(sender) => match sender.send_to_mesh(dst, frame) {
+                Ok(()) => {
+                    self.with_stats(|s| s.mesh_tcp_frames += 1);
+                    true
+                }
+                Err(error) => {
+                    self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                    eprintln!(
+                        "{}",
+                        n1_send_failure_line(dst, &format!("{error:?}"), frame.len())
+                    );
+                    false
+                }
+            },
+            None => {
+                // 装配未注入 N1 sender：没有 `N1Error` 可记，用哨兵 kind。
+                self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                eprintln!("{}", n1_send_failure_line(dst, "NoSender", frame.len()));
+                false
+            }
         }
-        sent
     }
 
     /// S9：N1 下行的 STREAM 帧注入终结器（fabric → app 方向）。
@@ -4450,6 +4479,9 @@ pub fn dataplane_stats_json(
             "dns_reply_write_failed": stats.dns_reply_write_failed,
             "qos_dropped": stats.qos_dropped,
             "mesh_dropped_no_n1": stats.mesh_dropped_no_n1,
+            // C-4：N1 STREAM 帧生产计数器（SYN/DATA/FIN/RST）。
+            // AC-N1-R1 的 A 端判据 `mesh_tcp_frames Δ>0` 依赖本字段可读。
+            "mesh_tcp_frames": stats.mesh_tcp_frames,
             "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
             "proxy_tcp_streams": stats.proxy_tcp_streams,
             "proxy_tcp_streams_ok": stats.proxy_tcp_streams_ok,
@@ -8355,5 +8387,81 @@ outbounds:
 
         drop(h);
         echo.join().expect("echo thread");
+    }
+
+    // ---- fix-r1：C-3 / C-4 / S-1 -------------------------------------------
+
+    /// C-3：失败种类行逐字模板（`kind` 取 `N1Error` 的 Debug 名）。
+    #[test]
+    fn n1_send_failure_line_carries_kind_and_len() {
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        assert_eq!(
+            n1_send_failure_line(dst, "PeerUnknown", 42),
+            "[nat-chunk] n1 send failed dst=10.200.0.5 kind=PeerUnknown len=42"
+        );
+        assert_eq!(
+            n1_send_failure_line(dst, "OversizeDatagram(1245)", 1245),
+            "[nat-chunk] n1 send failed dst=10.200.0.5 kind=OversizeDatagram(1245) len=1245"
+        );
+    }
+
+    /// C-3：无 sender 时仍按既有语义返回 false 并计 `mesh_dropped_no_n1`
+    /// （只加日志，返回值/计数/控制流不变）。
+    #[test]
+    fn mesh_send_without_sender_returns_false_and_counts_drop() {
+        let (dp, _mock) = test_dataplane();
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        assert!(!dp.send_mesh_tcp_frame(dst, &encode_stream_frame(1, 0x00, b"x")));
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 1);
+        assert_eq!(dp.stats().mesh_tcp_frames, 0);
+    }
+
+    /// C-4：`/localapi/v0/dataplane/stats` 的 `dataplane` 对象暴露
+    /// `mesh_tcp_frames`（AC-N1-R1 A 端判据），且不改既有字段。
+    #[test]
+    fn dataplane_stats_json_exposes_mesh_tcp_frames() {
+        let stats = DataplaneStats {
+            mesh_tcp_frames: 17,
+            mesh_dropped_no_n1: 2,
+            ..DataplaneStats::default()
+        };
+        let json = dataplane_stats_json(
+            true,
+            &RuntimeStatus::default(),
+            &stats,
+            serde_json::Value::Null,
+        );
+        assert_eq!(json["dataplane"]["mesh_tcp_frames"], 17);
+        assert_eq!(json["dataplane"]["mesh_dropped_no_n1"], 2);
+    }
+
+    /// S-1：`syn_target_display` 与 `encode_syn_payload` 的对等性——覆盖
+    /// 全部 addr-type（IPv4 / IPv6 / 域名），保证展示解码与冻结线格式同源。
+    #[test]
+    fn syn_target_display_matches_encode_syn_payload_for_every_addr_type() {
+        let cases: [(&str, u16, &str, &str); 5] = [
+            ("10.1.2.3", 443, "10.1.2.3:443", "IPv4"),
+            ("127.0.0.1", 80, "127.0.0.1:80", "IPv4 loopback"),
+            ("fd00:144::6", 8080, "[fd00:144::6]:8080", "IPv6"),
+            ("example.org", 443, "example.org:443", "domain"),
+            // F1：2 字符域名用 FQDN trailing-dot 形式编码（7 字节）。
+            ("ab", 21, "ab.:21", "2-char domain (F1)"),
+        ];
+        for (host, port, expected, label) in cases {
+            let payload = encode_syn_payload(host, port);
+            assert_eq!(
+                syn_target_display(&payload),
+                expected,
+                "{label}: display must match encode_syn_payload's wire form"
+            );
+        }
+
+        // 3b-5 旧 6 字节形态（encode_syn_payload 不产生，但 wire 兼容需展示）。
+        let legacy = [192, 0, 2, 7, 0x1f, 0x90];
+        assert_eq!(syn_target_display(&legacy), "192.0.2.7:8080");
+
+        // 非法/截断载荷 → 占位符（不 panic、不误报目标）。
+        assert_eq!(syn_target_display(&[]), "-");
+        assert_eq!(syn_target_display(&[0x02, 0x00]), "-");
     }
 }
