@@ -406,6 +406,19 @@ impl FabricListener {
         })
     }
 
+    /// Additive (WP1b/spec §19): total inbound mTLS handshakes this listener
+    /// rejected because the peer was unauthenticated or the handshake failed.
+    ///
+    /// This is a plain counter read; it deliberately does not change
+    /// `accept_timeout`'s error shape (a rejection still surfaces as
+    /// `FabricError::Timeout`). Callers derive per-poll deltas themselves.
+    pub fn rejected_handshakes(&self) -> u64 {
+        self.driver
+            .shared()
+            .rejected_handshakes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn accept(&self) -> Result<FabricConn, FabricError> {
         let inner = self.driver.accept_conn()?;
         Ok(FabricConn {
