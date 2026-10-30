@@ -308,6 +308,10 @@ pub fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
 /// Parsed TCP header: (src_ip, dst_ip, src_port, dst_port, flags, payload_offset).
 pub type TcpParsed = (IpAddr, IpAddr, u16, u16, u8, usize);
 
+/// TCP flags 位（`tcp[13]`，RFC 793）：FIN=0x01、SYN=0x02、RST=0x04、
+/// PSH=0x08、ACK=0x10。
+const TCP_FLAG_RST: u8 = 0x04;
+
 /// Minimal IPv4/IPv6 TCP header parse.
 ///
 /// v6 uses the shared fixed-header + extension-header chain walker
@@ -1069,17 +1073,19 @@ impl TcpTerminator {
     /// 本方法按 (client_ip, client_port, server_port) 查找连接，
     /// 将源 IP 改回 `orig_dst`，并修复 IP/TCP 校验和。
     ///
-    /// 非 smoltcp 接口地址的包（终结器自造的本地终止 RST，见
-    /// [`build_tcp_reset_for`]）已经是最终形态，原样返回；其余不匹配已知
-    /// 连接的包 → 返回 `None`（调用方计数丢弃）。
+    /// 非 smoltcp 接口地址的包只有一种合法形态：终结器自造的本地终止 RST
+    /// （见 [`build_tcp_reset_for`]），它已带真实源 IP、是最终形态，此时原样
+    /// 返回。其余非 iface 源包（含 RST 以外的任何段）一律返回 `None`（调用方
+    /// 计数丢弃），与基线「查无连接则丢弃」语义一致。
     pub fn fixup_tun_packet(&self, pkt: &[u8]) -> Option<Vec<u8>> {
-        let (src_ip, dst_ip, src_port, dst_port, _flags, _off) = parse_tcp(pkt)?;
+        let (src_ip, dst_ip, src_port, dst_port, flags, _off) = parse_tcp(pkt)?;
         let iface_src = match src_ip {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(SMOLTCP_IFACE_IP)),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(SMOLTCP_IFACE_IP6)),
         };
         if src_ip != iface_src {
-            return Some(pkt.to_vec());
+            // 仅自造 RST 形透传；RST 位取自 `parse_tcp` 返回的 tcp[13]。
+            return (flags & TCP_FLAG_RST != 0).then(|| pkt.to_vec());
         }
         // 按客户端 (dst_ip, dst_port) + 服务端端口 (src_port) 查找。
         // 注意：该谓词与 `note_sent_seq` 同口径，不含 server-IP。同一客户端
@@ -2289,7 +2295,8 @@ mod tests {
         );
     }
 
-    /// `fixup_tun_packet` 对已经带真实源 IP 的自造 RST 原样透传（不被丢弃）。
+    /// `fixup_tun_packet` 只对已经带真实源 IP 的自造 RST 原样透传（不被丢弃）；
+    /// 非 smoltcp 接口源的其它段（ACK/数据）一律丢弃。
     #[test]
     fn fixup_passes_through_already_fixed_packets() {
         let term = TcpTerminator::new();
@@ -2302,9 +2309,35 @@ mod tests {
         let rst = build_tcp_reset_for(&key, 1234).expect("build RST");
         let fixed = term.fixup_tun_packet(&rst).expect("passthrough");
         assert_eq!(fixed, rst);
+        assert_eq!(
+            fixed[33] & TCP_FLAG_RST,
+            TCP_FLAG_RST,
+            "passthrough form is a RST"
+        );
         // smoltcp 接口地址来源的未匹配包仍按既有语义丢弃。
         let stray = craft_tcp([10, 254, 0, 1], [10, 0, 0, 9], 8081, 40009, 1, 1, 0x10, &[]);
         assert!(term.fixup_tun_packet(&stray).is_none());
+        // 非 iface 源、非 RST 的包（真实源 IP 的 ACK / 数据形态）必须丢弃，
+        // 不得因「已是最终形态」被原样写回 TUN。
+        let real_ack = craft_tcp([1, 2, 3, 4], [10, 0, 0, 2], 8081, 40001, 5000, 1, 0x10, &[]);
+        assert!(
+            term.fixup_tun_packet(&real_ack).is_none(),
+            "non-RST packet from a real source IP must be dropped"
+        );
+        let real_data = craft_tcp(
+            [1, 2, 3, 4],
+            [10, 0, 0, 2],
+            8081,
+            40001,
+            6000,
+            1,
+            0x18, // PSH+ACK
+            b"payload",
+        );
+        assert!(
+            term.fixup_tun_packet(&real_data).is_none(),
+            "non-RST data packet from a real source IP must be dropped"
+        );
     }
 
     /// FIX-1（评审 m-1）：同一客户端源端口并发连两个不同 server-IP 的相同
