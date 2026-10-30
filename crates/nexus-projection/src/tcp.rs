@@ -652,6 +652,10 @@ pub struct TcpTermStats {
     /// 连接：同一客户端源端口并发连不同 server-IP 的相同 server-port（需源
     /// 端口复用）。歧义时跳过 `snd_nxt` 更新（不取首个，避免记错流），仅计数。
     pub snd_nxt_ambiguous: u64,
+    /// 本地终止路径（[`TcpTerminator::reset_by_key`]）未能产生 RST 段：连接
+    /// 缺席，或连接在场却没有可用的 `snd_nxt` / RST 构造失败。纯可观测，
+    /// 不改变返回值与既有行为。
+    pub reset_without_segment: u64,
 }
 
 pub struct TcpTerminator {
@@ -985,6 +989,7 @@ impl TcpTerminator {
 
     fn reset_by_key(&mut self, key: &FourTuple) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        let mut rst_emitted = false;
         if let Some(c) = self.conns.remove(key) {
             // smoltcp 0.12 的 `abort()` 只把状态置 Closed，不产生任何段
             // （RST 只在收到不可接受段时由 `rst_reply` 发出）。应用侧因此
@@ -993,12 +998,17 @@ impl TcpTerminator {
             if let Some(snd_nxt) = c.snd_nxt {
                 if let Some(rst) = build_tcp_reset_for(key, snd_nxt) {
                     out.push(rst);
+                    rst_emitted = true;
                 }
             }
             self.sockets.get_mut::<tcp::Socket>(c.sock).abort();
             self.sockets.remove(c.sock);
             // 清理反向索引（若已绑定）。
             self.by_id.retain(|_, k| k != key);
+        }
+        // 纯可观测：连接缺席，或连接在场却未能产段（无 `snd_nxt` / 构造失败）。
+        if !rst_emitted {
+            self.stats.reset_without_segment += 1;
         }
         self.poll_iface();
         out.extend(self.drain_tx());
@@ -2293,6 +2303,40 @@ mod tests {
             0,
             "TCP checksum over the final source address"
         );
+        // 产段路径不增加「无段」计数（FIX-3）。
+        assert_eq!(term.stats().reset_without_segment, 0);
+    }
+
+    /// FIX-3（评审 m-5）：`reset_by_key` 在连接缺席或连接在场但没有
+    /// `snd_nxt` 时不产段，必须计数（纯可观测，返回值不变）。
+    #[test]
+    fn reset_without_segment_counts_absent_and_unsequenced_conns() {
+        let mut term = TcpTerminator::new();
+        let unknown = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 40123,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: 8080,
+        };
+        let out = term.reset_by_tuple(&unknown);
+        assert!(out.is_empty(), "unknown four-tuple yields no segment");
+        assert_eq!(term.stats().reset_without_segment, 1);
+
+        // 连接在场但没有 snd_nxt：同样无段，计数再 +1。
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40124, 8080, 3000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn, "peer-B");
+        let key = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 40124,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: 8080,
+        };
+        assert!(term.conns.contains_key(&key));
+        term.conns.get_mut(&key).unwrap().snd_nxt = None;
+        let out = term.reset_by_tuple(&key);
+        assert!(out.is_empty(), "conn without snd_nxt yields no segment");
+        assert_eq!(term.stats().reset_without_segment, 2);
+        assert_eq!(term.conn_count(), 0, "connection is still removed");
     }
 
     /// `fixup_tun_packet` 只对已经带真实源 IP 的自造 RST 原样透传（不被丢弃）；
