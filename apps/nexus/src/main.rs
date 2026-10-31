@@ -167,8 +167,41 @@ impl RemoteTarget {
     }
 }
 
-/// 从参数中剥离全局 `--addr <ip:port>` / `--socket <path>`（D8：默认 unix socket）。
-/// 返回 (remote, 剩余 args)。
+/// 识别 `args[i]` 处的 `--addr <v>` / `--socket <v>` / `--addr=<v>` / `--socket=<v>`，
+/// 返回 (目标, 消耗的 token 数)；不是这两个选项时返回 `None`。
+/// 缺值、`=` 后为空或值以 `--` 开头均为用法错误。
+fn remote_option(args: &[String], i: usize) -> Option<Result<(RemoteTarget, usize), String>> {
+    let arg = args.get(i)?;
+    let (flag, inline) = match arg.split_once('=') {
+        Some((flag @ ("--addr" | "--socket"), value)) => (flag, Some(value)),
+        _ if matches!(arg.as_str(), "--addr" | "--socket") => (arg.as_str(), None),
+        _ => return None,
+    };
+    let (value, used) = match inline {
+        Some(value) => (Some(value).filter(|v| !v.is_empty()), 1),
+        None => (args.get(i + 1).map(String::as_str), 2),
+    };
+    Some(
+        value
+            .filter(|v| !v.starts_with("--"))
+            .map(|v| {
+                let target = if flag == "--addr" {
+                    RemoteTarget::Tcp(v.to_string())
+                } else {
+                    RemoteTarget::Socket(v.to_string())
+                };
+                (target, used)
+            })
+            .ok_or_else(|| format!("missing value for {flag}")),
+    )
+}
+
+/// 从参数中剥离全局 `--addr <ip:port>` / `--socket <path>`（及 `=` 形式；
+/// D8：默认 unix socket）。返回 (remote, 剩余 args)。
+///
+/// 全局选项只在子命令 token 之前生效：子命令及其后的参数原样透传给子命令解析
+/// （`nexus proxy --addr <ip:port>` 的 `--addr` 是 proxy 监听地址，不是 daemon 目标）。
+/// 前缀段的 `--json` 保留在 rest 中，由 `split_json_flag` 处理。
 fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>), String> {
     let mut remote = match localapi_client::default_target() {
         localapi_client::LocalApiTarget::Socket(p) => RemoteTarget::Socket(p.display().to_string()),
@@ -176,26 +209,41 @@ fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>),
     };
     let mut rest = Vec::with_capacity(args.len());
     let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--addr" => {
-                let value = args
-                    .get(i + 1)
-                    .filter(|v| !v.starts_with("--"))
-                    .ok_or_else(|| "missing value for --addr".to_string())?;
-                remote = RemoteTarget::Tcp(value.clone());
-                i += 2;
+    while let Some(arg) = args.get(i) {
+        if let Some(option) = remote_option(args, i) {
+            let (target, used) = option?;
+            remote = target;
+            i += used;
+        } else if arg == "--json" {
+            rest.push(arg.clone());
+            i += 1;
+        } else {
+            // 子命令 token：其后全部归子命令。
+            break;
+        }
+    }
+    rest.extend_from_slice(&args[i..]);
+    Ok((remote, rest))
+}
+
+/// daemon thin-client 命令族（`task` / `artifact` 与经 `query_daemon` 的观察命令）
+/// 自身不定义 `--addr` / `--socket`：其子命令解析把同名选项当作 daemon 目标
+/// （兼容 `nexus task show <id> --addr <ip:port>` 既有调用），其余参数原样保留。
+fn command_remote_target(
+    args: &[String],
+    mut remote: RemoteTarget,
+) -> Result<(RemoteTarget, Vec<String>), String> {
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match remote_option(args, i) {
+            Some(option) => {
+                let (target, used) = option?;
+                remote = target;
+                i += used;
             }
-            "--socket" => {
-                let value = args
-                    .get(i + 1)
-                    .filter(|v| !v.starts_with("--"))
-                    .ok_or_else(|| "missing value for --socket".to_string())?;
-                remote = RemoteTarget::Socket(value.clone());
-                i += 2;
-            }
-            other => {
-                rest.push(other.to_string());
+            None => {
+                rest.push(arg.clone());
                 i += 1;
             }
         }
@@ -249,6 +297,14 @@ fn run(args: &[String]) -> i32 {
 
     // N3 is a thin client of the authenticated, versioned daemon service.
     if matches!(args[0].as_str(), "task" | "artifact") {
+        let (target, args) = match command_remote_target(&args, target) {
+            Ok(v) => v,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                eprint!("{USAGE}");
+                return 2;
+            }
+        };
         return match nexus::task_cli::run(&args, json_mode, &target.to_client_target()) {
             Ok(output) => {
                 println!("{output}");
@@ -328,6 +384,15 @@ fn run(args: &[String]) -> i32 {
         return nexus::provider_cli::run_provider(&args[1..], json_mode);
     }
 
+    // 余下为 daemon 观察命令族：子命令之后的 `--addr` / `--socket` 仍作 daemon 目标。
+    let (target, args) = match command_remote_target(&args, target) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            eprint!("{USAGE}");
+            return 2;
+        }
+    };
     let command = match parse_command(&args) {
         Ok(cmd) => cmd,
         Err(msg) => {
@@ -1892,6 +1957,165 @@ mod tests {
     fn socket_flag_missing_value_is_usage_error() {
         let args = vec!["--socket".to_string()];
         assert!(extract_remote_target(&args).is_err());
+    }
+
+    fn extract(args: &[&str]) -> Result<(RemoteTarget, Vec<String>), String> {
+        extract_remote_target(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn default_target() -> RemoteTarget {
+        extract(&["status"]).unwrap().0
+    }
+
+    #[test]
+    fn proxy_addr_after_subcommand_reaches_proxy_listener() {
+        // 回归：`nexus proxy --addr <ip:port>` 的 --addr 是 proxy 监听地址，
+        // 不能被全局 daemon 目标预处理吞掉（否则 proxy 回落默认 127.0.0.1:1080）。
+        let args = ["proxy", "--addr", "127.0.0.1:18080"];
+        let (target, rest) = extract(&args).unwrap();
+        assert_eq!(target, default_target());
+        assert_eq!(rest, owned(&args));
+    }
+
+    #[test]
+    fn proxy_host_addr_and_json_reach_run_proxy_unchanged() {
+        let args = [
+            "--json",
+            "proxy",
+            "host",
+            "svc",
+            "--addr",
+            "127.0.0.1:18787",
+            "--token",
+            "t",
+        ];
+        let (target, rest) = extract(&args).unwrap();
+        assert_eq!(target, default_target());
+        let (json_mode, rest) = split_json_flag(&rest);
+        assert!(json_mode);
+        // run() 把 rest[1..] 交给 run_proxy。
+        assert_eq!(rest[0], "proxy");
+        assert_eq!(rest[1..], owned(&args[2..])[..]);
+    }
+
+    #[test]
+    fn options_after_subcommand_pass_through_verbatim() {
+        for args in [
+            &["pair", "join", "code", "--addr", "192.168.1.2:7000"][..],
+            &["proxy", "--addr=127.0.0.1:18080"],
+            &["proxy", "relay", "--socket", "/tmp/s.sock"],
+            &["status", "--addr", "127.0.0.1:9999"],
+            // 子命令之后缺值不在此处报错，交由子命令解析决定。
+            &["proxy", "--addr"],
+            &["proxy", "--addr", "--json"],
+        ] {
+            let (target, rest) = extract(args).unwrap();
+            assert_eq!(target, default_target(), "args={args:?}");
+            assert_eq!(rest, owned(args), "args={args:?}");
+        }
+    }
+
+    #[test]
+    fn global_addr_before_subcommand_still_selects_daemon_and_keeps_subcommand_addr() {
+        let (target, rest) = extract(&[
+            "--addr",
+            "127.0.0.1:9999",
+            "proxy",
+            "--addr",
+            "127.0.0.1:18080",
+        ])
+        .unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("127.0.0.1:9999".into()));
+        assert_eq!(rest, owned(&["proxy", "--addr", "127.0.0.1:18080"]));
+    }
+
+    #[test]
+    fn equals_forms_select_global_target_and_are_stripped() {
+        let (target, rest) = extract(&["--addr=127.0.0.1:9999", "status"]).unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("127.0.0.1:9999".into()));
+        assert_eq!(rest, owned(&["status"]));
+
+        let (target, rest) = extract(&["--socket=/tmp/nexusd.sock", "status"]).unwrap();
+        assert_eq!(target, RemoteTarget::Socket("/tmp/nexusd.sock".into()));
+        assert_eq!(rest, owned(&["status"]));
+    }
+
+    #[test]
+    fn prefix_keeps_json_and_last_target_wins() {
+        let (target, rest) = extract(&[
+            "--json",
+            "--addr=127.0.0.1:9999",
+            "--socket",
+            "/tmp/nexusd.sock",
+            "status",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(target, RemoteTarget::Socket("/tmp/nexusd.sock".into()));
+        // `--json` 留给 split_json_flag（任意位置剥离，语义不变）。
+        assert_eq!(rest, owned(&["--json", "status", "--json"]));
+        assert_eq!(split_json_flag(&rest), (true, owned(&["status"])));
+    }
+
+    #[test]
+    fn daemon_command_families_take_target_after_subcommand() {
+        // task/artifact 与 query_daemon 族自身不定义 --addr/--socket：
+        // 子命令之后的同名选项仍是 daemon 目标（n3_cli 等既有调用）。
+        let (target, rest) = command_remote_target(
+            &owned(&["task", "show", "id", "--json", "--addr", "127.0.0.1:9999"]),
+            default_target(),
+        )
+        .unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("127.0.0.1:9999".into()));
+        assert_eq!(rest, owned(&["task", "show", "id", "--json"]));
+
+        let (target, rest) = command_remote_target(
+            &owned(&["status", "--socket=/tmp/nexusd.sock"]),
+            RemoteTarget::Tcp("127.0.0.1:9999".into()),
+        )
+        .unwrap();
+        assert_eq!(target, RemoteTarget::Socket("/tmp/nexusd.sock".into()));
+        assert_eq!(rest, owned(&["status"]));
+
+        // 无同名选项时保留前缀段选定的目标。
+        let prefix = RemoteTarget::Tcp("127.0.0.1:9999".into());
+        let (target, rest) =
+            command_remote_target(&owned(&["artifact", "get", "a"]), prefix.clone()).unwrap();
+        assert_eq!(target, prefix);
+        assert_eq!(rest, owned(&["artifact", "get", "a"]));
+
+        for args in [
+            &["status", "--addr"][..],
+            &["task", "show", "id", "--addr="],
+        ] {
+            assert!(
+                command_remote_target(&owned(args), default_target()).is_err(),
+                "args={args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_missing_or_flag_like_value_is_usage_error() {
+        for args in [
+            &["--addr"][..],
+            &["--addr", "--json", "status"],
+            &["--socket", "--addr", "127.0.0.1:9999", "status"],
+            &["--addr=", "status"],
+            &["--socket="],
+            &["--addr=--json", "status"],
+            &["--json", "--socket=--x", "status"],
+        ] {
+            let err = extract(args).unwrap_err();
+            assert!(
+                err.starts_with("missing value for --"),
+                "args={args:?}: {err}"
+            );
+        }
     }
 
     #[test]

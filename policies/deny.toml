@@ -18,7 +18,14 @@ unsound = "workspace"
 # yanked=deny enforces supply-chain hygiene (never resolve to yanked crates).
 yanked = "deny"
 # Advisories evaluated and accepted must be recorded here with a reason.
-ignore = []
+ignore = [
+  # crypto-bigint 0.5.5 constant-time leaks (fixed only in 0.7.6). Reached solely
+  # via str0m 0.24.1 (latest) -> dimpl/str0m-rust-crypto -> elliptic-curve 0.13 in
+  # nexus-web-gateway, a workspace leaf no app/crate depends on: no shipped binary
+  # (nexus, nexusd, nexus-platform-host) links it. Revisit when str0m moves to
+  # elliptic-curve >= 0.14, or before nexus-web-gateway is wired into any binary.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only via str0m in unshipped nexus-web-gateway leaf; no compatible fix upstream" },
+]
 # Warnings for ignore entries that no longer apply (keeps ignore list honest).
 unused-ignored-advisory = "warn"
 
