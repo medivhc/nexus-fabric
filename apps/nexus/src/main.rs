@@ -168,6 +168,20 @@ impl RemoteTarget {
 }
 
 /// 从参数中剥离全局 `--addr <ip:port>` / `--socket <path>`（D8：默认 unix socket）。
+///
+/// 全局文法（见 usage：`nexus [--json] [--addr <ip:port>] <command>`）：全局选项
+/// 只出现在子命令 token 之前。本函数因此只扫描 argv 的前导全局段：
+/// `--addr <v>` / `--socket <v>`（空格传值）被消费；`--json` 原样透传（由
+/// `split_json_flag` 统一剥离）；遇到第一个子命令 token 即停止，其后所有 token
+/// 原样保留、归子命令所有——`nexus proxy --addr <监听地址>` 与
+/// `nexus proxy host <resource> --addr <入口地址>` 不再被全局提取吞掉。
+///
+/// 兼容性说明：子命令之后出现的 `--addr`/`--socket` 不再被全局消费。此前
+/// `nexus status --addr X` 会把 X 当作 daemon 目标；按新文法它归子命令所有，
+/// daemon 目标回落为默认值（见 PR 描述中的取舍记录）。
+/// 等号形式（`--addr=<v>`）在全局段不识别（与既有行为一致，落入
+/// unknown-command 错误路径）；子命令侧等号形式由 `parse_flags` 支持。
+///
 /// 返回 (remote, 剩余 args)。
 fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>), String> {
     let mut remote = match localapi_client::default_target() {
@@ -194,12 +208,17 @@ fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>),
                 remote = RemoteTarget::Socket(value.clone());
                 i += 2;
             }
-            other => {
-                rest.push(other.to_string());
+            // --json 是全局选项，但它由 split_json_flag 统一剥离：这里只透传，
+            // 让 `nexus --json --addr X <command>` 的全局段继续可扫描。
+            "--json" => {
+                rest.push(args[i].clone());
                 i += 1;
             }
+            // 第一个非全局 token 就是子命令：从这里开始的整段归子命令所有。
+            _ => break,
         }
     }
+    rest.extend_from_slice(&args[i..]);
     Ok((remote, rest))
 }
 
@@ -1005,6 +1024,13 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<Stri
     while i < args.len() {
         let arg = &args[i];
         if arg.starts_with("--") {
+            // 等号形式 `--flag=value`：值内联，键归一为 `--flag`
+            // （使 `nexus proxy --addr=<ip:port>` 与空格形式等效）。
+            if let Some(eq) = arg.find('=') {
+                map.insert(arg[..eq].to_string(), Some(arg[eq + 1..].to_string()));
+                i += 1;
+                continue;
+            }
             if let Some(value) = args.get(i + 1).filter(|v| !v.starts_with("--")) {
                 map.insert(arg.clone(), Some(value.clone()));
                 i += 2;
@@ -1892,6 +1918,146 @@ mod tests {
     fn socket_flag_missing_value_is_usage_error() {
         let args = vec!["--socket".to_string()];
         assert!(extract_remote_target(&args).is_err());
+    }
+
+    /// fix(proxy-addr)：`proxy` 的 `--addr`（空格形式）在全局预处理后必须完整
+    /// 保留给子命令，不再被全局提取吞掉（否则监听地址恒为默认 127.0.0.1:1080）。
+    #[test]
+    fn proxy_addr_space_form_survives_preprocessing() {
+        let args = vec![
+            "proxy".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:18099".to_string(),
+        ];
+        let (_, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(
+            rest,
+            vec![
+                "proxy".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:18099".to_string()
+            ]
+        );
+    }
+
+    /// fix(proxy-addr)：`--addr=<ip:port>` 等号形式同样必须完整保留给 proxy。
+    #[test]
+    fn proxy_addr_eq_form_survives_preprocessing() {
+        let args = vec!["proxy".to_string(), "--addr=127.0.0.1:18099".to_string()];
+        let (_, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(
+            rest,
+            vec!["proxy".to_string(), "--addr=127.0.0.1:18099".to_string()]
+        );
+        // parse_flags 等号形式归一：proxy 侧取到与空格形式相同的值。
+        let flags = parse_flags(&rest[1..]);
+        assert_eq!(
+            flags.get("--addr").and_then(|v| v.as_deref()),
+            Some("127.0.0.1:18099")
+        );
+    }
+
+    /// fix(proxy-addr)：`proxy host` 自带 `--addr <ip:port>`（提供方入口监听地址），
+    /// 同样不得被全局提取吞掉。
+    #[test]
+    fn proxy_host_addr_survives_preprocessing() {
+        let args = vec![
+            "proxy".to_string(),
+            "host".to_string(),
+            "service".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:9000".to_string(),
+        ];
+        let (_, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(
+            rest,
+            vec![
+                "proxy".to_string(),
+                "host".to_string(),
+                "service".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:9000".to_string()
+            ]
+        );
+    }
+
+    /// 全局文法不变：子命令之前的 `--addr`（含与 --json 混排）仍被提取为
+    /// daemon 目标。
+    #[test]
+    fn global_addr_before_command_still_extracted() {
+        let args = vec![
+            "--json".to_string(),
+            "--addr".to_string(),
+            "10.0.0.1:8080".to_string(),
+            "status".to_string(),
+        ];
+        let (target, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("10.0.0.1:8080".into()));
+        assert_eq!(rest, vec!["--json".to_string(), "status".to_string()]);
+        let (json_mode, rest) = split_json_flag(&rest);
+        assert!(json_mode);
+        assert_eq!(rest, vec!["status".to_string()]);
+    }
+
+    /// 全局文法不变：子命令之前的 `--socket` 仍被提取为 daemon 目标。
+    #[test]
+    fn global_socket_before_command_still_extracted() {
+        let args = vec![
+            "--socket".to_string(),
+            "/tmp/nexusd.sock".to_string(),
+            "status".to_string(),
+        ];
+        let (target, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Socket("/tmp/nexusd.sock".into()));
+        assert_eq!(rest, vec!["status".to_string()]);
+    }
+
+    /// 兼容性取舍（约束 3，明示不静默改变）：子命令之后出现的 `--addr` 按新文法
+    /// 归子命令所有，不再被全局消费——daemon 目标回落为默认值。此行为由本测试钉住。
+    #[test]
+    fn addr_after_subcommand_belongs_to_subcommand() {
+        let args = vec![
+            "status".to_string(),
+            "--addr".to_string(),
+            "10.0.0.2:9000".to_string(),
+        ];
+        let (target, rest) = extract_remote_target(&args).unwrap();
+        // 默认目标平台相关（unix socket / Windows TCP），这里只断言“未被全局消费”。
+        #[cfg(unix)]
+        {
+            assert!(matches!(target, RemoteTarget::Socket(_)));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &target;
+        }
+        assert_eq!(
+            rest,
+            vec![
+                "status".to_string(),
+                "--addr".to_string(),
+                "10.0.0.2:9000".to_string()
+            ]
+        );
+    }
+
+    /// parse_flags 等号形式：键归一为 `--flag`，与空格形式等效取值。
+    #[test]
+    fn parse_flags_supports_eq_form() {
+        let args = vec![
+            "--addr=10.1.2.3:40000".to_string(),
+            "--config".to_string(),
+            "/tmp/x.yaml".to_string(),
+        ];
+        let flags = parse_flags(&args);
+        assert_eq!(
+            flags.get("--addr").and_then(|v| v.as_deref()),
+            Some("10.1.2.3:40000")
+        );
+        assert_eq!(
+            flags.get("--config").and_then(|v| v.as_deref()),
+            Some("/tmp/x.yaml")
+        );
     }
 
     #[test]
