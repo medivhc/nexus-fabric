@@ -24,7 +24,7 @@ fn network_toml_good() -> String {
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"10.200.0.1\"\n\
-         mtu = 1200\n\
+         mtu = 1162\n\
          [[vpi.routes]]\n\
          subnet = \"10.200.0.0/24\"\n\
          peer = \"{peer_hex}\"\n"

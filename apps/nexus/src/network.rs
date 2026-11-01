@@ -908,7 +908,7 @@ mod tests {
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n",
+             mtu = 1162\n",
             hex32(&client.peer_id().0),
             hex32(&server.peer_id().0),
         );
@@ -1061,7 +1061,7 @@ mod tests {
     fn discovery_network_toml(peers: &str) -> String {
         format!(
             "peer_id = \"{}\"\n{peers}\
-             [vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1200\n",
+             [vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1162\n",
             "aa".repeat(32),
         )
     }

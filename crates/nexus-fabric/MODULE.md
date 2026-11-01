@@ -44,7 +44,10 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - S2: 连接身份 = (PeerId, ConnectionId)，不含 IP/端口。
 - S3: 漫游不丢数据：地址变更后未确认数据在新路径重传；流不断、不重不漏。
 - S4: 可靠流 = 有序完整交付；`finish` 后对端读到 EOF。
-- S5: 数据报 = 尽力而为，可丢失乱序；单包上限 1200 字节（PMTUD 前）。
+- S5: 数据报 = 尽力而为，可丢失乱序；单包载荷上限由 `FabricConn::datagram_cap()`
+  （quinn `datagrams().max_size()`）给出；本仓库装配下为 1162
+  （1200 初始 MTU − 29 QUIC 1RTT 开销 − 9 DATAGRAM 帧上界），保守下限常量为
+  `CONSERVATIVE_DATAGRAM_CAP`。
 - S6: 路径迁移需 challenge/response 验证，防地址欺骗。
 - S7: 显式关闭语义；关闭后新流拒绝。
 - S8: 统计诚实：无样本时标记 unknown，不编造 0。
@@ -89,8 +92,10 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 
 见 `src/lib.rs`：
 - `PeerId([u8; 32])`、`ConnectionId(u64)`、`ConnConfig`、`FabricConn`、`FabricListener`
-- `SendStream` / `RecvStream`、`ConnStats{rtt_ms, loss_rate, jitter_ms, throughput_bps, active_path, bytes_sent, bytes_recv}`（Option 语义，S8）
-- `FabricError{HandshakeFailed, PathUnreachable, Closed(u32), Timeout, Transport}`
+- `SendStream` / `RecvStream`、`ConnStats{rtt_ms, loss_rate, jitter_ms, throughput_bps, active_path, bytes_sent, bytes_recv, datagram_rejected, datagram_dropped, datagram_dropped_too_large, datagram_dropped_unsupported, datagram_evicted}`（Option 语义，S8）
+- `FabricError{HandshakeFailed, PathUnreachable, Closed(u32), Timeout, DatagramTooLarge{len,cap}, Transport}`
+- `FabricConn::datagram_cap() -> Option<usize>`：连接级有效 datagram 载荷上限
+  （`None` = 未协商/已关闭，调用方退到 `CONSERVATIVE_DATAGRAM_CAP`）。
 
 冻结语义（`scenarios/product/fabric_conn_basic.toml`、`fabric_conn_roam.toml`）：
 - 建连必须完成对端 `PeerId` 认证；认证失败不得建连。
@@ -126,8 +131,9 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - **Q2**（新增 API，纯增量、非破坏）：`send_datagram_seqed(&self, data: &[u8])
   -> Result<u64, FabricError>`：分配序号 `s`（分配后计数器 `wrapping_add(1)`），
   将 `s` 以 8 字节大端序 prepend 到载荷头部后经 QUIC datagram 发送；返回 `s`。
-  载荷长度限制：`data.len() <= 1192`（1200 上限减 8 字节序号头），超限返回
-  `FabricError::Transport`。
+  载荷长度限制：`data.len() <= datagram_cap − 8`（下限
+  `MAX_SEQED_PAYLOAD_FLOOR = 1154`），超限返回
+  `FabricError::DatagramTooLarge{len, cap}`，**不消耗序号**。
 - **Q3**（新增 API，纯增量、非破坏）：`recv_datagram_seqed(&self)
   -> Result<(u64, Vec<u8>), FabricError>`：收到的 datagram 若长度 `< 8`，
   返回 `FabricError::Transport("datagram too short for seq header")`；否则剥离
@@ -163,7 +169,9 @@ cargo clippy -p nexus-fabric --all-targets -- -D warnings
 ## Observability
 
 `ConnStats` 为稳定结构化字段；关联字段：`connection_id`、`peer_id`、`path_id`
-（见 AGENTS.md §22）。Hot path 禁止 per-packet log。
+（见 AGENTS.md §22）。Hot path 禁止 per-packet log：datagram 发送/逐出只计数
+（`ConnStats.datagram_*`），丢弃日志按连接 10s 限频（`DgramDropLog`，时间由
+driver loop 注入，协议 core 不读时钟）。
 
 ## Recovery Semantics
 

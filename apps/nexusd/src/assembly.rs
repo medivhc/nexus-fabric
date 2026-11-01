@@ -802,7 +802,7 @@ mod tests {
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n\
+             mtu = 1162\n\
              [[vpi.routes]]\n\
              subnet = \"10.200.0.0/24\"\n\
              peer = \"{peer_hex}\"\n"
@@ -829,7 +829,7 @@ mod tests {
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
              address6 = \"fd00:144::1\"\n\
-             mtu = 1200\n\
+             mtu = 1162\n\
              [[vpi.routes]]\n\
              subnet = \"10.200.0.0/24\"\n\
              peer = \"{peer_hex}\"\n\
@@ -862,7 +862,7 @@ mod tests {
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
              address6 = \"fd00:144::1\"\n\
-             mtu = 1200\n\
+             mtu = 1162\n\
              [[vpi.routes6]]\n\
              subnet = \"fd00:144::/64\"\n\
              peer = \"{peer_hex}\"\n"

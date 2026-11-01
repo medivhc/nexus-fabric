@@ -105,7 +105,7 @@ fn write_config(
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n",
+             mtu = 1162\n",
             hex32(&server.peer_id().0),
             hex32(&allowed.peer_id().0),
         ),

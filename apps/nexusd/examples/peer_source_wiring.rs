@@ -231,7 +231,7 @@ fn run() -> serde_json::Value {
 
     // 1. Real assembly: network.toml with peer_id + [vpi] only (no [[peers]]).
     let network_toml = format!(
-        "peer_id = \"{self_hex}\"\n[vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1200\n"
+        "peer_id = \"{self_hex}\"\n[vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1162\n"
     );
     let (_config, sessions, hub) = nexus::network::build_session_manager_with_discovery(
         &network_toml,

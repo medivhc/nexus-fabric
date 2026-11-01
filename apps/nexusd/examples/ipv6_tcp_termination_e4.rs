@@ -119,7 +119,7 @@ fn network_toml(routes6: &[&str]) -> String {
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"10.144.144.1\"\n\
-         mtu = 1200\n\
+         mtu = 1162\n\
          address6 = \"fd00:144::1\"\n\
          [[vpi.routes]]\n\
          subnet = \"10.144.144.0/24\"\n\
