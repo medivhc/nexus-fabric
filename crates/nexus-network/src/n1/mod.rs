@@ -25,9 +25,16 @@ use std::ops::{Deref, DerefMut};
 /// N1 datagram 有效载荷上限的**可证下限**（= quinn 在本仓库装配下的
 /// `datagrams().max_size()`）。
 ///
-/// `1162 = 1200 (quinn INITIAL_MTU，fabric `allow_mtud=false` ⇒ current_mtu
-/// 恒 1200) − 29 (1 flags + 8 dst-CID + 4 PN 上界 + 16 AEAD tag) − 9
-/// (DATAGRAM 帧 type 1B + length varint 8B)`。
+/// `1162 = 1200 (quinn INITIAL_MTU) − 29 (1 flags + 8 dst-CID + 4 PN 上界 +
+/// 16 AEAD tag) − 9 (DATAGRAM 帧 type 1B + length varint 8B)`。
+///
+/// 上限停在 1200 是因为组合根装配的 fabric driver 建 quinn 端点时把 MTU
+/// 发现开关（`Endpoint::new` 第 3 实参 `allow_mtud`）传成 `false`
+/// （fabric `src/driver.rs` `spawn_mode`）；vendored quinn 据此把
+/// `MtuDiscovery` 置为 disabled（`connection/paths.rs:86-99`、
+/// `connection/mtud.rs:46-49`）。诊断窗 ≥30 分钟阈值恒 1162 与此一致。
+/// 残余未定项：将来打开该开关后探针在本路径能否安全抬升上限未验证；
+/// 无论是否抬升，本值都是下限。
 ///
 /// portable core 不能依赖 `nexus-fabric`，故此处复制同一数值；两边的对账测试
 /// `floor_constants_agree` 在组合根 `apps/nexusd`（唯一同时依赖两者的 crate）。

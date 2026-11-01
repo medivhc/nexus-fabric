@@ -46,16 +46,30 @@ pub const SEQ_HEADER_LEN: usize = 8;
 /// 有效 datagram 载荷上限的**保守下限**（= quinn 在本仓库装配下的
 /// `datagrams().max_size()`）。
 ///
-/// `1162 = 1200 (quinn INITIAL_MTU，且本仓库 allow_mtud=false ⇒ current_mtu
-/// 恒 1200) − 29 (1 flags + 8 dst-CID + 4 PN 上界 + 16 AEAD tag) − 9
-/// (DATAGRAM 帧 type 1B + length varint 8B)`。
+/// `1162 = 1200 (quinn INITIAL_MTU) − 29 (1 flags + 8 dst-CID + 4 PN 上界 +
+/// 16 AEAD tag) − 9 (DATAGRAM 帧 type 1B + length varint 8B)`。
+///
+/// `current_mtu` 固定为 1200 的原因在**端点开关**，不在 `TransportConfig`：
+/// driver 建端点时 `Endpoint::new(..., allow_mtud = false, ...)`（`src/driver.rs`
+/// `spawn_mode`，第 3 个实参），vendored quinn 在 `connection/paths.rs:86-99`
+/// 用该标志过滤 `mtu_discovery_config`，false 时落
+/// `MtuDiscovery::disabled`（`connection/mtud.rs:46-49`）。因此
+/// `TransportConfig::default()` 默认的 `mtu_discovery_config: Some(..)`
+/// （`config/transport.rs:386`）不会发出探针；`min_mtu` 默认同为 1200，
+/// 黑洞恢复只能把 `current_mtu` 压到 1200，不会更低。
+///
+/// MTU 发现现状（2026-11-01 定案）：本装配下探针**构造即禁用、不会发出**；
+/// 诊断窗连接存活 ≥30 分钟、阈值恒 1162，与该结论一致。残余未定项：若将来
+/// 打开该开关，探针在本路径（含 TURN 中继）能否安全抬升上限未验证——但
+/// 1162 仍成立为下限（各消费点按连接级 live `max_size()` 工作）。
 ///
 /// 推导与对账测试见 `tests/datagram_cap.rs::effective_cap_matches_quinn` 与
 /// `src/lib.rs` 单测 `conservative_cap_formula`。
 ///
 /// 前提（破坏任一条都要重算并跑对账测试）：
 ///   1) 两端都是本仓库 nexus-fabric（CID 长 8）；
-///   2) driver 继续 `allow_mtud = false` / quinn `INITIAL_MTU` 不变；
+///   2) driver 继续以 `allow_mtud = false` 建端点，且 quinn `INITIAL_MTU` /
+///      默认 `min_mtu` 不变；
 ///   3) `quic_transport_config()` 的 `datagram_receive_buffer_size` 不降到
 ///      `< 1171`（否则 peer 上限 binding，1162 不再是下限）。
 pub const CONSERVATIVE_DATAGRAM_CAP: usize = 1162;

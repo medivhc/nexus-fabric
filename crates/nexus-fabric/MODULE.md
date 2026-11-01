@@ -47,7 +47,10 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - S5: 数据报 = 尽力而为，可丢失乱序；单包载荷上限由 `FabricConn::datagram_cap()`
   （quinn `datagrams().max_size()`）给出；本仓库装配下为 1162
   （1200 初始 MTU − 29 QUIC 1RTT 开销 − 9 DATAGRAM 帧上界），保守下限常量为
-  `CONSERVATIVE_DATAGRAM_CAP`。
+  `CONSERVATIVE_DATAGRAM_CAP`。1200 的来由是 driver 建 `Endpoint` 时
+  `allow_mtud=false`（`src/driver.rs` `spawn_mode`），quinn 因此禁用 MTU
+  发现（`connection/paths.rs` 以该标志过滤 `mtu_discovery_config`）；若将来
+  启用发现，1162 仍只是下限，消费点须继续用连接级真值。
 - S6: 路径迁移需 challenge/response 验证，防地址欺骗。
 - S7: 显式关闭语义；关闭后新流拒绝。
 - S8: 统计诚实：无样本时标记 unknown，不编造 0。
