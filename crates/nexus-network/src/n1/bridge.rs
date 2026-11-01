@@ -194,7 +194,8 @@ mod tests {
 
     impl N1Connection for FakeConn {
         fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-            if data.len() > 1200 {
+            // 与生产契约同口径：有效载荷下限（真值由连接的 datagram_cap 给出）。
+            if data.len() > super::super::DATAGRAM_PAYLOAD_FLOOR {
                 return Err(N1Error::OversizeDatagram(data.len()));
             }
             self.sent.lock().unwrap().push(data.to_vec());

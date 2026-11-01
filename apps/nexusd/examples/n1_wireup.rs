@@ -78,8 +78,8 @@ impl N1Sender for MockN1Sender {
         if self.fail_send {
             return Err(N1Error::PeerUnknown);
         }
-        // 1200B datagram 限制（对标 N1Connection）。
-        if packet.len() > 1200 {
+        // N1 datagram 有效载荷下限（与 N1Connection 契约同口径）。
+        if packet.len() > nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR {
             return Err(N1Error::OversizeDatagram(packet.len()));
         }
         self.sent.lock().unwrap().push((dst, packet.to_vec()));
