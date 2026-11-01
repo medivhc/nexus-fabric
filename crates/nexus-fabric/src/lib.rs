@@ -23,6 +23,7 @@ pub mod transport;
 use crate::cert::Identity;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -41,9 +42,28 @@ pub use transport::{StdUdpTransport, UdpTransport};
 /// QSEQ (GAP-2): length of the big-endian sequence header prepended by
 /// `send_datagram_seqed`.
 pub const SEQ_HEADER_LEN: usize = 8;
-/// QSEQ (GAP-2): max user payload for `send_datagram_seqed`
-/// (1200-byte datagram cap minus the 8-byte header).
-pub const MAX_SEQED_PAYLOAD: usize = 1192;
+
+/// 有效 datagram 载荷上限的**保守下限**（= quinn 在本仓库装配下的
+/// `datagrams().max_size()`）。
+///
+/// `1162 = 1200 (quinn INITIAL_MTU，且本仓库 allow_mtud=false ⇒ current_mtu
+/// 恒 1200) − 29 (1 flags + 8 dst-CID + 4 PN 上界 + 16 AEAD tag) − 9
+/// (DATAGRAM 帧 type 1B + length varint 8B)`。
+///
+/// 推导与对账测试见 `tests/datagram_cap.rs::effective_cap_matches_quinn` 与
+/// `src/lib.rs` 单测 `conservative_cap_formula`。
+///
+/// 前提（破坏任一条都要重算并跑对账测试）：
+///   1) 两端都是本仓库 nexus-fabric（CID 长 8）；
+///   2) driver 继续 `allow_mtud = false` / quinn `INITIAL_MTU` 不变；
+///   3) `quic_transport_config()` 的 `datagram_receive_buffer_size` 不降到
+///      `< 1171`（否则 peer 上限 binding，1162 不再是下限）。
+pub const CONSERVATIVE_DATAGRAM_CAP: usize = 1162;
+
+/// QSEQ (GAP-2): `send_datagram_seqed` 的用户载荷下限（`CONSERVATIVE_DATAGRAM_CAP`
+/// 减去 8 字节序号头）。连接级真值由 `FabricConn::datagram_cap()` 给出；
+/// 未协商时退到本下限。
+pub const MAX_SEQED_PAYLOAD_FLOOR: usize = CONSERVATIVE_DATAGRAM_CAP - SEQ_HEADER_LEN;
 
 /// Node identity: ed25519 public key (cf. iroh's EndpointId).
 ///
@@ -211,12 +231,20 @@ impl FabricConn {
         }
     }
 
-    /// Send an unreliable datagram (best-effort, S5). Max 1200 bytes pre-PMTUD.
+    /// Send an unreliable datagram (best-effort, S5).
+    ///
+    /// `data.len()` must be `<=` the connection's effective datagram payload cap
+    /// ([`FabricConn::datagram_cap`]; 1162 under this repository's assembly).
+    ///
+    /// 这里是**缓存快路径预检**：未协商完成时（`datagram_cap() == None`）放行，
+    /// 由 driver 线程在 `cmd_send_datagram` 里用 `quinn::datagrams().max_size()`
+    /// 做权威判定并返回同一 typed error。两条路径共用
+    /// `ConnShared::reject_datagram_too_large`，计数不重不漏。
     pub fn send_datagram(&self, data: &[u8]) -> Result<(), FabricError> {
-        if data.len() > 1200 {
-            return Err(FabricError::Transport(
-                "datagram too large (S5: 1200 byte cap)".into(),
-            ));
+        if let Some(cap) = self.datagram_cap() {
+            if data.len() > cap {
+                return Err(self.inner.reject_datagram_too_large(data.len(), cap));
+            }
         }
         let (tx, rx) = mpsc::channel();
         self.inner
@@ -241,22 +269,27 @@ impl FabricConn {
     /// renumbering — see MODULE.md QSEQ). It is a per-connection datagram
     /// identity sequence assigned at the QUIC send boundary.
     ///
-    /// `data.len()` must be `<= 1192` (1200 cap minus 8-byte header).
+    /// `data.len()` must be `<=` the connection's effective datagram cap minus
+    /// the 8-byte header (`datagram_cap − 8`; floor
+    /// [`MAX_SEQED_PAYLOAD_FLOOR`]). 超限返回
+    /// `FabricError::DatagramTooLarge { len, cap: limit }`，**不消耗序号**。
     pub fn send_datagram_seqed(&self, data: &[u8]) -> Result<u64, FabricError> {
-        if data.len() > MAX_SEQED_PAYLOAD {
-            return Err(FabricError::Transport(
-                "seqed datagram too large (1192 byte cap after 8-byte seq header)".into(),
-            ));
+        let limit = self
+            .datagram_cap()
+            .map(|cap| cap.saturating_sub(SEQ_HEADER_LEN))
+            .unwrap_or(MAX_SEQED_PAYLOAD_FLOOR);
+        if data.len() > limit {
+            return Err(self.inner.reject_datagram_too_large(data.len(), limit));
         }
         // Q4: fetch_add is atomic; the header is prepended and handed to the
         // driver in the same call, so there is no "assigned but not sent" window
         // visible to the caller. (Transmission order may still differ from
         // assignment order under concurrency; the receiver's ReorderBuffer
         // handles out-of-order delivery — that is its job.)
-        let seq = self
-            .inner
-            .datagram_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        //
+        // 顺序不能反：先判上限再取号，超限不得烧序号（否则接收端重排缓冲
+        // 出现真空号）。
+        let seq = self.inner.datagram_seq.fetch_add(1, Ordering::SeqCst);
         let mut buf = Vec::with_capacity(SEQ_HEADER_LEN + data.len());
         buf.extend_from_slice(&seq.to_be_bytes());
         buf.extend_from_slice(data);
@@ -321,6 +354,20 @@ impl FabricConn {
             .map_err(|_| FabricError::Closed(0))?;
         rx.recv().map_err(|_| FabricError::Closed(0))??;
         Ok(())
+    }
+
+    /// 当前连接的**真实有效 datagram 载荷上限**（载荷口径，不含 QUIC 包头与
+    /// DATAGRAM 帧头；等价于 quinn `datagrams().max_size()`）。
+    ///
+    /// - `Some(n)`：连接已协商，`n` 为驱动线程上次采样值（每次 pump 刷新）；
+    /// - `None`：握手未完成（对端 transport params 未知）、连接已关闭，或对端
+    ///   未通告 `max_datagram_frame_size`。调用方必须退到
+    ///   [`CONSERVATIVE_DATAGRAM_CAP`]（可证下限）。
+    ///
+    /// 语义：`send_datagram(data)` 要求 `data.len() <= n`。**不是** UDP/QUIC 线长。
+    /// 非阻塞、无 driver 往返（一次 atomic load + 一次 state 锁）。
+    pub fn datagram_cap(&self) -> Option<usize> {
+        self.inner.datagram_cap()
     }
 
     /// Measured connection statistics (S8: honest, unknown marked as such).
@@ -568,6 +615,17 @@ pub struct ConnStats {
     pub active_path: Option<SocketAddr>,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
+    /// 入队前被有效 datagram 上限拒绝的次数（API 快路径 + driver 权威判定）。
+    pub datagram_rejected: u64,
+    /// flush 期丢弃的 datagram 总数（`too_large + unsupported`）。
+    pub datagram_dropped: u64,
+    /// 子集：flush 期 `SendDatagramError::TooLarge`。
+    pub datagram_dropped_too_large: u64,
+    /// 子集：flush 期 `Disabled | UnsupportedByPeer`。
+    pub datagram_dropped_unsupported: u64,
+    /// 发送缓冲不足、本次 `send` 迫使 quinn 逐出旧 datagram 的次数
+    /// （近似语义：计"迫使逐出的 send 次数"，不是被逐出的条数）。
+    pub datagram_evicted: u64,
 }
 
 impl ConnStats {
@@ -580,6 +638,11 @@ impl ConnStats {
             active_path: None,
             bytes_sent: 0,
             bytes_recv: 0,
+            datagram_rejected: 0,
+            datagram_dropped: 0,
+            datagram_dropped_too_large: 0,
+            datagram_dropped_unsupported: 0,
+            datagram_evicted: 0,
         }
     }
 }
@@ -595,6 +658,11 @@ pub enum FabricError {
     /// Peer closed the connection with the given code.
     Closed(u32),
     Timeout,
+    /// Datagram 载荷超过连接的有效上限（永久失败：不要重试）。
+    DatagramTooLarge {
+        len: usize,
+        cap: usize,
+    },
     /// Internal transport error (includes "not implemented" during contract stage).
     Transport(String),
 }
@@ -606,6 +674,9 @@ impl fmt::Display for FabricError {
             FabricError::PathUnreachable => write!(f, "path unreachable"),
             FabricError::Closed(c) => write!(f, "closed by peer (code {c})"),
             FabricError::Timeout => write!(f, "timeout"),
+            FabricError::DatagramTooLarge { len, cap } => {
+                write!(f, "datagram too large: {len} bytes > {cap}")
+            }
             FabricError::Transport(s) => write!(f, "transport error: {s}"),
         }
     }
@@ -632,6 +703,16 @@ mod tests {
     fn peer_id_debug_is_short() {
         let s = format!("{:?}", PeerId([0xabu8; 32]));
         assert!(s.starts_with("PeerId(abababab"));
+    }
+
+    /// 有效盖公式对账（字面分解；改任一项都必须让本测试先红）。
+    ///
+    /// 1162 = INITIAL_MTU 1200 − (1 flags + 8 dst-CID + 4 PN 上界 + 16 AEAD tag)
+    ///        − 9 DATAGRAM frame bound。
+    #[test]
+    fn conservative_cap_formula() {
+        assert_eq!(CONSERVATIVE_DATAGRAM_CAP, 1200 - (1 + 8 + 4 + 16) - 9);
+        assert_eq!(MAX_SEQED_PAYLOAD_FLOOR, 1162 - 8);
     }
 
     #[test]

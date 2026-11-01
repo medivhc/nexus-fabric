@@ -10,7 +10,7 @@
 //! - 1162B 可以发出并被对端收到；
 //! - 1163B 返回 `DatagramTooLarge{len, cap}` 且对端只收到后续 marker。
 
-use nexus_fabric::{ConnConfig, FabricConn, FabricError, FabricIdentity, FabricListener};
+use nexus_fabric::{ConnConfig, FabricConn, FabricIdentity, FabricListener};
 use std::time::Duration;
 
 fn identity(seed: u8) -> FabricIdentity {

@@ -15,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread::{self, JoinHandle};
@@ -113,6 +113,13 @@ pub struct ConnShared {
     /// `send_datagram_seqed`. Monotonic `u64`, wraps via `fetch_add`.
     /// `send_datagram` (non-seqed) does not touch this counter (Q1).
     pub datagram_seq: AtomicU64,
+    /// 有效 datagram 载荷上限采样值（quinn `datagrams().max_size()`）。
+    /// `0` = 未知（握手未完成 / 连接已关闭 / 对端不支持 DATAGRAM）。
+    /// 驱动线程每次 pump 刷新；API 侧只读。
+    pub datagram_cap: AtomicUsize,
+    /// 入队前被有效 datagram 上限拒绝的次数（API 快路径 + driver 权威判定，
+    /// 共用 [`ConnShared::reject_datagram_too_large`]，合计只计一次）。
+    pub datagram_rejected: AtomicU64,
     /// F-EDGE-3: serializes concurrent `rebind()` calls on this connection.
     /// The driver loop is single-threaded so `Cmd::Rebind` execution is already
     /// sequential, but that is incidental to the current implementation, not an
@@ -158,8 +165,29 @@ impl ConnShared {
             dgram_cv: Condvar::new(),
             stats: Mutex::new(ConnStats::unknown()),
             datagram_seq: AtomicU64::new(0),
+            datagram_cap: AtomicUsize::new(0),
+            datagram_rejected: AtomicU64::new(0),
             rebind_lock: Mutex::new(()),
         }
+    }
+
+    /// 当前连接的有效 datagram 载荷上限（同 `FabricConn::datagram_cap`）。
+    ///
+    /// `Arc<ConnShared>` 消费者（如 `nexus-nat-quality`）可直接查询；`None`
+    /// 表示未知/已关闭，调用方退到 `CONSERVATIVE_DATAGRAM_CAP`。
+    pub fn datagram_cap(&self) -> Option<usize> {
+        if self.state.lock().unwrap().closed.is_some() {
+            return None;
+        }
+        let cap = self.datagram_cap.load(Ordering::Relaxed);
+        (cap != 0).then_some(cap)
+    }
+
+    /// 统一的"入队前拒绝"构造器：计数一次并返回 typed error
+    /// （保证 API 快路径与 driver 权威判定不重不漏）。
+    pub(crate) fn reject_datagram_too_large(&self, len: usize, cap: usize) -> FabricError {
+        self.datagram_rejected.fetch_add(1, Ordering::Relaxed);
+        FabricError::DatagramTooLarge { len, cap }
     }
 
     /// Open a bidirectional stream on this connection (C2 sync transport).
