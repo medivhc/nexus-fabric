@@ -329,6 +329,76 @@ fn n1_send_failure_line(dst: IpAddr, kind: &str, len: usize) -> String {
     format!("[nat-chunk] n1 send failed dst={dst} kind={kind} len={len}")
 }
 
+/// STREAM 帧头长度（`stream_id: u32 BE ‖ flags: u8`）。
+const STREAM_FRAME_HEADER_LEN: usize = 5;
+
+/// 拿不到连接级数值时的可证下限（= quinn `datagrams().max_size()` 在本仓库
+/// 装配下的值；推导见 `nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR`）。
+const DATAGRAM_PAYLOAD_FALLBACK: usize = nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR;
+
+/// 连接级 datagram 载荷上限；未知（握手未完成/已关闭）时退到可证下限。
+fn conn_datagram_cap(conn: &std::sync::Arc<dyn N1Connection>) -> usize {
+    conn.datagram_cap().unwrap_or(DATAGRAM_PAYLOAD_FALLBACK)
+}
+
+/// Mesh DATA 的发送结果（B-2 判据面）。
+///
+/// `DeliveredDirect` 与 `Lost` 在旧 `bool` 返回值里都是 `false`——前者含义是
+/// 「未交给 N1（direct 已交付）」，后者才是「字节确已丢失」。断流动作只允许
+/// 挂在 `Lost` 上，否则 direct 成功会被误判为失败而杀掉活流。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshSendOutcome {
+    /// 已交给 N1 并发送成功。
+    Delivered,
+    /// 已由 direct chunk 路径交付（不经 N1）。
+    DeliveredDirect,
+    /// 字节确已丢失（N1 发送失败或 direct 尝试失败）。
+    Lost,
+}
+
+/// 发送一个 STREAM 帧；超限的纯 DATA 帧在发送侧切片后逐片顺序发出。
+///
+/// 接收侧对 DATA 的唯一语义是「按到达序追加到该流的字节流」，因此同
+/// `stream_id`/`flags` 的连续切片与未切分整帧逐字节等价（帧头无 offset/seq）。
+///
+/// 规则：
+/// - `frame.len() <= datagram_cap` → 原样发送一次；
+/// - 超限且 `flags == 0`（纯 DATA）→ 每片载荷 ≤ `datagram_cap − 5`，顺序发送；
+///   任一片失败即返回该错误（已发出的前片使流出现空洞，由调用方的断流处理接管）；
+/// - 超限但 `flags != 0`（控制帧）或解码失败 → 原样发送，由 fabric 返回
+///   `DatagramTooLarge`（会被计数并可见，不静默切坏控制帧）。
+fn send_stream_frame_fragmented(
+    frame: &[u8],
+    datagram_cap: usize,
+    mut send: impl FnMut(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
+) -> Result<(), nexus_network::n1::N1Error> {
+    if frame.len() <= datagram_cap {
+        return send(frame);
+    }
+    let Some((stream_id, flags, payload)) = decode_stream_frame(frame) else {
+        return send(frame);
+    };
+    if flags != 0 {
+        return send(frame);
+    }
+    let payload_cap = datagram_cap
+        .checked_sub(STREAM_FRAME_HEADER_LEN)
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| {
+            nexus_network::n1::N1Error::Transport(format!(
+                "datagram cap {datagram_cap} too small for a STREAM frame"
+            ))
+        })?;
+    let mut off = 0;
+    while off < payload.len() {
+        let end = (off + payload_cap).min(payload.len());
+        let piece = encode_stream_frame(stream_id, flags, &payload[off..end]);
+        send(&piece)?;
+        off = end;
+    }
+    Ok(())
+}
+
 /// TPROXY 跨线程消息（spec §9.14）。
 #[derive(Debug)]
 pub enum TransparentInbound {
@@ -1021,7 +1091,9 @@ impl Dataplane {
     fn send_egress_reply(&mut self, peer_hex: &str, frame: &[u8]) {
         match self.n1_peer_conns.get(peer_hex).cloned() {
             Some(conn) => {
-                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f));
+                self.send_reply_over_n1(peer_hex, frame, conn_datagram_cap(&conn), |f| {
+                    conn.send_datagram(f)
+                });
             }
             None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
         }
@@ -1087,7 +1159,9 @@ impl Dataplane {
     fn send_reply(&mut self, sink: &ReplySink, peer_hex: &str, frame: &[u8]) {
         match sink {
             ReplySink::N1(conn) => {
-                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+                self.send_reply_over_n1(peer_hex, frame, conn_datagram_cap(conn), |f| {
+                    conn.send_datagram(f)
+                });
             }
             ReplySink::Direct(peer) => {
                 let chunk = {
@@ -1103,7 +1177,12 @@ impl Dataplane {
                     let conn = self.n1_peer_conns.get(peer_hex).cloned();
                     match conn {
                         Some(conn) => {
-                            self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+                            self.send_reply_over_n1(
+                                peer_hex,
+                                frame,
+                                conn_datagram_cap(&conn),
+                                |f| conn.send_datagram(f),
+                            );
                         }
                         None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
                     }
@@ -1112,9 +1191,14 @@ impl Dataplane {
                 let conn = self.n1_peer_conns.get(peer_hex).cloned();
                 let fallback = |_chunk: &[u8]| -> io::Result<()> {
                     match &conn {
-                        Some(conn) => conn
-                            .send_datagram(frame)
-                            .map_err(|e| io::Error::other(format!("n1 send failed: {e}"))),
+                        // chunk 本体不切分（direct 路径逐字节不变）；这条
+                        // fallback 走的是 N1 datagram，与正向/`N1` sink 同根，
+                        // 必须共用切分助手。
+                        Some(conn) => {
+                            let cap = conn_datagram_cap(conn);
+                            send_stream_frame_fragmented(frame, cap, |f| conn.send_datagram(f))
+                                .map_err(|e| io::Error::other(format!("n1 send failed: {e}")))
+                        }
                         None => Err(io::Error::new(
                             io::ErrorKind::NotConnected,
                             "n1 fallback conn missing",
@@ -1141,9 +1225,13 @@ impl Dataplane {
         &mut self,
         peer_hex: &str,
         frame: &[u8],
+        datagram_cap: usize,
         send: impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
     ) {
-        match send(frame) {
+        // Q-1（回程同根）：egress→originator 方向的 DATA 帧同样受连接有效
+        // datagram 上限约束（`TcpRelay::poll` 的 8192B 读缓冲可达 8197B 帧）。
+        // 与正向共用同一分片助手；`record_tx` 仍按逻辑帧计数一次。
+        match send_stream_frame_fragmented(frame, datagram_cap, send) {
             Ok(()) => self.n1_stats.record_tx(frame.len(), true),
             Err(e) => {
                 self.record_tx_error(peer_hex, frame, &format!("{e:?}"));
@@ -2985,8 +3073,22 @@ impl Dataplane {
                 // SYN/FIN/RST 仍由 `dispatch_tcp_events` 直接走 N1（不是 chunk）。
                 let frame = encode_stream_frame(stream_id, 0x00, bytes);
                 let n = bytes.len() as u64;
-                if self.send_mesh_data_frame(info.dst.ip(), &frame) {
-                    self.with_stats(|s| s.mesh_tcp_bytes += n);
+                match self.send_mesh_data_frame(info.dst.ip(), &frame) {
+                    MeshSendOutcome::Delivered => {
+                        self.with_stats(|s| s.mesh_tcp_bytes += n);
+                    }
+                    // direct 成功 = 字节已从 direct conn 交付，不经 N1 计数。
+                    MeshSendOutcome::DeliveredDirect => {}
+                    // B-2：字节确已丢失（不是 direct 成功那种「未交给 N1」），
+                    // 立即在本地终止该流，让应用看到 RST 而不是伪装成正常 EOF。
+                    MeshSendOutcome::Lost => {
+                        self.abort_mesh_stream(
+                            stream_id,
+                            info.dst.ip(),
+                            "data_send_lost",
+                            frame.len(),
+                        );
+                    }
                 }
             }
             Some(_) => {
@@ -3000,14 +3102,41 @@ impl Dataplane {
         }
     }
 
-    /// Mesh DATA dispatch (P0). Returns `true` iff the frame was handed to N1
-    /// successfully.
+    /// B-2：本地终止一条 mesh 流并向 TUN 侧注入 RST（应用立即可见，非 EOF）。
+    ///
+    /// 复用入向 RST 帧到达时的同一条机制路径：`handle_fabric_rst` 摘除终结器
+    /// 连接、`abort()` smoltcp socket 并返回应写回 TUN 的段。dataplane 侧流表
+    /// 与 Phase B 会话映射同步清理（与 `dispatch_tcp_events` 的 Closed 臂同款）。
+    ///
+    /// 计数沿用 `send_mesh_tcp_frame` 已记的 `mesh_dropped_no_n1`；本函数只加
+    /// 一条 `[n1-send] stream aborted` 行（含 stream/dst/kind/len），不新增计数。
+    fn abort_mesh_stream(&mut self, stream_id: u32, dst: IpAddr, cause: &str, frame_len: usize) {
+        let tun_pkts = self.tcp.handle_fabric_rst(stream_id);
+        self.tcp_streams.remove(&stream_id);
+        if let Some(session_id) = self.flow_tcp_streams.remove(&stream_id) {
+            let _ = session_id;
+            self.flow_key_to_stream.retain(|_, sid| *sid != stream_id);
+            self.flow_stream_to_key.remove(&stream_id);
+            self.flow_pending_data.remove(&stream_id);
+        }
+        eprintln!(
+            "[n1-send] stream aborted stream={stream_id} dst={dst} kind={cause} len={frame_len}"
+        );
+        self.write_tun_packets(tun_pkts);
+    }
+
+    /// Mesh DATA dispatch (P0). 返回三态 [`MeshSendOutcome`]：`Delivered`（经
+    /// N1 交付）/ `DeliveredDirect`（经 direct chunk 交付）/ `Lost`（字节确已
+    /// 丢失）。
+    ///
+    /// 三态是 B-2 的判据面：旧 `bool` 把「direct 成功」（`false`，含义是
+    /// 「未交给 N1」）与「发送失败」混在一起，直接用它触发 abort 会误杀活流。
     ///
     /// The fallback closure **ignores its argument** and sends the captured
     /// original `frame`: `send_chunk` passes the `KIND || FRAME` chunk, and
     /// forwarding that would inject a KIND byte into N1 (breaks the
     /// byte-for-byte invariant).
-    fn send_mesh_data_frame(&mut self, dst: IpAddr, frame: &[u8]) -> bool {
+    fn send_mesh_data_frame(&mut self, dst: IpAddr, frame: &[u8]) -> MeshSendOutcome {
         use crate::nat_chunk_stats::FallbackReason;
 
         // AC-H-1 `[P]` / spec §13.2: with no attached provider (no
@@ -3029,11 +3158,12 @@ impl Dataplane {
                 "[nat-chunk] fallback peer=- bytes={} reason=no_peer",
                 frame.len()
             );
-            if self.send_mesh_tcp_frame(dst, frame) {
-                return true;
-            }
-            stats.record_fallback_error(frame.len());
-            return false;
+            return if self.send_mesh_tcp_frame(dst, frame) {
+                MeshSendOutcome::Delivered
+            } else {
+                stats.record_fallback_error(frame.len());
+                MeshSendOutcome::Lost
+            };
         };
         let peer_name = crate::nat_consumer::peer_hex(&peer);
         let peer16 = &peer_name[..peer_name.len().min(16)];
@@ -3044,11 +3174,12 @@ impl Dataplane {
                 "[nat-chunk] fallback peer={peer16} bytes={} reason=no_path",
                 frame.len()
             );
-            if self.send_mesh_tcp_frame(dst, frame) {
-                return true;
-            }
-            stats.record_fallback_error(frame.len());
-            return false;
+            return if self.send_mesh_tcp_frame(dst, frame) {
+                MeshSendOutcome::Delivered
+            } else {
+                stats.record_fallback_error(frame.len());
+                MeshSendOutcome::Lost
+            };
         };
 
         let gate_open = self
@@ -3061,11 +3192,12 @@ impl Dataplane {
                 "[nat-chunk] fallback peer={peer16} bytes={} reason=quiet_gate",
                 frame.len()
             );
-            if self.send_mesh_tcp_frame(dst, frame) {
-                return true;
-            }
-            stats.record_fallback_error(frame.len());
-            return false;
+            return if self.send_mesh_tcp_frame(dst, frame) {
+                MeshSendOutcome::Delivered
+            } else {
+                stats.record_fallback_error(frame.len());
+                MeshSendOutcome::Lost
+            };
         }
 
         let mut chunk = Vec::with_capacity(1 + frame.len());
@@ -3093,7 +3225,7 @@ impl Dataplane {
                     "[nat-chunk] direct attempt peer={peer16} bytes={} result=ok",
                     chunk.len()
                 );
-                false
+                MeshSendOutcome::DeliveredDirect
             }
             Ok(crate::nat_switch::ChunkPath::Fallback) => {
                 stats.record_fallback(frame.len(), FallbackReason::NoDirect);
@@ -3101,7 +3233,7 @@ impl Dataplane {
                     "[nat-chunk] fallback peer={peer16} bytes={} reason=no_direct",
                     frame.len()
                 );
-                true
+                MeshSendOutcome::Delivered
             }
             Err(e) => {
                 if fallback_failed.get() {
@@ -3116,7 +3248,7 @@ impl Dataplane {
                     );
                     eprintln!("[nat-chunk] direct error peer={peer16} kind={:?}", e.kind());
                 }
-                false
+                MeshSendOutcome::Lost
             }
         }
     }
@@ -3155,6 +3287,11 @@ impl Dataplane {
         for stream_id in active_streams {
             if let Some(batches) = self.flow_pending_data.remove(&stream_id) {
                 for bytes in batches {
+                    // B-2：上一批已判定 Lost 并终止该流时，剩余批次不再转发
+                    // （否则只会走 `tcp_streams` 缺失的防御计数）。
+                    if !self.tcp_streams.contains_key(&stream_id) {
+                        break;
+                    }
                     self.forward_tcp_data(stream_id, &bytes);
                 }
             }
@@ -3475,7 +3612,18 @@ impl Dataplane {
                         // S4-Mesh：STREAM SYN 帧经 N1 发送（按原始目的路由）。
                         let payload = encode_syn_payload(&dst.ip().to_string(), dst.port());
                         let frame = encode_stream_frame(stream_id, STREAM_SYN, &payload);
-                        self.send_mesh_tcp_frame(dst.ip(), &frame);
+                        if !self.send_mesh_tcp_frame(dst.ip(), &frame) {
+                            // B-2：SYN 发不出去 = 建连不可能成功。本地立即终止
+                            // （应用 connect 立刻失败，不再挂到应用超时）；此时
+                            // 终结器连接已建（`lookup_id` 有绑定），`handle_fabric_rst`
+                            // 同时覆盖 flow-session Allocating 期。
+                            self.abort_mesh_stream(
+                                stream_id,
+                                dst.ip(),
+                                "syn_send_lost",
+                                frame.len(),
+                            );
+                        }
                     }
                 }
                 TcpEvent::Data {
@@ -3511,7 +3659,12 @@ impl Dataplane {
                             // S6-Mesh：STREAM FIN/RST 帧经 N1 发送。
                             let flag = if reset { STREAM_RST } else { STREAM_FIN };
                             let frame = encode_stream_frame(stream_id, flag, &[]);
-                            self.send_mesh_tcp_frame(info.dst.ip(), &frame);
+                            // B-2：FIN/RST 发送失败**只计数不动作**——本地连接
+                            // 已在拆除中、应用侧语义已终结，对已死流重复 abort
+                            // 只会引入竞态（`send_mesh_tcp_frame` 内已 +1 并发
+                            // C-3 行）。egress 回程 FIN/RST 因 conn 毒化发不出的
+                            // 形态，其应用可见性由对端 B-2 与会话层重建兜底。
+                            let _ = self.send_mesh_tcp_frame(info.dst.ip(), &frame);
                         }
                         // S6-Proxy：S4 已计流数，无额外动作。
                     }
@@ -3525,7 +3678,8 @@ impl Dataplane {
 
     /// S4/S5/S6-Mesh：STREAM 帧经 N1 发送；返回是否成功。
     ///
-    /// 成功 → `mesh_tcp_frames += 1`；失败（无 sender/无路由/发送错）→
+    /// 成功 → `mesh_tcp_frames += 1`（按**逻辑帧**计数：超限 DATA 帧的全部
+    /// 分片都发出才算 1 帧）；失败（无 sender/无路由/发送错）→
     /// `mesh_dropped_no_n1 += 1`（W1 语义复用）。
     ///
     /// C-3：失败分支同时记录 `N1Error` 种类（`[nat-chunk]` 既有风格）。
@@ -3535,22 +3689,30 @@ impl Dataplane {
     /// （严格 1:1），因此本函数是 `send_mesh_data_frame` 全部 fallback 失败
     /// 分支（NoPeer/NoPath/QuietGate/NoDirect）与 DATA/FIN/RST 发送失败的
     /// 唯一发射点。
+    ///
+    /// H2：超限 DATA 帧在此按连接级 `datagram_cap − 5` 切分
+    /// （[`send_stream_frame_fragmented`]），控制帧与 ≤cap 的帧原样发送。
     fn send_mesh_tcp_frame(&self, dst: IpAddr, frame: &[u8]) -> bool {
         match &self.n1_sender {
-            Some(sender) => match sender.send_to_mesh(dst, frame) {
-                Ok(()) => {
-                    self.with_stats(|s| s.mesh_tcp_frames += 1);
-                    true
+            Some(sender) => {
+                let cap = sender
+                    .datagram_cap_for(dst)
+                    .unwrap_or(DATAGRAM_PAYLOAD_FALLBACK);
+                match send_stream_frame_fragmented(frame, cap, |f| sender.send_to_mesh(dst, f)) {
+                    Ok(()) => {
+                        self.with_stats(|s| s.mesh_tcp_frames += 1);
+                        true
+                    }
+                    Err(error) => {
+                        self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                        eprintln!(
+                            "{}",
+                            n1_send_failure_line(dst, &format!("{error:?}"), frame.len())
+                        );
+                        false
+                    }
                 }
-                Err(error) => {
-                    self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
-                    eprintln!(
-                        "{}",
-                        n1_send_failure_line(dst, &format!("{error:?}"), frame.len())
-                    );
-                    false
-                }
-            },
+            }
             None => {
                 // 装配未注入 N1 sender：没有 `N1Error` 可记，用哨兵 kind。
                 self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
@@ -7657,6 +7819,7 @@ outbounds:
     struct RecordingProvider {
         chunks: Arc<Mutex<Vec<Vec<u8>>>>,
         direct: bool,
+        statuses: Vec<nexus_nat_wireup::PunchPeerStatus>,
     }
 
     impl NatPathProvider for RecordingProvider {
@@ -7678,7 +7841,7 @@ outbounds:
             }
         }
         fn peer_statuses(&self) -> Vec<nexus_nat_wireup::PunchPeerStatus> {
-            Vec::new()
+            self.statuses.clone()
         }
         fn path_active_switches(&self) -> u64 {
             0
@@ -7701,6 +7864,7 @@ outbounds:
         dp: &mut Dataplane,
         mock: &Arc<Mutex<nexus_projection::MockTun>>,
     ) -> u32 {
+        ensure_mesh_sender(dp);
         let syn = craft_tcp(
             [10, 200, 0, 2],
             [10, 200, 0, 5],
@@ -7927,6 +8091,7 @@ outbounds:
         slot.set(Arc::new(RecordingProvider {
             chunks: Arc::clone(&chunks),
             direct: true,
+            statuses: Vec::new(),
         }));
         dp.set_nat_path_slot(slot);
         let calls: RelayCalls = Arc::new(Mutex::new(Vec::new()));
@@ -8414,6 +8579,781 @@ outbounds:
         assert!(!dp.send_mesh_tcp_frame(dst, &encode_stream_frame(1, 0x00, b"x")));
         assert_eq!(dp.stats().mesh_dropped_no_n1, 1);
         assert_eq!(dp.stats().mesh_tcp_frames, 0);
+    }
+
+    /// 记录一次发送调用；`fail_at` 为 Some(i) 时第 i 次调用返回错误。
+    fn recording_send(
+        sent: &std::cell::RefCell<Vec<Vec<u8>>>,
+        fail_at: Option<usize>,
+    ) -> impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error> + '_ {
+        move |frame: &[u8]| {
+            let idx = sent.borrow().len();
+            sent.borrow_mut().push(frame.to_vec());
+            if Some(idx) == fail_at {
+                return Err(nexus_network::n1::N1Error::Transport(format!(
+                    "injected failure at piece {idx}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// H2 边界组（cap = quinn 真值 1162）：帧长 1162/1163/1200/8197/8202 的
+    /// DATA 帧 → 每片 ≤1162B、片数 = ceil(payload/1157)、按序拼回逐字节一致。
+    ///
+    /// 其中 frame 1162（1 片）与 frame 1163（2 片）就是本 run 的有效上限边界。
+    #[test]
+    fn stream_frame_fragmentation_boundaries() {
+        const CAP: usize = 1162;
+        // (payload 长度, 期望分片数)；帧长 = payload + 5B 头。
+        let cases: [(usize, usize); 5] = [
+            (1157, 1), // frame 1162 = cap
+            (1158, 2), // frame 1163 = cap + 1
+            (1195, 2), // frame 1200（旧名义上限）
+            (8192, 8), // frame 8197
+            (8197, 8), // frame 8202
+        ];
+        for (payload_len, expected_pieces) in cases {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+            let frame = encode_stream_frame(7, 0x00, &payload);
+            assert_eq!(frame.len(), payload_len + 5, "frame length sanity");
+            let sent = std::cell::RefCell::new(Vec::new());
+            {
+                let mut send = recording_send(&sent, None);
+                send_stream_frame_fragmented(&frame, CAP, &mut send).expect("fragmented send");
+            }
+            let sent = sent.into_inner();
+            assert_eq!(
+                sent.len(),
+                expected_pieces,
+                "payload {payload_len}: wrong piece count"
+            );
+            let mut rebuilt = Vec::new();
+            for piece in &sent {
+                assert!(
+                    piece.len() <= CAP,
+                    "payload {payload_len}: piece of {} bytes exceeds the cap",
+                    piece.len()
+                );
+                let (sid, flags, body) = decode_stream_frame(piece).expect("piece decodes");
+                assert_eq!(sid, 7, "stream id must be preserved");
+                assert_eq!(flags, 0x00, "DATA flag must be preserved");
+                rebuilt.extend_from_slice(body);
+            }
+            assert_eq!(rebuilt, payload, "payload {payload_len}: bytes differ");
+        }
+    }
+
+    /// 中间片失败 → 整体返回错误（前片已发出，后续不再发）。
+    #[test]
+    fn stream_frame_fragmentation_middle_piece_failure() {
+        let payload = vec![0xabu8; 3000]; // 3 片：1157 + 1157 + 686
+        let frame = encode_stream_frame(9, 0x00, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = {
+            let mut send = recording_send(&sent, Some(2));
+            send_stream_frame_fragmented(&frame, 1162, &mut send)
+        };
+        assert!(
+            matches!(
+                result,
+                Err(nexus_network::n1::N1Error::Transport(ref e))
+                    if e.contains("injected failure at piece 2")
+            ),
+            "expected the injected error, got {result:?}"
+        );
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 3, "stop after the failing piece");
+        assert!(sent.iter().all(|p| p.len() <= 1162));
+    }
+
+    /// 防御性规定：超限控制帧（flags != 0）不切分，照旧整帧交给发送端
+    /// （由 fabric 返回 `DatagramTooLarge`，会被计数并可见）。
+    #[test]
+    fn oversize_control_frame_is_not_fragmented() {
+        let payload = vec![0u8; 1300];
+        let frame = encode_stream_frame(11, STREAM_SYN, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = {
+            let mut send = recording_send(&sent, None);
+            send_stream_frame_fragmented(&frame, 1162, &mut send)
+        };
+        assert!(result.is_ok());
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1, "control frames must never be split");
+        assert_eq!(sent[0], frame, "control frame must be sent verbatim");
+    }
+
+    /// cap 小于 STREAM 帧头时必须显式报错，而不是除零/死循环。
+    #[test]
+    fn datagram_cap_too_small_does_not_loop() {
+        let payload = vec![0u8; 100];
+        let frame = encode_stream_frame(12, 0x00, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = {
+            let mut send = recording_send(&sent, None);
+            send_stream_frame_fragmented(&frame, 5, &mut send)
+        };
+        assert!(
+            matches!(
+                result,
+                Err(nexus_network::n1::N1Error::Transport(ref e))
+                    if e.contains("too small for a STREAM frame")
+            ),
+            "expected the cap guard, got {result:?}"
+        );
+        assert!(sent.into_inner().is_empty(), "nothing may be sent");
+    }
+
+    /// H2 正向接线：`send_mesh_tcp_frame` 对 8197B DATA 帧发 8 个 ≤1162B 的
+    /// datagram（fallback = DATAGRAM_PAYLOAD_FLOOR），且 `mesh_tcp_frames`
+    /// 按逻辑帧只 +1。
+    #[test]
+    fn mesh_send_fragments_oversize_data_frame() {
+        let (dp, _mock, frames) = mesh_dataplane_with_sender();
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        let payload = vec![0x5au8; 8192];
+        let frame = encode_stream_frame(21, 0x00, &payload);
+        assert!(dp.send_mesh_tcp_frame(dst, &frame));
+        let captured = frames.lock().unwrap();
+        assert_eq!(captured.len(), 8, "8197B frame → 8 datagrams at cap 1162");
+        let mut rebuilt = Vec::new();
+        for (got_dst, piece) in captured.iter() {
+            assert_eq!(*got_dst, dst);
+            assert!(piece.len() <= DATAGRAM_PAYLOAD_FALLBACK);
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (21, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        assert_eq!(dp.stats().mesh_tcp_frames, 1, "count per logical frame");
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 0);
+    }
+
+    /// Sender 提供连接级 cap（1000）时按该 cap 切分：每片 ≤1000，
+    /// 8197B 帧 → ceil(8192 / 995) = 9 片。
+    #[test]
+    fn mesh_send_uses_sender_cap() {
+        struct CappedN1Sender {
+            frames: CapturedFrames,
+            cap: usize,
+        }
+        impl N1Sender for CappedN1Sender {
+            fn send_to_mesh(
+                &self,
+                dst: IpAddr,
+                packet: &[u8],
+            ) -> Result<(), nexus_network::n1::N1Error> {
+                self.frames.lock().unwrap().push((dst, packet.to_vec()));
+                Ok(())
+            }
+            fn datagram_cap_for(&self, _dst: IpAddr) -> Option<usize> {
+                Some(self.cap)
+            }
+        }
+
+        let (mut dp, _mock) = test_dataplane();
+        let frames: CapturedFrames = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_sender(Arc::new(CappedN1Sender {
+            frames: Arc::clone(&frames),
+            cap: 1000,
+        }));
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        let payload = vec![0x6du8; 8192];
+        let frame = encode_stream_frame(22, 0x00, &payload);
+        assert!(dp.send_mesh_tcp_frame(dst, &frame));
+        let captured = frames.lock().unwrap();
+        assert_eq!(captured.len(), 9, "8192 payload / 995 = 9 pieces");
+        let mut rebuilt = Vec::new();
+        for (_, piece) in captured.iter() {
+            assert!(piece.len() <= 1000, "piece {} > sender cap", piece.len());
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (22, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        assert_eq!(dp.stats().mesh_tcp_frames, 1);
+    }
+
+    /// 组合根对账：portable core 的下限与 fabric 的保守常量必须一致。
+    #[test]
+    fn floor_constants_agree() {
+        assert_eq!(
+            nexus_fabric::CONSERVATIVE_DATAGRAM_CAP,
+            nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR
+        );
+    }
+
+    /// Q-1 回程接线：`send_reply_over_n1` 与正向共用切分助手；`tx.frames`
+    /// 仍按逻辑帧只计一次。
+    #[test]
+    fn reply_over_n1_fragments_oversize_data_frame() {
+        let (mut dp, _mock) = test_dataplane();
+        let payload = vec![0x33u8; 8192];
+        let frame = encode_stream_frame(31, 0x00, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        {
+            let send = recording_send(&sent, None);
+            dp.send_reply_over_n1("peer-hex", &frame, 1162, &send);
+        }
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 8);
+        let mut rebuilt = Vec::new();
+        for piece in &sent {
+            assert!(piece.len() <= 1162);
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (31, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        let snap = dp.n1_stats.snapshot();
+        assert_eq!(snap.tx_frames, 1, "tx counted per logical frame");
+        assert_eq!(snap.tx_errors, 0);
+    }
+
+    /// 可编程失败的 N1Sender（B-2 断流测试）。
+    struct ToggleN1Sender {
+        frames: CapturedFrames,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl N1Sender for ToggleN1Sender {
+        fn send_to_mesh(
+            &self,
+            dst: IpAddr,
+            packet: &[u8],
+        ) -> Result<(), nexus_network::n1::N1Error> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(nexus_network::n1::N1Error::Transport(
+                    "injected send failure".to_string(),
+                ));
+            }
+            self.frames.lock().unwrap().push((dst, packet.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// 可编程失败 dataplane 的返回元组（clippy: type_complexity）。
+    type ToggleDataplane = (
+        Dataplane,
+        Arc<Mutex<nexus_projection::MockTun>>,
+        Arc<AtomicBool>,
+        CapturedFrames,
+    );
+
+    /// 记录 chunk 的 provider（direct 可切换）+ 可开关的 N1 发送失败。
+    fn toggle_dataplane() -> ToggleDataplane {
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let tun = Box::new(SharedTun {
+            inner: Arc::clone(&mock),
+        });
+        let config = DataplaneConfig {
+            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
+            n1_configured: true,
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(tun, config, None).expect("dataplane new");
+        let frames: CapturedFrames = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(AtomicBool::new(false));
+        dp.set_n1_sender(Arc::new(ToggleN1Sender {
+            frames: Arc::clone(&frames),
+            fail: Arc::clone(&fail),
+        }));
+        (dp, mock, fail, frames)
+    }
+
+    /// 确保 dataplane 有可用的 mesh 发送器（无 sender 时 SYN 会被 B-2 判 Lost
+    /// 并本地终止，无法建立流）。已有 sender（如可编程失败的替身）时不覆盖。
+    fn ensure_mesh_sender(dp: &mut Dataplane) {
+        if !dp.n1_bridge_ready() {
+            dp.set_n1_sender(Arc::new(TestN1Sender {
+                frames: Arc::new(Mutex::new(Vec::new())),
+            }));
+        }
+    }
+
+    /// 建立一条 originator mesh 流，返回 (stream_id, 服务端初始 seq)。
+    fn establish_originator_stream_with_seq(
+        dp: &mut Dataplane,
+        mock: &Arc<Mutex<nexus_projection::MockTun>>,
+    ) -> (u32, u32) {
+        ensure_mesh_sender(dp);
+        let syn = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("syn"));
+        let written = mock.lock().unwrap().take_written();
+        let srv_seq = syn_ack_srv_seq(&written[0]);
+        let ack = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1001,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.process_one().expect("ack"));
+        assert_eq!(dp.stats().tcp_handshakes, 1);
+        let _ = mock.lock().unwrap().take_written();
+        let sid = *dp.tcp_streams.keys().next().expect("originator stream");
+        (sid, srv_seq)
+    }
+
+    fn craft_mesh_data(srv_seq: u32, payload: &[u8]) -> Vec<u8> {
+        craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1001,
+            srv_seq + 1,
+            0x18,
+            payload,
+        )
+    }
+
+    /// B-2：DATA 发送 Lost → 本地终止该流并向应用注入 RST（非 EOF、非挂起）。
+    #[test]
+    fn data_send_lost_aborts_stream_locally() {
+        let (mut dp, mock, fail, _frames) = toggle_dataplane();
+        let (sid, srv_seq) = establish_originator_stream_with_seq(&mut dp, &mock);
+        assert_eq!(dp.tcp.conn_count(), 1);
+        assert_eq!(dp.tcp_streams.len(), 1);
+
+        fail.store(true, Ordering::SeqCst);
+        mock.lock()
+            .unwrap()
+            .inject(craft_mesh_data(srv_seq, b"hello"));
+        assert!(dp.process_one().expect("data"));
+
+        // 终结器连接被摘除、dataplane 流表无残留。
+        assert_eq!(dp.tcp.conn_count(), 0, "terminator connection aborted");
+        assert!(dp.tcp_streams.is_empty(), "dataplane stream table cleaned");
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 1);
+        assert_eq!(dp.stats().mesh_tcp_bytes, 0, "lost bytes are not counted");
+
+        // 应用四元组收到 RST（源=服务端 80，目的=客户端 40000）。
+        let written = mock.lock().unwrap().take_written();
+        let rst = written
+            .iter()
+            .find(|pkt| pkt.len() >= 34 && pkt[33] & 0x04 != 0)
+            .expect("application must see a RST segment");
+        assert_eq!(
+            u16::from_be_bytes([rst[20], rst[21]]),
+            80,
+            "RST must come from the mesh-side port"
+        );
+        assert_eq!(u16::from_be_bytes([rst[22], rst[23]]), 40000);
+        let _ = sid;
+    }
+
+    /// 对照组：direct 交付成功（旧 bool 语义返回 false）不得触发 abort。
+    #[test]
+    fn direct_delivery_does_not_abort_stream() {
+        let (mut dp, mock, _fail, _frames) = toggle_dataplane();
+        let peer = nexus_fabric::PeerId([0x44; 32]);
+        let routes = vec![nexus_network::n1::pump::Ipv4Route {
+            subnet: nexus_network::n1::pump::Ipv4Net::parse("10.200.0.0/24").expect("subnet"),
+            peer: nexus_network::n1::N1PeerId(peer.0),
+        }];
+        dp.set_mesh_peer_resolver(Arc::new(
+            crate::mesh_peer_map::StaticMeshPeerMap::from_routes(&routes),
+        ));
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let slot = NatHandleSlot::new();
+        slot.set(Arc::new(RecordingProvider {
+            chunks: Arc::clone(&chunks),
+            direct: true,
+            statuses: vec![gate_status(peer)],
+        }));
+        dp.set_nat_path_slot(slot);
+        dp.set_direct_gate(Arc::new(crate::nat_chunk_recv::DirectGate::new(Arc::new(
+            FixedClock(40_000),
+        ))));
+
+        let (sid, srv_seq) = establish_originator_stream_with_seq(&mut dp, &mock);
+        mock.lock()
+            .unwrap()
+            .inject(craft_mesh_data(srv_seq, b"direct"));
+        assert!(dp.process_one().expect("data"));
+
+        // direct 成功：流保持存活，不走 N1 计数、不注入 RST。
+        assert_eq!(dp.tcp.conn_count(), 1, "direct success must not abort");
+        assert!(dp.tcp_streams.contains_key(&sid));
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 0);
+        assert_eq!(
+            dp.stats().mesh_tcp_bytes,
+            0,
+            "direct bytes are not N1 bytes"
+        );
+        assert_eq!(chunks.lock().unwrap().len(), 1, "direct chunk was used");
+        let written = mock.lock().unwrap().take_written();
+        assert!(
+            written
+                .iter()
+                .all(|pkt| pkt.len() < 34 || pkt[33] & 0x04 == 0),
+            "no RST may be written for a delivered stream"
+        );
+    }
+
+    /// 对照组：fallback 经 N1 成功交付同样不触发 abort（且按 N1 计字节）。
+    #[test]
+    fn fallback_delivery_does_not_abort_stream() {
+        let (mut dp, mock, _fail, _frames) = toggle_dataplane();
+        let peer = nexus_fabric::PeerId([0x45; 32]);
+        let routes = vec![nexus_network::n1::pump::Ipv4Route {
+            subnet: nexus_network::n1::pump::Ipv4Net::parse("10.200.0.0/24").expect("subnet"),
+            peer: nexus_network::n1::N1PeerId(peer.0),
+        }];
+        dp.set_mesh_peer_resolver(Arc::new(
+            crate::mesh_peer_map::StaticMeshPeerMap::from_routes(&routes),
+        ));
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let slot = NatHandleSlot::new();
+        slot.set(Arc::new(RecordingProvider {
+            chunks: Arc::clone(&chunks),
+            direct: false,
+            statuses: vec![gate_status(peer)],
+        }));
+        dp.set_nat_path_slot(slot);
+        dp.set_direct_gate(Arc::new(crate::nat_chunk_recv::DirectGate::new(Arc::new(
+            FixedClock(40_000),
+        ))));
+
+        let (sid, srv_seq) = establish_originator_stream_with_seq(&mut dp, &mock);
+        mock.lock()
+            .unwrap()
+            .inject(craft_mesh_data(srv_seq, b"fallback"));
+        assert!(dp.process_one().expect("data"));
+
+        assert_eq!(dp.tcp.conn_count(), 1);
+        assert!(dp.tcp_streams.contains_key(&sid));
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 0);
+        assert_eq!(
+            dp.stats().mesh_tcp_bytes,
+            8,
+            "fallback delivery counts N1 bytes"
+        );
+        assert_eq!(chunks.lock().unwrap().len(), 1, "chunk path was attempted");
+    }
+
+    /// 无 peer 路由且 N1 发送失败 → Lost（三态的失败出口之一）。
+    #[test]
+    fn mesh_send_outcome_without_peer_is_lost() {
+        let (mut dp, _mock, fail, _frames) = toggle_dataplane();
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        let frame = encode_stream_frame(1, 0x00, b"x");
+        assert_eq!(
+            dp.send_mesh_data_frame(dst, &frame),
+            MeshSendOutcome::Delivered
+        );
+        fail.store(true, Ordering::SeqCst);
+        assert_eq!(dp.send_mesh_data_frame(dst, &frame), MeshSendOutcome::Lost);
+    }
+
+    /// B-2：SYN 发送 Lost → 本地立即终止（应用 connect 立刻失败，不挂超时）。
+    #[test]
+    fn syn_send_lost_terminates_stream_locally() {
+        let (mut dp, mock, fail, _frames) = toggle_dataplane();
+        fail.store(true, Ordering::SeqCst);
+        let syn = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("syn"));
+        let written = mock.lock().unwrap().take_written();
+        let srv_seq = syn_ack_srv_seq(&written[0]);
+        let ack = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1001,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.process_one().expect("ack"));
+        assert_eq!(dp.stats().tcp_handshakes, 1, "SYN event was produced");
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 1, "SYN send was lost");
+        assert_eq!(dp.tcp.conn_count(), 0, "stream terminated locally");
+        assert!(dp.tcp_streams.is_empty());
+
+        let written = mock.lock().unwrap().take_written();
+        assert!(
+            written
+                .iter()
+                .any(|pkt| pkt.len() >= 34 && pkt[33] & 0x04 != 0),
+            "application must see a RST after a lost SYN"
+        );
+    }
+
+    /// B-2：FIN/RST 发送失败只计数不动作（本地已在拆除中，不重复 abort）。
+    #[test]
+    fn fin_send_lost_only_counts() {
+        let (mut dp, mock, fail, _frames) = toggle_dataplane();
+        let (sid, srv_seq) = establish_originator_stream_with_seq(&mut dp, &mock);
+        let conns_before = dp.tcp.conn_count();
+        fail.store(true, Ordering::SeqCst);
+        let fin = craft_tcp(
+            [10, 200, 0, 2],
+            [10, 200, 0, 5],
+            40000,
+            80,
+            1001,
+            srv_seq + 1,
+            0x11,
+            &[],
+        );
+        mock.lock().unwrap().inject(fin);
+        assert!(dp.process_one().expect("fin"));
+
+        assert_eq!(dp.stats().mesh_dropped_no_n1, 1, "FIN send failure counted");
+        assert!(
+            dp.tcp_streams.is_empty(),
+            "Closed arm still cleans the table"
+        );
+        assert_eq!(
+            dp.tcp.conn_count(),
+            conns_before,
+            "FIN/RST failure must not abort the (already closing) connection"
+        );
+        let written = mock.lock().unwrap().take_written();
+        assert!(
+            written
+                .iter()
+                .all(|pkt| pkt.len() < 34 || pkt[33] & 0x04 == 0),
+            "no RST may be injected for a FIN send failure"
+        );
+        let _ = sid;
+    }
+
+    /// §2.2 第 4 条：egress 回程 FIN/RST 因 conn 毒化发不出时只记 `tx.errors`
+    /// （不静默、不旁路）；其应用可见性由对端 B-2 与会话层重建兜底。
+    #[test]
+    fn egress_reply_failure_is_counted_not_aborted() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let peer = nexus_fabric::PeerId([0x66; 32]);
+        dp.n1_peer_conns.insert(
+            N1PeerId(peer.0).to_hex(),
+            Arc::new(FailingConn {
+                peer: N1PeerId(peer.0),
+            }) as Arc<dyn N1Connection>,
+        );
+        // 回程事件由 relay 的 `poll` 产出（connect 失败 → Closed{reset:true}）。
+        dp.set_n1_relay(Box::new(StaticPollRelay {
+            events: vec![RelayEvent::Closed {
+                stream_id: 5,
+                peer: N1PeerId(peer.0).to_hex(),
+                reset: true,
+            }],
+        }));
+        dp.n1_egress_poll();
+        let snap = stats.snapshot();
+        assert_eq!(snap.tx_errors, 1, "reply failure is counted");
+        assert_eq!(snap.tx_frames, 0);
+    }
+
+    /// Q-1 同类扫描：Direct sink 的 **N1 fallback** 也共用切分助手（chunk 本体
+    /// 不切分，逐字节不变保持）。
+    #[test]
+    fn direct_sink_n1_fallback_fragments_oversize_reply() {
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let peer = nexus_fabric::PeerId([0x68; 32]);
+        let peer_hex = N1PeerId(peer.0).to_hex();
+        let conn = Arc::new(TestConn::new(N1PeerId(peer.0)));
+        let sent = Arc::clone(&conn.sent);
+        dp.n1_peer_conns
+            .insert(peer_hex.clone(), conn as Arc<dyn N1Connection>);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let slot = NatHandleSlot::new();
+        slot.set(Arc::new(RecordingProvider {
+            chunks: Arc::clone(&chunks),
+            direct: false, // 无 direct conn → provider 调 fallback
+            statuses: Vec::new(),
+        }));
+        dp.set_nat_path_slot(slot);
+
+        let payload = vec![0x7eu8; 8192];
+        let frame = encode_stream_frame(0x91, 0x00, &payload);
+        dp.send_reply(&ReplySink::Direct(peer), &peer_hex, &frame);
+
+        assert_eq!(chunks.lock().unwrap().len(), 1, "chunk attempted");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 8, "N1 fallback must be fragmented");
+        let mut rebuilt = Vec::new();
+        for piece in sent.iter() {
+            assert!(piece.len() <= DATAGRAM_PAYLOAD_FALLBACK);
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (0x91, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        drop(sent);
+        assert_eq!(stats.snapshot().tx_frames, 1);
+    }
+
+    /// AC-F4 回归（装配层）：egress connect 失败 → `n1_egress_poll` 编码
+    /// STREAM_RST 经该 peer 的 N1 conn 回程（零线格式变更，复用既有帧型）。
+    #[test]
+    fn egress_connect_failure_replies_with_stream_rst() {
+        // 取一个必然拒绝的端口：绑定后立刻释放，connect 得到 ECONNREFUSED。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let (mut dp, _mock, stats) = n1_test_dataplane();
+        let peer = nexus_fabric::PeerId([0x77; 32]);
+        let peer_hex = N1PeerId(peer.0).to_hex();
+        let conn = Arc::new(TestConn::new(N1PeerId(peer.0)));
+        let sent = Arc::clone(&conn.sent);
+        dp.n1_peer_conns
+            .insert(peer_hex.clone(), conn as Arc<dyn N1Connection>);
+        dp.set_n1_relay(Box::new(TcpRelayEgress::new(Arc::clone(&stats))));
+
+        let mut payload = vec![127, 0, 0, 1];
+        payload.extend_from_slice(&port.to_be_bytes());
+        let frame = encode_stream_frame(9, STREAM_SYN, &payload);
+        let sink_conn = Arc::new(TestConn::new(N1PeerId(peer.0)));
+        dp.dispatch_inbound_stream(
+            &peer_hex,
+            ReplySink::N1(sink_conn as Arc<dyn N1Connection>),
+            &frame,
+        );
+
+        let mut got_rst = false;
+        for _ in 0..300 {
+            dp.n1_egress_poll();
+            if !sent.lock().unwrap().is_empty() {
+                got_rst = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(got_rst, "connect failure must produce an egress RST frame");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one RST (no duplicate channel)");
+        let (sid, flags, body) = decode_stream_frame(&sent[0]).expect("frame");
+        assert_eq!(sid, 9);
+        assert_eq!(flags, STREAM_RST);
+        assert!(body.is_empty());
+        drop(sent);
+        assert_eq!(stats.snapshot().egress_connect_failed, 1);
+        assert_eq!(stats.snapshot().tx_frames, 1);
+    }
+
+    /// AC-F4 回归（分派层）：入向 STREAM_RST 帧 → 终结器 abort → 应用侧 RST。
+    #[test]
+    fn inbound_rst_frame_resets_the_application_connection() {
+        let (mut dp, mock, _fail, _frames) = toggle_dataplane();
+        let (sid, _srv_seq) = establish_originator_stream_with_seq(&mut dp, &mock);
+        let tun_before = dp.stats().tun_written;
+
+        dp.inject_stream_frame_from_n1("peer-hex", &encode_stream_frame(sid, STREAM_RST, &[]));
+
+        assert_eq!(dp.tcp.conn_count(), 0, "terminator connection aborted");
+        assert!(
+            dp.stats().tun_written > tun_before,
+            "RST written back to TUN"
+        );
+        let written = mock.lock().unwrap().take_written();
+        let rst = written
+            .iter()
+            .find(|pkt| pkt.len() >= 34 && pkt[33] & 0x04 != 0)
+            .expect("application must see a RST segment");
+        assert_eq!(u16::from_be_bytes([rst[20], rst[21]]), 80);
+        assert_eq!(u16::from_be_bytes([rst[22], rst[23]]), 40000);
+    }
+
+    /// `DirectGate` 需要的 peer 状态：Succeeded 且 last_success 足够久。
+    fn gate_status(peer: nexus_fabric::PeerId) -> nexus_nat_wireup::PunchPeerStatus {
+        let mut status = nexus_nat_wireup::PunchPeerStatus::new(peer);
+        status.state = nexus_nat_wireup::PunchState::Succeeded;
+        status.last_success_ms = Some(0);
+        status
+    }
+
+    struct FixedClock(u64);
+
+    impl nexus_nat_traversal::PunchClock for FixedClock {
+        fn now_ms(&self) -> u64 {
+            self.0
+        }
+        fn wall_ms(&self) -> u64 {
+            self.0
+        }
+        fn sleep_until_ms(&self, _deadline_ms: u64) {}
+        fn sleep_ms(&self, _ms: u64) {}
+    }
+
+    /// 从 `poll` 一次性返回给定事件的 relay 替身。
+    struct StaticPollRelay {
+        events: Vec<RelayEvent>,
+    }
+
+    impl N1EgressRelay for StaticPollRelay {
+        fn handle_frame(
+            &mut self,
+            _stream_id: u32,
+            _flags: u8,
+            _payload: &[u8],
+            _from_peer: &str,
+        ) -> Result<Vec<RelayEvent>, N1RelayError> {
+            Ok(Vec::new())
+        }
+
+        fn poll(&mut self) -> Vec<RelayEvent> {
+            std::mem::take(&mut self.events)
+        }
+    }
+
+    /// `send_datagram` 恒定失败的 N1 conn（egress 回程失败路径）。
+    struct FailingConn {
+        peer: N1PeerId,
+    }
+
+    impl N1Connection for FailingConn {
+        fn send_datagram(&self, _data: &[u8]) -> Result<(), N1Error> {
+            Err(N1Error::PeerClosed(0))
+        }
+        fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn open_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn accept_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn rebind(&self) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn connection_id(&self) -> u64 {
+            8
+        }
+        fn peer(&self) -> N1PeerId {
+            self.peer
+        }
+        fn close(&self) {}
     }
 
     /// C-4：`/localapi/v0/dataplane/stats` 的 `dataplane` 对象暴露

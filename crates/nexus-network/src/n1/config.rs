@@ -16,7 +16,7 @@
 //! [vpi]
 //! interface = "nxtun0"
 //! address = "10.144.0.1"
-//! mtu = 1200
+//! mtu = 1162
 //!
 //! [[vpi.routes]]
 //! subnet = "10.144.0.0/24"
@@ -30,8 +30,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::link::LinkConfig;
-use super::pump::{DATAGRAM_CAP, Ipv4Net, Ipv4Route, Ipv6Net, Ipv6Route};
-use super::{N1Error, N1PeerId};
+use super::pump::{Ipv4Net, Ipv4Route, Ipv6Net, Ipv6Route};
+use super::{DATAGRAM_PAYLOAD_FLOOR, N1Error, N1PeerId};
 
 /// 静态对端条目（M3 首期：`PeerId` + 已知 locator）。
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub struct N1VpiConfig {
     pub address: Ipv4Addr,
     /// 本节点 VPI IPv6 地址（可选；有 `routes6` 时必填）。
     pub address6: Option<Ipv6Addr>,
-    /// TUN MTU（必须 ≤ 1200，对齐 fabric datagram 上限）。
+    /// TUN MTU（必须 ≤ 1162 = N1 datagram 有效载荷下限）。
     pub mtu: u16,
     /// 静态路由（IPv4）。
     pub routes: Vec<Ipv4Route>,
@@ -329,10 +329,15 @@ impl Parser {
                     let mtu: u16 = val
                         .parse()
                         .map_err(|_| Self::err(lineno, "bad vpi.mtu (integer expected)"))?;
-                    if usize::from(mtu) > DATAGRAM_CAP {
+                    if usize::from(mtu) > DATAGRAM_PAYLOAD_FLOOR {
+                        // 硬错误而非钳制：静默钳制会让"配置 N、设备 floor"
+                        // 分叉（AGENTS §18：不许静默降级）。
                         return Err(Self::err(
                             lineno,
-                            &format!("vpi.mtu must be <= {DATAGRAM_CAP} (fabric datagram cap)"),
+                            &format!(
+                                "vpi.mtu must be <= {DATAGRAM_PAYLOAD_FLOOR} (N1 datagram payload floor: \
+                                 1200 MTU - 29 QUIC 1RTT overhead - 9 DATAGRAM frame bound)"
+                            ),
                         ));
                     }
                     self.vpi_mtu = Some(mtu);
@@ -508,7 +513,7 @@ impl Parser {
                     N1Error::InvalidConfig("missing required: vpi.address".into())
                 })?,
                 address6: self.vpi_address6,
-                mtu: self.vpi_mtu.unwrap_or(1200),
+                mtu: self.vpi_mtu.unwrap_or(DATAGRAM_PAYLOAD_FLOOR as u16),
                 routes,
                 routes6,
             },
@@ -720,7 +725,7 @@ addrs = ["10.200.0.2:9000", "10.200.0.2:9001"]
 [vpi]
 interface = "nxtun0"
 address = "10.144.0.1"
-mtu = 1200
+mtu = 1162
 
 [[vpi.routes]]
 subnet = "10.144.0.0/24"
@@ -742,7 +747,7 @@ heartbeat_timeout_ms = 3000
         assert_eq!(c.peers[0].addrs.len(), 2);
         assert_eq!(c.vpi.interface, "nxtun0");
         assert_eq!(c.vpi.address, Ipv4Addr::new(10, 144, 0, 1));
-        assert_eq!(c.vpi.mtu, 1200);
+        assert_eq!(c.vpi.mtu, 1162);
         assert_eq!(c.vpi.routes.len(), 1);
         assert_eq!(c.vpi.routes[0].subnet.to_string(), "10.144.0.0/24");
         assert_eq!(c.vpi.address6, None);
@@ -757,6 +762,39 @@ heartbeat_timeout_ms = 3000
         );
     }
 
+    /// N1 datagram 有效上限修复（Red）：`vpi.mtu` 默认值必须是**真值下限**
+    /// 1162（= 1200 初始 MTU − 29 QUIC 1RTT 开销 − 9 DATAGRAM 帧上界），
+    /// 而不是名义上限 1200。1200 的 TUN MTU 会让 1163..1200 的整包被
+    /// fabric 拒收（静默丢）。
+    ///
+    /// 先用字面量 1162 保持 Red 证据的可读性；生产值由
+    /// `DATAGRAM_PAYLOAD_FLOOR` 提供。
+    #[test]
+    fn vpi_mtu_default_is_payload_floor() {
+        let minimal = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
+        let c = N1Config::parse_toml(minimal).unwrap();
+        assert_eq!(c.vpi.mtu as usize, DATAGRAM_PAYLOAD_FLOOR);
+    }
+
+    /// 超限是硬错误（不钳制）；1163 与 1200 都必须拒绝，1162 合法。
+    #[test]
+    fn vpi_mtu_above_floor_rejected() {
+        for mtu in [1163u16, 1200, 1500] {
+            let toml = format!(
+                "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\nmtu = {mtu}\n"
+            );
+            let err = N1Config::parse_toml(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("1162"),
+                "mtu {mtu} must be rejected with the floor in the message, got {err}"
+            );
+        }
+        let ok = format!(
+            "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\nmtu = {DATAGRAM_PAYLOAD_FLOOR}\n"
+        );
+        assert!(N1Config::parse_toml(&ok).is_ok());
+    }
+
     #[test]
     fn defaults_apply() {
         let bad_id = "peer_id = \"xyz\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
@@ -764,7 +802,7 @@ heartbeat_timeout_ms = 3000
         assert!(e.to_string().contains("peer_id"), "unexpected: {e}");
         let minimal = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
         let c = N1Config::parse_toml(minimal).unwrap();
-        assert_eq!(c.vpi.mtu, 1200);
+        assert_eq!(c.vpi.mtu, 1162);
         assert_eq!(
             c.link.probe_interval,
             std::time::Duration::from_secs(5),
@@ -785,7 +823,7 @@ heartbeat_timeout_ms = 3000
         // mtu 超过 datagram 上限。
         let bad = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\nmtu = 9000\n";
         let e = N1Config::parse_toml(bad).unwrap_err();
-        assert!(e.to_string().contains("1200"), "unexpected: {e}");
+        assert!(e.to_string().contains("1162"), "unexpected: {e}");
         // 非法 peer id。
         let bad2 = "peer_id = \"xyz\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
         assert!(N1Config::parse_toml(bad2).is_err());

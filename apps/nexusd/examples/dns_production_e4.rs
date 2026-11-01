@@ -202,7 +202,7 @@ fn network_toml(with_v6: bool) -> String {
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"10.144.144.1\"\n\
-         mtu = 1200\n"
+         mtu = 1162\n"
     );
     if with_v6 {
         text.push_str("address6 = \"fd00:144::1\"\n");

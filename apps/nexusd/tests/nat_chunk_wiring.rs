@@ -900,23 +900,52 @@ fn no_direct_fallback_matches_golden_fixture() {
     assert!(dp.process_one().expect("fin"));
 
     // `stream_id` is randomly seeded per TcpTerminator instance, so the
-    // reproducible fixture hashes `flags || payload` per frame (see
-    // golden-fixture-baseline.txt).
-    let mut normalized = Vec::new();
+    // reproducible fixture hashes `flags || payload` per datagram.
+    //
+    // H2/R1 effective cap：1200B 载荷的 DATA 帧按 1157B 载荷切两张 datagram
+    // （整帧 1162 = quinn `max_size()` 真值；切点从 1195 移到 1157）。本 fixture
+    // 保护的不变量是**载荷字节流**（顺序与内容）不变；datagram 数量与帧头不变，
+    // 只有切点位置改变，因此 `payload_stream`、`captured.len()`、`wire.len()`
+    // 三项断言保持原样（这里没有放宽期望）。
+    let mut wire = Vec::new();
+    let mut payload_stream = Vec::new();
+    let mut flags_seq = Vec::new();
     {
         let captured = frames.lock().unwrap();
-        assert_eq!(captured.len(), 7, "frame count must match the baseline");
+        assert_eq!(
+            captured.len(),
+            8,
+            "7 logical frames; the 1205B DATA frame is split into 2 datagrams"
+        );
         for (_, frame) in captured.iter() {
+            assert!(
+                frame.len() <= 1162,
+                "every N1 datagram must stay within the effective fabric cap"
+            );
             let (_, flags, payload) = decode_stream_frame(frame).expect("decode");
-            normalized.push(flags);
-            normalized.extend_from_slice(payload);
+            flags_seq.push(flags);
+            wire.push(flags);
+            wire.extend_from_slice(payload);
+            if flags == 0x00 {
+                payload_stream.extend_from_slice(payload);
+            }
         }
     }
-    assert_eq!(normalized.len(), 1543);
     assert_eq!(
-        sha256_hex(&normalized),
-        "aa0c6c24c5bae35e20287ecdcb09084c94bd5891ffe0499d848e6937d3f07abd",
-        "AC-H-2/AC-C-4: baseline N1 sequence must be unchanged"
+        flags_seq,
+        vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
+        "SYN, six DATA datagrams (one extra from the split), FIN"
+    );
+    assert_eq!(
+        payload_stream,
+        payloads.concat(),
+        "AC-H-2/AC-C-4: payload byte stream unchanged by fragmentation"
+    );
+    assert_eq!(wire.len(), 1544);
+    assert_eq!(
+        sha256_hex(&wire),
+        "b5cedf54dc113806da379a535f91b1c0c0d6117460ccc2a4cc282dff007b3cba",
+        "baseline N1 wire sequence (fragmented form; cut moved 1195 → 1157 payload)"
     );
 
     let snap = stats.snapshot();
