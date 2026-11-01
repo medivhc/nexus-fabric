@@ -8598,18 +8598,20 @@ outbounds:
         }
     }
 
-    /// H2 边界组：帧长 1195/1196/1200/1201/1245/8197 的 DATA 帧 →
-    /// 每片 ≤1200B、片数 = ceil(payload/1195)、按序拼回与原 payload 逐字节一致。
+    /// H2 边界组（cap = quinn 真值 1162）：帧长 1162/1163/1200/8197/8202 的
+    /// DATA 帧 → 每片 ≤1162B、片数 = ceil(payload/1157)、按序拼回逐字节一致。
+    ///
+    /// 其中 frame 1162（1 片）与 frame 1163（2 片）就是本 run 的有效上限边界。
     #[test]
     fn stream_frame_fragmentation_boundaries() {
+        const CAP: usize = 1162;
         // (payload 长度, 期望分片数)；帧长 = payload + 5B 头。
-        let cases: [(usize, usize); 6] = [
-            (1190, 1), // frame 1195
-            (1191, 1), // frame 1196
-            (1195, 1), // frame 1200
-            (1196, 2), // frame 1201
-            (1240, 2), // frame 1245
-            (8192, 7), // frame 8197
+        let cases: [(usize, usize); 5] = [
+            (1157, 1), // frame 1162 = cap
+            (1158, 2), // frame 1163 = cap + 1
+            (1195, 2), // frame 1200（旧名义上限）
+            (8192, 8), // frame 8197
+            (8197, 8), // frame 8202
         ];
         for (payload_len, expected_pieces) in cases {
             let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
@@ -8618,7 +8620,7 @@ outbounds:
             let sent = std::cell::RefCell::new(Vec::new());
             {
                 let mut send = recording_send(&sent, None);
-                send_stream_frame_fragmented(&frame, &mut send).expect("fragmented send");
+                send_stream_frame_fragmented(&frame, CAP, &mut send).expect("fragmented send");
             }
             let sent = sent.into_inner();
             assert_eq!(
@@ -8629,7 +8631,7 @@ outbounds:
             let mut rebuilt = Vec::new();
             for piece in &sent {
                 assert!(
-                    piece.len() <= N1_DATAGRAM_CAP,
+                    piece.len() <= CAP,
                     "payload {payload_len}: piece of {} bytes exceeds the cap",
                     piece.len()
                 );
@@ -8645,12 +8647,12 @@ outbounds:
     /// 中间片失败 → 整体返回错误（前片已发出，后续不再发）。
     #[test]
     fn stream_frame_fragmentation_middle_piece_failure() {
-        let payload = vec![0xabu8; 3000]; // 3 片：1195 + 1195 + 610
+        let payload = vec![0xabu8; 3000]; // 3 片：1157 + 1157 + 686
         let frame = encode_stream_frame(9, 0x00, &payload);
         let sent = std::cell::RefCell::new(Vec::new());
         let result = {
             let mut send = recording_send(&sent, Some(2));
-            send_stream_frame_fragmented(&frame, &mut send)
+            send_stream_frame_fragmented(&frame, 1162, &mut send)
         };
         assert!(
             matches!(
@@ -8662,11 +8664,11 @@ outbounds:
         );
         let sent = sent.into_inner();
         assert_eq!(sent.len(), 3, "stop after the failing piece");
-        assert!(sent.iter().all(|p| p.len() <= N1_DATAGRAM_CAP));
+        assert!(sent.iter().all(|p| p.len() <= 1162));
     }
 
     /// 防御性规定：超限控制帧（flags != 0）不切分，照旧整帧交给发送端
-    /// （今天不存在此形态；由 adapter 返回 `OversizeDatagram`，语义不变）。
+    /// （由 fabric 返回 `DatagramTooLarge`，会被计数并可见）。
     #[test]
     fn oversize_control_frame_is_not_fragmented() {
         let payload = vec![0u8; 1300];
@@ -8674,7 +8676,7 @@ outbounds:
         let sent = std::cell::RefCell::new(Vec::new());
         let result = {
             let mut send = recording_send(&sent, None);
-            send_stream_frame_fragmented(&frame, &mut send)
+            send_stream_frame_fragmented(&frame, 1162, &mut send)
         };
         assert!(result.is_ok());
         let sent = sent.into_inner();
@@ -8682,8 +8684,30 @@ outbounds:
         assert_eq!(sent[0], frame, "control frame must be sent verbatim");
     }
 
-    /// H2 正向接线：`send_mesh_tcp_frame` 对 8197B DATA 帧发 7 个 ≤1200B 的
-    /// datagram，且 `mesh_tcp_frames` 按逻辑帧只 +1。
+    /// cap 小于 STREAM 帧头时必须显式报错，而不是除零/死循环。
+    #[test]
+    fn datagram_cap_too_small_does_not_loop() {
+        let payload = vec![0u8; 100];
+        let frame = encode_stream_frame(12, 0x00, &payload);
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = {
+            let mut send = recording_send(&sent, None);
+            send_stream_frame_fragmented(&frame, 5, &mut send)
+        };
+        assert!(
+            matches!(
+                result,
+                Err(nexus_network::n1::N1Error::Transport(ref e))
+                    if e.contains("too small for a STREAM frame")
+            ),
+            "expected the cap guard, got {result:?}"
+        );
+        assert!(sent.into_inner().is_empty(), "nothing may be sent");
+    }
+
+    /// H2 正向接线：`send_mesh_tcp_frame` 对 8197B DATA 帧发 8 个 ≤1162B 的
+    /// datagram（fallback = DATAGRAM_PAYLOAD_FLOOR），且 `mesh_tcp_frames`
+    /// 按逻辑帧只 +1。
     #[test]
     fn mesh_send_fragments_oversize_data_frame() {
         let (dp, _mock, frames) = mesh_dataplane_with_sender();
@@ -8692,11 +8716,11 @@ outbounds:
         let frame = encode_stream_frame(21, 0x00, &payload);
         assert!(dp.send_mesh_tcp_frame(dst, &frame));
         let captured = frames.lock().unwrap();
-        assert_eq!(captured.len(), 7, "8197B frame → 7 datagrams");
+        assert_eq!(captured.len(), 8, "8197B frame → 8 datagrams at cap 1162");
         let mut rebuilt = Vec::new();
         for (got_dst, piece) in captured.iter() {
             assert_eq!(*got_dst, dst);
-            assert!(piece.len() <= N1_DATAGRAM_CAP);
+            assert!(piece.len() <= DATAGRAM_PAYLOAD_FALLBACK);
             let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
             assert_eq!((sid, flags), (21, 0x00));
             rebuilt.extend_from_slice(body);
@@ -8704,6 +8728,60 @@ outbounds:
         assert_eq!(rebuilt, payload);
         assert_eq!(dp.stats().mesh_tcp_frames, 1, "count per logical frame");
         assert_eq!(dp.stats().mesh_dropped_no_n1, 0);
+    }
+
+    /// Sender 提供连接级 cap（1000）时按该 cap 切分：每片 ≤1000，
+    /// 8197B 帧 → ceil(8192 / 995) = 9 片。
+    #[test]
+    fn mesh_send_uses_sender_cap() {
+        struct CappedN1Sender {
+            frames: CapturedFrames,
+            cap: usize,
+        }
+        impl N1Sender for CappedN1Sender {
+            fn send_to_mesh(
+                &self,
+                dst: IpAddr,
+                packet: &[u8],
+            ) -> Result<(), nexus_network::n1::N1Error> {
+                self.frames.lock().unwrap().push((dst, packet.to_vec()));
+                Ok(())
+            }
+            fn datagram_cap_for(&self, _dst: IpAddr) -> Option<usize> {
+                Some(self.cap)
+            }
+        }
+
+        let (mut dp, _mock) = test_dataplane();
+        let frames: CapturedFrames = Arc::new(Mutex::new(Vec::new()));
+        dp.set_n1_sender(Arc::new(CappedN1Sender {
+            frames: Arc::clone(&frames),
+            cap: 1000,
+        }));
+        let dst: IpAddr = "10.200.0.5".parse().unwrap();
+        let payload = vec![0x6du8; 8192];
+        let frame = encode_stream_frame(22, 0x00, &payload);
+        assert!(dp.send_mesh_tcp_frame(dst, &frame));
+        let captured = frames.lock().unwrap();
+        assert_eq!(captured.len(), 9, "8192 payload / 995 = 9 pieces");
+        let mut rebuilt = Vec::new();
+        for (_, piece) in captured.iter() {
+            assert!(piece.len() <= 1000, "piece {} > sender cap", piece.len());
+            let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
+            assert_eq!((sid, flags), (22, 0x00));
+            rebuilt.extend_from_slice(body);
+        }
+        assert_eq!(rebuilt, payload);
+        assert_eq!(dp.stats().mesh_tcp_frames, 1);
+    }
+
+    /// 组合根对账：portable core 的下限与 fabric 的保守常量必须一致。
+    #[test]
+    fn floor_constants_agree() {
+        assert_eq!(
+            nexus_fabric::CONSERVATIVE_DATAGRAM_CAP,
+            nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR
+        );
     }
 
     /// Q-1 回程接线：`send_reply_over_n1` 与正向共用切分助手；`tx.frames`
@@ -8716,13 +8794,13 @@ outbounds:
         let sent = std::cell::RefCell::new(Vec::new());
         {
             let send = recording_send(&sent, None);
-            dp.send_reply_over_n1("peer-hex", &frame, &send);
+            dp.send_reply_over_n1("peer-hex", &frame, 1162, &send);
         }
         let sent = sent.into_inner();
-        assert_eq!(sent.len(), 7);
+        assert_eq!(sent.len(), 8);
         let mut rebuilt = Vec::new();
         for piece in &sent {
-            assert!(piece.len() <= N1_DATAGRAM_CAP);
+            assert!(piece.len() <= 1162);
             let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
             assert_eq!((sid, flags), (31, 0x00));
             rebuilt.extend_from_slice(body);
@@ -9121,10 +9199,10 @@ outbounds:
 
         assert_eq!(chunks.lock().unwrap().len(), 1, "chunk attempted");
         let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 7, "N1 fallback must be fragmented");
+        assert_eq!(sent.len(), 8, "N1 fallback must be fragmented");
         let mut rebuilt = Vec::new();
         for piece in sent.iter() {
-            assert!(piece.len() <= N1_DATAGRAM_CAP);
+            assert!(piece.len() <= DATAGRAM_PAYLOAD_FALLBACK);
             let (sid, flags, body) = decode_stream_frame(piece).expect("piece");
             assert_eq!((sid, flags), (0x91, 0x00));
             rebuilt.extend_from_slice(body);

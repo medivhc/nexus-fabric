@@ -366,6 +366,43 @@ mod tests {
         dialer.close(0, b"done");
     }
 
+    /// 适配层不再本地判 1200：cap 来自 fabric（quinn 真值），1163 由 fabric
+    /// 的 typed error 映射为 `OversizeDatagram(1163)`。
+    #[test]
+    fn adapter_reports_fabric_cap_and_rejects_1163() {
+        let server = identity(43);
+        let client = identity(44);
+        let listener = FabricN1Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &server,
+            vec![N1PeerId(client.peer_id().0)],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let _dialer = FabricConn::connect_mtls(
+            server.peer_id(),
+            &client,
+            &config(listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let (_peer, conn) = listener.accept().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let cap = loop {
+            if let Some(cap) = conn.datagram_cap() {
+                break cap;
+            }
+            assert!(Instant::now() < deadline, "datagram_cap() stayed None");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(cap, 1162, "adapter must expose the fabric/quinn truth");
+        assert!(matches!(
+            conn.send_datagram(&vec![0u8; 1163]),
+            Err(N1Error::OversizeDatagram(1163))
+        ));
+        conn.close();
+    }
+
     #[test]
     fn stop_flag_turns_poll_timeout_into_closed() {
         let listener = FabricN1Listener::bind(

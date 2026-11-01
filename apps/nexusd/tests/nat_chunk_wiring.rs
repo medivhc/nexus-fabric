@@ -902,9 +902,11 @@ fn no_direct_fallback_matches_golden_fixture() {
     // `stream_id` is randomly seeded per TcpTerminator instance, so the
     // reproducible fixture hashes `flags || payload` per datagram.
     //
-    // H2（N1 R1）：1205B 的 DATA 帧现在被切成两张 datagram（1195 + 5 载荷），
-    // 保证每张 N1 datagram 都在 fabric 的 1200B 上限内。本 fixture 保护的
-    // 不变量是**载荷字节流**（顺序与内容）不变；datagram 数量与帧头会多一份。
+    // H2/R1 effective cap：1200B 载荷的 DATA 帧按 1157B 载荷切两张 datagram
+    // （整帧 1162 = quinn `max_size()` 真值；切点从 1195 移到 1157）。本 fixture
+    // 保护的不变量是**载荷字节流**（顺序与内容）不变；datagram 数量与帧头不变，
+    // 只有切点位置改变，因此 `payload_stream`、`captured.len()`、`wire.len()`
+    // 三项断言保持原样（这里没有放宽期望）。
     let mut wire = Vec::new();
     let mut payload_stream = Vec::new();
     let mut flags_seq = Vec::new();
@@ -917,8 +919,8 @@ fn no_direct_fallback_matches_golden_fixture() {
         );
         for (_, frame) in captured.iter() {
             assert!(
-                frame.len() <= 1200,
-                "every N1 datagram must stay within the fabric cap"
+                frame.len() <= 1162,
+                "every N1 datagram must stay within the effective fabric cap"
             );
             let (_, flags, payload) = decode_stream_frame(frame).expect("decode");
             flags_seq.push(flags);
@@ -942,8 +944,8 @@ fn no_direct_fallback_matches_golden_fixture() {
     assert_eq!(wire.len(), 1544);
     assert_eq!(
         sha256_hex(&wire),
-        "74282d6ec26f56ccb97f648861378eba471da49e540d9b6a1f1ca9881db91d24",
-        "baseline N1 wire sequence (fragmented form)"
+        "b5cedf54dc113806da379a535f91b1c0c0d6117460ccc2a4cc282dff007b3cba",
+        "baseline N1 wire sequence (fragmented form; cut moved 1195 → 1157 payload)"
     );
 
     let snap = stats.snapshot();
