@@ -757,6 +757,19 @@ heartbeat_timeout_ms = 3000
         );
     }
 
+    /// N1 datagram 有效上限修复（Red）：`vpi.mtu` 默认值必须是**真值下限**
+    /// 1162（= 1200 初始 MTU − 29 QUIC 1RTT 开销 − 9 DATAGRAM 帧上界），
+    /// 而不是名义上限 1200。1200 的 TUN MTU 会让 1163..1200 的整包被
+    /// fabric 拒收（静默丢）。
+    ///
+    /// 先用字面量 1162（`DATAGRAM_PAYLOAD_FLOOR` 在 S3 引入后改为引用常量）。
+    #[test]
+    fn vpi_mtu_default_is_payload_floor() {
+        let minimal = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
+        let c = N1Config::parse_toml(minimal).unwrap();
+        assert_eq!(c.vpi.mtu as usize, 1162);
+    }
+
     #[test]
     fn defaults_apply() {
         let bad_id = "peer_id = \"xyz\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";

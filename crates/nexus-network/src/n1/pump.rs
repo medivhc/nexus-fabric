@@ -652,10 +652,19 @@ mod tests {
         rx: Mutex<mpsc::Receiver<Vec<u8>>>,
         closed: AtomicBool,
         sent: AtomicUsize,
+        /// 连接级有效 datagram 载荷上限（`None` = 未知）。
+        cap: Option<usize>,
     }
 
     impl MemConn {
         fn pair(peer: N1PeerId) -> (Self, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+            Self::pair_with_cap(peer, None)
+        }
+
+        fn pair_with_cap(
+            peer: N1PeerId,
+            cap: Option<usize>,
+        ) -> (Self, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
             let (a_tx, a_rx) = mpsc::channel();
             let (b_tx, b_rx) = mpsc::channel();
             (
@@ -665,6 +674,7 @@ mod tests {
                     rx: Mutex::new(b_rx),
                     closed: AtomicBool::new(false),
                     sent: AtomicUsize::new(0),
+                    cap,
                 },
                 a_rx,
                 b_tx,
@@ -673,6 +683,9 @@ mod tests {
     }
 
     impl N1Connection for MemConn {
+        fn datagram_cap(&self) -> Option<usize> {
+            self.cap
+        }
         fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
             if data.len() > DATAGRAM_CAP {
                 return Err(N1Error::OversizeDatagram(data.len()));
@@ -888,6 +901,60 @@ mod tests {
         assert_eq!(pump.stats.downlink_rx.load(Ordering::Relaxed), 1);
         assert_eq!(pump.stats.downlink_delivered.load(Ordering::Relaxed), 1);
         assert_eq!(vpi_probe.take_outbound(), vec![pkt]);
+    }
+
+    /// N1 datagram 有效上限修复（Red）：连接级上限 1100 时，1150B 的 IPv4 包
+    /// 必须在上行就被丢弃并计数，绝不允许"交给 send_datagram 当作已发送"。
+    ///
+    /// 当前 HEAD 的 `DATAGRAM_CAP = 1200` 门会放行 1150B ⇒ `uplink_forwarded`
+    /// 变 1、`uplink_dropped` 保持 0 ⇒ 必红。
+    #[test]
+    fn uplink_drops_packet_above_conn_cap() {
+        let peer = N1PeerId([9u8; 32]);
+        let (conn, up_rx, _dn_tx) = MemConn::pair_with_cap(peer, Some(1100));
+        let conn = Arc::new(conn);
+        let vpi = MemVpi::new();
+        let vpi_probe = vpi.clone();
+        let vpi_obj: Arc<Mutex<Box<dyn VirtualPacketInterface>>> =
+            Arc::new(Mutex::new(Box::new(vpi)));
+        let lookup = Arc::new(MemLookup {
+            conns: Mutex::new(HashMap::from([(peer, Arc::clone(&conn))])),
+        });
+        let pump = VpiPump::new(
+            Arc::clone(&vpi_obj),
+            vec![Ipv4Route {
+                subnet: Ipv4Net::parse("10.144.0.0/24").unwrap(),
+                peer,
+            }],
+            lookup,
+        );
+        let stats = pump.stats();
+        let handle = pump.start();
+
+        vpi_probe.push_inbound(ipv4_pkt(Ipv4Addr::new(10, 144, 0, 2), 1150));
+        for _ in 0..100 {
+            if stats.uplink_dropped.load(Ordering::Relaxed)
+                + stats.uplink_forwarded.load(Ordering::Relaxed)
+                >= 1
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(stats.uplink_rx.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.uplink_dropped.load(Ordering::Relaxed),
+            1,
+            "1150B > conn cap 1100 must be dropped before send"
+        );
+        assert_eq!(stats.uplink_forwarded.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            conn.sent.load(Ordering::SeqCst),
+            0,
+            "must not reach send_datagram at all"
+        );
+        assert!(up_rx.try_recv().is_err());
+        handle.shutdown();
     }
 
     #[test]

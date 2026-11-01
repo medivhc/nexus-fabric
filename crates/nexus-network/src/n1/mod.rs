@@ -144,6 +144,14 @@ pub trait N1Connection: Send + Sync {
     fn connection_id(&self) -> u64;
     /// 对端身份。
     fn peer(&self) -> N1PeerId;
+    /// 当前连接的有效 datagram 载荷上限（口径 = quinn `datagrams().max_size()`，
+    /// 载荷不含 QUIC 包头与 DATAGRAM 帧头）。
+    ///
+    /// `None` = 实现未知（握手未完成 / 连接已关闭 / 实现不支持查询）。调用方
+    /// 必须退到 [`DATAGRAM_PAYLOAD_FLOOR`]（可证下限）。
+    fn datagram_cap(&self) -> Option<usize> {
+        None
+    }
     /// 关闭连接；阻塞中的 `recv_datagram` / `accept_keepalive` / keepalive 读
     /// 必须随之返回 `Closed`（结构化并发的取消路径，AGENTS.md §13）。
     fn close(&self);
