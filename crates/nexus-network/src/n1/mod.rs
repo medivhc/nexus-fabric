@@ -22,6 +22,18 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 
+/// N1 datagram 有效载荷上限的**可证下限**（= quinn 在本仓库装配下的
+/// `datagrams().max_size()`）。
+///
+/// `1162 = 1200 (quinn INITIAL_MTU，fabric `allow_mtud=false` ⇒ current_mtu
+/// 恒 1200) − 29 (1 flags + 8 dst-CID + 4 PN 上界 + 16 AEAD tag) − 9
+/// (DATAGRAM 帧 type 1B + length varint 8B)`。
+///
+/// portable core 不能依赖 `nexus-fabric`，故此处复制同一数值；两边的对账测试
+/// `floor_constants_agree` 在组合根 `apps/nexusd`（唯一同时依赖两者的 crate）。
+/// 连接建立后应优先使用 `N1Connection::datagram_cap()` 的真值；`None` 时退到本值。
+pub const DATAGRAM_PAYLOAD_FLOOR: usize = 1162;
+
 /// 节点身份：ed25519 公钥 32 字节（对标 fabric `PeerId`）。
 ///
 /// portable core 不能命名 fabric 类型，故自建；fabric `PeerId` ↔ `N1PeerId`
@@ -101,7 +113,7 @@ pub enum N1Error {
     PeerClosed(u32),
     /// 操作超时（心跳超时、握手超时等）。
     Timeout,
-    /// 数据报超限（>1200B，调用方计数后丢弃）。
+    /// 数据报超限（> 连接有效载荷上限，下限 [`DATAGRAM_PAYLOAD_FLOOR`]；调用方计数后丢弃）。
     OversizeDatagram(usize),
     /// 配置非法。
     InvalidConfig(String),
@@ -127,7 +139,12 @@ impl std::error::Error for N1Error {}
 ///
 /// `Send + Sync` 是必需的：连接被包泵双线程 + Link 观测器共享（D2 评审）。
 pub trait N1Connection: Send + Sync {
-    /// 发送不可靠数据报（≤1200B；超限返回 `OversizeDatagram`，调用方计数后丢弃）。
+    /// 发送不可靠数据报（长度不得超过连接有效载荷上限；超限返回
+    /// `OversizeDatagram`，调用方计数后丢弃）。
+    ///
+    /// 上限口径 = quinn `datagrams().max_size()`；未协商时以
+    /// [`DATAGRAM_PAYLOAD_FLOOR`] 为可证下限。实现若知道真值应覆盖
+    /// [`N1Connection::datagram_cap`]。
     ///
     /// 注意：fabric driver 吞掉了 UDP `send_to` 的 socket 错误，本方法返回 `Ok`
     /// 不代表包真的发出——"socket 错误"不能作为 Link 观测触发器（D3 评审）。

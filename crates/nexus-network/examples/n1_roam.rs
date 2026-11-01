@@ -109,6 +109,7 @@ fn map_fabric_err(e: FabricError) -> N1Error {
         FabricError::Timeout => N1Error::Timeout,
         FabricError::PathUnreachable => N1Error::PeerUnknown,
         FabricError::HandshakeFailed(s) => N1Error::Transport(format!("handshake: {s}")),
+        FabricError::DatagramTooLarge { len, .. } => N1Error::OversizeDatagram(len),
         FabricError::Transport(s) => N1Error::Transport(s),
     }
 }
@@ -123,10 +124,10 @@ struct FabricConnAdapter {
 
 impl N1Connection for FabricConnAdapter {
     fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-        if data.len() > 1200 {
-            return Err(N1Error::OversizeDatagram(data.len()));
-        }
         self.inner.send_datagram(data).map_err(map_fabric_err)
+    }
+    fn datagram_cap(&self) -> Option<usize> {
+        self.inner.datagram_cap()
     }
     fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
         self.inner.recv_datagram().map_err(map_fabric_err)

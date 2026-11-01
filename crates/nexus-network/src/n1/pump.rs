@@ -29,10 +29,7 @@ use std::time::Duration;
 
 use nexus_platform::VirtualPacketInterface;
 
-use super::{N1Connection, N1Error, N1PeerId};
-
-/// fabric datagram 上限（S5：1200B pre-PMTUD）；VPI MTU 与之对齐。
-pub const DATAGRAM_CAP: usize = 1200;
+use super::{DATAGRAM_PAYLOAD_FLOOR, N1Connection, N1Error, N1PeerId};
 
 /// 最小 IPv4 头长度。
 const IPV4_MIN_HEADER: usize = 20;
@@ -274,6 +271,9 @@ pub struct VpiPump {
     routes: Vec<Ipv4Route>,
     lookup: Arc<dyn PeerConnLookup>,
     stats: Arc<PumpStats>,
+    /// 超限日志一次性标志（portable core 不引入时钟；首次超限即打，
+    /// 之后只累计 `stats.uplink_dropped`）。
+    oversize_logged: AtomicBool,
 }
 
 impl VpiPump {
@@ -288,6 +288,7 @@ impl VpiPump {
             routes,
             lookup,
             stats: Arc::new(PumpStats::default()),
+            oversize_logged: AtomicBool::new(false),
         }
     }
 
@@ -445,9 +446,17 @@ impl VpiPump {
                 self.stats.uplink_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            if pkt.len() > DATAGRAM_CAP {
+            let cap = conn.datagram_cap().unwrap_or(DATAGRAM_PAYLOAD_FLOOR);
+            if pkt.len() > cap {
                 // 超限：调用方计数后丢弃（N1Connection::send_datagram 契约）。
+                // 首次打一条结构化日志，之后只累计（portable core 不取时钟）。
                 self.stats.uplink_dropped.fetch_add(1, Ordering::Relaxed);
+                if !self.oversize_logged.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[n1-pump] WARN: uplink packet exceeds datagram cap dst={dst} len={} cap={cap} (further drops counted only)",
+                        pkt.len()
+                    );
+                }
                 continue;
             }
             match conn.send_datagram(pkt) {
@@ -687,7 +696,7 @@ mod tests {
             self.cap
         }
         fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-            if data.len() > DATAGRAM_CAP {
+            if data.len() > DATAGRAM_PAYLOAD_FLOOR {
                 return Err(N1Error::OversizeDatagram(data.len()));
             }
             if self.closed.load(Ordering::SeqCst) {
@@ -959,10 +968,10 @@ mod tests {
 
     #[test]
     fn uplink_drops_oversize_and_counts() {
-        // 超限包（>1200B = DATAGRAM_CAP）在 send_datagram 前被丢弃并计数
+        // 超限包（> 可证下限 1162B）在 send_datagram 前被丢弃并计数
         // （见 uplink_routes_forwards_and_counts_drops 的 1300B 包断言）。
-        let big = ipv4_pkt(Ipv4Addr::new(10, 144, 0, 9), DATAGRAM_CAP + 100);
-        assert!(big.len() > DATAGRAM_CAP);
+        let big = ipv4_pkt(Ipv4Addr::new(10, 144, 0, 9), DATAGRAM_PAYLOAD_FLOOR + 100);
+        assert!(big.len() > DATAGRAM_PAYLOAD_FLOOR);
     }
 
     #[test]

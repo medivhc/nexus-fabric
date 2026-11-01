@@ -26,6 +26,15 @@ use super::{N1Error, N1PeerId};
 pub trait N1Sender: Send + Sync {
     /// 发送包进 mesh；无路由/无连接/发送失败 → `Err`。
     fn send_to_mesh(&self, dst: IpAddr, packet: &[u8]) -> Result<(), N1Error>;
+
+    /// `dst` 对应连接的有效 datagram 载荷上限（口径 = quinn
+    /// `datagrams().max_size()`）；`None` = 未知/无路由。
+    ///
+    /// 调用方必须退到 [`super::DATAGRAM_PAYLOAD_FLOOR`]。默认 `None` 让既有
+    /// 实现无需改动即保持"保守下限"语义。
+    fn datagram_cap_for(&self, _dst: IpAddr) -> Option<usize> {
+        None
+    }
 }
 
 /// Bridge from the unified dataplane to the N1 mesh.
@@ -158,6 +167,15 @@ impl N1MeshBridge {
 impl N1Sender for N1MeshBridge {
     fn send_to_mesh(&self, dst: IpAddr, packet: &[u8]) -> Result<(), N1Error> {
         self.send_routed(dst, packet)
+    }
+
+    /// `route(dst) → sessions.connection_for(peer) → conn.datagram_cap()`。
+    ///
+    /// 每逻辑帧多一次 LPM + 一次表查（量级与 `send_routed` 相同，可忽略）；
+    /// 返回 `None` 时调用方退到 `DATAGRAM_PAYLOAD_FLOOR`。
+    fn datagram_cap_for(&self, dst: IpAddr) -> Option<usize> {
+        let peer = self.route(dst)?;
+        self.sessions.connection_for(&peer)?.datagram_cap()
     }
 }
 
