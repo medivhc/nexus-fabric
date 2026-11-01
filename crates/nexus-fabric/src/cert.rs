@@ -443,8 +443,9 @@ pub(crate) fn verified_connection_peer(
 /// Enables unreliable datagram support (S5): without
 /// `datagram_receive_buffer_size` quinn-proto negotiates
 /// `max_datagram_frame_size = 0` and every `datagrams().send()` fails with
-/// `Disabled`/`UnsupportedByPeer`, which the driver silently drops. The
-/// 1 MiB buffer holds ~850 max-size (1200 B) datagrams.
+/// `Disabled`/`UnsupportedByPeer` (the driver classifies and counts those).
+/// The 1 MiB buffer holds many max-size datagrams (payload cap under this
+/// assembly is [`crate::CONSERVATIVE_DATAGRAM_CAP`], not the nominal 1200).
 pub fn quic_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.datagram_receive_buffer_size(Some(1024 * 1024));

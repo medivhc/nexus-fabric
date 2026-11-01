@@ -84,6 +84,89 @@ fn min_poll_timeout(d: Duration) -> Duration {
 /// Bounds both command latency and QUIC timer granularity (P0: coarse pacing is fine).
 const POLL_CAP: Duration = Duration::from_millis(5);
 
+/// datagram 丢弃日志的限频窗口（与 `apps/nexusd/src/log_throttle.rs` 的
+/// `OUTBOUND_UNAVAILABLE_LOG_INTERVAL` 同值，保持运维口径一致）。
+const DGRAM_DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 丢弃/逐出的分类（flush 期由 quinn 错误映射；纯数据，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DgramDropKind {
+    /// `SendDatagramError::TooLarge`（预检后被 cap 变化追上）。
+    TooLarge,
+    /// `SendDatagramError::Disabled | UnsupportedByPeer`。
+    Unsupported,
+    /// 发送缓冲不足，本次 `send` 迫使 quinn 逐出旧 datagram。
+    Evicted,
+}
+
+impl DgramDropKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLarge => "too_large",
+            Self::Unsupported => "unsupported",
+            Self::Evicted => "evicted",
+        }
+    }
+}
+
+/// per-connection datagram 丢弃计数（纯数据；`LiveConn` 内持有）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DgramCounters {
+    /// flush 期丢弃总数（`dropped_too_large + dropped_unsupported`）。
+    dropped: u64,
+    dropped_too_large: u64,
+    dropped_unsupported: u64,
+    /// 迫使 quinn 逐出的 send 次数（近似语义，不是被逐出的条数）。
+    evicted: u64,
+}
+
+impl DgramCounters {
+    /// 纯计数：无 I/O、无时钟。`Evicted` 不计入 `dropped`（不是丢弃）。
+    fn record_drop(&mut self, kind: DgramDropKind) {
+        match kind {
+            DgramDropKind::TooLarge => {
+                self.dropped += 1;
+                self.dropped_too_large += 1;
+            }
+            DgramDropKind::Unsupported => {
+                self.dropped += 1;
+                self.dropped_unsupported += 1;
+            }
+            DgramDropKind::Evicted => self.evicted += 1,
+        }
+    }
+}
+
+/// 丢弃日志限频判定：**不自取时钟**，`now` 由 driver loop（时间注入方）传入
+/// （AGENTS §22 / 既定决议：协议 core 不直接读系统时间）。
+#[derive(Default)]
+struct DgramDropLog {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl DgramDropLog {
+    /// `Some(suppressed)` = 本次应发射，并带出窗口内被抑制条数；`None` = 只累加。
+    fn decide(&mut self, now: Instant, interval: Duration) -> Option<u64> {
+        match self.last {
+            None => {
+                self.last = Some(now);
+                self.suppressed = 0;
+                Some(0)
+            }
+            Some(last) if now.saturating_duration_since(last) >= interval => {
+                let suppressed = std::mem::take(&mut self.suppressed);
+                self.last = Some(now);
+                Some(suppressed)
+            }
+            Some(_) => {
+                self.suppressed += 1;
+                None
+            }
+        }
+    }
+}
+
 /// Largest UDP datagram the driver reads.
 const RECV_BUF: usize = 65536;
 
@@ -703,6 +786,8 @@ struct LiveConn {
     shared: Arc<ConnShared>,
     streams: HashMap<StreamId, Arc<StreamShared>>,
     dgram_tx_q: VecDeque<Vec<u8>>,
+    dgram: DgramCounters,
+    dgram_drop_log: DgramDropLog,
     bytes_sent: u64,
     bytes_recv: u64,
     /// WP1b/§19: set once the QUIC/TLS handshake completed (`Connected`).
@@ -710,6 +795,32 @@ struct LiveConn {
     handshake_authenticated: bool,
     /// WP1b/§19: exactly-once latch for `DriverShared::rejected_handshakes`.
     rejection_counted: bool,
+}
+
+impl LiveConn {
+    /// 记录一次 flush 期丢弃/逐出，并按 10s 窗口限频打一行结构化日志。
+    ///
+    /// 时间来自 `pump_one(now)`（driver loop 注入），本函数零时钟调用。
+    fn log_dgram_drop(&mut self, now: Instant, kind: DgramDropKind, len: usize, cap: usize) {
+        let Some(suppressed) = self.dgram_drop_log.decide(now, DGRAM_DROP_LOG_INTERVAL) else {
+            return;
+        };
+        let total = match kind {
+            DgramDropKind::TooLarge => self.dgram.dropped_too_large,
+            DgramDropKind::Unsupported => self.dgram.dropped_unsupported,
+            DgramDropKind::Evicted => self.dgram.evicted,
+        };
+        eprintln!(
+            "[fabric] datagram drop conn={} peer={} reason={} len={} cap={} total={} suppressed={}",
+            self.shared.id.0,
+            crate::hex_short(&self.shared.peer.0),
+            kind.as_str(),
+            len,
+            cap,
+            total,
+            suppressed
+        );
+    }
 }
 
 struct Loop {
@@ -900,6 +1011,8 @@ impl Loop {
                 shared: shared.clone(),
                 streams: HashMap::new(),
                 dgram_tx_q: VecDeque::new(),
+                dgram: DgramCounters::default(),
+                dgram_drop_log: DgramDropLog::default(),
                 bytes_sent: 0,
                 bytes_recv: 0,
                 handshake_authenticated: false,
@@ -962,6 +1075,27 @@ impl Loop {
                     "mutual authentication incomplete".into(),
                 ));
             }
+        }
+        // **权威判定点**：用 quinn 现算的 `datagrams().max_size()`（载荷口径）。
+        // API 侧的 `FabricConn::send_datagram` 只是缓存快路径；这里的数字刷新
+        // 回 `ConnShared.datagram_cap` 供上层查询。
+        let cap = lc.quic.datagrams().max_size();
+        lc.shared
+            .datagram_cap
+            .store(cap.unwrap_or(0), Ordering::Relaxed);
+        let connected = lc.shared.state.lock().unwrap().connected;
+        match cap {
+            Some(c) if data.len() > c => {
+                return Err(lc.shared.reject_datagram_too_large(data.len(), c));
+            }
+            None if connected => {
+                // 对端未通告 `max_datagram_frame_size`：quinn 的 `send` 会返回
+                // `UnsupportedByPeer`。握手后即可同步判定，回归 typed error。
+                return Err(FabricError::Transport(
+                    "datagrams not supported by peer".into(),
+                ));
+            }
+            _ => {}
         }
         lc.dgram_tx_q.push_back(data);
         Ok(())
@@ -1111,6 +1245,8 @@ impl Loop {
                         shared: shared.clone(),
                         streams: HashMap::new(),
                         dgram_tx_q: VecDeque::new(),
+                        dgram: DgramCounters::default(),
+                        dgram_drop_log: DgramDropLog::default(),
                         bytes_sent: 0,
                         bytes_recv: 0,
                         handshake_authenticated: false,
@@ -1192,18 +1328,35 @@ impl Loop {
         }
         // Datagrams: flush queued sends, drain received.
         if let Some(lc) = self.live.get_mut(&id) {
+            // 每次 pump 刷新有效盖采样（握手完成 / MTU 变化 / 关闭都会反映到这里）。
+            let cap = lc.quic.datagrams().max_size().unwrap_or(0);
+            lc.shared.datagram_cap.store(cap, Ordering::Relaxed);
             while let Some(d) = lc.dgram_tx_q.pop_front() {
                 let len = d.len();
+                // `send(drop=true)` 在缓冲不足时会**静默逐出**旧 datagram，
+                // quinn 不报告这件事；只能在调用前用剩余空间预判并计数。
+                let evict = lc.quic.datagrams().send_buffer_space() < len;
                 match lc.quic.datagrams().send(Bytes::from(d), true) {
                     Ok(()) => {
                         lc.bytes_sent += len as u64;
+                        if evict {
+                            lc.dgram.record_drop(DgramDropKind::Evicted);
+                            lc.log_dgram_drop(now, DgramDropKind::Evicted, len, cap);
+                        }
                     }
                     Err(quinn_proto::SendDatagramError::Blocked(data)) => {
                         lc.dgram_tx_q.push_front(data.to_vec());
                         break;
                     }
-                    // Best-effort drop (S5).
-                    Err(_) => {}
+                    Err(quinn_proto::SendDatagramError::TooLarge) => {
+                        lc.dgram.record_drop(DgramDropKind::TooLarge);
+                        lc.log_dgram_drop(now, DgramDropKind::TooLarge, len, cap);
+                    }
+                    // Disabled | UnsupportedByPeer：对端不支持 DATAGRAM。
+                    Err(_) => {
+                        lc.dgram.record_drop(DgramDropKind::Unsupported);
+                        lc.log_dgram_drop(now, DgramDropKind::Unsupported, len, cap);
+                    }
                 }
             }
             let shared = lc.shared.clone();
@@ -1472,6 +1625,11 @@ impl Loop {
         st.active_path = Some(*self.shared.local_addr.lock().unwrap());
         st.bytes_sent = lc.bytes_sent;
         st.bytes_recv = lc.bytes_recv;
+        st.datagram_rejected = lc.shared.datagram_rejected.load(Ordering::Relaxed);
+        st.datagram_dropped = lc.dgram.dropped;
+        st.datagram_dropped_too_large = lc.dgram.dropped_too_large;
+        st.datagram_dropped_unsupported = lc.dgram.dropped_unsupported;
+        st.datagram_evicted = lc.dgram.evicted;
     }
 }
 
@@ -1507,6 +1665,73 @@ mod tests {
         assert_eq!(
             min_poll_timeout(Duration::from_secs(10)),
             Duration::from_secs(10)
+        );
+    }
+
+    /// 限频判定是纯函数：虚拟时刻推演，不 sleep、不在协议 core 取时钟。
+    #[test]
+    fn dgram_drop_log_throttles_with_injected_time() {
+        let mut log = DgramDropLog::default();
+        let t0 = Instant::now();
+        let interval = DGRAM_DROP_LOG_INTERVAL;
+        assert_eq!(log.decide(t0, interval), Some(0), "first drop always emits");
+        assert_eq!(
+            log.decide(t0 + Duration::from_secs(9), interval),
+            None,
+            "inside the window: suppressed"
+        );
+        assert_eq!(
+            log.decide(t0 + Duration::from_secs(9), interval),
+            None,
+            "still inside the window"
+        );
+        assert_eq!(
+            log.decide(t0 + Duration::from_secs(10), interval),
+            Some(2),
+            "window elapsed: emit with the suppressed count"
+        );
+        assert_eq!(
+            log.decide(t0 + Duration::from_secs(11), interval),
+            None,
+            "new window starts empty"
+        );
+        assert_eq!(log.decide(t0 + Duration::from_secs(20), interval), Some(1));
+    }
+
+    /// flush 期分类计数（纯函数，无 quinn 对象）。
+    #[test]
+    fn dgram_counters_classify_drops() {
+        let mut c = DgramCounters::default();
+        c.record_drop(DgramDropKind::TooLarge);
+        assert_eq!(
+            c,
+            DgramCounters {
+                dropped: 1,
+                dropped_too_large: 1,
+                dropped_unsupported: 0,
+                evicted: 0,
+            }
+        );
+        c.record_drop(DgramDropKind::Unsupported);
+        assert_eq!(
+            c,
+            DgramCounters {
+                dropped: 2,
+                dropped_too_large: 1,
+                dropped_unsupported: 1,
+                evicted: 0,
+            }
+        );
+        c.record_drop(DgramDropKind::Evicted);
+        assert_eq!(
+            c,
+            DgramCounters {
+                dropped: 2,
+                dropped_too_large: 1,
+                dropped_unsupported: 1,
+                evicted: 1,
+            },
+            "evictions are not drops"
         );
     }
 
