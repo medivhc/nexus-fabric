@@ -966,12 +966,57 @@ mod tests {
         handle.shutdown();
     }
 
+    /// 未知连接上限（`datagram_cap()` 返回 `None`）时，上行按可证下限
+    /// `DATAGRAM_PAYLOAD_FLOOR` 判定：1163B（下限 + 1）必须被丢弃并计数，
+    /// 不得进入 `send_datagram`。
     #[test]
     fn uplink_drops_oversize_and_counts() {
-        // 超限包（> 可证下限 1162B）在 send_datagram 前被丢弃并计数
-        // （见 uplink_routes_forwards_and_counts_drops 的 1300B 包断言）。
-        let big = ipv4_pkt(Ipv4Addr::new(10, 144, 0, 9), DATAGRAM_PAYLOAD_FLOOR + 100);
-        assert!(big.len() > DATAGRAM_PAYLOAD_FLOOR);
+        let peer = N1PeerId([9u8; 32]);
+        let (conn, up_rx, _dn_tx) = MemConn::pair(peer);
+        let conn = Arc::new(conn);
+        let vpi = MemVpi::new();
+        let vpi_probe = vpi.clone();
+        let vpi_obj: Arc<Mutex<Box<dyn VirtualPacketInterface>>> =
+            Arc::new(Mutex::new(Box::new(vpi)));
+        let lookup = Arc::new(MemLookup {
+            conns: Mutex::new(HashMap::from([(peer, Arc::clone(&conn))])),
+        });
+        let pump = VpiPump::new(
+            Arc::clone(&vpi_obj),
+            vec![Ipv4Route {
+                subnet: Ipv4Net::parse("10.144.0.0/24").unwrap(),
+                peer,
+            }],
+            lookup,
+        );
+        let stats = pump.stats();
+        let handle = pump.start();
+
+        let oversize = DATAGRAM_PAYLOAD_FLOOR + 1;
+        vpi_probe.push_inbound(ipv4_pkt(Ipv4Addr::new(10, 144, 0, 9), oversize));
+        for _ in 0..100 {
+            if stats.uplink_dropped.load(Ordering::Relaxed)
+                + stats.uplink_forwarded.load(Ordering::Relaxed)
+                >= 1
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(stats.uplink_rx.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.uplink_dropped.load(Ordering::Relaxed),
+            1,
+            "{oversize}B > floor {DATAGRAM_PAYLOAD_FLOOR} must be dropped (unknown conn cap)"
+        );
+        assert_eq!(stats.uplink_forwarded.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            conn.sent.load(Ordering::SeqCst),
+            0,
+            "must not reach send_datagram at all"
+        );
+        assert!(up_rx.try_recv().is_err());
+        handle.shutdown();
     }
 
     #[test]
