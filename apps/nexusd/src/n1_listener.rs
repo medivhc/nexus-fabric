@@ -33,10 +33,13 @@ pub struct N1ConnAdapter {
 
 impl N1Connection for N1ConnAdapter {
     fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-        if data.len() > 1200 {
-            return Err(N1Error::OversizeDatagram(data.len()));
-        }
+        // 本地 1200 门已删除：有效上限由 fabric 按 quinn 真值判定并返回 typed
+        // error（`DatagramTooLarge`），这里只做错误映射。
         self.inner.send_datagram(data).map_err(map_fabric_err)
+    }
+
+    fn datagram_cap(&self) -> Option<usize> {
+        self.inner.datagram_cap()
     }
 
     fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
@@ -311,6 +314,7 @@ fn map_fabric_err(e: FabricError) -> N1Error {
         FabricError::PathUnreachable => N1Error::PeerUnknown,
         FabricError::Closed(code) => N1Error::PeerClosed(code),
         FabricError::Timeout => N1Error::Timeout,
+        FabricError::DatagramTooLarge { len, .. } => N1Error::OversizeDatagram(len),
         FabricError::Transport(s) => N1Error::Transport(s),
     }
 }

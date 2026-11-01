@@ -329,15 +329,17 @@ fn n1_send_failure_line(dst: IpAddr, kind: &str, len: usize) -> String {
     format!("[nat-chunk] n1 send failed dst={dst} kind={kind} len={len}")
 }
 
-/// N1 datagram 上限（fabric S5 pre-PMTUD 的 1200B，与
-/// `nexus_network::n1::pump::DATAGRAM_CAP` 同值；本层只镜像，不改上限）。
-const N1_DATAGRAM_CAP: usize = 1200;
-
 /// STREAM 帧头长度（`stream_id: u32 BE ‖ flags: u8`）。
 const STREAM_FRAME_HEADER_LEN: usize = 5;
 
-/// 单个分片的 DATA 载荷上限：整帧（头 + 载荷）不得超过 [`N1_DATAGRAM_CAP`]。
-const N1_STREAM_PAYLOAD_CAP: usize = N1_DATAGRAM_CAP - STREAM_FRAME_HEADER_LEN;
+/// 拿不到连接级数值时的可证下限（= quinn `datagrams().max_size()` 在本仓库
+/// 装配下的值；推导见 `nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR`）。
+const DATAGRAM_PAYLOAD_FALLBACK: usize = nexus_network::n1::DATAGRAM_PAYLOAD_FLOOR;
+
+/// 连接级 datagram 载荷上限；未知（握手未完成/已关闭）时退到可证下限。
+fn conn_datagram_cap(conn: &std::sync::Arc<dyn N1Connection>) -> usize {
+    conn.datagram_cap().unwrap_or(DATAGRAM_PAYLOAD_FALLBACK)
+}
 
 /// Mesh DATA 的发送结果（B-2 判据面）。
 ///
@@ -360,16 +362,17 @@ enum MeshSendOutcome {
 /// `stream_id`/`flags` 的连续切片与未切分整帧逐字节等价（帧头无 offset/seq）。
 ///
 /// 规则：
-/// - `frame.len() <= 1200` → 原样发送一次（既有路径零改动）；
-/// - 超限且 `flags == 0`（纯 DATA）→ 每片载荷 ≤1195B，顺序发送；任一片
-///   失败即返回该错误（已发出的前片使流出现空洞，由调用方的断流处理接管）；
-/// - 超限但 `flags != 0`（控制帧）或解码失败 → 原样发送，保留既有的
-///   `OversizeDatagram` 失败语义（今天不存在此形态，不静默切坏控制帧）。
+/// - `frame.len() <= datagram_cap` → 原样发送一次；
+/// - 超限且 `flags == 0`（纯 DATA）→ 每片载荷 ≤ `datagram_cap − 5`，顺序发送；
+///   任一片失败即返回该错误（已发出的前片使流出现空洞，由调用方的断流处理接管）；
+/// - 超限但 `flags != 0`（控制帧）或解码失败 → 原样发送，由 fabric 返回
+///   `DatagramTooLarge`（会被计数并可见，不静默切坏控制帧）。
 fn send_stream_frame_fragmented(
     frame: &[u8],
+    datagram_cap: usize,
     mut send: impl FnMut(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
 ) -> Result<(), nexus_network::n1::N1Error> {
-    if frame.len() <= N1_DATAGRAM_CAP {
+    if frame.len() <= datagram_cap {
         return send(frame);
     }
     let Some((stream_id, flags, payload)) = decode_stream_frame(frame) else {
@@ -378,9 +381,17 @@ fn send_stream_frame_fragmented(
     if flags != 0 {
         return send(frame);
     }
+    let payload_cap = datagram_cap
+        .checked_sub(STREAM_FRAME_HEADER_LEN)
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| {
+            nexus_network::n1::N1Error::Transport(format!(
+                "datagram cap {datagram_cap} too small for a STREAM frame"
+            ))
+        })?;
     let mut off = 0;
     while off < payload.len() {
-        let end = (off + N1_STREAM_PAYLOAD_CAP).min(payload.len());
+        let end = (off + payload_cap).min(payload.len());
         let piece = encode_stream_frame(stream_id, flags, &payload[off..end]);
         send(&piece)?;
         off = end;
@@ -1080,7 +1091,9 @@ impl Dataplane {
     fn send_egress_reply(&mut self, peer_hex: &str, frame: &[u8]) {
         match self.n1_peer_conns.get(peer_hex).cloned() {
             Some(conn) => {
-                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f));
+                self.send_reply_over_n1(peer_hex, frame, conn_datagram_cap(&conn), |f| {
+                    conn.send_datagram(f)
+                });
             }
             None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
         }
@@ -1146,7 +1159,9 @@ impl Dataplane {
     fn send_reply(&mut self, sink: &ReplySink, peer_hex: &str, frame: &[u8]) {
         match sink {
             ReplySink::N1(conn) => {
-                self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+                self.send_reply_over_n1(peer_hex, frame, conn_datagram_cap(conn), |f| {
+                    conn.send_datagram(f)
+                });
             }
             ReplySink::Direct(peer) => {
                 let chunk = {
@@ -1162,7 +1177,12 @@ impl Dataplane {
                     let conn = self.n1_peer_conns.get(peer_hex).cloned();
                     match conn {
                         Some(conn) => {
-                            self.send_reply_over_n1(peer_hex, frame, |f| conn.send_datagram(f))
+                            self.send_reply_over_n1(
+                                peer_hex,
+                                frame,
+                                conn_datagram_cap(&conn),
+                                |f| conn.send_datagram(f),
+                            );
                         }
                         None => self.record_tx_error(peer_hex, frame, "no_n1_conn"),
                     }
@@ -1175,7 +1195,8 @@ impl Dataplane {
                         // fallback 走的是 N1 datagram，与正向/`N1` sink 同根，
                         // 必须共用切分助手。
                         Some(conn) => {
-                            send_stream_frame_fragmented(frame, |f| conn.send_datagram(f))
+                            let cap = conn_datagram_cap(conn);
+                            send_stream_frame_fragmented(frame, cap, |f| conn.send_datagram(f))
                                 .map_err(|e| io::Error::other(format!("n1 send failed: {e}")))
                         }
                         None => Err(io::Error::new(
@@ -1204,12 +1225,13 @@ impl Dataplane {
         &mut self,
         peer_hex: &str,
         frame: &[u8],
+        datagram_cap: usize,
         send: impl Fn(&[u8]) -> Result<(), nexus_network::n1::N1Error>,
     ) {
-        // Q-1（回程同根）：egress→originator 方向的 DATA 帧同样受 1200B
+        // Q-1（回程同根）：egress→originator 方向的 DATA 帧同样受连接有效
         // datagram 上限约束（`TcpRelay::poll` 的 8192B 读缓冲可达 8197B 帧）。
         // 与正向共用同一分片助手；`record_tx` 仍按逻辑帧计数一次。
-        match send_stream_frame_fragmented(frame, send) {
+        match send_stream_frame_fragmented(frame, datagram_cap, send) {
             Ok(()) => self.n1_stats.record_tx(frame.len(), true),
             Err(e) => {
                 self.record_tx_error(peer_hex, frame, &format!("{e:?}"));
@@ -3668,12 +3690,15 @@ impl Dataplane {
     /// 分支（NoPeer/NoPath/QuietGate/NoDirect）与 DATA/FIN/RST 发送失败的
     /// 唯一发射点。
     ///
-    /// H2：超限 DATA 帧在此按 ≤1195B/片切分（[`send_stream_frame_fragmented`]），
-    /// 控制帧与 ≤1200B 的帧原样发送。
+    /// H2：超限 DATA 帧在此按连接级 `datagram_cap − 5` 切分
+    /// （[`send_stream_frame_fragmented`]），控制帧与 ≤cap 的帧原样发送。
     fn send_mesh_tcp_frame(&self, dst: IpAddr, frame: &[u8]) -> bool {
         match &self.n1_sender {
             Some(sender) => {
-                match send_stream_frame_fragmented(frame, |f| sender.send_to_mesh(dst, f)) {
+                let cap = sender
+                    .datagram_cap_for(dst)
+                    .unwrap_or(DATAGRAM_PAYLOAD_FALLBACK);
+                match send_stream_frame_fragmented(frame, cap, |f| sender.send_to_mesh(dst, f)) {
                     Ok(()) => {
                         self.with_stats(|s| s.mesh_tcp_frames += 1);
                         true
