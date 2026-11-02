@@ -175,6 +175,9 @@ impl RemoteTarget {
 /// `split_json_flag` 统一剥离）；遇到第一个子命令 token 即停止，其后所有 token
 /// 原样保留、归子命令所有——`nexus proxy --addr <监听地址>` 与
 /// `nexus proxy host <resource> --addr <入口地址>` 不再被全局提取吞掉。
+/// 全局段的成员只有 `--addr` / `--socket` / `--json` 三者：任何其他 token
+/// （包括未知 flag）都视为子命令的起始、自此停止扫描——未知前导 flag 之后
+/// 出现的 `--addr` 同样归子命令所有，不被全局消费（评审 F2 明确化）。
 ///
 /// 兼容性说明：子命令之后出现的 `--addr`/`--socket` 不再被全局消费。此前
 /// `nexus status --addr X` 会把 X 当作 daemon 目标；按新文法它归子命令所有，
@@ -1026,8 +1029,14 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<Stri
         if arg.starts_with("--") {
             // 等号形式 `--flag=value`：值内联，键归一为 `--flag`
             // （使 `nexus proxy --addr=<ip:port>` 与空格形式等效）。
-            if let Some(eq) = arg.find('=') {
-                map.insert(arg[..eq].to_string(), Some(arg[eq + 1..].to_string()));
+            // 仅当键长于 `--` 本身才按等号形式处理（`--=x` 落回旧路径，评审 F4）；
+            // 空值与空格形式的无值 flag 等效，记 None 而非 Some("")（评审 F1）。
+            if let Some(eq) = arg.find('=').filter(|&eq| eq > 2) {
+                let value = &arg[eq + 1..];
+                map.insert(
+                    arg[..eq].to_string(),
+                    (!value.is_empty()).then(|| value.to_string()),
+                );
                 i += 1;
                 continue;
             }
@@ -2022,14 +2031,10 @@ mod tests {
             "10.0.0.2:9000".to_string(),
         ];
         let (target, rest) = extract_remote_target(&args).unwrap();
-        // 默认目标平台相关（unix socket / Windows TCP），这里只断言“未被全局消费”。
-        #[cfg(unix)]
-        {
-            assert!(matches!(target, RemoteTarget::Socket(_)));
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = &target;
+        // 默认目标平台相关（unix socket / Windows TCP），这里只断言“未被全局消费”：
+        // 若被全局吞掉，target 必然恰为 Tcp("10.0.0.2:9000")——全平台可判定（评审 F3）。
+        if let RemoteTarget::Tcp(addr) = &target {
+            assert_ne!(addr.as_str(), "10.0.0.2:9000");
         }
         assert_eq!(
             rest,
@@ -2057,6 +2062,28 @@ mod tests {
         assert_eq!(
             flags.get("--config").and_then(|v| v.as_deref()),
             Some("/tmp/x.yaml")
+        );
+    }
+
+    /// parse_flags 等号形式边界（评审 F1/F4）：`--addr=` 空值与无值 flag
+    /// 等效记 None；`--=x` 不合成无意义的 `--` 键。
+    #[test]
+    fn parse_flags_eq_form_edge_cases() {
+        let flags = parse_flags(&["--addr=".to_string()]);
+        assert_eq!(flags.get("--addr"), Some(&None));
+        let flags = parse_flags(&["--=x".to_string(), "v".to_string()]);
+        assert!(!flags.contains_key("--"));
+    }
+
+    /// 全局段不识别等号形式（评审 F5）：`--addr=<v>` 位于子命令之前时不被
+    /// 全局提取，整段保留、落入 unknown-command 错误路径（与旧行为一致）。
+    #[test]
+    fn global_addr_eq_form_is_not_extracted() {
+        let args = vec!["--addr=10.0.0.1:8080".to_string(), "status".to_string()];
+        let (_, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(
+            rest,
+            vec!["--addr=10.0.0.1:8080".to_string(), "status".to_string()]
         );
     }
 
