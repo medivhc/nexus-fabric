@@ -1735,6 +1735,256 @@ mod tests {
         );
     }
 
+    /// `send_to` 分类：`WouldBlock` 是正常背压，不是失败；`NotConnected`
+    /// 单列（rebind 窗口的 `ClosedTransport` 恒返该 kind），其余归 `Other`。
+    #[test]
+    fn send_failure_kind_classifies_io_errors() {
+        let kind = |k| SendFailureKind::classify(&io::Error::from(k));
+        assert_eq!(kind(io::ErrorKind::WouldBlock), SendFailureKind::WouldBlock);
+        assert_eq!(
+            kind(io::ErrorKind::NotConnected),
+            SendFailureKind::NotConnected
+        );
+        assert_eq!(
+            kind(io::ErrorKind::PermissionDenied),
+            SendFailureKind::Other
+        );
+        assert_eq!(
+            kind(io::ErrorKind::NetworkUnreachable),
+            SendFailureKind::Other
+        );
+        assert!(
+            !SendFailureKind::WouldBlock.is_failure(),
+            "WouldBlock is backpressure, not a send failure"
+        );
+        assert!(SendFailureKind::NotConnected.is_failure());
+        assert!(SendFailureKind::Other.is_failure());
+    }
+
+    /// Spec 5 第一项：注入 send_to 失败 → 计数增加；**首个错误立即出日志**
+    /// （首条不被限频吞），其后同窗口只累加，窗口到期带 suppressed 再发。
+    /// 时间由测试注入，观察器内部零时钟调用。
+    #[test]
+    fn send_failure_counts_and_first_error_is_never_throttled() {
+        let mut tracker = SendErrorTracker::default();
+        let t0 = Instant::now();
+        let fail = || {
+            Err::<usize, io::Error>(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "socket closed for rebind",
+            ))
+        };
+
+        let first = tracker
+            .observe(t0, &fail())
+            .expect("first failure emits immediately");
+        assert_eq!(first.kind, SendFailureKind::NotConnected);
+        assert_eq!(first.suppressed, 0);
+        assert_eq!(
+            tracker.counters,
+            SendErrorCounters {
+                failed: 1,
+                failed_not_connected: 1,
+                failed_other: 0,
+                would_block: 0,
+            }
+        );
+
+        assert!(
+            tracker
+                .observe(t0 + Duration::from_secs(1), &fail())
+                .is_none(),
+            "inside the 10s window the log is suppressed"
+        );
+        assert_eq!(tracker.counters.failed, 2, "suppressed errors still count");
+
+        let ev = tracker
+            .observe(t0 + SEND_ERROR_LOG_INTERVAL, &fail())
+            .expect("window elapsed: emit again");
+        assert_eq!(ev.suppressed, 1);
+        assert_eq!(tracker.counters.failed, 3);
+    }
+
+    /// Spec 5 第二项：WouldBlock → 不计失败、不触发错误日志，且**不消耗**
+    /// 日志窗口（背压之后的首个真实错误仍然立即可见）。
+    #[test]
+    fn would_block_is_counted_separately_and_never_logs() {
+        let mut tracker = SendErrorTracker::default();
+        let t0 = Instant::now();
+        let would_block = || {
+            Err::<usize, io::Error>(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "send buffer full",
+            ))
+        };
+
+        assert!(
+            tracker.observe(t0, &would_block()).is_none(),
+            "WouldBlock must not trigger the error log"
+        );
+        assert!(tracker.observe(t0, &would_block()).is_none());
+        assert_eq!(
+            tracker.counters,
+            SendErrorCounters {
+                failed: 0,
+                failed_not_connected: 0,
+                failed_other: 0,
+                would_block: 2,
+            },
+            "backpressure is not a send failure"
+        );
+
+        let ev = tracker
+            .observe(
+                t0 + Duration::from_millis(1),
+                &Err::<usize, io::Error>(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected failure",
+                )),
+            )
+            .expect("WouldBlock must not consume the log window");
+        assert_eq!(ev.kind, SendFailureKind::Other);
+        assert_eq!(ev.suppressed, 0);
+        assert_eq!(tracker.counters.failed, 1);
+        assert_eq!(tracker.counters.failed_other, 1);
+    }
+
+    /// Spec 5 第三项：成功路径零副作用（计数不变、不产生日志判定）。
+    #[test]
+    fn successful_send_leaves_counters_untouched() {
+        let mut tracker = SendErrorTracker::default();
+        assert!(
+            tracker
+                .observe(Instant::now(), &Ok::<usize, io::Error>(1200))
+                .is_none()
+        );
+        assert_eq!(tracker.counters, SendErrorCounters::default());
+    }
+
+    /// 端点级站点（无连接上下文）走同一个观察器：同样分类、同样限频，
+    /// 计数挂在 driver loop 内部（无公共读面）。
+    #[test]
+    fn endpoint_send_failure_is_classified_and_counted() {
+        let socket = SendErrorTransport::new(io::ErrorKind::NotConnected);
+        let mut tracker = SendErrorTracker::default();
+        let t0 = Instant::now();
+        let dest: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        send_endpoint_packet(&socket, &mut tracker, t0, b"reply", dest, "test_site");
+        assert_eq!(tracker.counters.failed, 1);
+        assert_eq!(tracker.counters.failed_not_connected, 1);
+        send_endpoint_packet(&socket, &mut tracker, t0, b"reply", dest, "test_site");
+        assert_eq!(tracker.counters.failed, 2);
+
+        let socket = SendErrorTransport::new(io::ErrorKind::WouldBlock);
+        let mut tracker = SendErrorTracker::default();
+        send_endpoint_packet(&socket, &mut tracker, t0, b"reply", dest, "test_site");
+        assert_eq!(tracker.counters.failed, 0, "WouldBlock is not a failure");
+        assert_eq!(tracker.counters.would_block, 1);
+    }
+
+    /// 主站点接线：真实 quinn 客户端 + 注入失败的 transport，断言 `pump_one`
+    /// 的 send_to 失败经 `update_stats` 进入 `ConnStats`。
+    #[test]
+    fn pump_send_failure_reaches_conn_stats() {
+        let driver = Driver::new_client_with_transport(Box::new(SendErrorTransport::new(
+            io::ErrorKind::NotConnected,
+        )))
+        .expect("driver spawns");
+        let conn = connect_for_send_error_test(&driver);
+        let stats = wait_for_stats(&conn, |s| s.send_failed > 0);
+        assert_eq!(
+            stats.send_failed,
+            stats.send_failed_not_connected + stats.send_failed_other,
+            "failed is the sum of its kind buckets"
+        );
+        assert!(stats.send_failed_not_connected > 0);
+        assert_eq!(stats.send_would_block, 0);
+    }
+
+    /// 主站点接线：WouldBlock 注入只进 `send_would_block`，失败计数保持 0。
+    #[test]
+    fn pump_would_block_never_counts_as_failure() {
+        let driver = Driver::new_client_with_transport(Box::new(SendErrorTransport::new(
+            io::ErrorKind::WouldBlock,
+        )))
+        .expect("driver spawns");
+        let conn = connect_for_send_error_test(&driver);
+        let stats = wait_for_stats(&conn, |s| s.send_would_block > 0);
+        assert_eq!(stats.send_failed, 0, "backpressure is not a send failure");
+        assert_eq!(stats.send_failed_not_connected, 0);
+        assert_eq!(stats.send_failed_other, 0);
+    }
+
+    /// 测试替身：send_to 恒返指定 kind；recv_from 立即 WouldBlock（带 1ms
+    /// 休眠避免忙等），driver 线程可正常处理命令与 pump。
+    struct SendErrorTransport {
+        kind: io::ErrorKind,
+    }
+
+    impl SendErrorTransport {
+        fn new(kind: io::ErrorKind) -> Self {
+            Self { kind }
+        }
+    }
+
+    impl UdpTransport for SendErrorTransport {
+        fn recv_from(&mut self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            thread::sleep(Duration::from_millis(1));
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets"))
+        }
+        fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            Err(io::Error::new(self.kind, "injected send failure"))
+        }
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            "127.0.0.1:41000".parse().map_err(io::Error::other)
+        }
+    }
+
+    fn connect_for_send_error_test(driver: &Arc<Driver>) -> Arc<ConnShared> {
+        let peer = PeerId([9u8; 32]);
+        let crypto = build_client_crypto(peer).expect("client crypto");
+        let (tx, rx) = mpsc::channel();
+        driver.send(Cmd::Connect {
+            remote: "127.0.0.1:9".parse().unwrap(),
+            crypto,
+            peer,
+            server_name: "nexus-fabric".to_string(),
+            reply: tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let id = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connect reply")
+            .expect("connection id");
+        driver
+            .shared()
+            .conns
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .expect("live connection is published")
+    }
+
+    fn wait_for_stats(conn: &Arc<ConnShared>, predicate: impl Fn(&ConnStats) -> bool) -> ConnStats {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = conn.stats.lock().unwrap().clone();
+            if predicate(&stats) {
+                return stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "send error was not surfaced in ConnStats within 5s: {stats:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// S11: a `Cmd::Connect` cancelled before the driver runs it must not
     /// create an orphan connection. This is what `Driver::connect` relies
     /// on when its phase-1 wait times out.
