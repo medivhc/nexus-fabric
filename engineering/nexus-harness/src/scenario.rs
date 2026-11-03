@@ -2999,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_returns_none_current_dir_for_all_276() {
+    fn resolve_returns_none_current_dir_for_all_277() {
         let repo = Repo::discover().expect("repo must be discoverable");
         let config = Config::load(&repo).expect("config must load");
         let scenarios = load_all(
@@ -3057,12 +3057,13 @@ mod tests {
         // product.ipv6-tcp-termination（ipv6_tcp_termination_e4）→ 296；合并门 CAC-1 补跑新增
         // product.cac1-proxy-v6-echo（同 example 的 --cac1 模式）→ 297（合并树实测重算）。
         // §11.9.5：+ product.nexusd-trojan-credential-probe（cargo run -p nexusd --example） = 298。
-        assert_eq!(parseable, 298, "298 cargo-run [when].command");
+        // §11.18.1：+ product.proxy-fwd-udp-vless-anytls（cargo run -p nexusd --example） = 299。
+        assert_eq!(parseable, 299, "299 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 276, "all declared targets resolve to Direct");
+        assert_eq!(direct, 277, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -3101,10 +3102,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            215,
-            "211 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            216,
+            "212 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 211);
+        assert_eq!(examples.len(), 212);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(

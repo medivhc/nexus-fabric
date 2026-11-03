@@ -470,5 +470,13 @@
     "module": "apps/nexusd",
     "category": "implementation-pitfall",
     "summary": "探测按截止时刻驱动 rustls（socket 超时是每次调用的）；TLS 错误之前已解密的 fallback 字节必须判 rejected（否则 fail-open）；终结器在三次握手后才发 Syn；断言「不改变既有行为」用开/关对照。"
+  },
+  {
+    "id": "udp-proxy-stream-pitfalls",
+    "file": "entries/2026-10-29-udp-proxy-stream-pitfalls.md",
+    "date": "2026-10-29",
+    "module": "apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "VLESS UDP 流在节点确认（响应头）前结束要按建流失败处理（否则逐包重连）；建流队列上限只用于建流期间，之后用字节背压；异步代理流在写出时才计 proxy_forwarded。"
   }
 ]
