@@ -630,7 +630,8 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
   两端 SHA-256 逐字一致（Oversize / 发送失败计数均为 0）、`kill -9` 后对端 **32 s 内**
   Escalate 有界退出、重启后会话约 3 s 重建且新流（64 KiB）全达。此前的
   `n1-mid-stream-send-failure-diagnosis` 诊断 run 已关闭，断裂根因已定性并修复（见下条
-  「已修复」）。**默认关闭不变**：`[network.n1]` 整节省略 = 禁用，默认开另行裁决。
+  「已修复」）。**默认关闭不变**：`[network.n1]` 整节省略 = 禁用，默认开另行裁决。对外
+  说明 usable 时必须同时复述下面的「诚实边界」全文，不得只引用状态词。
 
   > **升级行为变化（`network.toml` 的 `[vpi].mtu`，用户可见）**：同一修复把 VPI raw-IP
   > uplink 的 MTU 默认值与硬上界对齐到 N1 datagram 有效载荷下限 **1162**。新版本对
