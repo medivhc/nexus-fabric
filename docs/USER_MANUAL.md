@@ -644,7 +644,7 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
 * **已修复：2026-10-29 断裂的根因与修复落点**（诊断 run 已关闭）：
 
   * 根因：N1 分片按**假定**的 1200 字节上限切帧，而 quinn-proto 的实际有效上限是
-    `1200 − 29 − 9 = `**`1162`** 字节（STREAM 帧 1162 B 全通 / 1163 B 全灭）；
+    `1200 − 29 − 9 = 1162` 字节（STREAM 帧 1162 B 全通 / 1163 B 全灭）；
     `crates/nexus-fabric/src/driver.rs` 的 pump flush 对
     `SendDatagramError::TooLarge` **静默吞掉**（无计数、无日志），所以上层一直按
     1200 假设工作，而这类 flush 期丢弃在发送计数面上完全不可见。
