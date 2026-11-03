@@ -57,6 +57,7 @@ requirement_change_invalidates_evidence = true
 root_contract_paths = [
   "PRODUCT.md",
   "ARCHITECTURE.md",
+  "DEV-ENV.md",
   "policies/",
   "scenarios/"
 ]

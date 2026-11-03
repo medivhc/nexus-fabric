@@ -275,6 +275,9 @@ impl Repo {
 
     fn contract_digest(&self) -> Result<String, String> {
         let roots = self.contract_roots();
+        if let Some(bad) = roots.iter().find(|r| is_absolute_root(r)) {
+            return Err(format!("absolute contract root rejected: {bad}"));
+        }
         let mut args = vec![
             "ls-files".to_string(),
             "-z".to_string(),
@@ -325,9 +328,15 @@ impl Repo {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
-            None => ["PRODUCT.md", "ARCHITECTURE.md", "policies/", "scenarios/"]
-                .map(str::to_string)
-                .to_vec(),
+            None => [
+                "PRODUCT.md",
+                "ARCHITECTURE.md",
+                "DEV-ENV.md",
+                "policies/",
+                "scenarios/",
+            ]
+            .map(str::to_string)
+            .to_vec(),
         };
         roots
             .iter()
@@ -339,6 +348,19 @@ impl Repo {
     pub fn resolve(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
     }
+}
+
+/// Whether a configured contract root is an absolute path (`/x`, `\x`,
+/// `C:\x`). Absolute roots are rejected at load: one pointing inside the
+/// repo resolves only on the configuring machine, so the digest would
+/// take a machine-specific value there and disagree with every other
+/// clone, defeating the determinism contract_hash exists for.
+fn is_absolute_root(root: &str) -> bool {
+    root.starts_with('/')
+        || root.starts_with('\\')
+        || (root.len() >= 2
+            && root.as_bytes()[0].is_ascii_alphabetic()
+            && root.as_bytes()[1] == b':')
 }
 
 /// Toolchain/target info from `rustc -vV`.
@@ -741,6 +763,7 @@ pub(crate) mod tests {
         for (rel, body) in [
             ("PRODUCT.md", "product v1\n"),
             ("ARCHITECTURE.md", "arch v1\n"),
+            ("DEV-ENV.md", "toolchain v1\n"),
             ("policies/architecture.toml", "a = 1\n"),
             ("scenarios/product/s.toml", "id = \"s\"\n"),
             ("crates/demo/MODULE.md", "demo v1\n"),
@@ -774,6 +797,7 @@ pub(crate) mod tests {
         for rel in [
             "PRODUCT.md",
             "ARCHITECTURE.md",
+            "DEV-ENV.md",
             "policies/architecture.toml",
             "scenarios/product/s.toml",
             "crates/demo/MODULE.md",
@@ -854,21 +878,21 @@ pub(crate) mod tests {
     #[test]
     fn contract_hash_honors_configured_root_contract_paths() {
         let repo = contract_fixture("contract-config");
-        std::fs::write(repo.resolve("DEV-ENV.md"), "toolchain v1\n").unwrap();
+        std::fs::write(repo.resolve("NOTES.md"), "toolchain v1\n").unwrap();
         let unconfigured = repo.contract_hash();
-        std::fs::write(repo.resolve("DEV-ENV.md"), "toolchain v2\n").unwrap();
+        std::fs::write(repo.resolve("NOTES.md"), "toolchain v2\n").unwrap();
         assert_eq!(
             repo.contract_hash(),
             unconfigured,
-            "default set excludes DEV-ENV.md"
+            "default set excludes NOTES.md"
         );
         std::fs::write(
             repo.resolve("harness.toml"),
-            "[protection]\nroot_contract_paths = [\"PRODUCT.md\", \"DEV-ENV.md\"]\n",
+            "[protection]\nroot_contract_paths = [\"PRODUCT.md\", \"NOTES.md\"]\n",
         )
         .unwrap();
-        assert_contract_moves(&repo, "configured DEV-ENV.md", |r| {
-            std::fs::write(r.resolve("DEV-ENV.md"), "toolchain v3\n").unwrap()
+        assert_contract_moves(&repo, "configured NOTES.md", |r| {
+            std::fs::write(r.resolve("NOTES.md"), "toolchain v3\n").unwrap()
         });
         let configured = repo.contract_hash();
         std::fs::write(repo.resolve("ARCHITECTURE.md"), "arch v2\n").unwrap();
@@ -902,16 +926,16 @@ pub(crate) mod tests {
         ] {
             let repo = contract_fixture(tag);
             std::fs::write(repo.resolve("harness.toml"), harness).unwrap();
-            std::fs::write(repo.resolve("DEV-ENV.md"), "toolchain v1\n").unwrap();
+            std::fs::write(repo.resolve("NOTES.md"), "toolchain v1\n").unwrap();
             assert_contract_moves(&repo, tag, |r| {
                 std::fs::write(r.resolve("ARCHITECTURE.md"), "arch v2\n").unwrap()
             });
             let h = repo.contract_hash();
-            std::fs::write(repo.resolve("DEV-ENV.md"), "toolchain v2\n").unwrap();
+            std::fs::write(repo.resolve("NOTES.md"), "toolchain v2\n").unwrap();
             assert_eq!(
                 repo.contract_hash(),
                 h,
-                "{tag}: DEV-ENV.md is not a default contract"
+                "{tag}: NOTES.md is not a default contract"
             );
         }
     }
@@ -968,6 +992,40 @@ pub(crate) mod tests {
             repo.contract_hash(),
             h,
             "unrelated harness.toml edits do not count"
+        );
+    }
+
+    #[test]
+    fn contract_hash_rejects_absolute_roots() {
+        let repo = contract_fixture("contract-absroot");
+        assert_ne!(repo.contract_hash(), "contract-unknown");
+        // An absolute root pointing inside the repo would be accepted by
+        // git, but it resolves only on this machine: it must be rejected
+        // (sentinel), never hashed into a machine-specific value.
+        let abs = repo
+            .resolve("PRODUCT.md")
+            .to_string_lossy()
+            .replace('\\', "\\\\");
+        std::fs::write(
+            repo.resolve("harness.toml"),
+            format!("[protection]\nroot_contract_paths = [\"{abs}\"]\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            repo.contract_hash(),
+            "contract-unknown",
+            "absolute root inside the repo is rejected"
+        );
+        // Windows drive-letter forms are rejected on any host.
+        std::fs::write(
+            repo.resolve("harness.toml"),
+            "[protection]\nroot_contract_paths = [\"C:\\\\PRODUCT.md\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            repo.contract_hash(),
+            "contract-unknown",
+            "windows absolute root is rejected"
         );
     }
 
