@@ -26,6 +26,15 @@ use super::{N1Error, N1PeerId};
 pub trait N1Sender: Send + Sync {
     /// 发送包进 mesh；无路由/无连接/发送失败 → `Err`。
     fn send_to_mesh(&self, dst: IpAddr, packet: &[u8]) -> Result<(), N1Error>;
+
+    /// `dst` 对应连接的有效 datagram 载荷上限（口径 = quinn
+    /// `datagrams().max_size()`）；`None` = 未知/无路由。
+    ///
+    /// 调用方必须退到 [`super::DATAGRAM_PAYLOAD_FLOOR`]。默认 `None` 让既有
+    /// 实现无需改动即保持"保守下限"语义。
+    fn datagram_cap_for(&self, _dst: IpAddr) -> Option<usize> {
+        None
+    }
 }
 
 /// Bridge from the unified dataplane to the N1 mesh.
@@ -101,7 +110,18 @@ impl N1MeshBridge {
             .sessions
             .connection_for(&peer)
             .ok_or(N1Error::PeerUnknown)?;
-        conn.send_datagram(packet)
+        match conn.send_datagram(packet) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // H1：`PeerClosed` 是强死亡信号——登记谴责（只写表，不在此
+                // 线程摘除），下一次 `connection_for`/`dial`/`insert_accepted`
+                // 入口排空时该条目即失效，不再逐帧重试。
+                if matches!(error, N1Error::PeerClosed(_)) {
+                    self.sessions.condemn(&peer, conn.connection_id());
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Address-family dispatch (v4 → `route4`, v6 → `route6`).
@@ -148,6 +168,15 @@ impl N1Sender for N1MeshBridge {
     fn send_to_mesh(&self, dst: IpAddr, packet: &[u8]) -> Result<(), N1Error> {
         self.send_routed(dst, packet)
     }
+
+    /// `route(dst) → sessions.connection_for(peer) → conn.datagram_cap()`。
+    ///
+    /// 每逻辑帧多一次 LPM + 一次表查（量级与 `send_routed` 相同，可忽略）；
+    /// 返回 `None` 时调用方退到 `DATAGRAM_PAYLOAD_FLOOR`。
+    fn datagram_cap_for(&self, dst: IpAddr) -> Option<usize> {
+        let peer = self.route(dst)?;
+        self.sessions.connection_for(&peer)?.datagram_cap()
+    }
 }
 
 #[cfg(test)]
@@ -165,7 +194,8 @@ mod tests {
 
     impl N1Connection for FakeConn {
         fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-            if data.len() > 1200 {
+            // 与生产契约同口径：有效载荷下限（真值由连接的 datagram_cap 给出）。
+            if data.len() > super::super::DATAGRAM_PAYLOAD_FLOOR {
                 return Err(N1Error::OversizeDatagram(data.len()));
             }
             self.sent.lock().unwrap().push(data.to_vec());
@@ -313,6 +343,95 @@ mod tests {
         assert!(Ipv6Net::parse("not-a-cidr").is_err());
         assert!(Ipv6Net::parse("fd00::/129").is_err());
         assert!(Ipv6Net::parse("fd00::/64").is_ok());
+    }
+
+    /// H1：发送侧 `PeerClosed` 登记谴责，下一次入口排空即失效该条目。
+    #[test]
+    fn peer_closed_on_send_condemns_the_connection() {
+        struct ClosedConn {
+            peer: N1PeerId,
+            id: u64,
+        }
+        impl N1Connection for ClosedConn {
+            fn send_datagram(&self, _data: &[u8]) -> Result<(), N1Error> {
+                Err(N1Error::PeerClosed(0))
+            }
+            fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
+                Err(N1Error::Closed)
+            }
+            fn open_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+                Err(N1Error::Closed)
+            }
+            fn accept_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+                Err(N1Error::Closed)
+            }
+            fn rebind(&self) -> Result<(), N1Error> {
+                Ok(())
+            }
+            fn connection_id(&self) -> u64 {
+                self.id
+            }
+            fn peer(&self) -> N1PeerId {
+                self.peer
+            }
+            fn close(&self) {}
+        }
+
+        struct Dialer;
+        impl super::super::N1Dialer for Dialer {
+            fn dial(
+                &self,
+                peer: &N1PeerId,
+                addrs: &[std::net::SocketAddr],
+            ) -> Result<Box<dyn N1Connection>, N1Error> {
+                if addrs.is_empty() {
+                    return Err(N1Error::PeerUnknown);
+                }
+                Ok(Box::new(ClosedConn {
+                    peer: *peer,
+                    id: 41,
+                }))
+            }
+        }
+
+        struct Discovery;
+        impl super::super::N1Discovery for Discovery {
+            fn resolve(&self, _peer: &N1PeerId) -> Result<Vec<std::net::SocketAddr>, N1Error> {
+                Ok(vec!["127.0.0.1:9000".parse().expect("addr")])
+            }
+        }
+
+        struct NullSink;
+        impl super::super::N1EventSink for NullSink {
+            fn emit(&self, _event: super::super::N1Event) {}
+        }
+
+        let peer = N1PeerId([0x5a; 32]);
+        let sessions = Arc::new(N1SessionManager::new(
+            Arc::new(Dialer),
+            Arc::new(Discovery),
+            Arc::new(NullSink),
+            super::super::link::LinkConfig {
+                probe_interval: std::time::Duration::from_secs(3600),
+                heartbeat_timeout: std::time::Duration::from_secs(3600),
+                enable_rebind: false,
+                enable_watcher: false,
+            },
+        ));
+        sessions.dial(&peer).expect("dial");
+        let bridge =
+            N1MeshBridge::from_cidrs(Arc::clone(&sessions), &[("10.99.0.0/16", peer)], &[])
+                .expect("bridge");
+
+        let err = bridge
+            .send_to_mesh("10.99.0.5".parse().expect("dst"), b"x")
+            .expect_err("PeerClosed must surface");
+        assert!(matches!(err, N1Error::PeerClosed(0)));
+        assert!(
+            sessions.connection_for(&peer).is_none(),
+            "condemned connection must be drained at the next entry"
+        );
+        sessions.shutdown();
     }
 
     #[test]

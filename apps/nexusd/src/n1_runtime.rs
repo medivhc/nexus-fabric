@@ -256,7 +256,7 @@ mod tests {
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n"
+             mtu = 1162\n"
         );
         crate::assembly::assemble_n1_with_discovery(
             &text,
@@ -446,7 +446,7 @@ mod tests {
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n",
+             mtu = 1162\n",
             hex32(&listener_peer.0),
             hex32(&dialer_peer.0),
         );
@@ -482,7 +482,7 @@ mod tests {
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.2\"\n\
-             mtu = 1200\n",
+             mtu = 1162\n",
             hex32(&dialer_peer.0),
             hex32(&listener_peer.0),
         );

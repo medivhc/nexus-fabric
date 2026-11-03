@@ -113,7 +113,7 @@ fn network_toml(with_routes6: bool) -> String {
          interface = \"nexus0\"\n\
          address = \"10.144.144.1\"\n\
          {address6}\
-         mtu = 1200\n\
+         mtu = 1162\n\
          [[vpi.routes]]\n\
          subnet = \"10.144.144.0/24\"\n\
          peer = \"{PEER_ID}\"\n"

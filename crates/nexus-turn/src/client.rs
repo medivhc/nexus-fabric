@@ -20,9 +20,8 @@ use crate::stun::{
     self, is_channel_data, is_stun_message, valid_channel, Attribute, StunMessage,
     ALLOCATE_REQUEST, ALLOCATE_SUCCESS, ATTR_DATA, ATTR_ERROR_CODE, ATTR_LIFETIME, ATTR_NONCE,
     ATTR_REALM, ATTR_XOR_MAPPED_ADDRESS, ATTR_XOR_PEER_ADDRESS, ATTR_XOR_RELAYED_ADDRESS,
-    CHANNEL_BIND_REQUEST, CHANNEL_BIND_SUCCESS, CREATE_PERMISSION_FAILURE,
-    CREATE_PERMISSION_REQUEST, CREATE_PERMISSION_SUCCESS, DATA_INDICATION, REFRESH_REQUEST,
-    REFRESH_SUCCESS, SEND_INDICATION,
+    CHANNEL_BIND_REQUEST, CHANNEL_BIND_SUCCESS, CREATE_PERMISSION_REQUEST,
+    CREATE_PERMISSION_SUCCESS, DATA_INDICATION, REFRESH_REQUEST, REFRESH_SUCCESS, SEND_INDICATION,
 };
 
 /// TURN 长效认证凭证。
@@ -41,6 +40,11 @@ pub struct TurnStats {
     pub unauthorized_dropped: u64,
     pub relayed_bytes: u64,
     pub allocation_expired: u64,
+    /// 438 (Stale Nonce) 后采纳响应新 nonce、以新事务 ID 重发的次数
+    /// （同一 `transact()` 调用内、对调用方透明；重试最终仍失败也计入；
+    /// 成功恢复不增加 `allocation_expired`）。与真正的 integrity 失败区分，
+    /// 见 `transact`。
+    pub stale_nonce_retried: u64,
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +54,7 @@ struct AtomicStats {
     unauthorized_dropped: AtomicU64,
     relayed_bytes: AtomicU64,
     allocation_expired: AtomicU64,
+    stale_nonce_retried: AtomicU64,
 }
 
 impl AtomicStats {
@@ -60,6 +65,7 @@ impl AtomicStats {
             unauthorized_dropped: self.unauthorized_dropped.load(Ordering::Relaxed),
             relayed_bytes: self.relayed_bytes.load(Ordering::Relaxed),
             allocation_expired: self.allocation_expired.load(Ordering::Relaxed),
+            stale_nonce_retried: self.stale_nonce_retried.load(Ordering::Relaxed),
         }
     }
 }
@@ -191,9 +197,7 @@ impl TurnClient {
         let req = StunMessage::new(CREATE_PERMISSION_REQUEST).attr(Attribute::XorPeerAddress(peer));
         let mut inner = self.lock()?;
         let resp = inner.transact(req, REQUEST_TIMEOUT)?;
-        if resp.msg_type == CREATE_PERMISSION_FAILURE {
-            return Err(unexpected(&resp, "create-permission"));
-        }
+        // 错误响应在 `transact` 内已按错误码返回 Err。
         if resp.msg_type != CREATE_PERMISSION_SUCCESS {
             return Err(unexpected(&resp, "create-permission"));
         }
@@ -461,13 +465,26 @@ impl ClientInner {
     }
 
     /// 发送请求并等待匹配 txn 的响应；Data indication 暂存，无关响应按 txn 丢弃。
+    ///
+    /// 响应先按属性分类（RFC 8489 §9.2.5）：
+    /// - 401 质询：原样返回给调用方（`allocate` 的质询流不变）；
+    /// - 438 stale nonce：采纳响应携带的新 NONCE，并以 `stun::new_transaction_id()`
+    ///   生成的新事务 ID 在同一 `transact()` 调用内重发一次（对调用方透明）；
+    ///   服务端持续回 438 时第二次即失败（有界，不形成重试循环/请求风暴）；
+    ///   以新事务重发后，携带原事务 ID 的迟到响应不再被采纳；
+    /// - 其他错误码：返回带错误码与 reason 的明确错误（不再统一报 integrity failed）；
+    /// - 成功响应：按属性定位 MESSAGE-INTEGRITY 并强制验证（缺失/不符 fail-closed）。
+    ///
+    /// 错误响应不强制 MI（438 等可能不带 MI），但错误响应永远不会被当成成功；
+    /// 安全口径仍是「只有通过 MI 验证的成功响应才是成功」。
     fn transact(
         &mut self,
-        msg: StunMessage,
+        mut msg: StunMessage,
         timeout: Duration,
     ) -> io::Result<stun::DecodedMessage> {
-        let bytes = self.encode_request(&msg);
         let deadline = Instant::now() + timeout;
+        let mut stale_retries = 0u8;
+        let mut bytes = self.encode_request(&msg);
         self.sock.send(&bytes)?;
         let mut buf = vec![0u8; 65535];
         loop {
@@ -499,25 +516,60 @@ impl ClientInner {
             }
             let d = stun::decode(raw)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad stun message"))?;
-            if d.txn == msg.txn {
-                // RFC 5766 §2.2: 验证响应的 MESSAGE-INTEGRITY（401 质询无 MI，跳过）。
-                if !is_error(&d, 4, 1) && !verify_response_integrity(raw, &self.key) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "turn response integrity check failed",
-                    ));
+            // 只有与当前请求事务匹配的响应才被采纳（新 nonce 亦然）。
+            if d.txn != msg.txn {
+                if d.msg_type == DATA_INDICATION {
+                    if let (Some(Attribute::Data(data)), Some(Attribute::XorPeerAddress(peer))) =
+                        (d.get(ATTR_DATA), d.get(ATTR_XOR_PEER_ADDRESS))
+                    {
+                        let peer = *peer;
+                        self.pending_data.push_back((data.clone(), peer));
+                    }
                 }
-                return Ok(d);
+                // 其他无关响应：按 txn 丢弃（本实现同一时刻只有一个在途事务）。
+                continue;
             }
-            if d.msg_type == DATA_INDICATION {
-                if let (Some(Attribute::Data(data)), Some(Attribute::XorPeerAddress(peer))) =
-                    (d.get(ATTR_DATA), d.get(ATTR_XOR_PEER_ADDRESS))
-                {
-                    let peer = *peer;
-                    self.pending_data.push_back((data.clone(), peer));
+            if let Some(Attribute::ErrorCode(class, number, reason)) = d.get(ATTR_ERROR_CODE) {
+                match (*class, *number) {
+                    // 401：交给调用方走质询流（提取 REALM/NONCE 后认证重发）。
+                    (4, 1) => return Ok(d),
+                    // 438（RFC 8489 §9.2.5）：采纳新 nonce，以新事务 ID 重试一次。
+                    (4, 38) => {
+                        if stale_retries >= 1 {
+                            return Err(stale_nonce_persisted(msg.msg_type, reason));
+                        }
+                        let nonce = stale_nonce_value(&d)?;
+                        self.nonce = Some(nonce);
+                        stale_retries += 1;
+                        self.stats
+                            .stale_nonce_retried
+                            .fetch_add(1, Ordering::Relaxed);
+                        // 重试是一次新的请求事务：换 nonce 的同时必须换事务 ID，
+                        // 否则迟到的、携带原事务 ID 的重复 438 会被误当成重试的
+                        // 响应（消耗掉唯一一次有界重试）。
+                        let previous_txn = msg.txn;
+                        msg.txn = stun::new_transaction_id();
+                        eprintln!(
+                            "[turn] stale nonce recovered: 438 on request 0x{:04x}, \
+                             retrying once with fresh nonce (txn {:02x?} -> {:02x?})",
+                            msg.msg_type, previous_txn, msg.txn
+                        );
+                        bytes = self.encode_request(&msg);
+                        self.sock.send(&bytes)?;
+                        continue;
+                    }
+                    // 其他错误码：明确报出错误码与 reason。
+                    _ => return Err(error_response(msg.msg_type, *class, *number, reason)),
                 }
             }
-            // 其他无关响应：按 txn 丢弃（本实现同一时刻只有一个在途事务）。
+            // RFC 5766 §2.2: 验证成功响应的 MESSAGE-INTEGRITY。
+            if !verify_response_integrity(raw, &d, &self.key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "turn response integrity check failed",
+                ));
+            }
+            return Ok(d);
         }
     }
 }
@@ -527,19 +579,71 @@ fn is_error(d: &stun::DecodedMessage, class: u8, number: u8) -> bool {
     matches!(d.get(ATTR_ERROR_CODE), Some(Attribute::ErrorCode(c, n, _)) if *c == class && *n == number)
 }
 
-/// 验证 server 响应的 MESSAGE-INTEGRITY（RFC 5766 §2.2）。
+/// 从 438 响应提取可用的新 NONCE（不可用 → 明确错误，不静默沿用旧 nonce）。
+fn stale_nonce_value(d: &stun::DecodedMessage) -> io::Result<String> {
+    match d.get(ATTR_NONCE) {
+        Some(Attribute::Nonce(v)) => match String::from_utf8(v.clone()) {
+            Ok(n) if !n.is_empty() => Ok(n),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "turn 438 stale nonce: response carries an unusable NONCE",
+            )),
+        },
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "turn 438 stale nonce: response carries no NONCE",
+        )),
+    }
+}
+
+/// `"{class}{number:02} {reason}"`（reason 缺失时用 RFC 标准词组兜底，
+/// 保持调用方可按 "438 Stale Nonce" 识别的文本契约）。
+fn error_code_text(class: u8, number: u8, reason: &[u8]) -> String {
+    let reason = String::from_utf8_lossy(reason);
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        match (class, number) {
+            (4, 1) => "Unauthorized",
+            (4, 38) => "Stale Nonce",
+            _ => "",
+        }
+    } else {
+        reason
+    };
+    if reason.is_empty() {
+        format!("{class}{number:02}")
+    } else {
+        format!("{class}{number:02} {reason}")
+    }
+}
+
+/// 非 401/438 的错误响应 → 带错误码与 reason 的明确错误。
+fn error_response(request_type: u16, class: u8, number: u8, reason: &[u8]) -> io::Error {
+    io::Error::other(format!(
+        "turn request 0x{request_type:04x}: {}",
+        error_code_text(class, number, reason)
+    ))
+}
+
+/// 438 在换 nonce 重试后仍持续 → 有界失败（不形成重试循环）。
+fn stale_nonce_persisted(request_type: u16, reason: &[u8]) -> io::Error {
+    io::Error::other(format!(
+        "turn request 0x{request_type:04x}: {} persisted after nonce refresh (bounded retry exhausted)",
+        error_code_text(4, 38, reason)
+    ))
+}
+
+/// 验证 server 成功响应的 MESSAGE-INTEGRITY（RFC 5766 §2.2）。
 ///
-/// 约定：server 总把 MI 作为最后一个属性（见 `server::send_success`/`send_error`），
-/// 故 MI 值在数据报尾部 20 字节，前面是属性头 `00 08 00 14`。
-fn verify_response_integrity(raw: &[u8], key: &[u8]) -> bool {
-    if raw.len() < 24 {
-        return false;
+/// MI 按属性解析定位（`DecodedMessage::mi_value_offset`），不假设它位于报文
+/// 末位：RFC 5389 §15.5 允许 MI 之后出现 FINGERPRINT，HMAC 输入的长度验算
+/// 见 [`crate::auth::verify_integrity`]（RFC 5389 §15.4）。成功响应缺少 MI
+/// 或值与 key 不符 → 验证失败（fail-closed）。
+fn verify_response_integrity(raw: &[u8], d: &stun::DecodedMessage, key: &[u8]) -> bool {
+    match d.mi_value_offset {
+        Some(mi_off) => verify_integrity(raw, mi_off, key),
+        None => false,
     }
-    let mi_off = raw.len() - 20;
-    if raw[mi_off - 4..mi_off] != [0x00, 0x08, 0x00, 0x14] {
-        return false;
-    }
-    verify_integrity(raw, mi_off, key)
 }
 
 fn realm_nonce(d: &stun::DecodedMessage) -> io::Result<(String, String)> {

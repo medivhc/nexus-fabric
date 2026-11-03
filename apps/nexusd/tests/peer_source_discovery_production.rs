@@ -252,12 +252,12 @@ impl Drop for Daemon {
 
 fn network_toml(self_seed: u8, peer: Option<u8>, vip: &str) -> String {
     let mut text = format!(
-        "peer_id = \"{}\"\n\n[vpi]\ninterface = \"nxtun0\"\naddress = \"{vip}\"\nmtu = 1200\n",
+        "peer_id = \"{}\"\n\n[vpi]\ninterface = \"nxtun0\"\naddress = \"{vip}\"\nmtu = 1162\n",
         peer_id_hex(self_seed)
     );
     if let Some(peer_seed) = peer {
         text = format!(
-            "peer_id = \"{}\"\n\n[[peers]]\nid = \"{}\"\naddrs = [\"127.0.0.1:9\"]\n\n[vpi]\ninterface = \"nxtun0\"\naddress = \"{vip}\"\nmtu = 1200\n",
+            "peer_id = \"{}\"\n\n[[peers]]\nid = \"{}\"\naddrs = [\"127.0.0.1:9\"]\n\n[vpi]\ninterface = \"nxtun0\"\naddress = \"{vip}\"\nmtu = 1162\n",
             peer_id_hex(self_seed),
             peer_id_hex(peer_seed)
         );

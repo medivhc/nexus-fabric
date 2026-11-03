@@ -95,6 +95,7 @@ fn map_fabric_err(e: FabricError) -> N1Error {
         FabricError::Timeout => N1Error::Timeout,
         FabricError::PathUnreachable => N1Error::PeerUnknown,
         FabricError::HandshakeFailed(s) => N1Error::Transport(format!("handshake: {s}")),
+        FabricError::DatagramTooLarge { len, .. } => N1Error::OversizeDatagram(len),
         FabricError::Transport(s) => N1Error::Transport(s),
     }
 }
@@ -105,10 +106,11 @@ struct FabricConnAdapter {
 
 impl N1Connection for FabricConnAdapter {
     fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-        if data.len() > 1200 {
-            return Err(N1Error::OversizeDatagram(data.len()));
-        }
+        // 有效上限由 fabric 按 quinn 真值判定（typed error），此处不再本地判 1200。
         self.inner.send_datagram(data).map_err(map_fabric_err)
+    }
+    fn datagram_cap(&self) -> Option<usize> {
+        self.inner.datagram_cap()
     }
     fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
         self.inner.recv_datagram().map_err(map_fabric_err)
@@ -906,7 +908,7 @@ mod tests {
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n",
+             mtu = 1162\n",
             hex32(&client.peer_id().0),
             hex32(&server.peer_id().0),
         );
@@ -1059,7 +1061,7 @@ mod tests {
     fn discovery_network_toml(peers: &str) -> String {
         format!(
             "peer_id = \"{}\"\n{peers}\
-             [vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1200\n",
+             [vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1162\n",
             "aa".repeat(32),
         )
     }

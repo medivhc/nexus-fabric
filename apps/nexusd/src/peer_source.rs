@@ -1360,7 +1360,7 @@ mod feed_tests {
 
     fn sessions_with(peers: &[N1PeerId]) -> Arc<N1SessionManager> {
         let text = format!(
-            "peer_id = \"{}\"\n[vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1200\n",
+            "peer_id = \"{}\"\n[vpi]\ninterface = \"nexus0\"\naddress = \"10.200.0.1\"\nmtu = 1162\n",
             hex_id(0xaa)
         );
         let (_cfg, mgr, _hub) = nexus::network::build_session_manager_with_discovery(

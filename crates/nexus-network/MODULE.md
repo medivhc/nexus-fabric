@@ -94,6 +94,12 @@ cargo clippy -p nexus-network --all-targets -- -D warnings
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
 
+- VPI raw-IP uplink 的 MTU 约束：N1 datagram 有效载荷上限在本仓库装配下是
+  1162（见 `DATAGRAM_PAYLOAD_FLOOR`）。Linux 要求接口 MTU ≥ 1280 才能承载
+  IPv6，因此当该 TUN 需要承载 IPv6 时**不能**靠把 MTU 降到 1162 来规避；
+  只能按"超限丢弃 + 计数"处理（`PumpStats::uplink_dropped` + 一次性日志）。
+  当前 v9 CLI 的 VPI 只处理 IPv4，故 `vpi.mtu` 默认取 1162 是安全的。
+
 ---
 
 # N1 Universal Connectivity 装配契约（M1–M7）
@@ -232,6 +238,11 @@ N1 装配新增：
 - 信任模型：预共享 `peer_id`（静态配置）；无 PKI、无握手认证——后置。
 - Relay 本期只用于 Establishment fallback；传输中 Relay 断了的重建后置。
 - 建立失败只报告失败事实，不自行替换业务 Provider（v9 §8.2）。
+- raw-IP 转发（UDP/非终结 TCP）整包进一个 N1 datagram，没有 IP 分片：
+  超过连接有效上限（默认 1162，`[tun].mtu` 默认 1500 不改变这一点）的包会被
+  **诚实丢弃并计数**（`mesh_dropped_no_n1` / `PumpStats::uplink_dropped`），
+  不再被记成"已转发"。若产品要求大 UDP 包可达，需要独立的 N1 IP 分片 /
+  端到端 PMTU 能力，不属于当前 bugfix 范围。
 - 不宣称与公网 ss/trojan 服务互操作（沿用既有边界）；VMess 不做（standing）。
 - E4 驱动必须走生产路径（知识条目 `e4-must-use-production-path`）：example 只做外部可观察操作
   （发包、等统计、读 JSON），禁止"上帝之手"直接调内部函数补状态。

@@ -22,6 +22,25 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 
+/// N1 datagram 有效载荷上限的**可证下限**（= quinn 在本仓库装配下的
+/// `datagrams().max_size()`）。
+///
+/// `1162 = 1200 (quinn INITIAL_MTU) − 29 (1 flags + 8 dst-CID + 4 PN 上界 +
+/// 16 AEAD tag) − 9 (DATAGRAM 帧 type 1B + length varint 8B)`。
+///
+/// 上限停在 1200 是因为组合根装配的 fabric driver 建 quinn 端点时把 MTU
+/// 发现开关（`Endpoint::new` 第 3 实参 `allow_mtud`）传成 `false`
+/// （fabric `src/driver.rs` `spawn_mode`）；vendored quinn 据此把
+/// `MtuDiscovery` 置为 disabled（`connection/paths.rs:86-99`、
+/// `connection/mtud.rs:46-49`）。诊断窗 ≥30 分钟阈值恒 1162 与此一致。
+/// 残余未定项：将来打开该开关后探针在本路径能否安全抬升上限未验证；
+/// 无论是否抬升，本值都是下限。
+///
+/// portable core 不能依赖 `nexus-fabric`，故此处复制同一数值；两边的对账测试
+/// `floor_constants_agree` 在组合根 `apps/nexusd`（唯一同时依赖两者的 crate）。
+/// 连接建立后应优先使用 `N1Connection::datagram_cap()` 的真值；`None` 时退到本值。
+pub const DATAGRAM_PAYLOAD_FLOOR: usize = 1162;
+
 /// 节点身份：ed25519 公钥 32 字节（对标 fabric `PeerId`）。
 ///
 /// portable core 不能命名 fabric 类型，故自建；fabric `PeerId` ↔ `N1PeerId`
@@ -101,7 +120,7 @@ pub enum N1Error {
     PeerClosed(u32),
     /// 操作超时（心跳超时、握手超时等）。
     Timeout,
-    /// 数据报超限（>1200B，调用方计数后丢弃）。
+    /// 数据报超限（> 连接有效载荷上限，下限 [`DATAGRAM_PAYLOAD_FLOOR`]；调用方计数后丢弃）。
     OversizeDatagram(usize),
     /// 配置非法。
     InvalidConfig(String),
@@ -127,7 +146,12 @@ impl std::error::Error for N1Error {}
 ///
 /// `Send + Sync` 是必需的：连接被包泵双线程 + Link 观测器共享（D2 评审）。
 pub trait N1Connection: Send + Sync {
-    /// 发送不可靠数据报（≤1200B；超限返回 `OversizeDatagram`，调用方计数后丢弃）。
+    /// 发送不可靠数据报（长度不得超过连接有效载荷上限；超限返回
+    /// `OversizeDatagram`，调用方计数后丢弃）。
+    ///
+    /// 上限口径 = quinn `datagrams().max_size()`；未协商时以
+    /// [`DATAGRAM_PAYLOAD_FLOOR`] 为可证下限。实现若知道真值应覆盖
+    /// [`N1Connection::datagram_cap`]。
     ///
     /// 注意：fabric driver 吞掉了 UDP `send_to` 的 socket 错误，本方法返回 `Ok`
     /// 不代表包真的发出——"socket 错误"不能作为 Link 观测触发器（D3 评审）。
@@ -144,6 +168,14 @@ pub trait N1Connection: Send + Sync {
     fn connection_id(&self) -> u64;
     /// 对端身份。
     fn peer(&self) -> N1PeerId;
+    /// 当前连接的有效 datagram 载荷上限（口径 = quinn `datagrams().max_size()`，
+    /// 载荷不含 QUIC 包头与 DATAGRAM 帧头）。
+    ///
+    /// `None` = 实现未知（握手未完成 / 连接已关闭 / 实现不支持查询）。调用方
+    /// 必须退到 [`DATAGRAM_PAYLOAD_FLOOR`]（可证下限）。
+    fn datagram_cap(&self) -> Option<usize> {
+        None
+    }
     /// 关闭连接；阻塞中的 `recv_datagram` / `accept_keepalive` / keepalive 读
     /// 必须随之返回 `Closed`（结构化并发的取消路径，AGENTS.md §13）。
     fn close(&self);

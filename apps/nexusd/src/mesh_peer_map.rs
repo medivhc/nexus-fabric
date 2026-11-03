@@ -127,7 +127,7 @@ addrs = [\"127.0.0.1:22022\"]
 [vpi]
 interface = \"nxp0%d\"
 address = \"10.99.13.1\"
-mtu = 1200
+mtu = 1162
 
 [[vpi.routes]]
 subnet = \"10.99.13.2/32\"

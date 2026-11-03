@@ -661,17 +661,38 @@ impl TurnManager {
     }
 }
 
-/// 判断 Refresh 错误是否为 438 Stale Nonce。
+/// 判断 Refresh 错误是否为 438 (Stale Nonce)。
 ///
-/// W-5：不用裸 `contains("438")`（会误命中如端口 1438 之类的数字），而是匹配
-/// 完整词组 `"438 Stale Nonce"`。依据的格式契约：`nexus_turn::client` 的
-/// `unexpected()` 把错误响应格式化为
-/// `"turn {op}: unexpected response 0x{msg:04x} {class}{num:02} {reason}"`，
-/// 其中 438 的 reason 为 RFC 5389 标准词组 "Stale Nonce"。
-/// 完全类型化的 `TurnError::StaleNonce` 需要把 `TurnClient::refresh` 的公开
-/// `io::Result` 签名改掉——超出本次范围，记为后续工作。
+/// 接口现实：调用方只能拿到 `io::Error` 的文本（`TurnClient` 的公开
+/// `io::Result` 签名保持不变），拿不到结构化错误码。因此本判定完全依赖
+/// `nexus_turn::client` 的文本契约：
+///
+/// - `error_code_text()` 恒以 `"{class}{number:02} {reason}"` 产出错误码，
+///   438 必然以数字码 `438` 作为**独立 token**出现；
+/// - 438 重试耗尽后的文本形如
+///   `"turn request 0x....: 438 {reason} persisted after nonce refresh (bounded retry exhausted)"`，
+///   其中 `reason` 是 coturn 原文 `"Stale nonce"` / `"Wrong nonce"`（小写 n）；
+///   仅 reason 为空时由 `error_code_text()` 兜底为 `"Stale Nonce"`。
+///
+/// 判定规则：文本小写化后，`438` 必须以独立数字 token 出现（按非数字字符
+/// 切分，`1438` / `4380` 这类更长数字不会误命中）**且**包含 `nonce` 词干。
+/// 不再匹配裸词组 `"438 Stale Nonce"`——那对 coturn 的两种真实 reason
+/// 都会漏判（S4）。
+///
+/// 完全类型化的 `TurnError::StaleNonce` 需要改 `TurnClient::refresh` 的公开
+/// `io::Result` 签名（并让 nexus-turn 依赖 daemon 的错误分类），超出本次
+/// bugfix 范围，留待主会话单独裁决。
 fn is_stale_nonce(e: &io::Error) -> bool {
-    e.to_string().contains("438 Stale Nonce")
+    let text = e.to_string().to_ascii_lowercase();
+    contains_independent_code(&text, "438") && text.contains("nonce")
+}
+
+/// `code` 是否以独立数字 token 出现在 `text` 中。
+///
+/// 按非 ASCII 数字边界切分，避免把 `1438`、`4380` 这类更长数字误判为 `438`。
+fn contains_independent_code(text: &str, code: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_digit())
+        .any(|run| run == code)
 }
 
 /// 把分配失败分类为对外可见的降级原因。
@@ -1316,5 +1337,52 @@ mod tests {
             "3-strike path must send LIFETIME=0 Deallocate"
         );
         assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Inactive);
+    }
+
+    /// S4：`is_stale_nonce` 必须命中 coturn 的两种真实 438 reason 原文
+    /// （`nexus_turn::client` 的 persisted 文本），以及空 reason 的兜底形态。
+    #[test]
+    fn is_stale_nonce_matches_persisted_coturn_texts() {
+        // 与 `stale_nonce_persisted()` 逐字一致的文本形态。
+        let persisted = |reason: &str| {
+            io::Error::other(format!(
+                "turn request 0x0113: 438 {reason} persisted after nonce refresh \
+                 (bounded retry exhausted)"
+            ))
+        };
+        assert!(
+            is_stale_nonce(&persisted("Stale nonce")),
+            "coturn's 'Stale nonce' (lowercase n) must be recognized"
+        );
+        assert!(
+            is_stale_nonce(&persisted("Wrong nonce")),
+            "coturn's 'Wrong nonce' must be recognized"
+        );
+        // reason 为空时 `error_code_text()` 的兜底词组。
+        assert!(is_stale_nonce(&persisted("Stale Nonce")));
+        // 判定前统一小写化。
+        assert!(is_stale_nonce(&io::Error::other(
+            "turn request 0x0113: 438 STALE NONCE"
+        )));
+    }
+
+    /// S4：非 438 错误不得误命中（含 W-5 记过的 1438 类更长数字）。
+    #[test]
+    fn is_stale_nonce_ignores_non_stale_errors() {
+        let cases = [
+            "turn request 0x0113: 403 Forbidden",
+            "turn response integrity check failed",
+            "turn request timed out",
+            "turn request timed out talking to 10.0.0.1:1438",
+            "turn request 0x0113: 4380 Something Else",
+            "turn request 0x0113: 438 Something Else",
+            "turn nonce refresh failed",
+        ];
+        for text in cases {
+            assert!(
+                !is_stale_nonce(&io::Error::other(text)),
+                "must not be classified as 438 stale nonce: {text}"
+            );
+        }
     }
 }

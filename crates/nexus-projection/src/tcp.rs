@@ -308,6 +308,10 @@ pub fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
 /// Parsed TCP header: (src_ip, dst_ip, src_port, dst_port, flags, payload_offset).
 pub type TcpParsed = (IpAddr, IpAddr, u16, u16, u8, usize);
 
+/// TCP flags 位（`tcp[13]`，RFC 793）：FIN=0x01、SYN=0x02、RST=0x04、
+/// PSH=0x08、ACK=0x10。
+const TCP_FLAG_RST: u8 = 0x04;
+
 /// Minimal IPv4/IPv6 TCP header parse.
 ///
 /// v6 uses the shared fixed-header + extension-header chain walker
@@ -335,6 +339,83 @@ pub fn parse_tcp(packet: &[u8]) -> Option<TcpParsed> {
         tcp[13],
         view.l4_offset + data_off,
     ))
+}
+
+/// 解析 TCP 头：`(src_ip, dst_ip, src_port, dst_port, flags, payload_len, seq)`。
+///
+/// 与 [`parse_tcp`] 同一解析口径（v6 走扩展头链），额外返回 payload 长度与
+/// 序列号——本地终止构造 RST 时需要知道「我们发到哪」。
+fn parse_tcp_seq_len(packet: &[u8]) -> Option<(IpAddr, IpAddr, u16, u16, u8, usize, u32)> {
+    let view = parse_ip_packet(packet).ok()?;
+    if view.protocol != 6 {
+        return None;
+    }
+    let tcp = view.payload;
+    if tcp.len() < 20 {
+        return None;
+    }
+    let data_off = ((tcp[12] >> 4) as usize) * 4;
+    if data_off < 20 || tcp.len() < data_off {
+        return None;
+    }
+    Some((
+        view.src,
+        view.dst,
+        u16::from_be_bytes([tcp[0], tcp[1]]),
+        u16::from_be_bytes([tcp[2], tcp[3]]),
+        tcp[13],
+        tcp.len() - data_off,
+        u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+    ))
+}
+
+/// 构造一张发往应用侧的 TCP RST（`key` 为应用侧四元组：src=应用，dst=原始目的）。
+///
+/// `seq` 必须等于应用侧 rcv_nxt（见 [`TcpTerminator::note_sent_seq`]）；只发
+/// RST（不带 ACK），与对端进程死亡时内核发出的段同形。先按 smoltcp 接口地址
+/// 构造，再用 [`rewrite_src`] 把源 IP 改回原始目的地址（复用既有校验和修复）。
+fn build_tcp_reset_for(key: &FourTuple, seq: u32) -> Option<Vec<u8>> {
+    let mut segment = [0u8; 20];
+    segment[0..2].copy_from_slice(&key.dst_port.to_be_bytes());
+    segment[2..4].copy_from_slice(&key.src_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&seq.to_be_bytes());
+    segment[12] = 5 << 4; // data offset 5，无选项
+    segment[13] = 0x04; // RST
+    let packet = match (key.dst_ip, key.src_ip) {
+        (IpAddr::V4(_), IpAddr::V4(client)) => {
+            let src = Ipv4Addr::from(SMOLTCP_IFACE_IP);
+            let checksum = tcp_checksum(src.octets(), client.octets(), &segment);
+            segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+            let total_len = 20 + segment.len();
+            let mut packet = vec![0u8; total_len];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&u16::try_from(total_len).ok()?.to_be_bytes());
+            packet[8] = 64;
+            packet[9] = 6;
+            packet[12..16].copy_from_slice(&src.octets());
+            packet[16..20].copy_from_slice(&client.octets());
+            let header_checksum = ip_checksum(&packet[..20]);
+            packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+            packet[20..].copy_from_slice(&segment);
+            packet
+        }
+        (IpAddr::V6(_), IpAddr::V6(client)) => {
+            let src = Ipv6Addr::from(SMOLTCP_IFACE_IP6);
+            let checksum = tcp_udp_checksum_v6(src, client, 6, &segment);
+            segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+            let mut packet = vec![0u8; 40 + segment.len()];
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&u16::try_from(segment.len()).ok()?.to_be_bytes());
+            packet[6] = 6;
+            packet[7] = 64;
+            packet[8..24].copy_from_slice(&src.octets());
+            packet[24..40].copy_from_slice(&client.octets());
+            packet[40..].copy_from_slice(&segment);
+            packet
+        }
+        _ => return None,
+    };
+    rewrite_src(&packet, key.dst_ip)
 }
 
 /// Rewrite the IP destination and fix IP + TCP checksums.
@@ -517,6 +598,12 @@ struct TermConn {
     pending: Vec<u8>,
     /// S26: process/QoS labels resolved once at flow setup, cached here.
     labels: FlowLabels,
+    /// 发往应用的最后一个字节之后的序列号（= 应用侧 rcv_nxt）。
+    ///
+    /// 由 [`TcpTerminator::drain_tx`] 从实际发出的段更新。本地终止需要自己
+    /// 构造 RST（smoltcp 0.12 的 `abort()` 只改状态、不产段），RST 的 seq
+    /// 必须正好是应用侧期望的下一个序列号，否则内核按 RFC 5961 丢弃。
+    snd_nxt: Option<u32>,
 }
 
 /// Events produced by the terminator for the fabric / TUN layer.
@@ -561,6 +648,14 @@ pub struct TcpTermStats {
     /// resolved to our own terminator entry was dropped instead of being
     /// injected as application data.
     pub stream_syn_to_originator_dropped: u64,
+    /// 出站段按 `(client_ip, client_port, server_port)` 反查连接时命中多个
+    /// 连接：同一客户端源端口并发连不同 server-IP 的相同 server-port（需源
+    /// 端口复用）。歧义时跳过 `snd_nxt` 更新（不取首个，避免记错流），仅计数。
+    pub snd_nxt_ambiguous: u64,
+    /// 本地终止路径（[`TcpTerminator::reset_by_key`]）未能产生 RST 段：连接
+    /// 缺席，或连接在场却没有可用的 `snd_nxt` / RST 构造失败。纯可观测，
+    /// 不改变返回值与既有行为。
+    pub reset_without_segment: u64,
 }
 
 pub struct TcpTerminator {
@@ -762,6 +857,7 @@ impl TcpTerminator {
                     close_sent: false,
                     pending: Vec::new(),
                     labels,
+                    snd_nxt: None,
                 },
             );
             self.by_id.insert(stream_id, key);
@@ -892,18 +988,92 @@ impl TcpTerminator {
     }
 
     fn reset_by_key(&mut self, key: &FourTuple) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rst_emitted = false;
         if let Some(c) = self.conns.remove(key) {
+            // smoltcp 0.12 的 `abort()` 只把状态置 Closed，不产生任何段
+            // （RST 只在收到不可接受段时由 `rst_reply` 发出）。应用侧因此
+            // 看不到任何东西、一直挂到自身超时。本地终止必须自己补一张
+            // RST：seq = 应用侧 rcv_nxt（我们最后发出的序列号末端）。
+            if let Some(snd_nxt) = c.snd_nxt {
+                if let Some(rst) = build_tcp_reset_for(key, snd_nxt) {
+                    out.push(rst);
+                    rst_emitted = true;
+                }
+            }
             self.sockets.get_mut::<tcp::Socket>(c.sock).abort();
             self.sockets.remove(c.sock);
             // 清理反向索引（若已绑定）。
             self.by_id.retain(|_, k| k != key);
         }
+        // 纯可观测：连接缺席，或连接在场却未能产段（无 `snd_nxt` / 构造失败）。
+        if !rst_emitted {
+            self.stats.reset_without_segment += 1;
+        }
         self.poll_iface();
-        self.drain_tx()
+        out.extend(self.drain_tx());
+        out
     }
 
     fn drain_tx(&mut self) -> Vec<Vec<u8>> {
-        self.device.tx.drain(..).collect()
+        let packets: Vec<Vec<u8>> = self.device.tx.drain(..).collect();
+        for packet in &packets {
+            self.note_sent_seq(packet);
+        }
+        packets
+    }
+
+    /// 记录发往应用的最后一个序列号末端（应用侧 rcv_nxt）。
+    ///
+    /// 只统计本终结器自己发出的段：按「反向后四元组」找回对应连接。连接键
+    /// 谓词是 `(client_ip, client_port, server_port)`——不含 server-IP，因为
+    /// 出站包的源 IP 已重写成 smoltcp 接口地址。同一客户端源端口并发连不同
+    /// server-IP 的相同 server-port 时（需源端口复用）会命中多个连接；此时
+    /// **计数并跳过更新**（取首个会把 `snd_nxt` 记到错误的流上，导致后续
+    /// 本地终止 RST 的 seq 偏离该流 `rcv_nxt`）。
+    fn note_sent_seq(&mut self, packet: &[u8]) {
+        let Some((_src_ip, client_ip, src_port, client_port, flags, payload_len, seq)) =
+            parse_tcp_seq_len(packet)
+        else {
+            return;
+        };
+        // 纯 ACK 不推进序列号：跳过（避免热路径上的连接表扫描）。
+        if payload_len == 0 && flags & 0x03 == 0 {
+            return;
+        }
+        // 出站包的源 IP 是 smoltcp 接口地址，而连接键用的是应用侧原始目的
+        // 地址，故按 (client_ip, client_port, server_port) 反查（与
+        // `fixup_tun_packet` 同口径）。先收集匹配键（`FourTuple` 为 Copy），
+        // 再按键可变更新，避免同时持有两张表的借用。
+        let mut hits = self.conns.iter().filter_map(|(k, c)| {
+            self.by_id
+                .get(&c.stream_id)
+                .is_some_and(|bound| {
+                    bound.src_ip == client_ip
+                        && bound.src_port == client_port
+                        && bound.dst_port == src_port
+                })
+                .then_some(*k)
+        });
+        let first = hits.next();
+        let ambiguous = hits.next().is_some();
+        let Some(key) = first else {
+            return;
+        };
+        if ambiguous {
+            self.stats.snd_nxt_ambiguous += 1;
+            return;
+        }
+        let mut end = seq.wrapping_add(u32::try_from(payload_len).unwrap_or(u32::MAX));
+        if flags & 0x02 != 0 {
+            end = end.wrapping_add(1); // SYN
+        }
+        if flags & 0x01 != 0 {
+            end = end.wrapping_add(1); // FIN
+        }
+        if let Some(c) = self.conns.get_mut(&key) {
+            c.snd_nxt = Some(end);
+        }
     }
 
     /// GAP-5: 重写出站 TUN 包的源 IP。
@@ -913,17 +1083,25 @@ impl TcpTerminator {
     /// 本方法按 (client_ip, client_port, server_port) 查找连接，
     /// 将源 IP 改回 `orig_dst`，并修复 IP/TCP 校验和。
     ///
-    /// 包不匹配已知连接 → 返回 `None`（调用方计数丢弃）。
+    /// 非 smoltcp 接口地址的包只有一种合法形态：终结器自造的本地终止 RST
+    /// （见 [`build_tcp_reset_for`]），它已带真实源 IP、是最终形态，此时原样
+    /// 返回。其余非 iface 源包（含 RST 以外的任何段）一律返回 `None`（调用方
+    /// 计数丢弃），与基线「查无连接则丢弃」语义一致。
     pub fn fixup_tun_packet(&self, pkt: &[u8]) -> Option<Vec<u8>> {
-        let (src_ip, dst_ip, src_port, dst_port, _flags, _off) = parse_tcp(pkt)?;
+        let (src_ip, dst_ip, src_port, dst_port, flags, _off) = parse_tcp(pkt)?;
         let iface_src = match src_ip {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(SMOLTCP_IFACE_IP)),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(SMOLTCP_IFACE_IP6)),
         };
         if src_ip != iface_src {
-            return None;
+            // 仅自造 RST 形透传；RST 位取自 `parse_tcp` 返回的 tcp[13]。
+            return (flags & TCP_FLAG_RST != 0).then(|| pkt.to_vec());
         }
         // 按客户端 (dst_ip, dst_port) + 服务端端口 (src_port) 查找。
+        // 注意：该谓词与 `note_sent_seq` 同口径，不含 server-IP。同一客户端
+        // 源端口并发连不同 server-IP 的相同 server-port（需源端口复用）时会
+        // 命中多个连接；此处保留首个命中（改写源 IP 只是形态修复，不涉及流
+        // 身份），序列号跟踪侧已对同形歧义计数并跳过更新（`snd_nxt_ambiguous`）。
         let orig = self
             .conns
             .values()
@@ -2070,6 +2248,260 @@ mod tests {
             0,
             "connection table must be empty after FIN handshake"
         );
+    }
+
+    /// AC-F4 断点层级回归（终结器）：远程 RST 必须产生一张应用可见的 RST。
+    ///
+    /// smoltcp 0.12 的 `abort()` 只把状态置 Closed、不产段；修复前
+    /// `handle_fabric_rst` 返回空 vec，应用侧看不到任何东西（挂到自身超时）。
+    #[test]
+    fn remote_rst_emits_app_visible_reset() {
+        let mut term = TcpTerminator::new();
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40001, 8081, 2000, 0, 0x02, &[]);
+        let tun_pkts = term.handle_uplink(&syn, "peer-B");
+        assert_eq!(tun_pkts.len(), 1, "SYN-ACK expected");
+        let srv_seq = u32::from_be_bytes([
+            tun_pkts[0][24],
+            tun_pkts[0][25],
+            tun_pkts[0][26],
+            tun_pkts[0][27],
+        ]);
+        let ack = craft_tcp(
+            [10, 0, 0, 2],
+            [1, 2, 3, 4],
+            40001,
+            8081,
+            2001,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        term.handle_uplink(&ack, "peer-B");
+        let _ = term.poll(); // handshake done + Syn event
+        let sid = term.stream_ids()[0];
+
+        let out = term.handle_fabric_rst(sid);
+        assert_eq!(term.conn_count(), 0, "connection must be removed");
+        let rst = out
+            .iter()
+            .find(|p| p.len() >= 34 && p[33] & 0x04 != 0)
+            .expect("remote RST must yield an app-visible RST segment");
+        // 源 = 原始目的（应用拨号的对端），目的 = 应用。
+        assert_eq!(&rst[12..16], &[1, 2, 3, 4]);
+        assert_eq!(&rst[16..20], &[10, 0, 0, 2]);
+        assert_eq!(u16::from_be_bytes([rst[20], rst[21]]), 8081);
+        assert_eq!(u16::from_be_bytes([rst[22], rst[23]]), 40001);
+        // seq = 我们发往应用的下一序列号（ISN + 1，SYN 占一位）。
+        assert_eq!(
+            u32::from_be_bytes([rst[24], rst[25], rst[26], rst[27]]),
+            srv_seq.wrapping_add(1),
+            "RST seq must be the application's rcv_nxt"
+        );
+        assert_eq!(ip_checksum(&rst[..20]), 0, "IPv4 header checksum");
+        assert_eq!(
+            tcp_checksum([1, 2, 3, 4], [10, 0, 0, 2], &rst[20..]),
+            0,
+            "TCP checksum over the final source address"
+        );
+        // 产段路径不增加「无段」计数（FIX-3）。
+        assert_eq!(term.stats().reset_without_segment, 0);
+    }
+
+    /// FIX-3（评审 m-5）：`reset_by_key` 在连接缺席或连接在场但没有
+    /// `snd_nxt` 时不产段，必须计数（纯可观测，返回值不变）。
+    #[test]
+    fn reset_without_segment_counts_absent_and_unsequenced_conns() {
+        let mut term = TcpTerminator::new();
+        let unknown = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 40123,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: 8080,
+        };
+        let out = term.reset_by_tuple(&unknown);
+        assert!(out.is_empty(), "unknown four-tuple yields no segment");
+        assert_eq!(term.stats().reset_without_segment, 1);
+
+        // 连接在场但没有 snd_nxt：同样无段，计数再 +1。
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40124, 8080, 3000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn, "peer-B");
+        let key = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 40124,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: 8080,
+        };
+        assert!(term.conns.contains_key(&key));
+        term.conns.get_mut(&key).unwrap().snd_nxt = None;
+        let out = term.reset_by_tuple(&key);
+        assert!(out.is_empty(), "conn without snd_nxt yields no segment");
+        assert_eq!(term.stats().reset_without_segment, 2);
+        assert_eq!(term.conn_count(), 0, "connection is still removed");
+    }
+
+    /// `fixup_tun_packet` 只对已经带真实源 IP 的自造 RST 原样透传（不被丢弃）；
+    /// 非 smoltcp 接口源的其它段（ACK/数据）一律丢弃。
+    #[test]
+    fn fixup_passes_through_already_fixed_packets() {
+        let term = TcpTerminator::new();
+        let key = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 40001,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: 8081,
+        };
+        let rst = build_tcp_reset_for(&key, 1234).expect("build RST");
+        let fixed = term.fixup_tun_packet(&rst).expect("passthrough");
+        assert_eq!(fixed, rst);
+        assert_eq!(
+            fixed[33] & TCP_FLAG_RST,
+            TCP_FLAG_RST,
+            "passthrough form is a RST"
+        );
+        // smoltcp 接口地址来源的未匹配包仍按既有语义丢弃。
+        let stray = craft_tcp([10, 254, 0, 1], [10, 0, 0, 9], 8081, 40009, 1, 1, 0x10, &[]);
+        assert!(term.fixup_tun_packet(&stray).is_none());
+        // 非 iface 源、非 RST 的包（真实源 IP 的 ACK / 数据形态）必须丢弃，
+        // 不得因「已是最终形态」被原样写回 TUN。
+        let real_ack = craft_tcp([1, 2, 3, 4], [10, 0, 0, 2], 8081, 40001, 5000, 1, 0x10, &[]);
+        assert!(
+            term.fixup_tun_packet(&real_ack).is_none(),
+            "non-RST packet from a real source IP must be dropped"
+        );
+        let real_data = craft_tcp(
+            [1, 2, 3, 4],
+            [10, 0, 0, 2],
+            8081,
+            40001,
+            6000,
+            1,
+            0x18, // PSH+ACK
+            b"payload",
+        );
+        assert!(
+            term.fixup_tun_packet(&real_data).is_none(),
+            "non-RST data packet from a real source IP must be dropped"
+        );
+    }
+
+    /// FIX-1（评审 m-1）：同一客户端源端口并发连两个不同 server-IP 的相同
+    /// server-port 时，`note_sent_seq` 的反查谓词会同时命中两条连接；此时必须
+    /// 计数并跳过 `snd_nxt` 更新——不得把序列号写到任一连接上。
+    #[test]
+    fn note_sent_seq_skips_ambiguous_conn_matches() {
+        let client = [10u8, 0, 0, 2];
+        let client_port = 40000u16;
+        let server_port = 8080u16;
+        let mut term = TcpTerminator::new();
+        let key_a = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(client[0], client[1], client[2], client[3])),
+            src_port: client_port,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: server_port,
+        };
+        let key_b = FourTuple {
+            src_ip: IpAddr::V4(Ipv4Addr::new(client[0], client[1], client[2], client[3])),
+            src_port: client_port,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            dst_port: server_port,
+        };
+
+        // 第一条连接：无歧义，SYN-ACK 的序列号直接记入 snd_nxt。
+        let syn_a = craft_tcp(
+            client,
+            [1, 2, 3, 4],
+            client_port,
+            server_port,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        let ack_a = term.handle_uplink(&syn_a, "peer-B");
+        assert_eq!(ack_a.len(), 1, "SYN-ACK expected for conn A");
+        let isn_a = u32::from_be_bytes([ack_a[0][24], ack_a[0][25], ack_a[0][26], ack_a[0][27]]);
+        assert_eq!(
+            term.conns.get(&key_a).unwrap().snd_nxt,
+            Some(isn_a.wrapping_add(1)),
+            "unambiguous single match must still update snd_nxt"
+        );
+        assert_eq!(term.stats().snd_nxt_ambiguous, 0);
+
+        // 第二条连接：同 client (ip, port) + 同 server port、不同 server IP。
+        // 此后任何发往该 client 端口的出站段都会同时匹配两条连接。
+        let syn_b = craft_tcp(
+            client,
+            [5, 6, 7, 8],
+            client_port,
+            server_port,
+            2000,
+            0,
+            0x02,
+            &[],
+        );
+        let _ack_b = term.handle_uplink(&syn_b, "peer-B");
+        assert_eq!(term.conn_count(), 2);
+        assert_eq!(
+            term.conns.get(&key_a).unwrap().snd_nxt,
+            Some(isn_a.wrapping_add(1)),
+            "conn A must not be touched while the match is ambiguous"
+        );
+        assert_eq!(
+            term.conns.get(&key_b).unwrap().snd_nxt,
+            None,
+            "conn B must not inherit conn A's sequence"
+        );
+
+        // 一张同时匹配两条连接的出站数据段（iface 源 → 客户端）。
+        let before_count = term.stats().snd_nxt_ambiguous;
+        let data = craft_tcp(
+            SMOLTCP_IFACE_IP,
+            client,
+            server_port,
+            client_port,
+            9000,
+            1,
+            0x18, // PSH+ACK
+            b"data",
+        );
+        term.note_sent_seq(&data);
+        assert_eq!(
+            term.stats().snd_nxt_ambiguous,
+            before_count + 1,
+            "ambiguous match must be counted"
+        );
+        assert_eq!(
+            term.conns.get(&key_a).unwrap().snd_nxt,
+            Some(isn_a.wrapping_add(1)),
+            "ambiguous segment must not write snd_nxt on conn A"
+        );
+        assert_eq!(
+            term.conns.get(&key_b).unwrap().snd_nxt,
+            None,
+            "ambiguous segment must not write snd_nxt on conn B"
+        );
+
+        // 无歧义对照：单连接时同一形状的数据段仍正常推进 snd_nxt。
+        let mut solo = TcpTerminator::new();
+        let ack = solo.handle_uplink(&syn_a, "peer-B");
+        assert_eq!(ack.len(), 1);
+        let data = craft_tcp(
+            SMOLTCP_IFACE_IP,
+            client,
+            server_port,
+            client_port,
+            7000,
+            1,
+            0x18,
+            b"ping",
+        );
+        solo.note_sent_seq(&data);
+        assert_eq!(
+            solo.conns.get(&key_a).unwrap().snd_nxt,
+            Some(7004),
+            "unambiguous data segment must advance snd_nxt (seq + payload len)"
+        );
+        assert_eq!(solo.stats().snd_nxt_ambiguous, 0);
     }
 
     #[test]

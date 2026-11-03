@@ -319,7 +319,7 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"{CHILD_IP}\"\n\
-         mtu = 1200\n\
+         mtu = 1162\n\
          [[vpi.routes]]\n\
          subnet = \"10.200.0.0/24\"\n\
          peer = \"{peer_b_hex}\"\n"
