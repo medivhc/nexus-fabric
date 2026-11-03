@@ -627,7 +627,7 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
   **能力状态：usable**（自 2026-11-03 裁决 `MSR-n1-unlock-20261103` 起），范围**严格限定**
   为已验证形态：**单跳 relay 采纳路径**、**大流（≤10 MiB 级）**、**kill/重启恢复**——三项
   均已在真机（A=xc-pc-linux ↔ B=Hermes 腾讯云 VM）复验：双向各 **10,485,760 字节**全达、
-  两端 SHA-256 逐字一致（Oversize / 发送失败计数均为 0）、`kill -9` 后对端 **32 s 内**
+  两端 SHA-256 逐字一致（Oversize / 发送失败计数均为 0）、`kill -9` 后对端 **31 s 内**
   Escalate 有界退出、重启后会话约 3 s 重建且新流（64 KiB）全达。此前的
   `n1-mid-stream-send-failure-diagnosis` 诊断 run 已关闭，断裂根因已定性并修复（见下条
   「已修复」）。**默认关闭不变**：`[network.n1]` 整节省略 = 禁用，默认开另行裁决。对外
@@ -654,7 +654,7 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
     入参 cap 执行、发送错误改为 typed 回传并计数 + 限频日志；`vpi.mtu` 的默认值/上界
     同步对齐 1162。
   * 复验：F1 双向各 10,485,760 B 全达、两端 SHA-256 一致、Oversize / 发送失败双计数为
-    0；F2 `kill -9` → Escalate 32 s 有界退出 PASS；F3 实质 PASS（脚本窗口因 rig ssh
+    0；F2 `kill -9` → Escalate 31 s 有界退出 PASS；F3 实质 PASS（脚本窗口因 rig ssh
     挂死记 INVALID，产品行为由手工探针坐实）；旧边界分级复扫 **21/21** 全字节到达；
     合并点 `verify --fast` **9/9**。
 
@@ -1301,7 +1301,7 @@ whitespace、format、check、clippy、architecture-policy（fast 侧 delta）�
 | 传输层 crate                               | stub        | `nexus-platform-{linux,macos,android,ios}` 为骨架（`nexus-delivery`、`nexus-diagnostics`、`nexus-proto` 已于 2026-10-26 删除）                            |
 | fuzz 门禁                                 | 需 nightly   | `cargo +nightly fuzz check`（stable 下 libfuzzer -Z 选项失败）                                                                              |
 | NAT 打洞真实 STUN 集成测试                      | 待完善         | 单元测试 + example 已覆盖，真实 STUN 服务器集成测试待补充                                                                                                |
-| N1 入站监听（`[network.n1]`）                 | **usable（范围限定）** | 2026-11-03 裁决 `MSR-n1-unlock-20261103` 起记为 usable，**默认仍关**。范围限定为已验证形态：单跳 relay 采纳路径、大流（≤10 MiB 级，双向各 10,485,760 B 全达、两端 SHA-256 一致）、kill/重启恢复（`kill -9` 后 32 s 有界退出、重启后新流全达），均真机（xc ↔ Hermes）复验。断裂根因已定性并修复：分片误按 1200 切帧，而 quinn-proto 有效上限 = 1200 − 29 − 9 = **1162**（STREAM 帧 1162 B 全通 / 1163 B 全灭），且 fabric driver 的 pump flush 静默吞 `SendDatagramError::TooLarge`；修复（2026-11-01 merge `c936908f`）改为 `datagram_cap()` 采样实际上限、分片按入参 cap、发送错误 typed 回传 + 计数 + 限频日志。现行边界保留：走**不可靠 QUIC datagram**（无跨节点重传/重排/ack），**connect/send 成功 ≠ 送达**，完整性须靠结果级校验（如 SHA-256）；公网 TURN 中继数据面、直连打洞大流、传输中底层地址切换**未在本线验证**（归 AC-13 / 后续补验）；driver `send_to` 吞错为已知留置（P2，解锁后首个小 fix）；`[vpi].mtu` >1162 会被新版本拒启（升级前改配置）。2026-10-29 [R] 窗口的 145,400 B / SHA 不一致判读原样保留（见 §4.1.14） |
+| N1 入站监听（`[network.n1]`）                 | **usable（范围限定）** | 2026-11-03 裁决 `MSR-n1-unlock-20261103` 起记为 usable，**默认仍关**。范围限定为已验证形态：单跳 relay 采纳路径、大流（≤10 MiB 级，双向各 10,485,760 B 全达、两端 SHA-256 一致）、kill/重启恢复（`kill -9` 后 31 s 有界退出、重启后新流全达），均真机（xc ↔ Hermes）复验。断裂根因已定性并修复：分片误按 1200 切帧，而 quinn-proto 有效上限 = 1200 − 29 − 9 = **1162**（STREAM 帧 1162 B 全通 / 1163 B 全灭），且 fabric driver 的 pump flush 静默吞 `SendDatagramError::TooLarge`；修复（2026-11-01 merge `c936908f`）改为 `datagram_cap()` 采样实际上限、分片按入参 cap、发送错误 typed 回传 + 计数 + 限频日志。现行边界保留：走**不可靠 QUIC datagram**（无跨节点重传/重排/ack），**connect/send 成功 ≠ 送达**，完整性须靠结果级校验（如 SHA-256）；公网 TURN 中继数据面、直连打洞大流、传输中底层地址切换**未在本线验证**（归 AC-13 / 后续补验）；driver `send_to` 吞错为已知留置（P2，解锁后首个小 fix）；`[vpi].mtu` >1162 会被新版本拒启（升级前改配置）。2026-10-29 [R] 窗口的 145,400 B / SHA 不一致判读原样保留（见 §4.1.14） |
 | 磁盘注意                                    | 本机          | 构建产物优先放 D:（C:/E: 高水位告警）                                                                                                              |
 
 ### 6.2 修复记录（2026-09-20：requirement-change + bugfix，HEAD 6ff5fb1 校验发现）

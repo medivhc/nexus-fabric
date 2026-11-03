@@ -431,7 +431,7 @@
     改为按入参 cap 执行、发送错误 typed 回传 + 计数 + 限频日志；`vpi.mtu` 的默认值/
     上界同步对齐 1162。
   - 复验：F1 双向各 10,485,760 B 全达、两端 SHA-256 一致、Oversize / 发送失败双计数
-    为零；F2 `kill -9` → Escalate 32 s 有界退出 PASS；F3 实质 PASS（脚本窗口 INVALID
+    为零；F2 `kill -9` → Escalate 31 s 有界退出 PASS；F3 实质 PASS（脚本窗口 INVALID
     系 rig ssh 挂死，产品行为由手工探针坐实）；旧边界分级复扫 21/21；合并点
     `verify --fast` 9/9。
 - **升级行为变化（`network.toml` `[vpi].mtu`，用户可见）**：配置值 **>1162 以硬错误
