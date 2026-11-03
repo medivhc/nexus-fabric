@@ -1,7 +1,8 @@
-//! 438 (Stale Nonce) 恢复回归（RFC 8489 §9.2.4）。
+//! 438 (Stale Nonce) 恢复回归（RFC 8489 §9.2.5）。
 //!
 //! 服务端 nonce 过期时以 438 + 新 NONCE 应答，且该错误响应不带 MI。
-//! 客户端必须：按 ERROR-CODE 分类 → 采纳新 nonce → 在同一事务内重试一次；
+//! 客户端必须：按 ERROR-CODE 分类 → 采纳新 nonce → 以新的 transaction ID
+//! 在同一 `transact()` 调用内重试一次（对调用方透明）；
 //! 持续 438 必须有界失败；事务不匹配响应携带的 nonce 不得采纳；
 //! 其他错误码必须报出错误码本身（不再统一报 integrity failed）。
 
@@ -25,10 +26,11 @@ fn relayed() -> SocketAddr {
     RELAYED.parse().unwrap()
 }
 
-/// T1：Refresh 命中 438（旧 nonce）→ 换响应携带的新 nonce 在同一事务内重试，
-/// 最终成功；重试请求的 MI 必须按新 nonce 重新计算，且恢复不计失败。
+/// T1：Refresh 命中 438（旧 nonce）→ 换响应携带的新 nonce、以**新事务 ID**
+/// 在同一 `transact()` 调用内重试（对调用方透明），最终成功；重试请求的 MI
+/// 必须按新 nonce 重新计算，且恢复不计失败。
 #[test]
-fn refresh_recovers_from_438_with_new_nonce_in_same_transaction() {
+fn refresh_recovers_from_438_with_new_nonce_in_new_transaction() {
     let server = spawn_server(|sock| {
         let mut buf = vec![0u8; 4096];
         let mut seen = Vec::new();
@@ -90,7 +92,7 @@ fn refresh_recovers_from_438_with_new_nonce_in_same_transaction() {
         )
         .unwrap();
 
-        // 4) 同一事务内以 nonce2 重试 → 成功。
+        // 4) 以 nonce2 + 新事务 ID 重试 → 成功。
         let (req, src) = recv_request(sock, &mut buf);
         assert_eq!(req.msg_type, REFRESH_REQUEST);
         assert_eq!(
@@ -98,19 +100,19 @@ fn refresh_recovers_from_438_with_new_nonce_in_same_transaction() {
             Some(NONCE2),
             "retry must adopt the NONCE from the 438 response"
         );
-        assert_eq!(
+        assert_ne!(
             req.txn, stale_txn,
-            "retry must stay in the same transaction"
+            "retry must use a new transaction ID, not the stale one"
         );
         assert!(
             req.mi_valid(),
             "retry MI must be recomputed with the new nonce"
         );
-        seen.push(req);
+        seen.push(req.clone());
         sock.send_to(
             &signed_response(
                 REFRESH_SUCCESS,
-                stale_txn,
+                req.txn,
                 &[Attribute::Lifetime(600)],
                 false,
                 false,
@@ -128,7 +130,7 @@ fn refresh_recovers_from_438_with_new_nonce_in_same_transaction() {
 
     client
         .refresh()
-        .expect("438 must be recovered inside the transaction");
+        .expect("438 must be recovered within the transact() call");
 
     let seen = server.finish();
     assert_eq!(
@@ -143,6 +145,156 @@ fn refresh_recovers_from_438_with_new_nonce_in_same_transaction() {
         "a recovered 438 is not a refresh failure"
     );
     assert!(!client.is_expired());
+}
+
+/// 负面回归（S1 分歧点 ②）：重试已用新事务 ID 发出后，一份**迟到的、仍携带
+/// 原事务 ID** 的 438 重复副本必须被事务匹配丢弃——不得采纳其 nonce、不得
+/// 触发 `persisted` 失败、不得额外消耗那唯一一次有界重试。
+#[test]
+fn late_duplicate_438_on_original_txn_is_ignored() {
+    let server = spawn_server(|sock| {
+        let mut buf = vec![0u8; 4096];
+        let mut seen = Vec::new();
+
+        // 1) 未认证 Allocate → 401 质询（nonce1，无 MI）。
+        let (req, src) = recv_request(sock, &mut buf);
+        sock.send_to(
+            &response(
+                ALLOCATE_FAILURE,
+                req.txn,
+                &[
+                    Attribute::ErrorCode(4, 1, b"Unauthorized".to_vec()),
+                    Attribute::Realm(REALM.as_bytes().to_vec()),
+                    Attribute::Nonce(NONCE1.as_bytes().to_vec()),
+                ],
+            ),
+            src,
+        )
+        .unwrap();
+
+        // 2) 认证 Allocate（nonce1）→ 成功。
+        let (req, src) = recv_request(sock, &mut buf);
+        assert_eq!(req.nonce_str(), Some(NONCE1));
+        sock.send_to(
+            &signed_response(
+                ALLOCATE_SUCCESS,
+                req.txn,
+                &[
+                    Attribute::XorRelayedAddress(relayed()),
+                    Attribute::XorMappedAddress(src),
+                    Attribute::Lifetime(600),
+                ],
+                false,
+                false,
+            ),
+            src,
+        )
+        .unwrap();
+
+        // 3) Refresh（nonce1）→ 438 + nonce2（原事务 ID）。
+        let (req, src) = recv_request(sock, &mut buf);
+        assert_eq!(req.msg_type, REFRESH_REQUEST);
+        assert_eq!(req.nonce_str(), Some(NONCE1));
+        let original_txn = req.txn;
+        seen.push(req);
+        sock.send_to(
+            &response(
+                REFRESH_FAILURE,
+                original_txn,
+                &[
+                    // coturn 的 438 reason 原文（小写 n）。
+                    Attribute::ErrorCode(4, 38, b"Stale nonce".to_vec()),
+                    Attribute::Nonce(NONCE2.as_bytes().to_vec()),
+                ],
+            ),
+            src,
+        )
+        .unwrap();
+
+        // 4) 重试：nonce2 + 新事务 ID。
+        let (req, src) = recv_request(sock, &mut buf);
+        assert_eq!(req.msg_type, REFRESH_REQUEST);
+        assert_eq!(req.nonce_str(), Some(NONCE2));
+        assert_ne!(req.txn, original_txn, "retry must use a new transaction ID");
+        let retry_txn = req.txn;
+        seen.push(req);
+
+        // 5) 迟到的重复 438：仍携带原事务 ID（旧行为下会命中重试事务并
+        //    把唯一一次重试消耗成 persisted 失败）。
+        sock.send_to(
+            &response(
+                REFRESH_FAILURE,
+                original_txn,
+                &[
+                    Attribute::ErrorCode(4, 38, b"Stale nonce".to_vec()),
+                    Attribute::Nonce(b"late-duplicate-nonce".to_vec()),
+                ],
+            ),
+            src,
+        )
+        .unwrap();
+
+        // 6) 重试事务（retry_txn）的成功响应。
+        sock.send_to(
+            &signed_response(
+                REFRESH_SUCCESS,
+                retry_txn,
+                &[Attribute::Lifetime(600)],
+                false,
+                false,
+            ),
+            src,
+        )
+        .unwrap();
+
+        // 7) 下一次 Refresh：nonce 必须仍是 nonce2（迟到副本的 nonce 未被采纳）。
+        let (req, src) = recv_request(sock, &mut buf);
+        assert_eq!(req.msg_type, REFRESH_REQUEST);
+        seen.push(req.clone());
+        sock.send_to(
+            &signed_response(
+                REFRESH_SUCCESS,
+                req.txn,
+                &[Attribute::Lifetime(600)],
+                false,
+                false,
+            ),
+            src,
+        )
+        .unwrap();
+
+        seen
+    });
+
+    let client = TurnClient::allocate_bound(server.addr, creds(), "127.0.0.1:0".parse().unwrap())
+        .expect("allocate before late-duplicate 438");
+    client
+        .refresh()
+        .expect("late duplicate 438 on the original txn must not fail the retry");
+    client
+        .refresh()
+        .expect("second refresh after the late duplicate");
+
+    let seen = server.finish();
+    assert_eq!(
+        seen.len(),
+        3,
+        "expected stale request + one retry + the following refresh"
+    );
+    assert_eq!(
+        seen[2].nonce_str(),
+        Some(NONCE2),
+        "a late duplicate 438 must never replace the adopted nonce"
+    );
+    let stats = client.stats();
+    assert_eq!(
+        stats.stale_nonce_retried, 1,
+        "the late duplicate must not consume the bounded retry"
+    );
+    assert_eq!(
+        stats.allocation_expired, 0,
+        "the late duplicate must not turn recovery into a failure"
+    );
 }
 
 /// T4：服务端持续回 438 → 重试有界（每个事务最多换一次 nonce），
