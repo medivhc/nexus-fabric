@@ -88,6 +88,9 @@ const POLL_CAP: Duration = Duration::from_millis(5);
 /// `OUTBOUND_UNAVAILABLE_LOG_INTERVAL` 同值，保持运维口径一致）。
 const DGRAM_DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// socket 发送失败日志的限频窗口（与 datagram 丢弃日志同值，保持运维口径一致）。
+const SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 丢弃/逐出的分类（flush 期由 quinn 错误映射；纯数据，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DgramDropKind {
@@ -137,15 +140,16 @@ impl DgramCounters {
     }
 }
 
-/// 丢弃日志限频判定：**不自取时钟**，`now` 由 driver loop（时间注入方）传入
+/// 限频日志判定（datagram 丢弃与 socket 发送失败共用）：**不自取时钟**，
+/// `now` 由 driver loop（时间注入方）传入
 /// （AGENTS §22 / 既定决议：协议 core 不直接读系统时间）。
 #[derive(Default)]
-struct DgramDropLog {
+struct RateLimitedLog {
     last: Option<Instant>,
     suppressed: u64,
 }
 
-impl DgramDropLog {
+impl RateLimitedLog {
     /// `Some(suppressed)` = 本次应发射，并带出窗口内被抑制条数；`None` = 只累加。
     fn decide(&mut self, now: Instant, interval: Duration) -> Option<u64> {
         match self.last {
@@ -165,6 +169,133 @@ impl DgramDropLog {
             }
         }
     }
+}
+
+/// `UdpTransport::send_to` 结果分类（纯数据）。
+///
+/// `WouldBlock` 是正常背压（socket 发送缓冲满），**不是发送失败**：单独计数、
+/// 不触发错误日志。`NotConnected` 单列——rebind 窗口内的 `ClosedTransport`
+/// 恒返该 kind，窗口内经它发出的 transmit 失败计入这里是诚实语义。其余 kind
+/// 归入 `Other` 计数（原始 kind 只进日志，避免无界的计数维度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailureKind {
+    WouldBlock,
+    NotConnected,
+    Other,
+}
+
+impl SendFailureKind {
+    fn classify(err: &io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::WouldBlock => Self::WouldBlock,
+            io::ErrorKind::NotConnected => Self::NotConnected,
+            _ => Self::Other,
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        !matches!(self, Self::WouldBlock)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WouldBlock => "would_block",
+            Self::NotConnected => "not_connected",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// socket 发送结果分类计数（纯数据；不含时钟/日志）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SendErrorCounters {
+    /// 非 `WouldBlock` 的失败总数（= `failed_not_connected + failed_other`）。
+    failed: u64,
+    failed_not_connected: u64,
+    failed_other: u64,
+    /// 正常背压次数（不计入 `failed`）。
+    would_block: u64,
+}
+
+impl SendErrorCounters {
+    fn record(&mut self, kind: SendFailureKind) {
+        match kind {
+            SendFailureKind::WouldBlock => self.would_block += 1,
+            SendFailureKind::NotConnected => {
+                self.failed += 1;
+                self.failed_not_connected += 1;
+            }
+            SendFailureKind::Other => {
+                self.failed += 1;
+                self.failed_other += 1;
+            }
+        }
+    }
+}
+
+/// 一次发送错误的日志判定结果；连接/站点上下文由调用方补充。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendErrorEvent {
+    kind: SendFailureKind,
+    /// 原始 `io::ErrorKind`（`Other` 桶的细分信息只进日志，不进计数）。
+    io_kind: io::ErrorKind,
+    /// 本窗口内被限频吞掉的错误条数（首条恒为 0）。
+    suppressed: u64,
+}
+
+/// `send_to` 结果观察器：成功**零副作用**；失败按 kind 分类计数，
+/// 非 `WouldBlock` 再走 10s 限频日志判定。时间由调用方注入，本结构零时钟调用。
+#[derive(Default)]
+struct SendErrorTracker {
+    counters: SendErrorCounters,
+    log: RateLimitedLog,
+}
+
+impl SendErrorTracker {
+    fn observe(&mut self, now: Instant, result: &io::Result<usize>) -> Option<SendErrorEvent> {
+        let err = result.as_ref().err()?;
+        let kind = SendFailureKind::classify(err);
+        self.counters.record(kind);
+        if !kind.is_failure() {
+            return None;
+        }
+        self.log
+            .decide(now, SEND_ERROR_LOG_INTERVAL)
+            .map(|suppressed| SendErrorEvent {
+                kind,
+                io_kind: err.kind(),
+                suppressed,
+            })
+    }
+}
+
+/// 端点级发送（`on_udp` / `on_new_connection`，无连接上下文）：失败按 kind
+/// 计入 driver loop 内部计数并按 10s 限频打日志。
+///
+/// 该计数**暂无公共读面**（本 run 裁决：不新开 stats 端点），只经日志与单测观察；
+/// 连接内的同一类失败则经 `ConnStats.send_*` 暴露。
+fn send_endpoint_packet(
+    socket: &dyn UdpTransport,
+    tracker: &mut SendErrorTracker,
+    now: Instant,
+    pkt: &[u8],
+    dest: SocketAddr,
+    site: &'static str,
+) {
+    let result = socket.send_to(pkt, dest);
+    let Some(ev) = tracker.observe(now, &result) else {
+        return;
+    };
+    eprintln!(
+        "[fabric] socket send failed site={} kind={} io_kind={:?} len={} dest={} total={} suppressed={}",
+        site,
+        ev.kind.as_str(),
+        ev.io_kind,
+        pkt.len(),
+        dest,
+        tracker.counters.failed,
+        ev.suppressed
+    );
 }
 
 /// Largest UDP datagram the driver reads.
@@ -487,6 +618,7 @@ impl Driver {
             out: Vec::new(),
             stun_sink: None,
             stun_pending: HashMap::new(),
+            endpoint_send_errors: SendErrorTracker::default(),
         };
         let thread = thread::Builder::new()
             .name("nexus-fabric-drv".into())
@@ -787,7 +919,8 @@ struct LiveConn {
     streams: HashMap<StreamId, Arc<StreamShared>>,
     dgram_tx_q: VecDeque<Vec<u8>>,
     dgram: DgramCounters,
-    dgram_drop_log: DgramDropLog,
+    dgram_drop_log: RateLimitedLog,
+    send_errors: SendErrorTracker,
     bytes_sent: u64,
     bytes_recv: u64,
     /// WP1b/§19: set once the QUIC/TLS handshake completed (`Connected`).
@@ -837,6 +970,9 @@ struct Loop {
     out: Vec<u8>,
     stun_sink: Option<std::sync::Arc<dyn crate::stun::StunSink>>,
     stun_pending: HashMap<[u8; 12], Instant>,
+    /// 端点级（无连接上下文）`send_to` 失败/背压计数。driver loop 内部状态，
+    /// 暂无公共读面（本 run 裁决）。
+    endpoint_send_errors: SendErrorTracker,
 }
 
 impl Loop {
@@ -1012,7 +1148,8 @@ impl Loop {
                 streams: HashMap::new(),
                 dgram_tx_q: VecDeque::new(),
                 dgram: DgramCounters::default(),
-                dgram_drop_log: DgramDropLog::default(),
+                dgram_drop_log: RateLimitedLog::default(),
+                send_errors: SendErrorTracker::default(),
                 bytes_sent: 0,
                 bytes_recv: 0,
                 handshake_authenticated: false,
@@ -1201,7 +1338,14 @@ impl Loop {
             None => {}
             Some(DatagramEvent::Response(t)) => {
                 let pkt = self.out[..t.size].to_vec();
-                let _ = self.socket.send_to(&pkt, t.destination);
+                send_endpoint_packet(
+                    &*self.socket,
+                    &mut self.endpoint_send_errors,
+                    now,
+                    &pkt,
+                    t.destination,
+                    "datagram_response",
+                );
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
                 self.on_new_connection(incoming, now);
@@ -1246,7 +1390,8 @@ impl Loop {
                         streams: HashMap::new(),
                         dgram_tx_q: VecDeque::new(),
                         dgram: DgramCounters::default(),
-                        dgram_drop_log: DgramDropLog::default(),
+                        dgram_drop_log: RateLimitedLog::default(),
+                        send_errors: SendErrorTracker::default(),
                         bytes_sent: 0,
                         bytes_recv: 0,
                         handshake_authenticated: false,
@@ -1262,7 +1407,14 @@ impl Loop {
             Err(e) => {
                 if let Some(t) = e.response {
                     let pkt = self.out[..t.size].to_vec();
-                    let _ = self.socket.send_to(&pkt, t.destination);
+                    send_endpoint_packet(
+                        &*self.socket,
+                        &mut self.endpoint_send_errors,
+                        now,
+                        &pkt,
+                        t.destination,
+                        "accept_response",
+                    );
                 }
             }
         }
@@ -1373,10 +1525,27 @@ impl Loop {
             }
         }
         // Transmit.
+        //
+        // quinn sans-IO：`poll_transmit` 交出包即视为已发送。本层 send_to 失败时
+        // 包按丢失处理（不归还、不重试、不自旋），由 QUIC 自身丢包检测/PTO 重传；
+        // 这里只负责让它**可见**（计数 + 首条即出、其后 10s 限频的日志）。
         if let Some(lc) = self.live.get_mut(&id) {
             while let Some(t) = lc.quic.poll_transmit(now, 1, &mut self.out) {
                 let pkt = self.out[..t.size].to_vec();
-                let _ = self.socket.send_to(&pkt, t.destination);
+                let result = self.socket.send_to(&pkt, t.destination);
+                if let Some(ev) = lc.send_errors.observe(now, &result) {
+                    eprintln!(
+                        "[fabric] socket send failed conn={} peer={} kind={} io_kind={:?} len={} dest={} total={} suppressed={}",
+                        lc.shared.id.0,
+                        crate::hex_short(&lc.shared.peer.0),
+                        ev.kind.as_str(),
+                        ev.io_kind,
+                        pkt.len(),
+                        t.destination,
+                        lc.send_errors.counters.failed,
+                        ev.suppressed
+                    );
+                }
                 self.out.clear();
             }
         }
@@ -1630,6 +1799,10 @@ impl Loop {
         st.datagram_dropped_too_large = lc.dgram.dropped_too_large;
         st.datagram_dropped_unsupported = lc.dgram.dropped_unsupported;
         st.datagram_evicted = lc.dgram.evicted;
+        st.send_failed = lc.send_errors.counters.failed;
+        st.send_failed_not_connected = lc.send_errors.counters.failed_not_connected;
+        st.send_failed_other = lc.send_errors.counters.failed_other;
+        st.send_would_block = lc.send_errors.counters.would_block;
     }
 }
 
@@ -1671,7 +1844,7 @@ mod tests {
     /// 限频判定是纯函数：虚拟时刻推演，不 sleep、不在协议 core 取时钟。
     #[test]
     fn dgram_drop_log_throttles_with_injected_time() {
-        let mut log = DgramDropLog::default();
+        let mut log = RateLimitedLog::default();
         let t0 = Instant::now();
         let interval = DGRAM_DROP_LOG_INTERVAL;
         assert_eq!(log.decide(t0, interval), Some(0), "first drop always emits");
@@ -1779,6 +1952,7 @@ mod tests {
             .observe(t0, &fail())
             .expect("first failure emits immediately");
         assert_eq!(first.kind, SendFailureKind::NotConnected);
+        assert_eq!(first.io_kind, io::ErrorKind::NotConnected);
         assert_eq!(first.suppressed, 0);
         assert_eq!(
             tracker.counters,
@@ -1844,6 +2018,7 @@ mod tests {
             )
             .expect("WouldBlock must not consume the log window");
         assert_eq!(ev.kind, SendFailureKind::Other);
+        assert_eq!(ev.io_kind, io::ErrorKind::PermissionDenied);
         assert_eq!(ev.suppressed, 0);
         assert_eq!(tracker.counters.failed, 1);
         assert_eq!(tracker.counters.failed_other, 1);
