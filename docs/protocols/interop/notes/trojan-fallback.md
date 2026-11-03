@@ -27,7 +27,7 @@
 | R-2 | fallback 等客户端先发载荷后才响应 | 零载荷判据失效，同上。post-success late guard 仅在客户端零载荷期间生效；客户端载荷后的 `HTTP/` 应答按 origin 应答交付（R-2/R-7 范围内） | 本注记（承诺边界） |
 | R-3 | `signature` 模式下的非 HTTP fallback | 显式安全降级的已知漏报 | 本注记 + PRODUCT §11.9.3 |
 | R-4 | 客户端在 success 前 pipelined 载荷（`seed` 非空） | 守卫不适用（扣压又违反上行零扣压） | 本注记 |
-| R-5 | `nexusd` TUN / `ProxyEngine` 路径 | 该入口的「成功」由 smoltcp SYN-ACK 伪造，仍 fail-open | `NEXT-STEPS.md`（单独立项） |
+| R-5 | `nexusd` TUN / `ProxyEngine` 路径 | 已由凭据探测在 nexusd 路径部分关闭（PRODUCT §11.9.5）：密码错误时节点 fallback 的应答在拨号前被探测判 `rejected`，拨号以 `auth_rejected` 失败、不触节点；残余 = inconclusive 形态、只应答非 HTTP 载荷的 fallback、Trojan UDP | 本注记（部分关闭，残余登记于此） |
 | R-6 | HTTP 绝对形式转发（non-CONNECT） | 不回本地成功应答，fallback 的 404 仍作为 origin 响应出现 | `NEXT-STEPS.md` |
 | R-7 | 服务端被完全劫持并伪装成真实目标 | 超出协议可判定范围（需端到端认证/证书钉扎） | 威胁模型边界 |
 

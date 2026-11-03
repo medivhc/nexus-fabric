@@ -846,6 +846,19 @@ trojan 出站必须显式声明 TLS，判据是**字段是否出现**：
   进入 `last_failure_reason`。
 - **不覆盖**：只对非 HTTP 载荷才应答的 fallback（探测判 `passed` / `inconclusive`）、
   `nexus proxy`（§11.9.3）、服务端被劫持（R-7）、Trojan UDP（nexusd 未接线）。
+  另有三项已登记的行为边界（登记 ≠ 关闭）：
+  - **误判侧（误杀）**：密码正确、但节点实现是「上游失败即 fallback」的非标准形态时，
+    节点会对不可达的探测目标回送 fallback 字节，探测误判 `rejected`，配置正确的出站
+    被阻断（每次阻断至 `rejected` 结果过期，60 s；该形态节点每次重探都会再次误判）；
+  - **凭据时效窗口**：`passed` 结果缓存的 10 min 内，节点侧吊销或轮换密码不被感知，
+    该窗口内凭据已失效的流仍按 `passed` 照常拨号（fail-open 至重探为止）；
+  - **节点侧副作用**：探测为每个出站每个有效期新增 1 条 TLS 连接（`inconclusive`
+    时最多每 10 s 一条），可能出现在节点日志中、或触发节点侧连接限流。
+  两项限定注记：`first_bytes_hex`「不含密码及其哈希」的前提是 fallback 不回显请求
+  字节——echo 型 fallback 理论上可回显 Trojan 请求头的前 16 字节（即 SHA-224(密码)
+  的前 8 字节 hex，不可反推原密码）；单次探测 ≤ 13 s 的唯一例外是 strict-verify
+  路径下加载系统根证书（`load_native_certs`）本身挂死（与既有拨号同源），等待同一
+  结果的流没有独立于该探测的超时。
 - **E4 场景**：`scenarios/product/nexusd_trojan_credential_probe.toml`（`carrier = "n1-fabric"`）
   ——nexusd 引擎（`Dataplane` + `ProxyEngine` + MockTun）+ 本地 TLS Trojan 节点，每个用例
   一个子进程（断言 stderr 的 `result=`）：
