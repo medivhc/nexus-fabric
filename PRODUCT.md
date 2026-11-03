@@ -365,7 +365,7 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
 - TUN / TPROXY 透明入站：已按 §11.18 落地（TUN 生产链 + Linux TPROXY 前端；
   E4 离线闭环 + E5 netns 验收已执行（S1–S10；S2 的 UDP 回包源端口项曾因冻结 spec
   §9.1/§9.4 冲突挂起，已由 tproxy-udp-reply-origdst 按 §11.18「UDP 回包源地址」修复，
-  2026-10-27 E5 S2 PASS）。
+  2026-10-27 E5 S2 作者自报 4/5（一跑为 dig 在回包路径建立前超时、环境归因；我方 rig 复跑列为证据债）。
   Windows/macOS TPROXY、IPv6 透明代理、DoH/DoT
   仍为后续项（见 §11.18 末条）；
 - Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；

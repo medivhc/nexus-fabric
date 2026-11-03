@@ -4,7 +4,7 @@
 
 实现 Linux 平台 Capability Adapter，包括 TUN、Linux TPROXY capture adapter（`tproxy`：`IP_TRANSPARENT` TCP listener / `IP_RECVORIGDSTADDR` UDP socket / iptables+nftables+external 捕获规则）、Mount/Filesystem、Service/Privilege 等宿主桥接。
 
-`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` 不得出现在该目录之外。TPROXY UDP 回包 socket 绑定在 `orig_dst` 上，因此捕获规则不得加入 `socket`/DIVERT 类按已存在 socket 投递的规则：那会把客户端后续数据报投给只发不收的回包 socket，绕开监听 socket。
+`unsafe` 只允许出现在 `src/tproxy/` 内，每个 unsafe 块必须有 `// SAFETY:` 说明；`IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` 不得出现在该目录之外。TPROXY UDP 回包 socket 绑定在 `orig_dst` 上，因此捕获规则不得加入 `socket`/DIVERT 类按已存在 socket 投递的规则：那会把客户端后续数据报投给只发不收的回包 socket，绕开监听 socket。同理，捕获规则必须排除 local 目的地（iptables `-m addrtype --dst-type LOCAL -j RETURN`、nftables `fib daddr type local return`）：`backend=external` 时规则由用户自管、同样必须含此排除，否则回包 socket 一旦 bind 到 local `orig_dst`，会以内核 UDP exact-match 评分截走本机自发往同名 addr:port 本地服务的数据报（回包 socket 只发不收，截走即静默黑洞、无计数无日志）。
 
 ## Non-Responsibilities
 
@@ -96,6 +96,8 @@ TPROXY UDP 回包（PRODUCT §11.18）的单测需要 `CAP_NET_ADMIN`：无权�
 ```text
 sudo -E env NEXUS_REQUIRE_PRIVILEGED_TESTS=1 cargo test -p nexus-platform-linux --lib tproxy_udp
 ```
+
+注：以 setcap 等非 root 方式授予特权运行时，若 `orig_dst` 含低端口（如 53），除 `CAP_NET_ADMIN` 外还需 `CAP_NET_BIND_SERVICE`（bind 低端口受 `ip_unprivileged_port_start` 约束）；以 root/sudo 运行时不受此限。
 
 产品级观察为 E5 `scripts/acceptance/tproxy/run.sh s2`：回包源为 `orig_dst`（IP 与端口）；
 router netns 独占持有某个 `orig_dst` 时该回包被丢弃（客户端收不到任何源的回包）并计
