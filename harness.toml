@@ -52,6 +52,8 @@ freeze_module_invariants = true
 requirement_change_invalidates_evidence = true
 
 [protection]
+# Input set of the evidence contract_hash (with every **/MODULE.md); see
+# engineering/nexus-harness/MODULE.md Invariants.
 root_contract_paths = [
   "PRODUCT.md",
   "ARCHITECTURE.md",
