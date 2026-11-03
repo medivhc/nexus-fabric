@@ -412,13 +412,46 @@
   `/localapi/v0/n1/stats` 的 `egress.*`）。计数口径：`egress.connect_ok` 只计
   本地 socket 已产出证据的连接（静默连接少计、不多计）；`egress.bytes_to_local`
   计 DATA 载荷进入 relay 写路径的字节（正常缓冲下等于写入本地 socket）。
-- **已知失败 / 待诊断**：2026-10-29 公网 [R] 窗口 10 MiB relay 传输在
-  145,400 字节（1.39%）处中断，SHA-256 不一致；两端应用均未报错
-  （发送端 `send` 成功、接收端干净 EOF `reset=false`），根因未定性，且
-  按 spec §12.3 **不是** `FAIL(loss)`（接收端收到发送端几乎全部帧，发送端
-  `fallback_errors` +8,339）。诊断 follow-up：
-  `n1-mid-stream-send-failure-diagnosis`。本能力状态按 **preview** 记录，
-  不得据此宣称 N1 可用；用户文档的诚实边界见 `docs/USER_MANUAL.md` §4.1.14。
+- **能力状态（2026-11-03 起）：usable（范围限定）**（裁决 `MSR-n1-unlock-20261103`）：
+  范围限定为已验证形态——单跳 relay 采纳路径、大流（≤10 MiB 级）、kill/重启恢复，
+  均真机（A=xc-pc-linux ↔ B=Hermes）复验；**默认关闭不变**（`[network.n1]` 整节省略
+  = 禁用），默认开另行裁决。原「已知失败」条目已闭环为下一条。
+- **已定性 / 已修复（2026-10-29 [R] 窗口 10 MiB 断裂）**：
+  - 现象（原判读保留、不改写）：10 MiB relay 传输在 145,400 字节（1.39%）处中断、
+    SHA-256 不一致；两端应用均未报错（发送端 `send` 成功、接收端干净 EOF
+    `reset=false`）；按 spec §12.3 **不是** `FAIL(loss)`（接收端收到发送端几乎全部帧，
+    发送端 `fallback_errors` +8,339）。该窗口 AC 终态账（R1 FAIL）不改写。
+  - 根因：N1 分片按**假定**的 1200 B 上限切帧，而 quinn-proto 的实际有效上限为
+    `1200 − 29 − 9 = 1162` B（STREAM 帧 1162 B 全通 / 1163 B 全灭）；
+    `crates/nexus-fabric/src/driver.rs` 的 pump flush 对
+    `SendDatagramError::TooLarge` **静默吞掉**（无计数、无日志），上层一直按 1200
+    假设工作。
+  - 修复落点（2026-11-01 合入 master，merge `c936908f`；现行 master `736d667e` 为其
+    后代）：`datagram_cap()` 采样 quinn 实际 `max_size()`（本仓库装配为 1162）、分片
+    改为按入参 cap 执行、发送错误 typed 回传 + 计数 + 限频日志；`vpi.mtu` 的默认值/
+    上界同步对齐 1162。
+  - 复验：F1 双向各 10,485,760 B 全达、两端 SHA-256 一致、Oversize / 发送失败双计数
+    为零；F2 `kill -9` → Escalate 32 s 有界退出 PASS；F3 实质 PASS（脚本窗口 INVALID
+    系 rig ssh 挂死，产品行为由手工探针坐实）；旧边界分级复扫 21/21；合并点
+    `verify --fast` 9/9。
+- **升级行为变化（`network.toml` `[vpi].mtu`，用户可见）**：配置值 **>1162 以硬错误
+  拒绝启动**（不钳制、不静默降级，rc=1，错误文案含 `1162`）；旧默认 1200 与任何
+  1163–1500 的存量配置**升级前必须改到 ≤1162**。例外：Linux 承载 IPv6 的接口要求
+  MTU ≥1280，需要 IPv6 的 TUN 不能靠把 MTU 降到 1162 规避，该类超限 raw-IP 包按
+  「诚实丢弃 + 计数」处理（`crates/nexus-network/MODULE.md` 的 Platform Constraints；
+  `PumpStats::uplink_dropped`）。注意 `vpi.mtu` 与 `[tun].mtu` 是两个键：后者合法
+  区间仍为 [1280, 9000]（见 T1）。
+- **诚实边界（usable 后仍保留）**：
+  - 走**不可靠 QUIC datagram**：无跨节点重传、重排、ack；完整性依赖结果级校验
+    （如 SHA-256），**connect/send 成功 ≠ 送达**，失败时两端应用都可能看不到错误。
+  - **未在本线验证**：公网 TURN 中继数据面大流（rig 采纳路径的 QUIC 数据面实际经
+    EasyTier mesh 直达，coturn 仅控制面背书）、直连打洞大流、传输中底层地址切换
+    （白皮书 §6.3 字面口径为「分层恢复」；地址切换场景在本线从未正式验收）——
+    分别归 AC-13 campaign 与后续补验，不得据此宣称可用。
+  - **已知留置（P2）**：driver `socket.send_to` 仍吞真实 UDP 发送错误（诊断已定性它
+    **不是** 1162 丢弃点，但 EMSGSIZE / 网卡抖动仍会静默）；解锁后首个小 fix 处理
+    （可与 `harness-lock-fd-hygiene` 并案）。
+  - 用户文档的诚实边界见 `docs/USER_MANUAL.md` §4.1.14。
 
 ### 常规要求
 
