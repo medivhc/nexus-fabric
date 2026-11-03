@@ -20,6 +20,7 @@ mod anytls;
 mod framing;
 pub(crate) mod legacy;
 mod tls;
+mod trojan_probe;
 mod vless;
 
 #[cfg(test)]
@@ -467,6 +468,7 @@ pub fn build_dialer(
             Ok(Arc::new(legacy::TrojanProxyTransportDialer::new(
                 outbound.tag.clone(),
                 config,
+                outbound.credential_probe.unwrap_or(true),
             )))
         }
         OutboundKind::Vless => {

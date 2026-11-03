@@ -462,5 +462,13 @@
     "module": "apps/nexus",
     "category": "implementation-pitfall",
     "summary": "首包判别守卫的前提「客户端尚未载荷」失效时（读到 n>0 的客户端载荷）必须清除守卫并按序交付已暂存前缀；echo 载荷的矩阵覆盖不到明文 HTTP 误判。"
+  },
+  {
+    "id": "trojan-credential-probe-deadlines",
+    "file": "entries/2026-10-29-trojan-credential-probe-deadlines.md",
+    "date": "2026-10-29",
+    "module": "apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "探测按截止时刻驱动 rustls（socket 超时是每次调用的）；TLS 错误之前已解密的 fallback 字节必须判 rejected（否则 fail-open）；终结器在三次握手后才发 Syn；断言「不改变既有行为」用开/关对照。"
   }
 ]

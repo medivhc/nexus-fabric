@@ -64,6 +64,7 @@ fn run() -> Result<String, Outcome> {
         obfs_password: None,
         fallback_guard: None,
         ready_window_ms: None,
+        credential_probe: None,
     };
     let obfs = cfg.obfs.as_deref();
     let params = ObfsParams {
