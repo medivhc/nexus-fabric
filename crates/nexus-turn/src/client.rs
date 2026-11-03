@@ -40,9 +40,10 @@ pub struct TurnStats {
     pub unauthorized_dropped: u64,
     pub relayed_bytes: u64,
     pub allocation_expired: u64,
-    /// 438 (Stale Nonce) 后采纳响应新 nonce 并在同一事务内重试的次数
-    /// （重试最终仍失败也计入；成功恢复不增加 `allocation_expired`）。
-    /// 与真正的 integrity 失败区分，见 `transact`。
+    /// 438 (Stale Nonce) 后采纳响应新 nonce、以新事务 ID 重发的次数
+    /// （同一 `transact()` 调用内、对调用方透明；重试最终仍失败也计入；
+    /// 成功恢复不增加 `allocation_expired`）。与真正的 integrity 失败区分，
+    /// 见 `transact`。
     pub stale_nonce_retried: u64,
 }
 
@@ -465,10 +466,12 @@ impl ClientInner {
 
     /// 发送请求并等待匹配 txn 的响应；Data indication 暂存，无关响应按 txn 丢弃。
     ///
-    /// 响应先按属性分类（RFC 8489 §9.2.4）：
+    /// 响应先按属性分类（RFC 8489 §9.2.5）：
     /// - 401 质询：原样返回给调用方（`allocate` 的质询流不变）；
-    /// - 438 stale nonce：采纳响应携带的新 NONCE，在同一事务内重发一次；
+    /// - 438 stale nonce：采纳响应携带的新 NONCE，并以 `stun::new_transaction_id()`
+    ///   生成的新事务 ID 在同一 `transact()` 调用内重发一次（对调用方透明）；
     ///   服务端持续回 438 时第二次即失败（有界，不形成重试循环/请求风暴）；
+    ///   以新事务重发后，携带原事务 ID 的迟到响应不再被采纳；
     /// - 其他错误码：返回带错误码与 reason 的明确错误（不再统一报 integrity failed）；
     /// - 成功响应：按属性定位 MESSAGE-INTEGRITY 并强制验证（缺失/不符 fail-closed）。
     ///
@@ -476,7 +479,7 @@ impl ClientInner {
     /// 安全口径仍是「只有通过 MI 验证的成功响应才是成功」。
     fn transact(
         &mut self,
-        msg: StunMessage,
+        mut msg: StunMessage,
         timeout: Duration,
     ) -> io::Result<stun::DecodedMessage> {
         let deadline = Instant::now() + timeout;
@@ -530,7 +533,7 @@ impl ClientInner {
                 match (*class, *number) {
                     // 401：交给调用方走质询流（提取 REALM/NONCE 后认证重发）。
                     (4, 1) => return Ok(d),
-                    // 438（RFC 8489 §9.2.4）：采纳新 nonce，同一事务内重试一次。
+                    // 438（RFC 8489 §9.2.5）：采纳新 nonce，以新事务 ID 重试一次。
                     (4, 38) => {
                         if stale_retries >= 1 {
                             return Err(stale_nonce_persisted(msg.msg_type, reason));
@@ -541,10 +544,15 @@ impl ClientInner {
                         self.stats
                             .stale_nonce_retried
                             .fetch_add(1, Ordering::Relaxed);
+                        // 重试是一次新的请求事务：换 nonce 的同时必须换事务 ID，
+                        // 否则迟到的、携带原事务 ID 的重复 438 会被误当成重试的
+                        // 响应（消耗掉唯一一次有界重试）。
+                        let previous_txn = msg.txn;
+                        msg.txn = stun::new_transaction_id();
                         eprintln!(
                             "[turn] stale nonce recovered: 438 on request 0x{:04x}, \
-                             retrying once with fresh nonce (txn {:02x?})",
-                            msg.msg_type, msg.txn
+                             retrying once with fresh nonce (txn {:02x?} -> {:02x?})",
+                            msg.msg_type, previous_txn, msg.txn
                         );
                         bytes = self.encode_request(&msg);
                         self.sock.send(&bytes)?;
