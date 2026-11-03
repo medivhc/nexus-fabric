@@ -88,6 +88,9 @@ const POLL_CAP: Duration = Duration::from_millis(5);
 /// `OUTBOUND_UNAVAILABLE_LOG_INTERVAL` 同值，保持运维口径一致）。
 const DGRAM_DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// socket 发送失败日志的限频窗口（与 datagram 丢弃日志同值，保持运维口径一致）。
+const SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 丢弃/逐出的分类（flush 期由 quinn 错误映射；纯数据，便于单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DgramDropKind {
@@ -137,15 +140,16 @@ impl DgramCounters {
     }
 }
 
-/// 丢弃日志限频判定：**不自取时钟**，`now` 由 driver loop（时间注入方）传入
+/// 限频日志判定（datagram 丢弃与 socket 发送失败共用）：**不自取时钟**，
+/// `now` 由 driver loop（时间注入方）传入
 /// （AGENTS §22 / 既定决议：协议 core 不直接读系统时间）。
 #[derive(Default)]
-struct DgramDropLog {
+struct RateLimitedLog {
     last: Option<Instant>,
     suppressed: u64,
 }
 
-impl DgramDropLog {
+impl RateLimitedLog {
     /// `Some(suppressed)` = 本次应发射，并带出窗口内被抑制条数；`None` = 只累加。
     fn decide(&mut self, now: Instant, interval: Duration) -> Option<u64> {
         match self.last {
@@ -165,6 +169,152 @@ impl DgramDropLog {
             }
         }
     }
+}
+
+/// `UdpTransport::send_to` 结果分类（纯数据）。
+///
+/// `WouldBlock` 是正常背压（socket 发送缓冲满），**不是发送失败**：单独计数、
+/// 不触发错误日志。`NotConnected` 单列——rebind 窗口内的 `ClosedTransport`
+/// 恒返该 kind，窗口内经它发出的 transmit 失败计入这里是诚实语义。其余 kind
+/// 归入 `Other` 计数（原始 kind 只进日志，避免无界的计数维度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailureKind {
+    WouldBlock,
+    NotConnected,
+    Other,
+}
+
+impl SendFailureKind {
+    fn classify(err: &io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::WouldBlock => Self::WouldBlock,
+            io::ErrorKind::NotConnected => Self::NotConnected,
+            _ => Self::Other,
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        !matches!(self, Self::WouldBlock)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WouldBlock => "would_block",
+            Self::NotConnected => "not_connected",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// socket 发送结果分类计数（纯数据；不含时钟/日志）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SendErrorCounters {
+    /// 非 `WouldBlock` 的失败总数（= `failed_not_connected + failed_other`）。
+    failed: u64,
+    failed_not_connected: u64,
+    failed_other: u64,
+    /// 正常背压次数（不计入 `failed`）。
+    would_block: u64,
+}
+
+impl SendErrorCounters {
+    fn record(&mut self, kind: SendFailureKind) {
+        match kind {
+            SendFailureKind::WouldBlock => self.would_block += 1,
+            SendFailureKind::NotConnected => {
+                self.failed += 1;
+                self.failed_not_connected += 1;
+            }
+            SendFailureKind::Other => {
+                self.failed += 1;
+                self.failed_other += 1;
+            }
+        }
+    }
+
+    /// 记录一次 `send_to` 结果：成功零副作用；失败按 kind 计数。
+    /// `Some((kind, io_kind))` = 非 `WouldBlock` 的失败，由调用方决定是否
+    /// 走限频日志（`WouldBlock` 是背压，不产生日志）。
+    fn observe_result(
+        &mut self,
+        result: &io::Result<usize>,
+    ) -> Option<(SendFailureKind, io::ErrorKind)> {
+        let err = result.as_ref().err()?;
+        let kind = SendFailureKind::classify(err);
+        self.record(kind);
+        kind.is_failure().then_some((kind, err.kind()))
+    }
+}
+
+/// 一次发送错误的日志判定结果；连接/站点上下文由调用方补充。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendErrorEvent {
+    kind: SendFailureKind,
+    /// 原始 `io::ErrorKind`（`Other` 桶的细分信息只进日志，不进计数）。
+    io_kind: io::ErrorKind,
+    /// 本窗口内被限频吞掉的错误条数（首条恒为 0）。
+    suppressed: u64,
+}
+
+/// `send_to` 结果观察器：成功**零副作用**；失败按 kind 分类计数，
+/// 非 `WouldBlock` 再走 10s 限频日志判定。时间由调用方注入，本结构零时钟调用。
+#[derive(Default)]
+struct SendErrorTracker {
+    counters: SendErrorCounters,
+    log: RateLimitedLog,
+}
+
+impl SendErrorTracker {
+    fn observe(&mut self, now: Instant, result: &io::Result<usize>) -> Option<SendErrorEvent> {
+        let (kind, io_kind) = self.counters.observe_result(result)?;
+        self.log
+            .decide(now, SEND_ERROR_LOG_INTERVAL)
+            .map(|suppressed| SendErrorEvent {
+                kind,
+                io_kind,
+                suppressed,
+            })
+    }
+}
+
+/// 端点级发送（`on_udp` / `on_new_connection`，无连接上下文）：失败按 kind
+/// 计入 driver loop 内部计数并按 10s 限频打日志。
+///
+/// 限频器由调用方按站点传入（`datagram_response` / `accept_response` 各一个），
+/// 避免一个站点的窗口吞掉另一个站点的首条错误；计数则共用 driver 级
+/// `SendErrorCounters`（`total=` 是两站点合计，站点归属看 `site=`）。
+///
+/// 该计数**暂无公共读面**（本 run 裁决：不新开 stats 端点），只经日志与单测观察；
+/// 连接内的同一类失败则经 `ConnStats.send_*` 暴露。
+fn send_endpoint_packet(
+    socket: &dyn UdpTransport,
+    counters: &mut SendErrorCounters,
+    log: &mut RateLimitedLog,
+    now: Instant,
+    pkt: &[u8],
+    dest: SocketAddr,
+    site: &'static str,
+) -> Option<SendErrorEvent> {
+    let result = socket.send_to(pkt, dest);
+    let (kind, io_kind) = counters.observe_result(&result)?;
+    let suppressed = log.decide(now, SEND_ERROR_LOG_INTERVAL)?;
+    // `total` 是 driver 级端点发送失败**合计**（两个端点级站点共用计数），
+    // 不是单个站点的条数；跨站点归因看 `site=`。
+    eprintln!(
+        "[fabric] socket send failed site={} kind={} io_kind={:?} len={} dest={} total={} suppressed={}",
+        site,
+        kind.as_str(),
+        io_kind,
+        pkt.len(),
+        dest,
+        counters.failed,
+        suppressed
+    );
+    Some(SendErrorEvent {
+        kind,
+        io_kind,
+        suppressed,
+    })
 }
 
 /// Largest UDP datagram the driver reads.
@@ -451,43 +601,7 @@ impl Driver {
         server: Option<(ServerConfig, Identity)>,
         mutual_auth: bool,
     ) -> Result<Arc<Self>, FabricError> {
-        let local_addr = transport
-            .local_addr()
-            .map_err(|e| FabricError::Transport(e.to_string()))?;
-        let (server_config, identity) = server
-            .map(|(c, i)| (Some(Arc::new(c)), Some(i)))
-            .unwrap_or((None, None));
-        let peer_id = identity.as_ref().map(|i| i.peer_id);
-        let endpoint = Endpoint::new(
-            Arc::new(EndpointConfig::default()),
-            server_config.clone(),
-            false,
-            None,
-        );
-        let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(DriverShared {
-            conns: Mutex::new(HashMap::new()),
-            accept_q: Mutex::new(VecDeque::new()),
-            accept_cv: Condvar::new(),
-            local_addr: Mutex::new(local_addr),
-            peer_id,
-            rejected_handshakes: AtomicU64::new(0),
-        });
-        let lp = Loop {
-            rx,
-            tx: tx.clone(),
-            shared: shared.clone(),
-            socket: transport,
-            endpoint,
-            server_config,
-            mutual_auth,
-            live: HashMap::new(),
-            handle_map: HashMap::new(),
-            buf: vec![0u8; RECV_BUF],
-            out: Vec::new(),
-            stun_sink: None,
-            stun_pending: HashMap::new(),
-        };
+        let (lp, shared, tx) = Loop::build(transport, server, mutual_auth)?;
         let thread = thread::Builder::new()
             .name("nexus-fabric-drv".into())
             .spawn(move || lp.run())
@@ -787,7 +901,8 @@ struct LiveConn {
     streams: HashMap<StreamId, Arc<StreamShared>>,
     dgram_tx_q: VecDeque<Vec<u8>>,
     dgram: DgramCounters,
-    dgram_drop_log: DgramDropLog,
+    dgram_drop_log: RateLimitedLog,
+    send_errors: SendErrorTracker,
     bytes_sent: u64,
     bytes_recv: u64,
     /// WP1b/§19: set once the QUIC/TLS handshake completed (`Connected`).
@@ -837,9 +952,68 @@ struct Loop {
     out: Vec<u8>,
     stun_sink: Option<std::sync::Arc<dyn crate::stun::StunSink>>,
     stun_pending: HashMap<[u8; 12], Instant>,
+    /// 端点级（无连接上下文）`send_to` 失败/背压计数。driver loop 内部状态，
+    /// 暂无公共读面（本 run 裁决）。两个端点级站点共用此计数，`total=` 为合计。
+    endpoint_send_errors: SendErrorCounters,
+    /// `datagram_response` 站点的限频窗口（与 accept 站点独立，互不吞首条）。
+    datagram_response_log: RateLimitedLog,
+    /// `accept_response` 站点的限频窗口（与 datagram 站点独立，互不吞首条）。
+    accept_response_log: RateLimitedLog,
 }
 
 impl Loop {
+    /// 构造驱动循环的未启动状态（socket + endpoint + 共享状态 + 命令通道）。
+    ///
+    /// 抽出来是为了让测试能在**同一构造路径**上驱动 `on_udp` /
+    /// `on_new_connection`（生产接线级验证），而不是复制一份 struct 字面量。
+    fn build(
+        transport: Box<dyn UdpTransport>,
+        server: Option<(ServerConfig, Identity)>,
+        mutual_auth: bool,
+    ) -> Result<(Self, Arc<DriverShared>, mpsc::Sender<Cmd>), FabricError> {
+        let local_addr = transport
+            .local_addr()
+            .map_err(|e| FabricError::Transport(e.to_string()))?;
+        let (server_config, identity) = server
+            .map(|(c, i)| (Some(Arc::new(c)), Some(i)))
+            .unwrap_or((None, None));
+        let peer_id = identity.as_ref().map(|i| i.peer_id);
+        let endpoint = Endpoint::new(
+            Arc::new(EndpointConfig::default()),
+            server_config.clone(),
+            false,
+            None,
+        );
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(DriverShared {
+            conns: Mutex::new(HashMap::new()),
+            accept_q: Mutex::new(VecDeque::new()),
+            accept_cv: Condvar::new(),
+            local_addr: Mutex::new(local_addr),
+            peer_id,
+            rejected_handshakes: AtomicU64::new(0),
+        });
+        let lp = Self {
+            rx,
+            tx: tx.clone(),
+            shared: shared.clone(),
+            socket: transport,
+            endpoint,
+            server_config,
+            mutual_auth,
+            live: HashMap::new(),
+            handle_map: HashMap::new(),
+            buf: vec![0u8; RECV_BUF],
+            out: Vec::new(),
+            stun_sink: None,
+            stun_pending: HashMap::new(),
+            endpoint_send_errors: SendErrorCounters::default(),
+            datagram_response_log: RateLimitedLog::default(),
+            accept_response_log: RateLimitedLog::default(),
+        };
+        Ok((lp, shared, tx))
+    }
+
     fn run(mut self) {
         loop {
             let now = Instant::now();
@@ -1012,7 +1186,8 @@ impl Loop {
                 streams: HashMap::new(),
                 dgram_tx_q: VecDeque::new(),
                 dgram: DgramCounters::default(),
-                dgram_drop_log: DgramDropLog::default(),
+                dgram_drop_log: RateLimitedLog::default(),
+                send_errors: SendErrorTracker::default(),
                 bytes_sent: 0,
                 bytes_recv: 0,
                 handshake_authenticated: false,
@@ -1201,7 +1376,15 @@ impl Loop {
             None => {}
             Some(DatagramEvent::Response(t)) => {
                 let pkt = self.out[..t.size].to_vec();
-                let _ = self.socket.send_to(&pkt, t.destination);
+                send_endpoint_packet(
+                    &*self.socket,
+                    &mut self.endpoint_send_errors,
+                    &mut self.datagram_response_log,
+                    now,
+                    &pkt,
+                    t.destination,
+                    "datagram_response",
+                );
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
                 self.on_new_connection(incoming, now);
@@ -1246,7 +1429,8 @@ impl Loop {
                         streams: HashMap::new(),
                         dgram_tx_q: VecDeque::new(),
                         dgram: DgramCounters::default(),
-                        dgram_drop_log: DgramDropLog::default(),
+                        dgram_drop_log: RateLimitedLog::default(),
+                        send_errors: SendErrorTracker::default(),
                         bytes_sent: 0,
                         bytes_recv: 0,
                         handshake_authenticated: false,
@@ -1262,7 +1446,15 @@ impl Loop {
             Err(e) => {
                 if let Some(t) = e.response {
                     let pkt = self.out[..t.size].to_vec();
-                    let _ = self.socket.send_to(&pkt, t.destination);
+                    send_endpoint_packet(
+                        &*self.socket,
+                        &mut self.endpoint_send_errors,
+                        &mut self.accept_response_log,
+                        now,
+                        &pkt,
+                        t.destination,
+                        "accept_response",
+                    );
                 }
             }
         }
@@ -1373,10 +1565,27 @@ impl Loop {
             }
         }
         // Transmit.
+        //
+        // quinn sans-IO：`poll_transmit` 交出包即视为已发送。本层 send_to 失败时
+        // 包按丢失处理（不归还、不重试、不自旋），由 QUIC 自身丢包检测/PTO 重传；
+        // 这里只负责让它**可见**（计数 + 首条即出、其后 10s 限频的日志）。
         if let Some(lc) = self.live.get_mut(&id) {
             while let Some(t) = lc.quic.poll_transmit(now, 1, &mut self.out) {
                 let pkt = self.out[..t.size].to_vec();
-                let _ = self.socket.send_to(&pkt, t.destination);
+                let result = self.socket.send_to(&pkt, t.destination);
+                if let Some(ev) = lc.send_errors.observe(now, &result) {
+                    eprintln!(
+                        "[fabric] socket send failed conn={} peer={} kind={} io_kind={:?} len={} dest={} total={} suppressed={}",
+                        lc.shared.id.0,
+                        crate::hex_short(&lc.shared.peer.0),
+                        ev.kind.as_str(),
+                        ev.io_kind,
+                        pkt.len(),
+                        t.destination,
+                        lc.send_errors.counters.failed,
+                        ev.suppressed
+                    );
+                }
                 self.out.clear();
             }
         }
@@ -1630,6 +1839,10 @@ impl Loop {
         st.datagram_dropped_too_large = lc.dgram.dropped_too_large;
         st.datagram_dropped_unsupported = lc.dgram.dropped_unsupported;
         st.datagram_evicted = lc.dgram.evicted;
+        st.send_failed = lc.send_errors.counters.failed;
+        st.send_failed_not_connected = lc.send_errors.counters.failed_not_connected;
+        st.send_failed_other = lc.send_errors.counters.failed_other;
+        st.send_would_block = lc.send_errors.counters.would_block;
     }
 }
 
@@ -1671,7 +1884,7 @@ mod tests {
     /// 限频判定是纯函数：虚拟时刻推演，不 sleep、不在协议 core 取时钟。
     #[test]
     fn dgram_drop_log_throttles_with_injected_time() {
-        let mut log = DgramDropLog::default();
+        let mut log = RateLimitedLog::default();
         let t0 = Instant::now();
         let interval = DGRAM_DROP_LOG_INTERVAL;
         assert_eq!(log.decide(t0, interval), Some(0), "first drop always emits");
@@ -1733,6 +1946,399 @@ mod tests {
             },
             "evictions are not drops"
         );
+    }
+
+    /// `send_to` 分类：`WouldBlock` 是正常背压，不是失败；`NotConnected`
+    /// 单列（rebind 窗口的 `ClosedTransport` 恒返该 kind），其余归 `Other`。
+    #[test]
+    fn send_failure_kind_classifies_io_errors() {
+        let kind = |k| SendFailureKind::classify(&io::Error::from(k));
+        assert_eq!(kind(io::ErrorKind::WouldBlock), SendFailureKind::WouldBlock);
+        assert_eq!(
+            kind(io::ErrorKind::NotConnected),
+            SendFailureKind::NotConnected
+        );
+        assert_eq!(
+            kind(io::ErrorKind::PermissionDenied),
+            SendFailureKind::Other
+        );
+        assert_eq!(
+            kind(io::ErrorKind::NetworkUnreachable),
+            SendFailureKind::Other
+        );
+        assert!(
+            !SendFailureKind::WouldBlock.is_failure(),
+            "WouldBlock is backpressure, not a send failure"
+        );
+        assert!(SendFailureKind::NotConnected.is_failure());
+        assert!(SendFailureKind::Other.is_failure());
+    }
+
+    /// Spec 5 第一项：注入 send_to 失败 → 计数增加；**首个错误立即出日志**
+    /// （首条不被限频吞），其后同窗口只累加，窗口到期带 suppressed 再发。
+    /// 时间由测试注入，观察器内部零时钟调用。
+    #[test]
+    fn send_failure_counts_and_first_error_is_never_throttled() {
+        let mut tracker = SendErrorTracker::default();
+        let t0 = Instant::now();
+        let fail = || {
+            Err::<usize, io::Error>(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "socket closed for rebind",
+            ))
+        };
+
+        let first = tracker
+            .observe(t0, &fail())
+            .expect("first failure emits immediately");
+        assert_eq!(first.kind, SendFailureKind::NotConnected);
+        assert_eq!(first.io_kind, io::ErrorKind::NotConnected);
+        assert_eq!(first.suppressed, 0);
+        assert_eq!(
+            tracker.counters,
+            SendErrorCounters {
+                failed: 1,
+                failed_not_connected: 1,
+                failed_other: 0,
+                would_block: 0,
+            }
+        );
+
+        assert!(
+            tracker
+                .observe(t0 + Duration::from_secs(1), &fail())
+                .is_none(),
+            "inside the 10s window the log is suppressed"
+        );
+        assert_eq!(tracker.counters.failed, 2, "suppressed errors still count");
+
+        let ev = tracker
+            .observe(t0 + SEND_ERROR_LOG_INTERVAL, &fail())
+            .expect("window elapsed: emit again");
+        assert_eq!(ev.suppressed, 1);
+        assert_eq!(tracker.counters.failed, 3);
+    }
+
+    /// Spec 5 第二项：WouldBlock → 不计失败、不触发错误日志，且**不消耗**
+    /// 日志窗口（背压之后的首个真实错误仍然立即可见）。
+    #[test]
+    fn would_block_is_counted_separately_and_never_logs() {
+        let mut tracker = SendErrorTracker::default();
+        let t0 = Instant::now();
+        let would_block = || {
+            Err::<usize, io::Error>(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "send buffer full",
+            ))
+        };
+
+        assert!(
+            tracker.observe(t0, &would_block()).is_none(),
+            "WouldBlock must not trigger the error log"
+        );
+        assert!(tracker.observe(t0, &would_block()).is_none());
+        assert_eq!(
+            tracker.counters,
+            SendErrorCounters {
+                failed: 0,
+                failed_not_connected: 0,
+                failed_other: 0,
+                would_block: 2,
+            },
+            "backpressure is not a send failure"
+        );
+
+        let ev = tracker
+            .observe(
+                t0 + Duration::from_millis(1),
+                &Err::<usize, io::Error>(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected failure",
+                )),
+            )
+            .expect("WouldBlock must not consume the log window");
+        assert_eq!(ev.kind, SendFailureKind::Other);
+        assert_eq!(ev.io_kind, io::ErrorKind::PermissionDenied);
+        assert_eq!(ev.suppressed, 0);
+        assert_eq!(tracker.counters.failed, 1);
+        assert_eq!(tracker.counters.failed_other, 1);
+    }
+
+    /// Spec 5 第三项：成功路径零副作用（计数不变、不产生日志判定）。
+    #[test]
+    fn successful_send_leaves_counters_untouched() {
+        let mut tracker = SendErrorTracker::default();
+        assert!(
+            tracker
+                .observe(Instant::now(), &Ok::<usize, io::Error>(1200))
+                .is_none()
+        );
+        assert_eq!(tracker.counters, SendErrorCounters::default());
+    }
+
+    /// 端点级站点（无连接上下文）：同样分类、同样限频，计数挂在 driver loop
+    /// 内部（无公共读面）。限频器由站点传入。
+    #[test]
+    fn endpoint_send_failure_is_classified_and_counted() {
+        let socket = SendErrorTransport::new(io::ErrorKind::NotConnected);
+        let mut counters = SendErrorCounters::default();
+        let mut log = RateLimitedLog::default();
+        let t0 = Instant::now();
+        let dest: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        let first = send_endpoint_packet(
+            &socket,
+            &mut counters,
+            &mut log,
+            t0,
+            b"reply",
+            dest,
+            "test_site",
+        )
+        .expect("first endpoint failure is logged");
+        assert_eq!(first.suppressed, 0);
+        assert_eq!(counters.failed, 1);
+        assert_eq!(counters.failed_not_connected, 1);
+        assert!(
+            send_endpoint_packet(
+                &socket,
+                &mut counters,
+                &mut log,
+                t0,
+                b"reply",
+                dest,
+                "test_site"
+            )
+            .is_none(),
+            "same site inside the window stays throttled"
+        );
+        assert_eq!(counters.failed, 2);
+
+        let socket = SendErrorTransport::new(io::ErrorKind::WouldBlock);
+        let mut counters = SendErrorCounters::default();
+        let mut log = RateLimitedLog::default();
+        assert!(
+            send_endpoint_packet(
+                &socket,
+                &mut counters,
+                &mut log,
+                t0,
+                b"reply",
+                dest,
+                "test_site"
+            )
+            .is_none()
+        );
+        assert_eq!(counters.failed, 0, "WouldBlock is not a failure");
+        assert_eq!(counters.would_block, 1);
+        assert_eq!(log.last, None, "WouldBlock must not consume the log window");
+    }
+
+    /// C1 回归：两个端点级站点各自持有独立限频器。站点 A 在 t0 首发打开自己的
+    /// 窗口后，站点 B 在窗口内发生的**有史以来第一条**错误仍必须立即发射
+    /// （`suppressed=0`），不允许被 A 的窗口吞掉；计数保持 driver 级跨站点合计。
+    #[test]
+    fn endpoint_sites_do_not_suppress_each_others_first_error() {
+        let socket = SendErrorTransport::new(io::ErrorKind::NetworkUnreachable);
+        let mut counters = SendErrorCounters::default();
+        let mut datagram_log = RateLimitedLog::default();
+        let mut accept_log = RateLimitedLog::default();
+        let t0 = Instant::now();
+        let dest: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        let a = send_endpoint_packet(
+            &socket,
+            &mut counters,
+            &mut datagram_log,
+            t0,
+            b"reply",
+            dest,
+            "datagram_response",
+        )
+        .expect("site A's first error must be logged");
+        assert_eq!(a.suppressed, 0);
+
+        // A's own window is now open: its next error is throttled.
+        assert!(
+            send_endpoint_packet(
+                &socket,
+                &mut counters,
+                &mut datagram_log,
+                t0 + Duration::from_secs(1),
+                b"reply",
+                dest,
+                "datagram_response",
+            )
+            .is_none(),
+            "site A suppresses its own repeated error inside the window"
+        );
+
+        // Site B's first error arrives 1s later, inside A's window: it must emit.
+        let b = send_endpoint_packet(
+            &socket,
+            &mut counters,
+            &mut accept_log,
+            t0 + Duration::from_secs(1),
+            b"reject",
+            dest,
+            "accept_response",
+        )
+        .expect("site B's first error must not be suppressed by site A's window");
+        assert_eq!(b.suppressed, 0);
+        assert_eq!(b.kind, SendFailureKind::Other);
+        assert_eq!(
+            counters.failed, 3,
+            "counters stay driver-level across sites"
+        );
+        assert_eq!(counters.failed_other, 3);
+    }
+
+    /// S1：生产接线级验证——`on_udp` 收到需要端点响应的数据报（此处为不支持的
+    /// QUIC 版本 → Version Negotiation 响应），其 `send_to` 失败必须落到 `Loop`
+    /// 的端点计数与日志判定，而不是被重新吞回 `let _ =`。
+    #[test]
+    fn on_udp_response_send_failure_reaches_endpoint_counters() {
+        let id = generate_identity().expect("identity");
+        let cfg = build_server_config(&id).expect("server config");
+        let (mut lp, _shared, _tx) = Loop::build(
+            Box::new(SendErrorTransport::new(io::ErrorKind::NetworkUnreachable)),
+            Some((cfg, id)),
+            false,
+        )
+        .expect("loop builds");
+
+        let packet = unsupported_version_datagram();
+        lp.buf[..packet.len()].copy_from_slice(&packet);
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        lp.on_udp(packet.len(), remote);
+
+        assert_eq!(
+            lp.endpoint_send_errors.failed, 1,
+            "on_udp -> DatagramEvent::Response -> send_to failure is counted"
+        );
+        assert_eq!(lp.endpoint_send_errors.failed_other, 1);
+        assert!(
+            lp.datagram_response_log.last.is_some(),
+            "the first endpoint send failure is logged (not throttled)"
+        );
+        assert_eq!(
+            lp.accept_response_log.last, None,
+            "the other site's window must stay untouched"
+        );
+    }
+
+    /// 构造一个 QUIC 长头数据报，其版本不在端点的 supported_versions 中；
+    /// 长度达到 `MIN_INITIAL_SIZE`，服务端端点会以 Version Negotiation 响应
+    /// （`DatagramEvent::Response`）作为 `on_udp` 的输入。
+    fn unsupported_version_datagram() -> Vec<u8> {
+        let mut pkt = vec![0u8; 1200];
+        pkt[0] = 0xC0; // long header + fixed bit
+        pkt[1..5].copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        pkt[5] = 8; // dst CID length
+        pkt[14] = 8; // src CID length
+        pkt
+    }
+
+    /// 主站点接线：真实 quinn 客户端 + 注入失败的 transport，断言 `pump_one`
+    /// 的 send_to 失败经 `update_stats` 进入 `ConnStats`。
+    #[test]
+    fn pump_send_failure_reaches_conn_stats() {
+        let driver = Driver::new_client_with_transport(Box::new(SendErrorTransport::new(
+            io::ErrorKind::NotConnected,
+        )))
+        .expect("driver spawns");
+        let conn = connect_for_send_error_test(&driver);
+        let stats = wait_for_stats(&conn, |s| s.send_failed > 0);
+        assert_eq!(
+            stats.send_failed,
+            stats.send_failed_not_connected + stats.send_failed_other,
+            "failed is the sum of its kind buckets"
+        );
+        assert!(stats.send_failed_not_connected > 0);
+        assert_eq!(stats.send_would_block, 0);
+    }
+
+    /// 主站点接线：WouldBlock 注入只进 `send_would_block`，失败计数保持 0。
+    #[test]
+    fn pump_would_block_never_counts_as_failure() {
+        let driver = Driver::new_client_with_transport(Box::new(SendErrorTransport::new(
+            io::ErrorKind::WouldBlock,
+        )))
+        .expect("driver spawns");
+        let conn = connect_for_send_error_test(&driver);
+        let stats = wait_for_stats(&conn, |s| s.send_would_block > 0);
+        assert_eq!(stats.send_failed, 0, "backpressure is not a send failure");
+        assert_eq!(stats.send_failed_not_connected, 0);
+        assert_eq!(stats.send_failed_other, 0);
+    }
+
+    /// 测试替身：send_to 恒返指定 kind；recv_from 立即 WouldBlock（带 1ms
+    /// 休眠避免忙等），driver 线程可正常处理命令与 pump。
+    struct SendErrorTransport {
+        kind: io::ErrorKind,
+    }
+
+    impl SendErrorTransport {
+        fn new(kind: io::ErrorKind) -> Self {
+            Self { kind }
+        }
+    }
+
+    impl UdpTransport for SendErrorTransport {
+        fn recv_from(&mut self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            thread::sleep(Duration::from_millis(1));
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets"))
+        }
+        fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            Err(io::Error::new(self.kind, "injected send failure"))
+        }
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            "127.0.0.1:41000".parse().map_err(io::Error::other)
+        }
+    }
+
+    fn connect_for_send_error_test(driver: &Arc<Driver>) -> Arc<ConnShared> {
+        let peer = PeerId([9u8; 32]);
+        let crypto = build_client_crypto(peer).expect("client crypto");
+        let (tx, rx) = mpsc::channel();
+        driver.send(Cmd::Connect {
+            remote: "127.0.0.1:9".parse().unwrap(),
+            crypto,
+            peer,
+            server_name: "nexus-fabric".to_string(),
+            reply: tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let id = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connect reply")
+            .expect("connection id");
+        driver
+            .shared()
+            .conns
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .expect("live connection is published")
+    }
+
+    fn wait_for_stats(conn: &Arc<ConnShared>, predicate: impl Fn(&ConnStats) -> bool) -> ConnStats {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = conn.stats.lock().unwrap().clone();
+            if predicate(&stats) {
+                return stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "send error was not surfaced in ConnStats within 5s: {stats:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// S11: a `Cmd::Connect` cancelled before the driver runs it must not

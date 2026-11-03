@@ -95,7 +95,7 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 
 见 `src/lib.rs`：
 - `PeerId([u8; 32])`、`ConnectionId(u64)`、`ConnConfig`、`FabricConn`、`FabricListener`
-- `SendStream` / `RecvStream`、`ConnStats{rtt_ms, loss_rate, jitter_ms, throughput_bps, active_path, bytes_sent, bytes_recv, datagram_rejected, datagram_dropped, datagram_dropped_too_large, datagram_dropped_unsupported, datagram_evicted}`（Option 语义，S8）
+- `SendStream` / `RecvStream`、`ConnStats{rtt_ms, loss_rate, jitter_ms, throughput_bps, active_path, bytes_sent, bytes_recv, datagram_rejected, datagram_dropped, datagram_dropped_too_large, datagram_dropped_unsupported, datagram_evicted, send_failed, send_failed_not_connected, send_failed_other, send_would_block}`（Option 语义，S8）
 - `FabricError{HandshakeFailed, PathUnreachable, Closed(u32), Timeout, DatagramTooLarge{len,cap}, Transport}`
 - `FabricConn::datagram_cap() -> Option<usize>`：连接级有效 datagram 载荷上限
   （`None` = 未协商/已关闭，调用方退到 `CONSERVATIVE_DATAGRAM_CAP`）。
@@ -173,8 +173,13 @@ cargo clippy -p nexus-fabric --all-targets -- -D warnings
 
 `ConnStats` 为稳定结构化字段；关联字段：`connection_id`、`peer_id`、`path_id`
 （见 AGENTS.md §22）。Hot path 禁止 per-packet log：datagram 发送/逐出只计数
-（`ConnStats.datagram_*`），丢弃日志按连接 10s 限频（`DgramDropLog`，时间由
+（`ConnStats.datagram_*`），丢弃日志按连接 10s 限频（`RateLimitedLog`，时间由
 driver loop 注入，协议 core 不读时钟）。
+
+socket `send_to` 失败同为可观察性路径（不改变发送语义）：连接内失败计入
+`ConnStats.send_*`（`WouldBlock` 为背压单列，不计失败），端点级（无连接上下文）
+失败计入 driver loop 内部计数（暂无公共读面）；两处错误日志共用 `RateLimitedLog`
+10s 限频，首个错误立即输出。
 
 ## Recovery Semantics
 

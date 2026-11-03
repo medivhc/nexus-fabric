@@ -640,6 +640,18 @@ pub struct ConnStats {
     /// 发送缓冲不足、本次 `send` 迫使 quinn 逐出旧 datagram 的次数
     /// （近似语义：计"迫使逐出的 send 次数"，不是被逐出的条数）。
     pub datagram_evicted: u64,
+    /// 本连接 `UdpTransport::send_to` 失败次数（不含 `WouldBlock`）。
+    ///
+    /// 可观察性补齐：失败包按丢失处理并由 QUIC 重传；此前这些失败完全不可见，
+    /// 本字段不改变发送语义，也不宣称修复丢包。
+    pub send_failed: u64,
+    /// `send_failed` 子集：`io::ErrorKind::NotConnected`（含 rebind 窗口内经
+    /// `ClosedTransport` 发出的包）。
+    pub send_failed_not_connected: u64,
+    /// `send_failed` 子集：其余 `io::ErrorKind`。
+    pub send_failed_other: u64,
+    /// `io::ErrorKind::WouldBlock` 次数：正常背压，**不是**发送失败。
+    pub send_would_block: u64,
 }
 
 impl ConnStats {
@@ -657,6 +669,10 @@ impl ConnStats {
             datagram_dropped_too_large: 0,
             datagram_dropped_unsupported: 0,
             datagram_evicted: 0,
+            send_failed: 0,
+            send_failed_not_connected: 0,
+            send_failed_other: 0,
+            send_would_block: 0,
         }
     }
 }
