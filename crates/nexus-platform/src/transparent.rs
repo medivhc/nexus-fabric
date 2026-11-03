@@ -222,7 +222,7 @@ pub trait TransparentUdpIngress: Send {
         &mut self,
         now_millis: u64,
     ) -> Result<Option<ReceivedDatagram>, TransparentIngressError>;
-    /// 以原始目的地为源地址回包（`sendmsg` + `IP_PKTINFO`）。
+    /// 以原始目的地（IP 与端口）为源地址回包；做不到时返回错误而不改用其它源地址。
     fn send_from(
         &mut self,
         orig_dst: SocketAddrV4,

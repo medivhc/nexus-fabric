@@ -428,13 +428,12 @@ fn reader_loop(
 }
 
 /// 只移除「仍指向本 reader 连接」的会话项，避免旧 reader 误删新拨通的连接。
+///
+/// H1：条件判定与摘除下沉到 `N1SessionManager::remove_if_conn`（单次加锁），
+/// 与谴责排空共用同一原子操作——两者都以 conn_id 为条件，任一先执行，另一
+/// 方看到的要么是条目已不存在，要么是已换的新 conn（不摘）。
 fn remove_if_current(sessions: &N1SessionManager, peer: N1PeerId, conn_id: u64) {
-    let current_is_ours = sessions
-        .connection_for(&peer)
-        .is_some_and(|conn| conn.connection_id() == conn_id);
-    if current_is_ours {
-        sessions.remove(&peer);
-    } else if sessions.connection_for(&peer).is_some() {
+    if !sessions.remove_if_conn(&peer, conn_id) && sessions.connection_for(&peer).is_some() {
         eprintln!(
             "[n1-rx] peer={} stale reader for conn={conn_id} exited without removing rebound session",
             peer_hex8(&peer)

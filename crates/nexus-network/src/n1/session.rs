@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::link::{LinkConfig, LinkStateWatcher, WatcherHandle};
-use super::{N1Connection, N1Dialer, N1Discovery, N1Error, N1EventSink, N1PeerId};
+use super::{
+    N1Connection, N1Dialer, N1Discovery, N1Disposition, N1Error, N1Event, N1EventSink, N1PeerId,
+};
 
 /// 对端连接生命周期阶段（AGENTS.md §14）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,13 @@ impl N1Peer {
 /// （`accept_loop` 的生产循环由 Composition Root 驱动，见 [`N1SessionManager::accept_loop`]）。
 pub struct N1SessionManager {
     peers: Mutex<HashMap<N1PeerId, N1Peer>>,
+    /// 谴责表（H1）：`peer → connection_id`。
+    ///
+    /// 由 `Escalate` 事件（watcher 线程，只登记不摘除）与发送侧
+    /// `PeerClosed`（bridge）写入；由数据面/拨号/accept 线程的入口排空。
+    /// 单独一张表的原因：`emit` 在 watcher 线程内执行，而摘除要 join
+    /// watcher 线程——在 emit 里同步摘除会自 join 死锁。
+    condemned: Arc<Mutex<HashMap<N1PeerId, u64>>>,
     dialer: Arc<dyn N1Dialer>,
     discovery: Arc<dyn N1Discovery>,
     sink: Arc<dyn N1EventSink>,
@@ -68,8 +77,15 @@ impl N1SessionManager {
         sink: Arc<dyn N1EventSink>,
         link_config: LinkConfig,
     ) -> Self {
+        let condemned = Arc::new(Mutex::new(HashMap::new()));
+        // 事件 sink 包一层谴责适配：转发全部事件，`Escalate` 时只登记。
+        let sink: Arc<dyn N1EventSink> = Arc::new(CondemningSink {
+            inner: sink,
+            condemned: Arc::clone(&condemned),
+        });
         Self {
             peers: Mutex::new(HashMap::new()),
+            condemned,
             dialer,
             discovery,
             sink,
@@ -80,6 +96,8 @@ impl N1SessionManager {
     /// 经 `N1Dialer` 向对端建连并登记；已存在时直接返回（per-peer 单 Connection
     /// 不变量：不重复建连）。
     pub fn dial(&self, peer: &N1PeerId) -> Result<(), N1Error> {
+        // 先排空谴责：被谴责的旧条目必须先消失，重拨才有意义。
+        self.drain_condemned();
         if self.peers.lock().unwrap().contains_key(peer) {
             return Ok(());
         }
@@ -96,6 +114,8 @@ impl N1SessionManager {
 
     /// 登记一条入向连接（`accept_loop` 收到后调用）。
     pub fn insert_accepted(&self, peer: N1PeerId, conn: Box<dyn N1Connection>) {
+        // 先清后纳：对端重启后的重建连接不能被自己的死条目挡在门外。
+        self.drain_condemned();
         if self.peers.lock().unwrap().contains_key(&peer) {
             // 已有连接：关闭新到的重复连接，保持单 Connection 不变量。
             conn.close();
@@ -145,6 +165,8 @@ impl N1SessionManager {
     /// 取对端连接（包泵路由查表用）。
     #[must_use]
     pub fn connection_for(&self, peer: &N1PeerId) -> Option<Arc<dyn N1Connection>> {
+        // 数据面/拨号/accept 线程的安全排空点（非 watcher 线程，join 安全）。
+        self.drain_condemned();
         self.peers
             .lock()
             .unwrap()
@@ -181,12 +203,83 @@ impl N1SessionManager {
         }
     }
 
+    /// 按 `connection_id` 条件摘除（单次加锁判定 + 摘除）。
+    ///
+    /// 与 [`Self::remove`] 的区别：只有当表里的条目仍是 `conn_id` 指向的那条
+    /// 连接时才摘除。reader 退出路径与谴责排空共用本方法——任一先执行，另一
+    /// 方看到的要么是条目已不存在（`false`），要么是已换的新 conn（id 不符，
+    /// 不摘），因此不会误删重建后的连接。
+    pub fn remove_if_conn(&self, peer: &N1PeerId, conn_id: u64) -> bool {
+        let entry = {
+            let mut peers = self.peers.lock().unwrap();
+            match peers.get(peer) {
+                Some(p) if p.conn.connection_id() == conn_id => peers.remove(peer),
+                _ => None,
+            }
+        };
+        let Some(mut p) = entry else {
+            return false;
+        };
+        p.phase = N1PeerPhase::Draining;
+        // E-3 顺序：先 close 打断阻塞中的 watcher，再 join。
+        p.conn.close();
+        if let Some(w) = p.watcher.take() {
+            w.shutdown();
+        }
+        p.phase = N1PeerPhase::Disposed;
+        true
+    }
+
+    /// 登记谴责（H1）：`peer` 当前那条 `conn_id` 连接已被判定死亡。
+    ///
+    /// 只写表、不摘除（可在 watcher 线程内安全调用）。真正的摘除发生在
+    /// [`Self::connection_for`] / [`Self::dial`] / [`Self::insert_accepted`]
+    /// 三个入口。
+    pub(crate) fn condemn(&self, peer: &N1PeerId, conn_id: u64) {
+        self.condemned.lock().unwrap().insert(*peer, conn_id);
+    }
+
+    /// 排空谴责表：id 仍匹配 → 摘除；已换新 conn（id 不符）→ 丢弃谴责。
+    fn drain_condemned(&self) {
+        let entries: Vec<(N1PeerId, u64)> = {
+            let mut condemned = self.condemned.lock().unwrap();
+            if condemned.is_empty() {
+                return;
+            }
+            condemned.drain().collect()
+        };
+        for (peer, conn_id) in entries {
+            self.remove_if_conn(&peer, conn_id);
+        }
+    }
+
     /// 关闭全部对端（Owner 退出路径）。
     pub fn shutdown(&self) {
         let peers: Vec<N1PeerId> = self.peers();
         for peer in peers {
             self.remove(&peer);
         }
+    }
+}
+
+/// 事件 sink 的谴责适配层：转发全部事件，`Escalate` 时登记谴责。
+///
+/// 只登记、不摘除：`emit` 在 watcher 线程内被调用，而 `remove()` 需要 join
+/// watcher 线程（自 join 死锁）。
+struct CondemningSink {
+    inner: Arc<dyn N1EventSink>,
+    condemned: Arc<Mutex<HashMap<N1PeerId, u64>>>,
+}
+
+impl N1EventSink for CondemningSink {
+    fn emit(&self, event: N1Event) {
+        if event.disposition == N1Disposition::Escalate {
+            self.condemned
+                .lock()
+                .unwrap()
+                .insert(event.peer, event.connection_id);
+        }
+        self.inner.emit(event);
     }
 }
 
@@ -220,7 +313,8 @@ mod tests {
 
     impl N1Connection for FakeConn {
         fn send_datagram(&self, data: &[u8]) -> Result<(), N1Error> {
-            if data.len() > 1200 {
+            // 与生产契约同口径：有效载荷下限（真值由连接的 datagram_cap 给出）。
+            if data.len() > crate::n1::DATAGRAM_PAYLOAD_FLOOR {
                 return Err(N1Error::OversizeDatagram(data.len()));
             }
             if self.closed.load(Ordering::SeqCst) {
@@ -327,6 +421,135 @@ mod tests {
         m.insert_accepted(p, Box::new(FakeConn::new(p, 999)));
         assert_eq!(m.connection_for(&p).unwrap().connection_id(), before);
         m.shutdown();
+    }
+
+    /// H1：谴责命中的条目在下一个入口被摘除（数据面/拨号/accept 线程）。
+    #[test]
+    fn condemn_removes_the_matching_connection() {
+        let m = manager();
+        let p = peer_id(11);
+        m.dial(&p).unwrap();
+        let id = m.connection_for(&p).unwrap().connection_id();
+        m.condemn(&p, id);
+        assert!(
+            m.connection_for(&p).is_none(),
+            "condemned connection must be drained"
+        );
+        assert_eq!(m.phase_of(&p), None);
+        m.shutdown();
+    }
+
+    /// H1 核心对冲：谴责的是旧 conn_id 时，不得误摘已重建的新连接。
+    #[test]
+    fn condemn_of_old_connection_does_not_remove_rebuilt_connection() {
+        let m = manager();
+        let p = peer_id(12);
+        m.dial(&p).unwrap();
+        let old_id = m.connection_for(&p).unwrap().connection_id();
+        m.remove(&p);
+        m.dial(&p).unwrap();
+        let new_id = m.connection_for(&p).unwrap().connection_id();
+        assert_ne!(
+            old_id, new_id,
+            "test precondition: rebuilt conn has a new id"
+        );
+
+        m.condemn(&p, old_id);
+        let current = m
+            .connection_for(&p)
+            .expect("rebuilt connection must survive");
+        assert_eq!(current.connection_id(), new_id);
+        m.shutdown();
+    }
+
+    /// H1：`insert_accepted` 先清后纳——对端重启后的重建连接不被死条目挡住。
+    #[test]
+    fn insert_accepted_drains_condemnation_before_accepting() {
+        let m = manager();
+        let p = peer_id(14);
+        m.dial(&p).unwrap();
+        let stale_id = m.connection_for(&p).unwrap().connection_id();
+        m.condemn(&p, stale_id);
+
+        m.insert_accepted(p, Box::new(FakeConn::new(p, 999)));
+        let current = m.connection_for(&p).expect("accepted connection must land");
+        assert_eq!(
+            current.connection_id(),
+            999,
+            "stale entry must be drained before dedup, not the new conn closed"
+        );
+        m.shutdown();
+    }
+
+    /// H1：`Escalate`（RebindFailed）后，dial 生命周期可重新拨通。
+    #[test]
+    fn dial_recovers_after_escalation() {
+        let m = manager();
+        let p = peer_id(15);
+        m.dial(&p).unwrap();
+        let dead_id = m.connection_for(&p).unwrap().connection_id();
+        // watcher 在 RebindFailed 时发 Escalate → 适配 sink 只登记谴责。
+        m.condemn(&p, dead_id);
+
+        m.dial(&p).expect("dial must recover after condemnation");
+        let current = m.connection_for(&p).expect("fresh connection");
+        assert_ne!(current.connection_id(), dead_id, "a new conn was dialed");
+        assert_eq!(current.connection_id(), 2, "FakeDialer allocates id 2 next");
+        m.shutdown();
+    }
+
+    /// Escalate 事件经 sink 适配层登记谴责；其他 disposition 不登记。
+    #[test]
+    fn escalate_event_condemns_via_sink_adapter() {
+        let condemned: Arc<Mutex<HashMap<N1PeerId, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sink = CondemningSink {
+            inner: Arc::new(NullSink),
+            condemned: Arc::clone(&condemned),
+        };
+        let p = peer_id(16);
+        sink.emit(N1Event {
+            peer: p,
+            connection_id: 77,
+            kind: super::super::N1EventKind::RebindSucceeded,
+            disposition: N1Disposition::Retry,
+        });
+        assert!(
+            condemned.lock().unwrap().is_empty(),
+            "Retry must not condemn"
+        );
+        sink.emit(N1Event {
+            peer: p,
+            connection_id: 77,
+            kind: super::super::N1EventKind::RebindFailed {
+                reason: "injected".to_string(),
+            },
+            disposition: N1Disposition::Escalate,
+        });
+        assert_eq!(condemned.lock().unwrap().get(&p), Some(&77));
+    }
+
+    /// 原子条件摘除：id 不符不摘；并发重复摘除恰好一次成功。
+    #[test]
+    fn remove_if_conn_is_atomic_and_id_checked() {
+        let m = Arc::new(manager());
+        let p = peer_id(17);
+        m.dial(&p).unwrap();
+        let id = m.connection_for(&p).unwrap().connection_id();
+        assert!(!m.remove_if_conn(&p, id + 1), "wrong id must not remove");
+        assert!(m.connection_for(&p).is_some());
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = Arc::clone(&m);
+            handles.push(thread::spawn(move || m.remove_if_conn(&p, id)));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .filter(|removed| *removed)
+            .count();
+        assert_eq!(wins, 1, "exactly one caller may remove the connection");
+        assert!(m.connection_for(&p).is_none());
     }
 
     #[test]

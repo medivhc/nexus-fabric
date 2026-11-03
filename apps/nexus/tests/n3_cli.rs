@@ -16,9 +16,11 @@ fn cli(args: &[&str]) -> Output {
     // Build nexusd before standalone nexus tests, or point the fixture at its
     // binary. Never launch Cargo inside a running Cargo test process.
     let daemon = DisabledDaemon::start();
+    // 全局选项位于子命令之前（fix(proxy-addr) 后的文法）：`--addr` 指定 daemon
+    // 目标，必须放在子命令 token 之前；置于其后会归子命令所有而被拒绝。
     Command::new(env!("CARGO_BIN_EXE_nexus"))
-        .args(args)
         .args(["--addr", &daemon.addr])
+        .args(args)
         .env(
             "NEXUS_LOCALAPI_TOKEN_FILE",
             daemon.root.join("localapi.token"),

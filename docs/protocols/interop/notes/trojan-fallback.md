@@ -24,7 +24,7 @@
 | # | 残余 | 用户可见后果 | 去向 |
 |---|---|---|---|
 | R-1 | fallback 响应慢于 `W`（>1 RTT + 50ms，或 >600ms 自适应上限；显式覆盖过小时同理） | success 已写出，窗口外到达的 fallback 内容仍可能被当作隧道数据 | 本注记（承诺边界） |
-| R-2 | fallback 等客户端先发载荷后才响应 | 零载荷判据失效，同上 | 本注记（承诺边界） |
+| R-2 | fallback 等客户端先发载荷后才响应 | 零载荷判据失效，同上。post-success late guard 仅在客户端零载荷期间生效；客户端载荷后的 `HTTP/` 应答按 origin 应答交付（R-2/R-7 范围内） | 本注记（承诺边界） |
 | R-3 | `signature` 模式下的非 HTTP fallback | 显式安全降级的已知漏报 | 本注记 + PRODUCT §11.9.3 |
 | R-4 | 客户端在 success 前 pipelined 载荷（`seed` 非空） | 守卫不适用（扣压又违反上行零扣压） | 本注记 |
 | R-5 | `nexusd` TUN / `ProxyEngine` 路径 | 该入口的「成功」由 smoltcp SYN-ACK 伪造，仍 fail-open | `NEXT-STEPS.md`（单独立项） |

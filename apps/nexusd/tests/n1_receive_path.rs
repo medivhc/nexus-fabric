@@ -130,7 +130,7 @@ fn network_toml(me: &FabricIdentity, peer: &FabricIdentity, peer_addr: &str) -> 
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"10.200.0.1\"\n\
-         mtu = 1200\n\
+         mtu = 1162\n\
          [[vpi.routes]]\n\
          subnet = \"127.0.0.1/32\"\n\
          peer = \"{}\"\n",
@@ -569,7 +569,7 @@ fn write_network(dir: &Path, me: &FabricIdentity, peer: Option<&FabricIdentity>)
          [vpi]\n\
          interface = \"nexus0\"\n\
          address = \"10.200.0.1\"\n\
-         mtu = 1200\n",
+         mtu = 1162\n",
         hex32(&me.peer_id().0)
     );
     if let Some(peer) = peer {
@@ -581,7 +581,7 @@ fn write_network(dir: &Path, me: &FabricIdentity, peer: Option<&FabricIdentity>)
              [vpi]\n\
              interface = \"nexus0\"\n\
              address = \"10.200.0.1\"\n\
-             mtu = 1200\n",
+             mtu = 1162\n",
             hex32(&me.peer_id().0),
             hex32(&peer.peer_id().0),
         );

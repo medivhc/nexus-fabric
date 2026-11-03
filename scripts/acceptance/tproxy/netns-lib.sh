@@ -165,11 +165,15 @@ assert_file_empty() {
 
 setup_host_alias() {
     timeout 10 sudo -n "${IP}" netns delete "${NS_HOST}" >/dev/null 2>&1 || true
-    timeout 10 sudo -n "${IP}" netns attach "${NS_HOST}" 1 >/dev/null 2>&1 || {
-        record "FAIL host_alias_attach ns=${NS_HOST}"
+    # The host netns is PID 1's by default. Sandboxes that hide PID 1's
+    # namespaces can point NEXUS_E5_HOST_PID at a process in the host netns
+    # (e.g. the invoking shell).
+    local host_pid="${NEXUS_E5_HOST_PID:-1}"
+    timeout 10 sudo -n "${IP}" netns attach "${NS_HOST}" "${host_pid}" >/dev/null 2>&1 || {
+        record "FAIL host_alias_attach ns=${NS_HOST} pid=${host_pid}"
         return 1
     }
-    record "host_alias=${NS_HOST} (pid 1 netns)"
+    record "host_alias=${NS_HOST} (pid ${host_pid} netns)"
 }
 
 cleanup_host_alias() {
@@ -443,6 +447,33 @@ stats_json() {
         timeout 10 sudo -n "${IP}" netns exec "${NS_R}" \
             curl -sS --max-time 8 "${LOCALAPI}" >"${out}" 2>"${out}.err"
     fi
+}
+
+# nexusd publishes tproxy counters at most once per second (apps/nexusd
+# main.rs), so one read right after traffic can still see the previous
+# snapshot. Poll `out` until every `<jq expr> <minimum>` pair holds, up to 12
+# polls 0.25 s apart (each poll is itself bounded by stats_json's 10 s
+# timeout); the last poll stays in `out` for the assertions that follow, which
+# keep their thresholds. A timeout is reported on stderr, not as a verdict.
+stats_wait() {
+    local out="$1" i j ok actual
+    shift
+    local args=("$@")
+    for i in $(seq 1 12); do
+        stats_json "${out}" >/dev/null 2>&1 || true
+        ok=1
+        for ((j = 0; j < ${#args[@]}; j += 2)); do
+            actual="$(stats_value "${out}" "${args[j]}")"
+            if ! [ "${actual:-0}" -ge "${args[j + 1]}" ] 2>/dev/null; then
+                ok=0
+                break
+            fi
+        done
+        [ "${ok}" = 1 ] && return 0
+        sleep 0.25
+    done
+    printf 'stats_wait: %s did not reach %s\n' "${out}" "${args[*]}" >&2
+    return 0
 }
 
 stats_value() {

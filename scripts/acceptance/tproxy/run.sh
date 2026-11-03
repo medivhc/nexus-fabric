@@ -165,7 +165,7 @@ step_s1() {
     ss_local="$(awk '$1=="ESTAB" && $4=="'"${UPSTREAM_ADDR}"':8080" {print $4; exit}' "$ev/ss.txt")"
     assert_eq ss_accepted_local "$ss_local" "${UPSTREAM_ADDR}:8080"
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.tcp_accepted' 1
     local tcp missing upstream state ipv6
     tcp="$(stats_value "$ev/status.json" '.tproxy.counters.tcp_accepted')"
     missing="$(stats_value "$ev/status.json" '.tproxy.counters.orig_dst_missing')"
@@ -247,7 +247,9 @@ step_s2() {
         STEP_FAILED=1
     fi
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    # dig + udp_client's DNS query + echo: wait for all three datagrams so the
+    # == 0 checks below cover all of this step's traffic.
+    stats_wait "$ev/status.json" '.tproxy.counters.udp_datagrams' 3
     local datagrams reply_failed missing state ipv6
     datagrams="$(stats_value "$ev/status.json" '.tproxy.counters.udp_datagrams')"
     reply_failed="$(stats_value "$ev/status.json" '.tproxy.counters.udp_reply_failed')"
@@ -259,6 +261,41 @@ step_s2() {
     assert_eq orig_dst_missing "$missing" 0
     assert_eq tproxy_state "$state" active
     assert_eq tproxy_ipv6_enabled "$ipv6" false
+
+    # Failure path (PRODUCT §11.18): with orig_dst ip:port held exclusively in
+    # the router namespace the reply is dropped and counted, never sent from
+    # another source. A one-shot echo on SITE_ADDR:9000 (not used above, so no
+    # reply socket is cached for it) makes the upstream answer.
+    local hold_py="${TPROXY_DIR}/reply_hold.py" tag="nxtp-held-${RUN_ID}-s${STEP_N}"
+    local failed_before="${reply_failed:-0}" probe_out
+    timeout 20 sudo -n "${IP}" netns exec "${NS_U}" python3 "${hold_py}" \
+        echo "${SITE_ADDR}" 9000 --secs 12 --tag "${tag}" >"$ev/held-echo.txt" 2>&1 &
+    local echo_pid=$!
+    timeout 20 sudo -n "${IP}" netns exec "${NS_R}" python3 "${hold_py}" \
+        hold "${SITE_ADDR}" 9000 --secs 12 --tag "${tag}" >"$ev/reply-holder.txt" 2>&1 &
+    local holder_pid=$!
+    for _ in $(seq 1 30); do
+        grep -q held "$ev/reply-holder.txt" 2>/dev/null \
+            && grep -q ready "$ev/held-echo.txt" 2>/dev/null && break
+        sleep 0.1
+    done
+    assert_contains reply_holder_bound "$(cat "$ev/reply-holder.txt")" held
+    assert_contains held_echo_ready "$(cat "$ev/held-echo.txt")" ready
+    probe_out="$(timeout 8 sudo -n "${IP}" netns exec "${NS_C}" python3 "${hold_py}" \
+        probe "${SITE_ADDR}" 9000 --secs 3 2>&1)"
+    printf '%s\n' "$probe_out" >"$ev/held-probe.txt"
+    assert_contains held_upstream_answered "$(cat "$ev/held-echo.txt")" echoed
+    assert_eq held_reply_dropped "$probe_out" no_reply
+    stats_wait "$ev/status-held.json" '.tproxy.counters.udp_reply_failed' $((failed_before + 1))
+    assert_ge udp_reply_failed_counted \
+        "$(stats_value "$ev/status-held.json" '.tproxy.counters.udp_reply_failed')" \
+        $((failed_before + 1))
+    assert_contains udp_reply_failed_logged "$(cat "$ev/nexusd.log" 2>/dev/null)" \
+        "event=udp_reply_failed orig_dst=${SITE_ADDR}:9000"
+    # 记录的 `timeout … sudo …` 包装 pid：timeout 把 TERM 转给子进程；helper 自身
+    # 也在 --secs 后退出（不用 pkill -f，它会匹配到自己的包装命令行）。
+    kill "${echo_pid}" "${holder_pid}" 2>/dev/null || true
+    wait "${echo_pid}" "${holder_pid}" 2>/dev/null || true
 
     finalize_step
     step_exit_code
@@ -509,7 +546,7 @@ step_s5() {
         record "PASS no_direct_bypass no router-originated packet to ${SITE_ADDR}"
     fi
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.upstream_failed' 1
     local upstream last_reason
     upstream="$(stats_value "$ev/status.json" '.tproxy.counters.upstream_failed')"
     last_reason="$(stats_value "$ev/status.json" '.tproxy.last_failure_reason')"
@@ -708,7 +745,7 @@ step_s8() {
     dig_out="$(client_dig example.nexus 2>&1)"
     assert_contains dig_answer "$dig_out" "${SITE_ADDR}"
 
-    stats_json "$ev/status.json" >/dev/null 2>&1 || true
+    stats_wait "$ev/status.json" '.tproxy.counters.tcp_accepted' 1 '.tproxy.counters.udp_datagrams' 1
     local backend tcp datagrams
     backend="$(stats_value "$ev/status.json" '.tproxy.backend')"
     tcp="$(stats_value "$ev/status.json" '.tproxy.counters.tcp_accepted')"
