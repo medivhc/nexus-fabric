@@ -33,7 +33,7 @@ nexusd 经 VLESS / AnyTLS 承载 UDP（PRODUCT §11.18.1），代码评审 r1 �
 2. 建流期间 64 个数据报；建流之后改为 1 MiB 未写出字节的背压。worker 有流量时 2 ms 读超时、
    空闲时 20 ms。
 3. `UdpForwarder::handle_packet` 返回 `UdpSend { Written, Queued, Dropped }`；只有 `Written`
-   当场计转发，代理流的写出经 `ProxyPollResult.udp_forwarded` 在写出后计入。
+   当场计转发，代理流的写出经 `UdpForwarder::take_stream_writes()` / `ProxyEngine::take_udp_stream_writes()` 在写出后由 dataplane 单一同步点计入 `proxy_forwarded`。
 
 ## 教训/可复用要点
 
