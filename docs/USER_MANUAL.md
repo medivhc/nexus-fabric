@@ -636,10 +636,11 @@ ASSOCIATE 会成功返回（`REP=0x00` + 有效 BND），能力判定发生在�
   > **升级行为变化（`network.toml` 的 `[vpi].mtu`，用户可见）**：同一修复把 VPI raw-IP
   > uplink 的 MTU 默认值与硬上界对齐到 N1 datagram 有效载荷下限 **1162**。新版本对
   > `vpi.mtu` **>1162 的配置直接以硬错误拒绝启动**（不钳制、不静默降级，rc=1，错误文案
-  > 含 `1162`）；存量部署的旧默认 `1200` 以及任何配在 1163 以上的 `vpi.mtu`，**升级前
-  > 必须先改到 ≤1162**。例外：Linux 承载 IPv6 的接口要求 MTU ≥1280，需要 IPv6 的 TUN
-  > 不能靠把 MTU 降到 1162 规避——该类超限 raw-IP 包按「诚实丢弃 + 计数」处理
-  > （见 `crates/nexus-network/MODULE.md` 的 Platform Constraints）。
+  > 含 `1162`）；存量部署的旧默认 `1200` 以及其他配在 1163–1200（旧上界）的
+  > `vpi.mtu`，**升级前必须先改到 ≤1162**。例外：Linux 承载 IPv6 的接口要求 MTU
+  > ≥1280，需要 IPv6 的 TUN 不能靠把 MTU 降到 1162 规避——该类超限 raw-IP 包按
+  > 「诚实丢弃 + 计数」处理（见 `crates/nexus-network/MODULE.md` 的 Platform
+  > Constraints）。
 
 * **已修复：2026-10-29 断裂的根因与修复落点**（诊断 run 已关闭）：
 
