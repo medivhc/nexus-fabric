@@ -33,7 +33,7 @@ use crate::log_throttle::KeyedLogThrottle;
 const MAX_QUEUED_DURING_OPEN: u64 = 64;
 /// 建流之后每条流未写出的字节上限（写背压）。
 const MAX_PENDING_BYTES_AFTER_OPEN: u64 = 1024 * 1024;
-/// 写背压里每个数据报的固定开销（缓冲与命令的内存），使零长 / 极小数据报同样受限。
+/// 写背压里每个数据报的固定开销（缓冲与命令的内存），使零长 / 极小数据报同样受限）。
 const PER_DATAGRAM_OVERHEAD: u64 = 64;
 /// 同时存在的流上限（既有 `MAX_UDP_FLOWS`）。
 pub(super) const MAX_STREAMS: usize = 1024;
@@ -121,7 +121,7 @@ impl Stream {
     /// 本数据报是否超出当前上限。
     fn full(&self, len: u64) -> bool {
         if self.opened {
-            self.enqueued_bytes - self.sent_bytes + charge(len) > MAX_PENDING_BYTES_AFTER_OPEN
+            self.enqueued_bytes.saturating_sub(self.sent_bytes) + charge(len) > MAX_PENDING_BYTES_AFTER_OPEN
         } else {
             self.enqueued >= MAX_QUEUED_DURING_OPEN
         }
@@ -199,7 +199,7 @@ impl StreamTable {
         if self
             .failed_at
             .get(&key)
-            .is_some_and(|failed| now.duration_since(*failed) < OPEN_RETRY_SPACING)
+            .is_some_and(|failed| now.saturating_duration_since(*failed) < OPEN_RETRY_SPACING)
             || self.streams.len() >= MAX_STREAMS
         {
             stats.udp_send_failed += 1;
@@ -224,7 +224,7 @@ impl StreamTable {
         let idle: Vec<StreamKey> = self
             .streams
             .iter()
-            .filter(|(_, stream)| now.duration_since(stream.last_activity) >= STREAM_IDLE_TIMEOUT)
+            .filter(|(_, stream)| now.saturating_duration_since(stream.last_activity) >= STREAM_IDLE_TIMEOUT)
             .map(|(key, _)| *key)
             .collect();
         for key in idle {
@@ -234,7 +234,7 @@ impl StreamTable {
             }
         }
         self.failed_at
-            .retain(|_, failed| now.duration_since(*failed) < OPEN_RETRY_SPACING);
+            .retain(|_, failed| now.saturating_duration_since(*failed) < OPEN_RETRY_SPACING);
         self.reap_finished();
         std::mem::take(&mut self.replies)
     }
@@ -272,8 +272,8 @@ impl StreamTable {
                     }
                 }
                 StreamEvent::Sent { key, id, bytes } => {
-                    stats.udp_sent += 1;
                     if let Some(stream) = self.current(key, id) {
+                        stats.udp_sent += 1;
                         stream.sent += 1;
                         stream.sent_bytes += charge(bytes);
                     }
